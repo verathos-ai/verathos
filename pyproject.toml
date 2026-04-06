@@ -1,0 +1,135 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verathos"
+version = "0.1.0"
+description = "Zero-Knowledge Verified LLM Inference and Training"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Fabian Mueller"}
+]
+keywords = [
+    "zero-knowledge",
+    "zkp",
+    "llm",
+    "inference-verification",
+    "verifiable-training",
+    "sumcheck",
+    "verified-llm",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "blake3>=0.3",
+    # zkllm is installed from the local dist/ wheel (not on PyPI).
+    # Run: pip install dist/zkllm-*.whl (setup_miner.sh does this automatically)
+]
+
+[project.optional-dependencies]
+inference = [
+    "transformers>=4.30",
+    "accelerate>=0.20",
+    "safetensors>=0.3",
+]
+training = [
+    "transformers>=4.30",
+    "accelerate>=0.20",
+    "safetensors>=0.3",
+    "peft>=0.5",
+    "datasets>=2.14",
+    "optimum>=1.24.0",
+    "streamlit>=1.30",
+    "altair>=5.0",
+]
+quantization = [
+    "bitsandbytes>=0.42",
+    "gptqmodel>=0.9",
+]
+hashing = [
+    # blake3 is now a core dependency — this extra is kept for backwards
+    # compatibility with existing install commands that reference it.
+]
+vllm = [
+    "vllm>=0.17,<0.18",
+    "bitsandbytes>=0.42",
+    "streamlit>=1.30",
+    "ninja>=1.11",
+]
+api = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "httpx>=0.24",
+]
+chain = [
+    "web3>=6.0",
+    "eth-account>=0.9",
+]
+tee = [
+    "pynacl>=1.5",
+]
+tee-gpu = [
+    "pynacl>=1.5",
+    "nv-attestation-sdk>=1.0",
+]
+x402 = [
+    "x402[fastapi,evm]>=2.2",
+]
+postgres = [
+    "psycopg[binary]>=3.1",
+    "psycopg_pool>=3.1",
+]
+neurons = [
+    "verathos[api,chain,tee]",
+    "bittensor>=10.0",
+    "substrate-interface>=1.7",
+    "transformers>=4.30",
+    "safetensors>=0.3",
+    "bcrypt>=4.0",
+]
+neurons-pg = [
+    "verathos[neurons,postgres]",
+]
+all = [
+    "verathos[inference,training,quantization,hashing,api]",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "pytest-benchmark>=4.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+verathos = "neurons.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+verathos = "verallm.vllm_plugin:register_verathos_plugin"
+
+[tool.setuptools.packages.find]
+include = ["verallm*", "trainllm*", "neurons*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true

@@ -1,0 +1,123 @@
+{
+  "name": "@elizaos/plugin-verathos",
+  "version": "0.1.0",
+  "description": "Verified LLM inference for elizaOS agents via Verathos on Bittensor — cryptographic proof verification with optional x402 USDC pay-per-request",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "lint": "biome check src/",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@elizaos/core": "^1.0.0"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.9",
+    "ai": "^6.0.30",
+    "js-tiktoken": "^1.0.18",
+    "viem": "^2.23.0"
+  },
+  "optionalDependencies": {
+    "@coinbase/cdp-sdk": "^1.45.0",
+    "x402": "^2.3.0"
+  },
+  "devDependencies": {
+    "@elizaos/core": "^1.0.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "agentConfig": {
+    "pluginType": "elizaos:plugin:1.0.0",
+    "pluginParameters": {
+      "VERATHOS_API_KEY": {
+        "type": "string",
+        "description": "API key for Verathos (not needed in x402 mode)",
+        "required": false,
+        "sensitive": true
+      },
+      "VERATHOS_API_URL": {
+        "type": "string",
+        "description": "Verathos API base URL",
+        "required": false,
+        "default": "https://api.verathos.ai/v1",
+        "sensitive": false
+      },
+      "VERATHOS_X402_PRIVATE_KEY": {
+        "type": "string",
+        "description": "EVM private key for x402 payments (dev/testnet — use CDP for production)",
+        "required": false,
+        "sensitive": true
+      },
+      "CDP_API_KEY_ID": {
+        "type": "string",
+        "description": "Coinbase CDP API key ID for MPC wallet x402 payments (production)",
+        "required": false,
+        "sensitive": true
+      },
+      "CDP_API_KEY_SECRET": {
+        "type": "string",
+        "description": "Coinbase CDP API key secret",
+        "required": false,
+        "sensitive": true
+      },
+      "CDP_WALLET_SECRET": {
+        "type": "string",
+        "description": "Coinbase CDP wallet secret (authenticates signing in TEE)",
+        "required": false,
+        "sensitive": true
+      },
+      "VERATHOS_X402_CDP_ACCOUNT": {
+        "type": "string",
+        "description": "CDP wallet account name (default: verathos-agent)",
+        "required": false,
+        "default": "verathos-agent",
+        "sensitive": false
+      },
+      "VERATHOS_X402_TESTNET": {
+        "type": "boolean",
+        "description": "Use Base Sepolia testnet for x402 payments",
+        "required": false,
+        "default": false,
+        "sensitive": false
+      },
+      "VERATHOS_SMALL_MODEL": {
+        "type": "string",
+        "description": "Model identifier for TEXT_SMALL requests",
+        "required": false,
+        "sensitive": false
+      },
+      "VERATHOS_LARGE_MODEL": {
+        "type": "string",
+        "description": "Model identifier for TEXT_LARGE requests",
+        "required": false,
+        "sensitive": false
+      },
+      "VERATHOS_EMBEDDING_MODEL": {
+        "type": "string",
+        "description": "Model identifier for TEXT_EMBEDDING requests",
+        "required": false,
+        "sensitive": false
+      }
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "elizaos",
+    "plugin",
+    "bittensor",
+    "verathos",
+    "verified-inference",
+    "zk-proofs",
+    "x402",
+    "usdc",
+    "cdp",
+    "ai-agents"
+  ]
+}

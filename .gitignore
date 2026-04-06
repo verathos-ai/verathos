@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+# But keep Cython-compiled modules shipped in public repo
+!verallm/prover/*.so
+!verallm/verifier/*.so
+!verallm/miner/*.so
+!verallm/moe/*.so
+*.egg
+*.egg-info/
+dist/*
+# But keep pre-built zkllm wheels shipped in public repo
+!dist/*.whl
+build/
+eggs/
+.eggs/
+*.manifest
+*.spec
+
+# Virtual environments
+.venv/
+.venv-vllm/
+.venv-vllm-016/
+.venv-vllm-*/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Generated figures
+analysis/figures/
+
+# CUDA compiled extensions (machine-specific, must be rebuilt per torch version)
+zkllm/cuda/*.so
+zkllm/cuda/*.so.*
+zkllm/cuda/*.o
+zkllm/cuda/build/
+
+# Environment files (contain secrets/paths)
+.env
+.env.*
+!.env.example
+
+# PM2 ecosystem config (contains wallet names, tokens — user-specific)
+ecosystem.config.js
+!ecosystem.config.example.js
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VeriLLM caches (large, machine-specific)
+.model_root_cache/
+.merkle_tree_cache/
+.verallm_pending_load.json
+
+# Foundry (Forge) build artifacts
+contracts/broadcast/
+contracts/out/
+contracts/cache/
+
+# Archive (evaluation docs, external specs — not part of repo)
+.archive/
+
+# Credits database (contains user balances, API key hashes — instance-specific)
+verathos_credits.db
+verathos_credits.db-journal
+verathos_credits.db-wal
+backups/
+
+# Misc
+*.bak
+*.tmp
+*.xlsx
+.claude/

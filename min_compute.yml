@@ -1,0 +1,86 @@
+# Verathos (Subnet 96) — Minimum Compute Requirements
+# https://github.com/verathos-ai/verathos
+#
+# Format follows the official Bittensor subnet template:
+# https://github.com/opentensor/bittensor-subnet-template/blob/main/min_compute.yml
+
+version: '1.0'
+
+compute_spec:
+
+  miner:
+    cpu:
+      min_cores: 4
+      min_speed: 2.5  # GHz
+      recommended_cores: 8
+      architecture: x86_64
+    gpu:
+      required: true
+      min_vram: 24  # GB — RTX 4090 / RTX 3090 Ti / L4 / A10
+      recommended_vram: 48  # GB — A6000 / A40 / L40S
+      min_compute_capability: 7.0  # SM 7.0 (Volta+), practically 8.0+ recommended
+      recommended_gpu: "NVIDIA RTX 4090"
+      cuda_version: "12.8+"
+    memory:
+      min_ram: 32  # GB
+      recommended_ram: 64  # GB
+      min_swap: 8  # GB
+    storage:
+      min_space: 100  # GB — model weights + Merkle tree cache
+      recommended_space: 200  # GB
+      type: SSD
+    os:
+      name: Ubuntu
+      version: 22.04
+
+  validator:
+    cpu:
+      min_cores: 4
+      min_speed: 2.0  # GHz
+      recommended_cores: 8
+      architecture: x86_64
+    gpu:
+      required: false
+    memory:
+      min_ram: 16  # GB
+      recommended_ram: 32  # GB
+      min_swap: 4  # GB
+    storage:
+      min_space: 50  # GB
+      recommended_space: 100  # GB
+      type: SSD
+    os:
+      name: Ubuntu
+      version: 22.04
+
+network_spec:
+  bandwidth:
+    download: 100  # Mbps
+    upload: 100  # Mbps — miners serve inference traffic
+
+gpu_tiers:
+  # Supported GPU tiers for mining (min 24 GB VRAM)
+  - tier: GB_24
+    vram: 24
+    examples: "RTX 4090, RTX 3090/Ti, L4, A10"
+  - tier: GB_32
+    vram: 32
+    examples: "RTX 5090"
+  - tier: GB_48
+    vram: 48
+    examples: "RTX A6000, A40, L40S"
+  - tier: GB_80
+    vram: 80
+    examples: "A100 80GB, H100 80GB"
+  - tier: GB_96
+    vram: 96
+    examples: "RTX PRO 6000 Blackwell"
+  - tier: GB_141
+    vram: 141
+    examples: "H200 SXM"
+  - tier: GB_192
+    vram: 192
+    examples: "B200"
+  - tier: GB_288
+    vram: 288
+    examples: "B300 Blackwell Ultra"

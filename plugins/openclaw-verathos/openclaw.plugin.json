@@ -1,0 +1,34 @@
+{
+  "id": "verathos",
+  "providers": ["verathos"],
+  "providerAuthEnvVars": {
+    "verathos": ["VERATHOS_API_KEY"]
+  },
+  "providerAuthChoices": [
+    {
+      "provider": "verathos",
+      "method": "api-key",
+      "choiceId": "verathos-api-key",
+      "choiceLabel": "Verathos API key",
+      "choiceHint": "Verified LLM inference on Bittensor",
+      "groupId": "verathos",
+      "groupLabel": "Verathos",
+      "groupHint": "Cryptographically verified inference"
+    },
+    {
+      "provider": "verathos",
+      "method": "custom",
+      "choiceId": "verathos-custom",
+      "choiceLabel": "Verathos (custom endpoint)",
+      "choiceHint": "Self-hosted or custom Verathos proxy",
+      "groupId": "verathos",
+      "groupLabel": "Verathos",
+      "groupHint": "Custom endpoint URL"
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "openclaw-verathos",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenClaw provider plugin for Verathos — verified LLM inference on Bittensor",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

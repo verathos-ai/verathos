@@ -1,0 +1,11 @@
+{
+  "chain_id": 945,
+  "netuid": 405,
+  "model_registry_address": "0xd12E40271D94c3A646511060673c288CFe3602B0",
+  "miner_registry_address": "0x9e80EFf508f5345b36056297E64534b5446AD521",
+  "payment_gateway_address": "0x17AC08237abD000E6ddf4B8c6e0e54a0b444a09F",
+  "validator_registry_address": "0x6f4508E88CCaA0FAbA251dFB9B4b79Bbc487a301",
+  "checkpoint_registry_address": "0xA028a2D439E3A29f77C90D43B5338D02af8B55B9",
+  "subnet_config_address": "0x583524B1a7BA24f0baCA9191034B46Cf5679c656",
+  "mock": false
+}
