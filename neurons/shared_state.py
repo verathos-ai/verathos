@@ -66,6 +66,9 @@ class ValidatorSharedState:
     # Per-model demand scores (model_id -> bps 0-10000) computed from organic
     # traffic.  Proxy serves these via /v1/network/stats for the webapp dashboard.
     demand_scores: Dict[str, int] = field(default_factory=dict)
+    # EVM address (lowercase) → {hotkey_ss58, coldkey_ss58} for all known miners.
+    # Proxy uses this to resolve SS58 for miners discovered on-chain.
+    ss58_map: Dict[str, Dict[str, str]] = field(default_factory=dict)
     updated_at: float = 0.0
 
 
@@ -97,6 +100,7 @@ def write_shared_state(
         ],
         "last_weights": {str(k): v for k, v in state.last_weights.items()},
         "demand_scores": state.demand_scores,
+        "ss58_map": state.ss58_map,
         "updated_at": time.time(),
     }
     tmp_path = path + ".tmp"
@@ -150,6 +154,7 @@ def read_shared_state(
             probation_miners=data.get("probation_miners", {}),
             miner_endpoints=miner_endpoints,
             demand_scores=data.get("demand_scores", {}),
+            ss58_map=data.get("ss58_map", {}),
             updated_at=data.get("updated_at", 0.0),
         )
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):

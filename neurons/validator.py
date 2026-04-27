@@ -731,6 +731,18 @@ class ValidatorNeuron:
                 f"TCP pre-filter: {len(alive_miners)}/{len(self._epoch_miners)} alive, "
                 f"{prefilter_dead} unreachable"
             )
+            # Create DB entries for unreachable miners so they appear in
+            # miner_scores with ema=0 (not absent → proxy defaults to 1.0).
+            dead_miners = [m for m in self._epoch_miners if m not in alive_miners]
+            for m in dead_miners:
+                self._db.upsert_entry(
+                    address=m.address, model_index=m.model_index,
+                    model_id=m.model_id, endpoint=m.endpoint,
+                    quant=m.quant, max_context_len=m.max_context_len,
+                    epoch=epoch_number,
+                    hotkey_ss58=getattr(m, "hotkey_ss58", ""),
+                    coldkey_ss58=getattr(m, "coldkey_ss58", ""),
+                )
         self._epoch_miners = alive_miners
         if not self._epoch_miners:
             bt.logging.warning(f"Epoch {epoch_number}: no reachable miners after TCP pre-filter")
@@ -2388,10 +2400,23 @@ class ValidatorNeuron:
         shared.epoch_start_block = self._epoch_start_block
         shared.last_weights = getattr(self, "_last_weights", {})
         shared.demand_scores = getattr(self, "_last_demand_scores", {})
+        # Build ss58_map with UIDs so the proxy can resolve UIDs for
+        # miners not in miner_endpoints (e.g. inactive/unreachable).
+        uid_map_all = self._db.get_all_uids()
+        ss58_with_uid: Dict[str, Dict[str, str]] = {}
+        for addr, info in self._ss58_cache.items():
+            entry = dict(info)  # copy {hotkey_ss58, coldkey_ss58}
+            uid_val = uid_map_all.get(addr)
+            if uid_val is not None:
+                entry["uid"] = str(uid_val)
+            ss58_with_uid[addr] = entry
+        shared.ss58_map = ss58_with_uid
 
-        # Build miner endpoints from live miners if available, else from DB.
-        # Both paths use _ss58_cache for O(1) SS58 lookup.
-        uid_map = self._db.get_all_uids()
+        # Build miner endpoints from live miners (epoch miners).
+        # Only reachable miners go here — the proxy uses its own on-chain
+        # discovery for the full set and falls back to ss58_map (above)
+        # for UID/SS58 of miners the validator can't TCP-reach.
+        uid_map = uid_map_all
         miners = getattr(self, "_epoch_miners", [])
         if not miners:
             # No live miners (startup before first epoch) — reconstruct from DB
@@ -2887,6 +2912,18 @@ def main():
                 compute_capability=miner.compute_capability,
                 gpu_uuids=miner.gpu_uuids,
             )
+        # Re-apply UIDs after upsert_entry created the rows.
+        # _enrich_miners_from_metagraph calls set_uid (UPDATE) before
+        # upsert_entry (INSERT), so the UPDATE is a no-op for new miners.
+        for miner in neuron._epoch_miners:
+            uid_val = neuron._db.get_uid(miner.address)
+            if uid_val is None:
+                try:
+                    uid_val = neuron._miner_client.get_associated_uid(miner.address)
+                    if uid_val is not None:
+                        neuron._db.set_uid(miner.address, uid_val)
+                except Exception:
+                    pass
         bt.logging.info(f"Startup discovery: {len(neuron._epoch_miners)} miners enriched")
     except Exception as e:
         bt.logging.debug(f"Startup discovery failed: {e} — shared state from DB only")
