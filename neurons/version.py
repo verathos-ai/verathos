@@ -84,7 +84,7 @@ version_str: str = _version_str(SPEC_MAJOR, SPEC_MINOR, SPEC_PATCH)
 
 MINER_MAJOR = 0
 MINER_MINOR = 1
-MINER_PATCH = 0
+MINER_PATCH = 1
 
 miner_version: int = _encode(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)

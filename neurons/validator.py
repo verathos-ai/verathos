@@ -1573,10 +1573,12 @@ class ValidatorNeuron:
             bt.logging.info(f"Epoch {epoch_number} peer medians: {_pm_summary}")
 
         # ── Read all scoring params from SubnetConfig (single RPC) ──
-        self._scoring = ScoringParams()  # defaults
+        # Fall back to last successfully read params (not hardcoded defaults)
+        # so a transient RPC failure doesn't cause a one-epoch scoring glitch.
         if self._subnet_config_client is not None:
             try:
                 self._scoring = self._subnet_config_client.get_scoring_params()
+                self._last_good_scoring = self._scoring  # cache for fallback
                 bt.logging.debug(
                     f"SubnetConfig scoring: tee={self._scoring.tee_bonus:.2f} "
                     f"ema={self._scoring.ema_alpha:.2f} tp={self._scoring.throughput_power:.1f} "
@@ -1586,8 +1588,15 @@ class ValidatorNeuron:
                     f"burn={self._scoring.emission_burn:.0%}"
                 )
             except Exception as e:
-                # Fallback to local defaults — not a degraded state.
-                bt.logging.info(f"SubnetConfig read failed, using defaults: {e}")
+                if hasattr(self, "_last_good_scoring"):
+                    self._scoring = self._last_good_scoring
+                    bt.logging.info(f"SubnetConfig read failed, using last-known values (burn={self._scoring.emission_burn:.0%}): {e}")
+                else:
+                    self._scoring = ScoringParams()  # hardcoded defaults on first-ever failure
+                    bt.logging.info(f"SubnetConfig read failed, no cache, using defaults: {e}")
+        else:
+            if not hasattr(self, "_last_good_scoring"):
+                self._scoring = ScoringParams()
 
         # Update scorer EMA alpha + throughput power from chain
         self.scorer.ema_alpha = self._scoring.ema_alpha

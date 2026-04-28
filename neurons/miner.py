@@ -50,6 +50,129 @@ from verallm.chain.wallet import derive_evm_private_key, derive_evm_address
 logger = logging.getLogger(__name__)
 
 
+def _check_external_port(endpoint: str) -> None:
+    """Verify the miner's endpoint port is reachable from the internet.
+
+    Starts a temporary TCP listener on the port, asks external services
+    to probe it, then shuts it down — all before vLLM loads. If a service
+    confirms the port is closed, abort with a clear error. If all services
+    are unreachable, log a warning and continue (skip).
+    """
+    from urllib.parse import urlparse
+    import socket as _socket
+    import threading as _threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    parsed = urlparse(endpoint)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    if not host:
+        bt.logging.warning("Cannot parse endpoint host — skipping external port check")
+        return
+
+    bt.logging.info(f"Checking if port {port} on {host} is reachable from the internet...")
+
+    # Start a temporary HTTP server so external services have something to connect to.
+    # Runs in a background thread, shut down after the check.
+    class _SilentHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *args):
+            pass  # silence
+
+    tmp_server = None
+    tmp_thread = None
+    try:
+        tmp_server = HTTPServer(("0.0.0.0", port), _SilentHandler)
+        tmp_thread = _threading.Thread(target=tmp_server.serve_forever, daemon=True)
+        tmp_thread.start()
+        time.sleep(0.5)  # let it bind
+    except OSError as e:
+        # Port already in use (maybe server already running) — skip temp server,
+        # the real server will handle it
+        bt.logging.debug(f"Could not start temp listener on port {port}: {e} — port may already be in use")
+        tmp_server = None
+
+    # Try multiple external port-check services for reliability.
+    # Each returns (responded: bool, port_open: bool).
+    checks: list[tuple[str, bool, bool]] = []
+
+    # Service 1: yougetsignal.com (returns HTML with "is open" or "is closed")
+    try:
+        resp = httpx.post(
+            "https://ports.yougetsignal.com/check-port.php",
+            data={"remoteAddress": host, "portNumber": str(port)},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            body = resp.text.lower()
+            is_open = "is open" in body
+            checks.append(("yougetsignal", True, is_open))
+        else:
+            checks.append(("yougetsignal", False, False))
+    except Exception:
+        checks.append(("yougetsignal", False, False))
+
+    # Service 2: portchecker.io
+    try:
+        resp = httpx.get(
+            f"https://portchecker.io/api/v1/query?host={host}&ports={port}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            # Response: {"host": ..., "ports": [{"port": N, "status": "open"|"closed"}]}
+            ports_list = body.get("ports", [])
+            is_open = any(p.get("status") == "open" for p in ports_list)
+            checks.append(("portchecker.io", True, is_open))
+        else:
+            checks.append(("portchecker.io", False, False))
+    except Exception:
+        checks.append(("portchecker.io", False, False))
+
+    # Shut down temp server before returning
+    def _cleanup():
+        if tmp_server is not None:
+            tmp_server.shutdown()
+
+    responded = [(name, is_open) for name, ok, is_open in checks if ok]
+    if not responded:
+        _cleanup()
+        bt.logging.warning(
+            "External port check: no check service reachable. "
+            "Skipping — port may or may not be open."
+        )
+        return
+
+    if any(is_open for _, is_open in responded):
+        _cleanup()
+        bt.logging.success(f"External port check passed: {host}:{port} is reachable")
+        return
+
+    # All responding services say port is closed
+    _cleanup()
+    services_str = ", ".join(name for name, _ in responded)
+    bt.logging.error(
+        f"\n{'=' * 60}\n"
+        f"  EXTERNAL PORT CHECK FAILED\n"
+        f"  Port {port} on {host} is NOT reachable from the internet.\n"
+        f"  (Checked via: {services_str})\n\n"
+        f"  Your miner server is running but nobody can connect to it.\n"
+        f"  Common causes:\n"
+        f"    - Firewall blocking the port (check: sudo ufw allow {port}/tcp)\n"
+        f"    - Cloud provider security group missing inbound rule\n"
+        f"    - NAT/router not forwarding port {port} to this machine\n\n"
+        f"  Registration aborted — fix the port and restart.\n"
+        f"{'=' * 60}"
+    )
+    sys.exit(1)
+
+
 def _extract_hotkey_seed(wallet_name: str, hotkey_name: str, wallet) -> bytes:
     """Extract the 32-byte Ed25519 seed from a Bittensor hotkey.
 
@@ -1138,6 +1261,12 @@ def main():
             neuron._refresh_validator_allowlist()
         except Exception as e:
             bt.logging.warning(f"Initial validator allowlist write failed: {e} — server will block until next refresh succeeds")
+
+    # ── External port reachability check ──
+    # Verify the endpoint port is reachable from outside BEFORE loading vLLM
+    # (which takes 10+ min). Starts a temporary TCP listener on the port,
+    # asks external services to probe it, then shuts it down.
+    _check_external_port(args.endpoint)
 
     neuron.start_server(server_args)
 
