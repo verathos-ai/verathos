@@ -200,8 +200,22 @@ def _format_ctx(max_context_len: int) -> str:
 
 
 def _format_score(score: float) -> str:
-    """Color-coded score: green >= 0.5, yellow > 0, red/dim = 0."""
-    s = f"{score:.3f}"
+    """Color-coded score: green >= 0.5, yellow > 0, red/dim = 0.
+
+    Adapts decimal places to keep output within 7 chars:
+    0.000-9.999 → 3 decimals (5 chars)
+    10.00-99.99 → 2 decimals (5 chars)
+    100.0-999.9 → 1 decimal  (5 chars)
+    1000+       → 0 decimals
+    """
+    if score >= 1000:
+        s = f"{score:.0f}"
+    elif score >= 100:
+        s = f"{score:.1f}"
+    elif score >= 10:
+        s = f"{score:.2f}"
+    else:
+        s = f"{score:.3f}"
     if score >= 0.5:
         return green(s)
     elif score > 0:
@@ -294,11 +308,11 @@ def render_network(data: dict) -> None:
         # Column headers.
         hdr = (
             f"  {'UID':>4s}  {'Addr':<9s}  {'Model':<25s}  {'Quant':<6s}  "
-            f"{'Score':>5s}  {'Health':<8s}  {'TEE':<3s}  {'GPU':<16s}  {'Ctx':>4s}"
+            f"{'Score':>7s}  {'Health':<8s}  {'TEE':<3s}  {'GPU':<16s}  {'Ctx':>4s}"
         )
         print(dim(hdr))
         print(dim(f"  {'─' * 4}  {'─' * 9}  {'─' * 25}  {'─' * 6}  "
-                   f"{'─' * 5}  {'─' * 8}  {'─' * 3}  {'─' * 16}  {'─' * 4}"))
+                   f"{'─' * 7}  {'─' * 8}  {'─' * 3}  {'─' * 16}  {'─' * 4}"))
 
         for m in sorted_miners:
             uid = m.get("uid")
@@ -306,7 +320,7 @@ def render_network(data: dict) -> None:
             addr = _short_addr(m.get("ss58_address", ""), m.get("address", ""))
             model = _short_model(m.get("model_id", ""))[:25]
             quant = (m.get("quant") or "-")[:6]
-            score = _pad(_format_score(m.get("score", 0)), 5, ">")
+            score = _pad(_format_score(m.get("score", 0)), 7, ">")
             health = _pad(
                 _format_health(m.get("healthy", True), m.get("on_probation", False)),
                 8,
