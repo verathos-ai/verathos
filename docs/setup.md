@@ -302,17 +302,18 @@ btcli wallet create --wallet.name validator
 btcli subnet register --wallet.name validator --netuid 96 --subtensor.network finney
 ```
 
-### 3. Fund your EVM address
+### 3. Fund your EVM address (optional)
 
-Same process as the miner:
+Optional. With funding, your validator contributes to on-chain `reportOffline` votes (faster dead-miner cleanup). Without it, the network self-cleans via 24h lease expiry and other validators' votes; your validator still sets weights normally.
+
+To fund (recommended):
 
 ```bash
-# Show your EVM address and SS58 mirror
 python scripts/show_evm_info.py --wallet validator --hotkey default
-
-# Fund (use the SS58 mirror from above)
-btcli wallet transfer --dest <SS58_MIRROR> --amount 0.1 --subtensor.network finney
+btcli wallet transfer --dest <SS58_MIRROR> --amount 0.05 --subtensor.network finney
 ```
+
+To skip, pass `--no-evm` to the validator (step 4). If unfunded, the validator auto-degrades with a startup warning.
 
 ### 4. Start the validator
 

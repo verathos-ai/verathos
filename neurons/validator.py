@@ -264,6 +264,10 @@ class ValidatorNeuron:
 
         self.evm_pk = ""
         self.evm_addr = ""
+        # Set True when validator runs without EVM registration (no on-chain
+        # reportOffline / updateDemandScores). Triggered explicitly by
+        # config.no_evm or implicitly when registerEvm fails (e.g. low TAO).
+        self._evm_disabled: bool = bool(getattr(config, "no_evm", False))
         self._model_client = None
         self._miner_client = None
         self._subnet_config_client = None
@@ -306,13 +310,31 @@ class ValidatorNeuron:
 
     @property
     def _subtensor(self):
-        """Lazy Subtensor connection — only connects when actually needed."""
+        """Lazy Subtensor connection — only connects when actually needed.
+
+        Retries on transient errors (rate limits, network blips). Local
+        subtensor connects on first try; public RPC may need a few retries
+        when the per-IP quota is saturated.
+        """
         if self.__subtensor is None:
+            import time as _time
             bt_log = __import__("bittensor").logging
             bt_log.info("Connecting to Subtensor...")
             bt = self._bt_module
             SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
-            self.__subtensor = SubtensorCls(network=self.config.subtensor_network)
+            attempt = 0
+            while True:
+                try:
+                    self.__subtensor = SubtensorCls(network=self.config.subtensor_network)
+                    break
+                except Exception as e:
+                    attempt += 1
+                    wait = min(60, 2 ** min(attempt, 6))  # 2,4,8,16,32,60,60,...
+                    bt_log.warning(
+                        f"Subtensor connect failed (attempt {attempt}): {e}. "
+                        f"Retrying in {wait}s..."
+                    )
+                    _time.sleep(wait)
             bt_log.info("Subtensor connected")
         return self.__subtensor
 
@@ -388,6 +410,9 @@ class ValidatorNeuron:
 
     def _ensure_evm_registered(self):
         """Ensure registerEvm(uid) has been called on the current MinerRegistry."""
+        if self._evm_disabled:
+            bt.logging.info("EVM disabled (--no-evm), skipping MinerRegistry registration")
+            return
         try:
             if self._miner_client.is_evm_registered(self.evm_addr):
                 return
@@ -419,12 +444,12 @@ class ValidatorNeuron:
                 private_key=self.evm_pk,
             )
         except Exception as e:
-            bt.logging.error(
-                f"registerEvm({uid}) on MinerRegistry failed: {e}. "
-                f"The validator cannot verify miners without EVM registration. "
-                f"Ensure the EVM account {self.evm_addr} has sufficient TAO for gas."
+            self._evm_disabled = True
+            bt.logging.warning(
+                f"registerEvm({uid}) failed: {e} "
+                f"Continuing without EVM (no on-chain reportOffline). "
+                f"Pass --no-evm to silence."
             )
-            sys.exit(1)
 
     def _ensure_validator_registry_registered(self):
         """Register on ValidatorRegistry with empty endpoint (participation signal).
@@ -433,6 +458,9 @@ class ValidatorNeuron:
         appear in the participation count. Proxies overwrite the endpoint later
         via their own register(real_url) call at startup.
         """
+        if self._evm_disabled:
+            bt.logging.info("EVM disabled, skipping ValidatorRegistry registration")
+            return
         try:
             from verallm.chain.validator_registry import ValidatorRegistryClient
             vr = ValidatorRegistryClient(self.config)
@@ -2385,6 +2413,12 @@ class ValidatorNeuron:
 
     def _report_offline(self, miner: ActiveMiner):
         """Report a miner-model entry as offline."""
+        if self._evm_disabled:
+            bt.logging.debug(
+                f"EVM disabled — skipping reportOffline for {miner.address[:10]} "
+                f"model_index={miner.model_index} (other validators + 24h lease handle it)"
+            )
+            return
         try:
             self._miner_client.report_offline(
                 miner.address, miner.model_index, private_key=self.evm_pk,
@@ -2794,6 +2828,12 @@ def parse_args():
                              "By default, backup files older than 7 days are deleted after export.")
     parser.add_argument("--allow-mock-tee", action="store_true",
                         help="Allow mock TEE attestation even on mainnet (testing only).")
+    parser.add_argument("--no-evm", action="store_true",
+                        help="Run validator without EVM registration. Skips on-chain "
+                             "registerEvm + reportOffline calls. Use this if you don't "
+                             "want to fund an EVM mirror with TAO. Network still works "
+                             "fine: dead miners get cleaned up via 24h lease expiry and "
+                             "other validators' reportOffline votes.")
     # Bittensor logging flags (--logging.debug, --logging.trace, --logging.info)
     bt.logging.add_args(parser)
     return parser.parse_args()
@@ -2847,6 +2887,7 @@ def main():
         config.subtensor_network = ws_ep  # Subtensor() accepts ws:// URL as network
 
     config.allow_mock_tee = getattr(args, "allow_mock_tee", False)
+    config.no_evm = getattr(args, "no_evm", False)
     neuron = ValidatorNeuron(config)
     if args.analytics:
         bt.logging.info("Analytics database enabled (--analytics)")

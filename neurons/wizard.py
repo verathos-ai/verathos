@@ -981,6 +981,7 @@ def _generate_validator_entry(
     analytics: bool = True,
     retain_backups: bool = False,
     hf_token: str = "",
+    no_evm: bool = False,
 ) -> str:
     """Generate a PM2 validator app entry as JS text."""
     net_flag = f"--subtensor-network {network}"
@@ -989,11 +990,12 @@ def _generate_validator_entry(
     log_flag = " --logging.debug" if log_level == "debug" else ""
     analytics_flag = " --analytics" if analytics else ""
     retain_flag = " --retain-backups" if retain_backups else ""
+    no_evm_flag = " --no-evm" if no_evm else ""
     args = (
         f"-u -m neurons.validator "
         f"--wallet {wallet} --hotkey {hotkey} "
         f"--netuid {netuid} {net_flag}{chain_flag}{evm_flag} "
-        f"--auto-update{analytics_flag}{retain_flag}{log_flag}"
+        f"--auto-update{analytics_flag}{retain_flag}{no_evm_flag}{log_flag}"
     )
     return f"""    {{
       name: "validator",
@@ -1047,6 +1049,7 @@ def step_config(
             analytics=opts.get("analytics", True),
             retain_backups=opts.get("retain_backups", False),
             hf_token=opts.get("hf_token", ""),
+            no_evm=opts.get("no_evm", False),
         )
         if config_path.exists() and existing_miners:
             # Append validator to existing config
@@ -1930,8 +1933,9 @@ def run_wizard(role: str = "miner") -> None:
     evm_info = step_evm_funding(wallet_info, net_info, role=role)
 
     if not evm_info.get("evm_funded"):
-        if role == "validator" and _confirm("Skip EVM funding and continue?", default=True):
-            print(dim("  Skipping — validator will register EVM on first start if funded."))
+        if role == "validator" and _confirm("Skip EVM funding and run validator without EVM?", default=True):
+            print(dim("  Skipping. Validator will run with --no-evm (no on-chain reportOffline)."))
+            evm_info["no_evm"] = True
         else:
             _cmd = "verathos setup" if role == "miner" else "verathos setup validator"
             print()
@@ -1969,6 +1973,8 @@ def run_wizard(role: str = "miner") -> None:
         # Step 6: Options (subtensor, logging, analytics)
         _header(6, total_steps, "Options")
         options = step_options(role)
+        if evm_info.get("no_evm"):
+            options["no_evm"] = True
 
         _header(7, total_steps, "ecosystem.config.js")
         config_info = step_config(role, repo, wallet_info, net_info, https_info, model_info, options)

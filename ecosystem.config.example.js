@@ -47,6 +47,8 @@ module.exports = {
     // Required: --wallet, --hotkey, --netuid
     // Optional: --analytics (canary results, epoch scores, network receipts)
     //           --retain-backups (keep analytics backup files; default: auto-deleted after 7 days)
+    //           --no-evm (skip on-chain registerEvm + reportOffline; use if
+    //              you don't want to fund an EVM mirror)
     // Logging: INFO by default. Add --logging.debug for verbose output.
     {
       name: "validator",
