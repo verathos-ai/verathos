@@ -500,6 +500,13 @@ For local development without a chain, set `"mock": true`.
 
 ## Troubleshooting
 
+### DGX Spark / ARM64 compatibility
+
+DGX Spark uses ARM64/aarch64. The miner requires native `zkllm` and `verallm`
+artifacts built for the local Python ABI and Linux architecture; x86_64 wheels
+cannot be used. If setup fails with a missing `linux_aarch64` wheel or native
+extension message, see [DGX Spark / ARM64 Compatibility](dgx_spark_arm64.md).
+
 ### "Invalid SR25519 signature"
 
 The hotkey doesn't match the claimed UID. Ensure your wallet is registered on the subnet (`btcli subnet metagraph`).

@@ -64,6 +64,29 @@ fi
 
 cd "$REPO_DIR"
 
+# ── Platform artifact compatibility ─────────────────────────────────────────
+
+python_tag() {
+    $PYTHON -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+}
+
+platform_arch_tag() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) uname -m ;;
+    esac
+}
+
+find_zkllm_wheel() {
+    local py_tag="$1"
+    local arch_tag="$2"
+    find "$REPO_DIR/dist" -maxdepth 1 -type f -name "zkllm-*-${py_tag}-*.whl" 2>/dev/null \
+        | grep -E "(linux|manylinux).*(${arch_tag}|arm64)" \
+        | sort \
+        | head -1
+}
+
 # ── Venv setup ───────────────────────────────────────────────────────────────
 
 VENV_DIR="${REPO_DIR}/.venv-validator"
@@ -108,13 +131,15 @@ if [ "$SKIP_INSTALL" = false ]; then
     $PYTHON -m pip install --no-cache-dir 'async-substrate-interface>=1.6,<2' 2>&1 | tail -3
 
     # Install zkllm wheel (required for verallm imports even without GPU)
-    PY_VER=$($PYTHON -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
-    ZKLLM_WHEEL=$(ls "${REPO_DIR}/dist"/zkllm-*-${PY_VER}-*.whl 2>/dev/null | head -1)
+    PY_VER="$(python_tag)"
+    ARCH_TAG="$(platform_arch_tag)"
+    ZKLLM_WHEEL="$(find_zkllm_wheel "$PY_VER" "$ARCH_TAG")"
     if [ -n "$ZKLLM_WHEEL" ]; then
         echo "  Installing zkllm wheel..."
         $PYTHON -m pip install --no-cache-dir "$ZKLLM_WHEEL" 2>&1 | tail -5
     else
-        echo "  WARNING: No zkllm wheel found for $PY_VER in dist/"
+        echo "  WARNING: No zkllm wheel found for ${PY_VER}/linux_${ARCH_TAG} in dist/"
+        echo "  Validator imports may fail until a compatible zkllm wheel is published."
     fi
 
     echo ""

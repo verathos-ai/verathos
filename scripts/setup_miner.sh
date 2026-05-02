@@ -122,6 +122,99 @@ fi
 
 cd "$REPO_DIR"
 
+# ── Platform artifact compatibility ─────────────────────────────────────────
+# Verathos ships native artifacts for zkllm and several verallm packages.  Fail
+# before the expensive dependency install if this checkout does not contain
+# artifacts for the current CPU architecture / Python ABI.
+
+python_tag() {
+    $PYTHON -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+}
+
+platform_arch_tag() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) uname -m ;;
+    esac
+}
+
+find_zkllm_wheel() {
+    local py_tag="$1"
+    local arch_tag="$2"
+    find "$REPO_DIR/dist" -maxdepth 1 -type f -name "zkllm-*-${py_tag}-*.whl" 2>/dev/null \
+        | grep -E "(linux|manylinux).*(${arch_tag}|arm64)" \
+        | sort \
+        | head -1
+}
+
+check_native_artifacts() {
+    local py_tag arch_tag wheel has_error
+    py_tag="$(python_tag)"
+    arch_tag="$(platform_arch_tag)"
+    wheel="$(find_zkllm_wheel "$py_tag" "$arch_tag")"
+    has_error=0
+
+    echo "  Platform: $(uname -m) (${arch_tag}), Python ABI: ${py_tag}"
+
+    if [ -z "$wheel" ]; then
+        echo ""
+        echo "  ERROR: No compatible zkllm wheel found for ${py_tag}/linux_${arch_tag}."
+        echo "  Available zkllm wheels:"
+        find "$REPO_DIR/dist" -maxdepth 1 -type f -name "zkllm-*.whl" -printf "    %f\n" 2>/dev/null | sort
+        echo ""
+        echo "  This platform needs a wheel named like:"
+        echo "    zkllm-<version>-${py_tag}-${py_tag}-linux_${arch_tag}.whl"
+        echo "  or a compatible manylinux_${arch_tag} wheel."
+        echo ""
+        echo "  DGX Spark is ARM64/aarch64, so x86_64 wheels cannot be used."
+        echo "  See docs/dgx_spark_arm64.md for the required ARM64 release artifacts."
+        has_error=1
+    fi
+
+    if ! $PYTHON - "$REPO_DIR" "$arch_tag" <<'PY'
+import pathlib
+import sys
+
+repo = pathlib.Path(sys.argv[1])
+arch = sys.argv[2]
+binary_dirs = [
+    repo / "verallm" / "miner",
+    repo / "verallm" / "moe",
+    repo / "verallm" / "prover",
+    repo / "verallm" / "verifier",
+]
+missing = []
+for directory in binary_dirs:
+    if not directory.is_dir():
+        continue
+    so_files = list(directory.glob("*.so"))
+    if so_files and not any(arch in path.name or "abi3" in path.name for path in so_files):
+        missing.append(str(directory.relative_to(repo)))
+
+if missing:
+    print("")
+    print("  ERROR: Native verallm extension artifacts are missing for this architecture.")
+    print(f"  Required architecture: {arch}")
+    print("  Directories with only incompatible extension binaries:")
+    for item in missing:
+        print(f"    {item}")
+    print("")
+    print("  Publish matching ARM64/aarch64 extension artifacts or source-build these")
+    print("  modules during setup. See docs/dgx_spark_arm64.md.")
+    sys.exit(1)
+PY
+    then
+        has_error=1
+    fi
+
+    if [ "$has_error" -ne 0 ]; then
+        exit 1
+    fi
+}
+
+check_native_artifacts
+
 # ── LD_LIBRARY_PATH: find pip-installed NVIDIA libs ──────────────────────────
 # torch 2.9+ (from vLLM pip) needs libcusparseLt.so.0 which lives in
 # site-packages/nvidia/*/lib/ — not on the default search path.
@@ -370,12 +463,13 @@ if [ "$SKIP_INSTALL" = false ]; then
 
     echo ""
     echo "Step 1/5: Installing zkllm wheel..."
-    if ls "$REPO_DIR/dist"/zkllm-*.whl &>/dev/null; then
-        # Use --find-links so pip auto-selects the wheel matching this Python version
-        $PYTHON -m pip install --no-cache-dir --find-links "$REPO_DIR/dist" zkllm 2>&1 | tail -5
+    PY_TAG="$(python_tag)"
+    ARCH_TAG="$(platform_arch_tag)"
+    ZKLLM_WHEEL="$(find_zkllm_wheel "$PY_TAG" "$ARCH_TAG")"
+    if [ -n "$ZKLLM_WHEEL" ]; then
+        $PYTHON -m pip install --no-cache-dir "$ZKLLM_WHEEL" 2>&1 | tail -5
     else
-        echo "  ERROR: No zkllm wheels found in dist/."
-        echo "  The dist/ directory should contain pre-built zkllm wheels."
+        echo "  ERROR: No compatible zkllm wheel found for ${PY_TAG}/linux_${ARCH_TAG}."
         exit 1
     fi
 
