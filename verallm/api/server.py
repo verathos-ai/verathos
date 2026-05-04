@@ -2285,12 +2285,29 @@ def _preflight_gpu_check(skip: bool = False) -> None:
         bt.logging.error("No CUDA GPU detected. VeraLLM requires a GPU.")
         raise SystemExit(1)
 
-    # Check for other processes using the GPU via nvidia-smi
+    # Check for other processes using the GPU via nvidia-smi.
+    # Filter to GPUs actually visible to THIS process (CUDA_VISIBLE_DEVICES)
+    # so a miner on GPU 1 doesn't trip on a sibling miner running on GPU 0.
     import subprocess
     my_pid = os.getpid()
+
+    def _norm_uuid(u: str) -> str:
+        s = u.strip().lower()
+        return s[4:] if s.startswith("gpu-") else s
+
+    my_gpu_uuids: set[str] = set()
+    try:
+        for i in range(torch.cuda.device_count()):
+            try:
+                my_gpu_uuids.add(_norm_uuid(str(torch.cuda.get_device_properties(i).uuid)))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory,name",
+            ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_gpu_memory,name",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         )
@@ -2302,11 +2319,18 @@ def _preflight_gpu_check(skip: bool = False) -> None:
         for line in result.stdout.strip().splitlines():
             if not line.strip():
                 continue
-            parts = [p.strip() for p in line.split(",", 2)]
-            if len(parts) < 3:
+            parts = [p.strip() for p in line.split(",", 3)]
+            if len(parts) < 4:
                 continue
-            pid, mem_mb, name = int(parts[0]), parts[1], parts[2]
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            gpu_uuid, mem_mb, name = parts[1], parts[2], parts[3]
             if pid == my_pid:
+                continue
+            # Skip processes on GPUs not visible to this miner.
+            if my_gpu_uuids and _norm_uuid(gpu_uuid) not in my_gpu_uuids:
                 continue
             # Ignore small consumers like Xorg (display server, typically <50 MB)
             try:
@@ -2393,6 +2417,55 @@ def _init_tee(args, model_spec: ModelSpec):
 
     bt.logging.info(f"Weight Merkle root: {model_spec.weight_merkle_root.hex()[:16]}...")
     bt.logging.info("TEE ready -- /tee/info, /tee/chat, /tee/reattest endpoints active")
+
+
+def _resolve_model_gpu_uuids(state) -> list[str]:
+    """Return UUIDs of the GPU(s) the loaded model actually resides on.
+
+    Walks ``model.parameters()`` to find the unique CUDA device indices the
+    weights are loaded on, then maps each index back to its NVIDIA UUID via
+    ``torch.cuda.get_device_properties(idx).uuid``.
+
+    For tensor-parallel models, returns the UUID of every device in the TP
+    group. For single-GPU loads (the common case), returns a single UUID.
+
+    Falls back to enumerating all visible CUDA devices if vLLM internals
+    can't be accessed (e.g. version drift) or the model isn't loaded yet.
+    The caller is responsible for handling the fallback list — this
+    function never raises.
+    """
+    try:
+        miner = state.miner
+        if miner is None or miner.llm is None:
+            raise AttributeError("miner.llm not available")
+        engine = getattr(miner.llm, "llm_engine", None)
+        if engine is None:
+            raise AttributeError("llm_engine not present")
+        executor = getattr(engine, "model_executor", None)
+        worker = getattr(executor, "driver_worker", None) if executor else None
+        runner = getattr(worker, "model_runner", None) if worker else None
+        model = getattr(runner, "model", None) if runner else None
+        if model is None:
+            raise AttributeError(
+                "vLLM model not accessible — internal API may have changed"
+            )
+        indices = sorted({
+            p.device.index
+            for p in model.parameters()
+            if p.is_cuda and p.device.index is not None
+        })
+        if indices:
+            return [str(torch.cuda.get_device_properties(i).uuid) for i in indices]
+        raise RuntimeError("model has no CUDA parameters")
+    except Exception as e:
+        bt.logging.warning(
+            f"Could not introspect model GPU device(s); falling back to "
+            f"all-visible enumeration: {type(e).__name__}: {e}"
+        )
+    return [
+        str(torch.cuda.get_device_properties(i).uuid)
+        for i in range(torch.cuda.device_count())
+    ]
 
 
 def startup(args):
@@ -2656,6 +2729,26 @@ def startup(args):
     torch.cuda.empty_cache()
 
     state.miner = miner
+
+    # Refresh gpu_uuids to reflect ONLY the device(s) the model actually
+    # loaded onto. The earlier startup-time population enumerated every
+    # visible CUDA device, which over-reports on multi-GPU hosts that
+    # didn't isolate via CUDA_VISIBLE_DEVICES.
+    try:
+        _resolved = _resolve_model_gpu_uuids(state)
+        if _resolved:
+            if state.gpu_uuids != _resolved:
+                bt.logging.info(
+                    f"GPU UUIDs refined to model-resident set: "
+                    f"{[u[:8] + '...' for u in _resolved]} "
+                    f"(was {[u[:8] + '...' for u in state.gpu_uuids]})"
+                )
+            state.gpu_uuids = _resolved
+            state.gpu_count = len(_resolved)
+    except Exception as e:
+        bt.logging.warning(
+            f"GPU UUID post-load refresh failed; keeping startup values: {e}"
+        )
 
     # ── TEE setup (confidential GPU mode) ───────────────────────────
     if getattr(args, 'tee_enabled', False):

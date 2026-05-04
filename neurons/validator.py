@@ -1679,13 +1679,34 @@ class ValidatorNeuron:
         for _uuid, _eps in _uuid_endpoints.items():
             if len(_eps) <= 1:
                 continue
-            bt.logging.warning(
+            bt.logging.debug(
                 f"GPU UUID {_uuid[:16]}... used by {len(_eps)} endpoints — keeping best"
             )
             _eps.sort(key=lambda x: -x[2])  # highest EMA first
             for _addr, _midx, _ema in _eps[1:]:
                 _sybil_skip.add((_addr, _midx))
-                bt.logging.warning(f"  GPU dedup: skipping {_addr[:10]} model_index={_midx} (ema={_ema:.4f})")
+                # Zero stale EMA on the skipped slot. Without this, the
+                # slot's score from before the dup was observed stays
+                # frozen (probation can't decay it because the scoring
+                # pass below `continue`s past the probation block).
+                _zuid = self._resolve_uid(_addr)
+                if _zuid is not None and _zuid in self.scorer.states:
+                    _zentry = self.scorer.states[_zuid].entries.get(_midx)
+                    if _zentry is not None and _zentry.ema_score != 0.0:
+                        _zold = _zentry.ema_score
+                        _zentry.ema_score = 0.0
+                        bt.logging.debug(
+                            f"  GPU dedup: skipping {_addr[:10]} model_index={_midx} "
+                            f"(zeroed stale ema {_zold:.4f} → 0.0)"
+                        )
+                    else:
+                        bt.logging.debug(
+                            f"  GPU dedup: skipping {_addr[:10]} model_index={_midx} (ema=0)"
+                        )
+                else:
+                    bt.logging.debug(
+                        f"  GPU dedup: skipping {_addr[:10]} model_index={_midx} (ema={_ema:.4f}, uid unresolved)"
+                    )
 
         # ── Pass 2: score each miner-model entry ─────────────────
         for miner in self._epoch_miners:

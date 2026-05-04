@@ -100,6 +100,39 @@ if [ "${GPU_SM:-0}" -ge 120 ] && [ "${GPU_DRIVER_MAJOR:-0}" -lt 575 ]; then
     fi
 fi
 
+# ── vLLM version policy & known issues ──────────────────────────────────────
+# Default install: vLLM 0.19.x (pinned in pyproject.toml [vllm] extra).
+# Ships torch 2.10 + cu128.  Production-tested on sm_80/86/89/90/120
+# (Ampere/Ada/Hopper/Blackwell) — UID 94 (H100), UID 91 (RTX 5090),
+# UID 140 (RTX 4090) all run on this stack.
+#
+# KNOWN ISSUE: A small number of sm_89 operators (RTX 4090 / L4 / L40S
+# / RTX 6000 Ada) hit `cudaErrorIllegalAddress` during model load
+# (vLLM CUDA-graph capture phase).  The vLLM FLA kernel guard
+# (`state_idx < 0` in 0.19) does NOT catch the NULL_BLOCK_ID=0 padding,
+# so any combination that triggers a zero-padded state index reads
+# uninitialised memory.  Hopper (sm_90) masks the corruption.
+#
+# RECOVERY:
+# 1) Try a clean restart first — Triton autotune is non-deterministic, so
+#    the next compile may pick different params and avoid the bad codegen.
+#    Stop the miner, wipe caches, restart:
+#       pm2 stop miner
+#       rm -rf /tmp/torchinductor_* ~/.cache/vllm/torch_compile_cache ~/.triton/cache
+#       pm2 restart miner
+#    (miner.py auto-clears stale caches at startup, but only after the
+#     vllm subprocess crash that creates the bad cache entry — manual
+#     pre-restart wipe is more reliable.)
+#
+# 2) If clean restart still crashes, downgrade to vLLM 0.17.1 (uses an
+#    older Triton kernel path that doesn't trip this bug):
+#       source .venv-vllm/bin/activate
+#       pip install --no-cache-dir 'vllm==0.17.1' \
+#           'flashinfer-python==0.6.4' 'flashinfer-cubin==0.6.4'
+#       pm2 restart miner
+#    Trade-off: Qwen 3.6 / Gemma 4 require vLLM >= 0.19, so they will not
+#    work on the 0.17.1 fallback.  Qwen 3.5 family works fine.
+
 # ── Clone or update repo ─────────────────────────────────────────────────────
 
 if [ -f "pyproject.toml" ] && grep -q "verathos" pyproject.toml 2>/dev/null; then
@@ -173,29 +206,48 @@ sos = sorted(glob.glob(f'{sp}/vllm/_*.so'))
 if not sos:
     sys.exit(0)
 
+# Find a working cuobjdump once.
+cuobjdump = None
 for cmd in ['/usr/local/cuda/bin/cuobjdump', 'cuobjdump']:
     try:
-        r = subprocess.run([cmd, '--list-elf', sos[0]],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
-            if sm_str not in r.stdout:
-                # PTX forward-compat: NVIDIA GPUs can run cubins from the
-                # same major arch via JIT.  e.g. sm_86 (RTX 3090, A6000)
-                # runs on sm_80 cubins.  The official vLLM wheel ships
-                # only select SMs to save space.  Check if the base SM
-                # (same major, minor=0) is present — if so, trust the
-                # runtime Marlin check below instead of forcing a rebuild.
-                base_sm = (sm // 10) * 10
-                base_str = f'sm_{base_sm}'
-                if base_sm != sm and base_str in r.stdout:
-                    print(f'{sm_str} not in wheel but {base_str} present — using PTX fallback')
-                    break
-                print(f'{sm_str} not found in vLLM CUDA kernels')
-                sys.exit(1)
+        if subprocess.run([cmd, '--help'], capture_output=True, timeout=5).returncode == 0:
+            cuobjdump = cmd
             break
     except (FileNotFoundError, subprocess.TimeoutExpired):
         continue
+
+if cuobjdump is not None:
+    # vLLM ships a *set* of _*.so files (Marlin, MoE, attention etc.); not
+    # every one carries every sm.  Scan ALL of them — if ANY contains the
+    # current sm, the wheel is good.  Earlier code only inspected sos[0]
+    # which falsely flagged 0.20.x as incompatible on sm_89 even though
+    # other .so files in the same wheel did contain sm_89 cubins.
+    sm_found = False
+    base_sm = (sm // 10) * 10
+    base_str = f'sm_{base_sm}'
+    base_found = False
+    for so in sos:
+        try:
+            r = subprocess.run([cuobjdump, '--list-elf', so],
+                               capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            continue
+        if r.returncode != 0:
+            continue
+        if sm_str in r.stdout:
+            sm_found = True
+            break
+        if base_sm != sm and base_str in r.stdout:
+            base_found = True
+    if not sm_found:
+        if base_found:
+            # PTX forward-compat fallback (e.g. sm_86 runs on sm_80 cubins).
+            print(f'{sm_str} not in any wheel .so but {base_str} present — using PTX fallback')
+        else:
+            print(f'{sm_str} not found in any of {len(sos)} vLLM CUDA kernels')
+            sys.exit(1)
 else:
+    # No cuobjdump available — fall back to known wheel arch list.
     known = {80, 86, 89, 90}
     if sm not in known:
         print(f'{sm_str} not in known wheel archs {known}')
@@ -277,8 +329,9 @@ except Exception:
     echo "  MAX_JOBS=$NJOBS ($(nproc) CPUs available)"
 
     rm -rf "$BUILD_DIR"
-    # Pin to v0.17.1 tag to avoid breaking changes on main branch
-    git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git "$BUILD_DIR"
+    # Pin to v0.19.1 tag — matches the [vllm] extra range in pyproject.toml.
+    # Avoids breaking changes on main branch.
+    git clone --depth 1 --branch v0.19.1 https://github.com/vllm-project/vllm.git "$BUILD_DIR"
     cd "$BUILD_DIR"
 
     export PATH="${CUDA_HOME_PATH}/bin:$PATH"

@@ -55,10 +55,20 @@ hashing = [
     # compatibility with existing install commands that reference it.
 ]
 vllm = [
+    # Pin >=0.19 — vLLM 0.18.x has a GDN/FLA crash on Qwen3 GDN models
+    # (vllm#37749), fixed in 0.19 (vllm#37448).  Required for Qwen3.6 /
+    # Gemma 4 support.  See setup_miner.sh for the known sm_89 + AWQ
+    # CUDA-graph capture issue and recovery path.
     "vllm>=0.19,<0.20",
     "bitsandbytes>=0.42",
     "streamlit>=1.30",
-    "ninja>=1.11",
+    "ninja>=1.11",  # Required by FlashInfer for JIT kernel compilation
+    # Pin `kernels` below 0.13 — kernels 0.13.0 (released 2026-04-11)
+    # ships a `str | None` annotation in `PythonPackage.import_name`
+    # that breaks huggingface_hub 0.36.2's strict dataclass validator
+    # at import time, crashing every fresh vllm install.  0.12.3 is the
+    # last known-good version.
+    "kernels>=0.12,<0.13",
 ]
 api = [
     "fastapi>=0.100",
@@ -85,7 +95,8 @@ postgres = [
 ]
 neurons = [
     "verathos[api,chain,tee]",
-    "bittensor>=10.0",
+    "bittensor>=10.2,<10.3",  # pin minor — bump after testing new releases
+    "async-substrate-interface<2",  # ASI 2.0 breaks bittensor 10.2.x (ScaleObj removed)
     "substrate-interface>=1.7",
     "transformers>=4.30",
     "safetensors>=0.3",

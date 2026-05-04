@@ -262,6 +262,17 @@ server {
 }
 ```
 
+### Multi-GPU box: registering more than one model endpoint
+
+One UID can register multiple model endpoints — one per GPU on the same machine,
+each on its own port. Run `verathos setup` once, then re-run and pick
+**`[3] Add model endpoint`** for each extra GPU; the wizard auto-assigns
+`CUDA_VISIBLE_DEVICES`, internal vLLM port, external HTTPS port (via
+`setup_https.sh --append`), and PM2 process name (`miner`, `miner-1`, …).
+
+Each endpoint reports its real GPU UUID in `/health`. Validators dedupe by GPU
+UUID, so two endpoints sharing a single physical GPU collapse to one.
+
 ---
 
 ## Validator Setup

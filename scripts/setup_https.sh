@@ -18,11 +18,13 @@ set -e
 
 HTTPS_PORT=443
 BACKEND_PORT=8000
+APPEND=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port) HTTPS_PORT="$2"; shift 2 ;;
         --backend-port) BACKEND_PORT="$2"; shift 2 ;;
+        --append) APPEND=1; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
@@ -92,13 +94,10 @@ if [ -n "$CONFLICTS" ]; then
     echo "  Remove or edit the conflicting config before continuing."
 fi
 
-# Check if nginx.conf includes sites-enabled (standard distro setup).
-# Many cloud GPU images ship a custom nginx.conf without sites-enabled —
-# in that case, write our server block directly into nginx.conf.
-if grep -q "include.*sites-enabled" /etc/nginx/nginx.conf 2>/dev/null; then
-    # Standard setup — use sites-available/sites-enabled
-    NGINX_CONF="/etc/nginx/sites-available/verathos-miner"
-    cat > "$NGINX_CONF" << CONFEOF
+# Reusable server-block snippet (writes to stdout).  Used by both fresh
+# write and append paths; --append wraps it in a one-line awk insertion.
+write_server_block() {
+    cat << CONFEOF
 server {
     listen $HTTPS_PORT ssl;
     ssl_certificate $CERT_DIR/miner.crt;
@@ -117,33 +116,83 @@ server {
     }
 }
 CONFEOF
+}
+
+# Check if nginx.conf includes sites-enabled (standard distro setup).
+# Many cloud GPU images ship a custom nginx.conf without sites-enabled —
+# in that case, write our server block directly into nginx.conf.
+USES_SITES=0
+if grep -q "include.*sites-enabled" /etc/nginx/nginx.conf 2>/dev/null; then
+    USES_SITES=1
+fi
+
+if [ "$APPEND" = "1" ]; then
+    # ── Append a second/Nth server block, preserve existing ones ──
+    if [ "$USES_SITES" = "1" ]; then
+        TARGET="/etc/nginx/sites-available/verathos-miner"
+        if [ ! -f "$TARGET" ]; then
+            echo "  ERROR: --append used but $TARGET doesn't exist."
+            echo "  Run setup_https.sh without --append first to create the base config."
+            exit 1
+        fi
+        # Skip if a server block for this port already exists.
+        if grep -qE "listen[[:space:]]+$HTTPS_PORT[[:space:]]+ssl" "$TARGET"; then
+            echo "  Port $HTTPS_PORT already configured in $TARGET — nothing to append."
+        else
+            echo "" >> "$TARGET"
+            write_server_block >> "$TARGET"
+            echo "  Appended server block (port $HTTPS_PORT → :$BACKEND_PORT) to $TARGET"
+        fi
+        ln -sf "$TARGET" /etc/nginx/sites-enabled/verathos-miner
+    else
+        # Custom nginx.conf — append a server block inside the http {} body.
+        TARGET="/etc/nginx/nginx.conf"
+        if grep -qE "listen[[:space:]]+$HTTPS_PORT[[:space:]]+ssl" "$TARGET"; then
+            echo "  Port $HTTPS_PORT already configured in $TARGET — nothing to append."
+        else
+            cp "$TARGET" "$TARGET.bak.$(date +%s)"
+            BLOCK="$(write_server_block | sed 's/^/    /')"
+            # Insert before the FINAL closing brace of the http {} block
+            # (last "}" line in the file).  Escape special chars for awk.
+            tmp="$(mktemp)"
+            awk -v block="$BLOCK" '
+                {
+                    lines[NR] = $0
+                }
+                END {
+                    last_brace = 0
+                    for (i = NR; i >= 1; i--) {
+                        if (lines[i] ~ /^[[:space:]]*}[[:space:]]*$/) {
+                            last_brace = i
+                            break
+                        }
+                    }
+                    for (i = 1; i <= NR; i++) {
+                        if (i == last_brace) print block
+                        print lines[i]
+                    }
+                }
+            ' "$TARGET" > "$tmp"
+            mv "$tmp" "$TARGET"
+            echo "  Appended server block (port $HTTPS_PORT → :$BACKEND_PORT) to $TARGET"
+        fi
+    fi
+elif [ "$USES_SITES" = "1" ]; then
+    # ── Fresh write, sites-enabled layout ──
+    NGINX_CONF="/etc/nginx/sites-available/verathos-miner"
+    write_server_block > "$NGINX_CONF"
     mkdir -p /etc/nginx/sites-enabled
     ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/verathos-miner
     if [ -f /etc/nginx/sites-enabled/default ]; then
         rm -f /etc/nginx/sites-enabled/default
     fi
 else
-    # Custom nginx.conf (common on cloud GPU images) — write minimal config
-    # that only includes our miner server block.
+    # ── Fresh write, custom nginx.conf layout ──
     cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
     cat > /etc/nginx/nginx.conf << CONFEOF
 events { worker_connections 2048; }
 http {
-    server {
-        listen $HTTPS_PORT ssl;
-        ssl_certificate $CERT_DIR/miner.crt;
-        ssl_certificate_key $CERT_DIR/miner.key;
-
-        location / {
-            proxy_pass http://127.0.0.1:$BACKEND_PORT;
-            proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            proxy_buffering off;
-            proxy_cache off;
-            proxy_read_timeout 120s;
-        }
-    }
+$(write_server_block | sed 's/^/    /')
 }
 CONFEOF
     echo "  Note: replaced nginx.conf (backup at nginx.conf.bak)"
@@ -151,13 +200,20 @@ fi
 
 # Test and reload
 if nginx -t 2>&1 | grep -q "syntax is ok"; then
-    nginx -s quit 2>/dev/null
-    sleep 1
-    nginx 2>/dev/null || {
-        echo "  WARNING: nginx failed to start. Check for port conflicts:"
-        echo "    ss -tlnp | grep $HTTPS_PORT"
-        exit 1
-    }
+    # If nginx is running, reload gracefully; otherwise start fresh.
+    # `nginx -s quit` fails when no nginx is running — `|| true` keeps
+    # us going under `set -e`.
+    if pgrep -x nginx >/dev/null 2>&1; then
+        nginx -s reload 2>/dev/null || nginx -s quit 2>/dev/null || true
+        sleep 1
+    fi
+    if ! pgrep -x nginx >/dev/null 2>&1; then
+        nginx 2>/dev/null || {
+            echo "  WARNING: nginx failed to start. Check for port conflicts:"
+            echo "    ss -tlnp | grep $HTTPS_PORT"
+            exit 1
+        }
+    fi
     echo ""
     echo "  nginx configured and running on port $HTTPS_PORT"
 else

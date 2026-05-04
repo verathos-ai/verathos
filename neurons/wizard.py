@@ -75,6 +75,22 @@ def _skip() -> str:
     return yellow("—")
 
 
+def _privileged(cmd: list[str]) -> Optional[list[str]]:
+    """Wrap a command with sudo only when needed and available.
+
+    - Already root (e.g. inside a container like RunPod): returns ``cmd`` as-is.
+    - Non-root with sudo on PATH: prepends ``sudo``.
+    - Non-root without sudo: returns ``None`` so the caller can surface a
+      clear "re-run as root or install sudo" message instead of raising
+      ``FileNotFoundError`` from ``subprocess``.
+    """
+    if os.geteuid() == 0:
+        return cmd
+    if shutil.which("sudo"):
+        return ["sudo", *cmd]
+    return None
+
+
 def _prompt(msg: str, default: str = "") -> str:
     """Prompt user for input with an optional default."""
     suffix = f" [{default}]" if default else ""
@@ -477,12 +493,24 @@ def _detect_https_config() -> Optional[dict]:
     return None
 
 
-def step_https(repo: Path) -> dict:
-    """Set up HTTPS reverse proxy."""
+def step_https(repo: Path, add_mode: bool = False,
+               existing_ports: Optional[set] = None,
+               backend_port: str = "") -> dict:
+    """Set up HTTPS reverse proxy.
+
+    ``add_mode=True`` skips the "already configured" early return,
+    forces a fresh port prompt, and runs setup_https.sh with
+    ``--append`` so an existing miner's nginx server block is preserved.
+    ``backend_port`` is forwarded as ``--backend-port`` (the internal
+    vLLM port the new miner will bind on); empty leaves the default 8000.
+    ``existing_ports`` are rejected at the prompt (the new HTTPS port
+    must differ from any miner already configured).
+    """
     existing = _detect_https_config()
     public_ip = _detect_public_ip()
+    blocked_ports = existing_ports or set()
 
-    if existing:
+    if existing and not add_mode:
         endpoint = f"https://{public_ip}:{existing['port']}" if public_ip else f"https://YOUR_IP:{existing['port']}"
         print(f"  HTTPS already configured (port {existing['port']})")
         print(f"  Endpoint: {endpoint}")
@@ -490,6 +518,9 @@ def step_https(repo: Path) -> dict:
             return {"endpoint": endpoint, "port": existing["port"], "host": public_ip}
         host = _prompt("Public IP or domain", public_ip or "")
         return {"endpoint": f"https://{host}:{existing['port']}", "port": existing["port"], "host": host}
+
+    if add_mode and blocked_ports:
+        print(dim(f"  Existing miner port(s): {sorted(blocked_ports)} — choose a different port for this endpoint."))
 
     print(f"  Public IP: {public_ip or yellow('not detected')}")
 
@@ -511,10 +542,18 @@ def step_https(repo: Path) -> dict:
         host = host_input
         while True:
             port_str = _prompt("HTTPS port", "443").strip()
-            if port_str.isdigit() and 1 <= int(port_str) <= 65535:
-                port = int(port_str)
-                break
-            print(red(f"  Invalid port: enter a number between 1 and 65535."))
+            if not (port_str.isdigit() and 1 <= int(port_str) <= 65535):
+                print(red("  Invalid port: enter a number between 1 and 65535."))
+                continue
+            port = int(port_str)
+            if port in blocked_ports:
+                print(red(f"  Port {port} is already used by another miner — pick a different one."))
+                continue
+            break
+
+    if add_mode and port in blocked_ports:
+        print(red(f"  Port {port} collides with an existing miner. Aborting HTTPS setup."))
+        return {"endpoint": f"https://{host}:{port}", "port": port, "host": host}
 
     endpoint = f"https://{host}:{port}" if port != 443 else f"https://{host}"
     print(f"  Endpoint: {endpoint}")
@@ -525,17 +564,35 @@ def step_https(repo: Path) -> dict:
         return {"endpoint": endpoint, "port": port, "host": host}
 
     if _confirm("Set up HTTPS now (nginx + self-signed cert)?"):
-        print(f"  Running setup_https.sh --port {port}...")
-        r = subprocess.run(
-            ["sudo", "bash", str(setup_script), "--port", str(port)],
-            stdin=sys.stdin,
-        )
+        script_args = ["bash", str(setup_script), "--port", str(port)]
+        if backend_port:
+            script_args.extend(["--backend-port", backend_port])
+        if add_mode:
+            script_args.append("--append")
+        cmd = _privileged(script_args)
+        if cmd is None:
+            print(red(
+                "  Not running as root and `sudo` is not available. "
+                "Re-run as root, or install sudo and try again."
+            ))
+            return {"endpoint": endpoint, "port": port, "host": host}
+        sudo_hint = "sudo " if cmd[0] == "sudo" else ""
+        # Strip the leading 'bash' from the displayed args list.
+        display = " ".join(cmd[1:] if cmd[0] == "sudo" else cmd)
+        print(f"  Running {sudo_hint}{display}...")
+        r = subprocess.run(cmd, stdin=sys.stdin)
         if r.returncode != 0:
             print(yellow("  HTTPS setup returned non-zero — check output above."))
-            print("  You can re-run manually: sudo bash scripts/setup_https.sh --port " + str(port))
+            print(f"  You can re-run manually: {sudo_hint}{display}")
     else:
+        sudo_hint = "sudo " if (os.geteuid() != 0 and shutil.which("sudo")) else ""
+        manual = f"bash scripts/setup_https.sh --port {port}"
+        if backend_port:
+            manual += f" --backend-port {backend_port}"
+        if add_mode:
+            manual += " --append"
         print(yellow("  Skipped HTTPS setup. Run later:"))
-        print(f"    sudo bash scripts/setup_https.sh --port {port}")
+        print(f"    {sudo_hint}{manual}")
 
     return {"endpoint": endpoint, "port": port, "host": host}
 
@@ -694,12 +751,16 @@ def step_pm2() -> dict:
             _install_done = threading.Event()
             _install_ok = [False]
             def _do_node_install():
-                if shutil.which("apt-get"):
-                    subprocess.run(["sudo", "apt-get", "update", "-qq"], capture_output=True)
-                    r = subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "nodejs", "npm"], capture_output=True)
+                _update = _privileged(["apt-get", "update", "-qq"])
+                _apt = _privileged(["apt-get", "install", "-y", "-qq", "nodejs", "npm"])
+                _dnf = _privileged(["dnf", "install", "-y", "nodejs", "npm"])
+                if shutil.which("apt-get") and _apt is not None:
+                    if _update is not None:
+                        subprocess.run(_update, capture_output=True)
+                    r = subprocess.run(_apt, capture_output=True)
                     _install_ok[0] = r.returncode == 0
-                elif shutil.which("dnf"):
-                    r = subprocess.run(["sudo", "dnf", "install", "-y", "nodejs", "npm"], capture_output=True)
+                elif shutil.which("dnf") and _dnf is not None:
+                    r = subprocess.run(_dnf, capture_output=True)
                     _install_ok[0] = r.returncode == 0
                 _install_done.set()
             threading.Thread(target=_do_node_install, daemon=True).start()
@@ -728,8 +789,10 @@ def step_pm2() -> dict:
                 break
     if npm:
         _pm2_done = threading.Event()
+        _pm2_cmd = _privileged([npm, "install", "-g", "pm2"])
         def _do_pm2_install():
-            subprocess.run(["sudo", npm, "install", "-g", "pm2"], capture_output=True)
+            if _pm2_cmd is not None:
+                subprocess.run(_pm2_cmd, capture_output=True)
             _pm2_done.set()
         threading.Thread(target=_do_pm2_install, daemon=True).start()
         _chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -879,8 +942,8 @@ def _parse_existing_config(repo: Path) -> list[dict]:
     # Simple regex-based parsing of the JS config
     for m in re.finditer(r'name:\s*["\']([^"\']*miner[^"\']*)["\']', text):
         name = m.group(1)
-        # Find the args line near this match
-        section = text[m.start():m.start() + 500]
+        # Find the args line near this match (and its env block, if any)
+        section = text[m.start():m.start() + 800]
         args_m = re.search(r'args:\s*["\']([^"\']*)["\']', section)
         if args_m:
             args_str = args_m.group(1)
@@ -896,6 +959,13 @@ def _parse_existing_config(repo: Path) -> list[dict]:
             h_m = re.search(r"--hotkey\s+(\S+)", args_str)
             if h_m:
                 entry["hotkey"] = h_m.group(1)
+            # Extract CUDA_VISIBLE_DEVICES from env block (set by the wizard
+            # for multi-GPU isolation). Falls through to None if absent.
+            cvd_m = re.search(
+                r'CUDA_VISIBLE_DEVICES\s*:\s*["\']([^"\']*)["\']', section,
+            )
+            if cvd_m:
+                entry["cuda_device"] = cvd_m.group(1)
             miners.append(entry)
     return miners
 
@@ -931,19 +1001,28 @@ def _generate_miner_entry(
     extra_args: str = "",
     log_level: str = "",
     evm_rpc_url: str = "",
+    vllm_port: str = "",
 ) -> str:
-    """Generate a single PM2 miner app entry as JS text."""
+    """Generate a single PM2 miner app entry as JS text.
+
+    ``vllm_port`` (when set) appends ``--port N`` to the args. ``neurons.miner``
+    parses unknown args and forwards them to the ``verallm.api.server``
+    subprocess, so this lets each instance bind its own internal port.
+    Empty ``vllm_port`` keeps the default (8000) — required for
+    backward compatibility with existing single-miner configs.
+    """
     net_flag = f"--subtensor-network {network}"
     chain_flag = f" --subtensor-chain-endpoint {chain_endpoint}" if chain_endpoint else ""
     evm_flag = f" --evm-rpc-url {evm_rpc_url}" if evm_rpc_url else ""
     log_flag = " --logging.debug" if log_level == "debug" else ""
     quant_flag = f" --quant {quant}" if quant else ""
+    port_flag = f" --port {vllm_port}" if vllm_port else ""
     args = (
         f"-u -m neurons.miner "
         f"--wallet {wallet} --hotkey {hotkey} "
         f"--netuid {netuid} {net_flag}{chain_flag}{evm_flag} "
         f"--model-id {model_id}{quant_flag} --endpoint {endpoint} "
-        f"--auto-update{log_flag}"
+        f"--auto-update{log_flag}{port_flag}"
     )
     if extra_args:
         args += f" {extra_args}"
@@ -1016,6 +1095,93 @@ def _generate_validator_entry(
     }}"""
 
 
+def _next_miner_name(existing_miners: list[dict]) -> str:
+    """Return a non-colliding PM2 name for a new miner entry.
+
+    Convention: first miner is ``"miner"``; subsequent entries are
+    ``"miner-1"``, ``"miner-2"``, etc.
+    """
+    used = {m.get("name") for m in existing_miners if m.get("name")}
+    if "miner" not in used:
+        return "miner"
+    for i in range(1, 100):
+        candidate = f"miner-{i}"
+        if candidate not in used:
+            return candidate
+    return "miner-extra"
+
+
+def _existing_endpoint_ports(existing_miners: list[dict]) -> set[int]:
+    """Extract endpoint ports already in use by existing miner entries."""
+    from urllib.parse import urlparse
+    ports: set[int] = set()
+    for m in existing_miners:
+        ep = m.get("endpoint", "")
+        try:
+            p = urlparse(ep).port
+            if p:
+                ports.add(p)
+        except Exception:
+            pass
+    return ports
+
+
+def _existing_internal_ports(existing_miners: list[dict]) -> set[int]:
+    """Extract internal vLLM ports (the ``--port N`` arg passed through to
+    the server subprocess) from each existing miner's args. Defaults to
+    8000 when the arg is absent (matches verallm.api.server default)."""
+    ports: set[int] = set()
+    for m in existing_miners:
+        args = m.get("args", "") or ""
+        match = re.search(r"--port\s+(\d+)", args)
+        if match:
+            try:
+                ports.add(int(match.group(1)))
+            except ValueError:
+                pass
+        else:
+            ports.add(8000)  # implicit default
+    return ports
+
+
+def _pick_free_internal_port(existing_miners: list[dict]) -> str:
+    """Pick the lowest free internal vLLM port starting from 8000."""
+    used = _existing_internal_ports(existing_miners)
+    for p in range(8000, 8100):
+        if p not in used:
+            return str(p)
+    return "8099"
+
+
+def _pick_free_gpu_index(existing_miners: list[dict], n_gpus: int) -> Optional[str]:
+    """Return the lowest-numbered free GPU index as a string, or ``None``
+    if the host is single-GPU (no isolation needed) or every GPU is taken.
+
+    "In use" = an existing miner entry whose env block has
+    ``CUDA_VISIBLE_DEVICES`` set, OR an entry without an env block (which
+    implicitly defaults to GPU 0). The wizard caller is responsible for
+    showing the operator the chosen index and warning if all GPUs are
+    saturated.
+    """
+    if n_gpus <= 1:
+        return None  # single-GPU host — no isolation needed
+    in_use: set[int] = set()
+    for em in existing_miners:
+        cvd = em.get("cuda_device")
+        if cvd is not None:
+            try:
+                in_use.add(int(cvd))
+            except (ValueError, TypeError):
+                pass
+        else:
+            # No env block: vLLM defaults to GPU 0
+            in_use.add(0)
+    for idx in range(n_gpus):
+        if idx not in in_use:
+            return str(idx)
+    return None  # all GPUs taken
+
+
 def step_config(
     role: str,
     repo: Path,
@@ -1024,8 +1190,15 @@ def step_config(
     https_info: dict,
     model_info: Optional[dict] = None,
     options: Optional[dict] = None,
+    add_mode: bool = False,
+    vllm_port: str = "",
 ) -> dict:
-    """Generate or update ecosystem.config.js."""
+    """Generate or update ecosystem.config.js.
+
+    ``add_mode=True`` appends a new entry to an existing config (used by
+    the menu's ``[3] Add model endpoint`` flow). Auto-names the new
+    entry ``miner-N`` to avoid PM2 name collisions.
+    """
     config_path = repo / "ecosystem.config.js"
     existing_miners = _parse_existing_config(repo)
     repo_root = str(repo)
@@ -1064,8 +1237,48 @@ def step_config(
     if not endpoint:
         endpoint = _prompt("Miner endpoint URL", "https://YOUR_IP")
 
+    # Auto-assign a free GPU index on multi-GPU hosts so each instance
+    # gets isolated via CUDA_VISIBLE_DEVICES. Without this, every vLLM
+    # process tries to load on cuda:0 and OOMs on multi-instance setups.
+    cuda_device: Optional[str] = opts.get("cuda_device") or None
+    if cuda_device is None:
+        try:
+            import torch as _torch
+            n_gpus = _torch.cuda.device_count() if _torch.cuda.is_available() else 0
+        except Exception:
+            n_gpus = 0
+        if n_gpus > 1:
+            cuda_device = _pick_free_gpu_index(existing_miners, n_gpus)
+            if cuda_device is None:
+                print(yellow(
+                    f"  Warning: all {n_gpus} GPUs already assigned to existing "
+                    f"miners — new entry will not be GPU-isolated. Free a GPU or "
+                    f"set --gpu-index N manually."
+                ))
+            else:
+                try:
+                    import torch as _torch
+                    _name = _torch.cuda.get_device_properties(int(cuda_device)).name
+                except Exception:
+                    _name = "GPU"
+                print(green(
+                    f"  Auto-assigned CUDA_VISIBLE_DEVICES={cuda_device} ({_name})"
+                ))
+
+    miner_name = _next_miner_name(existing_miners) if add_mode else "miner"
+
+    # Pick a free internal vLLM port only when adding a new entry alongside
+    # existing ones — otherwise leave empty so the server uses the default
+    # 8000 (backward compatible with all current single-miner configs).
+    # Accept a precomputed value from the caller (run_wizard pre-computes
+    # so step_https can pass it as --backend-port to nginx).
+    if not vllm_port and add_mode and existing_miners:
+        vllm_port = _pick_free_internal_port(existing_miners)
+    if vllm_port:
+        print(green(f"  Internal vLLM port: {vllm_port}"))
+
     entry = _generate_miner_entry(
-        name="miner",
+        name=miner_name,
         wallet=wallet_info["wallet"],
         hotkey=wallet_info["hotkey"],
         endpoint=endpoint,
@@ -1077,6 +1290,8 @@ def step_config(
         chain_endpoint=chain_endpoint,
         evm_rpc_url=evm_rpc_url,
         log_level=log_level,
+        cuda_device=cuda_device or "",
+        vllm_port=vllm_port,
     )
 
     print()
@@ -1092,14 +1307,20 @@ def step_config(
         print(dim(f"    log level: {log_level}"))
     print()
 
+    if add_mode and existing_miners and config_path.exists():
+        # Append-mode: keep all existing entries, add the new one.
+        _append_to_ecosystem_config(config_path, entry)
+        print(green(f"  Appended {miner_name} to {config_path}"))
+        return {"config_generated": True, "pm2_name": miner_name}
+
     if config_path.exists():
         if not _confirm("Overwrite existing ecosystem.config.js?", default=False):
             print(yellow("  Keeping existing config."))
-            return {"config_generated": True, "pm2_name": "miner"}
+            return {"config_generated": True, "pm2_name": miner_name}
 
     _write_ecosystem_config(config_path, [entry])
     print(green(f"  Written: {config_path}"))
-    return {"config_generated": True, "pm2_name": "miner"}
+    return {"config_generated": True, "pm2_name": miner_name}
 
 
 def _write_ecosystem_config(path: Path, entries: list[str]) -> None:
@@ -1586,23 +1807,50 @@ def _quick_start(repo: Path, pm2_name: str) -> None:
             print()
             return
 
-    # Check for OTHER miner processes that might be using the GPU
-    # (e.g. miner-mainnet, miner-gpu1). Don't check for validators/proxies.
+    # Check for OTHER miner processes whose GPU index actually overlaps with
+    # ours. Multi-miner setups with distinct CUDA_VISIBLE_DEVICES per process
+    # are fine — only warn when there's a real conflict on the same GPU.
     if "miner" in pm2_name:
+        # Resolve OUR configured GPU index from the freshly-generated config.
+        # No env block / unset = implicit GPU 0 (vLLM default).
+        def _entry_cvd(cvd_str: Optional[str]) -> int:
+            try:
+                return int(cvd_str) if cvd_str is not None else 0
+            except (ValueError, TypeError):
+                return 0
+
+        our_cvd: Optional[int] = None
+        try:
+            for em in _parse_existing_config(repo):
+                if em.get("name") == pm2_name:
+                    our_cvd = _entry_cvd(em.get("cuda_device"))
+                    break
+        except Exception:
+            our_cvd = None  # parse failure → fall back to original behavior
+
+        def _proc_cvd(p: dict) -> int:
+            env = (p.get("pm2_env") or {}).get("env") or {}
+            return _entry_cvd(env.get("CUDA_VISIBLE_DEVICES"))
+
         other_miners = [
             p for p in procs
             if "miner" in p.get("name", "")
             and p.get("name") != pm2_name
             and p.get("pm2_env", {}).get("status") == "online"
         ]
+        # If we know our CVD, narrow to GPU-conflicting peers only.
+        if our_cvd is not None:
+            other_miners = [p for p in other_miners if _proc_cvd(p) == our_cvd]
+
         if other_miners:
             print()
-            print(yellow(f"  Warning: {len(other_miners)} other miner process(es) running:"))
+            _gpu_msg = f" on GPU {our_cvd}" if our_cvd is not None else ""
+            print(yellow(f"  Warning: {len(other_miners)} other miner process(es) running{_gpu_msg}:"))
             for p in other_miners:
                 _name = p.get("name", "?")
                 _pid = p.get("pid", "?")
                 print(f"    {_name} (pid {_pid})")
-            print("  Starting another miner may fail if the GPU is already in use.")
+            print("  Starting another miner on the same GPU will fail.")
             print()
             print(f"    [Enter] Start anyway")
             print(f"    [S]     Stop other miners first, then start")
@@ -1677,10 +1925,13 @@ def _change_endpoint(repo: Path, miners: list[dict]) -> None:
         setup_script = repo / "scripts" / "setup_https.sh"
         if setup_script.exists():
             if _confirm(f"Set up HTTPS on port {port}?", default=True):
-                subprocess.run(
-                    ["sudo", "bash", str(setup_script), "--port", str(port)],
-                    stdin=sys.stdin,
-                )
+                _https_cmd = _privileged(["bash", str(setup_script), "--port", str(port)])
+                if _https_cmd is None:
+                    print(red(
+                        "  Cannot run setup_https.sh: not root and sudo is unavailable."
+                    ))
+                else:
+                    subprocess.run(_https_cmd, stdin=sys.stdin)
 
     if _confirm("Restart with new endpoint?", default=True):
         pm2 = shutil.which("pm2")
@@ -1840,6 +2091,8 @@ def run_wizard(role: str = "miner") -> None:
     repo = _find_repo_root()
     _banner(role)
 
+    add_mode = False  # set True if user picks "[3] Add model endpoint"
+
     # ── Early detection: existing config? ─────────────────────────────
     existing_miners = _parse_existing_config(repo) if role == "miner" else []
     if existing_miners:
@@ -1869,6 +2122,7 @@ def run_wizard(role: str = "miner") -> None:
             _change_model(repo, existing_miners)
             return
         elif choice == "3":
+            add_mode = True
             # Check GPU count before adding a model endpoint
             try:
                 import torch
@@ -1943,9 +2197,22 @@ def run_wizard(role: str = "miner") -> None:
             return
 
     if role == "miner":
+        # Pre-compute the new miner's internal vLLM port when adding alongside
+        # existing entries, so both step_https (passes --backend-port to nginx)
+        # and step_config (writes --port into the args) agree.
+        new_vllm_port = (
+            _pick_free_internal_port(existing_miners)
+            if add_mode and existing_miners else ""
+        )
+
         # Step 5: HTTPS
         _header(5, total_steps, "HTTPS Endpoint")
-        https_info = step_https(repo)
+        https_info = step_https(
+            repo,
+            add_mode=add_mode,
+            existing_ports=_existing_endpoint_ports(existing_miners) if add_mode else None,
+            backend_port=new_vllm_port,
+        )
 
         # Step 6: Model Selection
         _header(6, total_steps, "Model Selection")
@@ -1961,7 +2228,10 @@ def run_wizard(role: str = "miner") -> None:
 
         # Step 9: Config
         _header(9, total_steps, "ecosystem.config.js")
-        config_info = step_config(role, repo, wallet_info, net_info, https_info, model_info, options)
+        config_info = step_config(
+            role, repo, wallet_info, net_info, https_info, model_info, options,
+            add_mode=add_mode, vllm_port=new_vllm_port,
+        )
     else:
         # Validator: skip HTTPS + model, still need PM2 + options + config
         https_info = {"endpoint": "", "port": 0, "host": ""}
