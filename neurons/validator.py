@@ -830,7 +830,10 @@ class ValidatorNeuron:
                     result = future.result()
                     if result is False:
                         bt.logging.info(f"Identity FAILED for {miner.address[:10]} at {miner.endpoint} — excluding from epoch")
-                        self._report_offline(miner)
+                        # Dispatch chain call to executor — wait_for_transaction_receipt
+                        # blocks up to 360s per call (3×120s retries) and would stall the
+                        # main loop while we wait.  Background task logs its own outcome.
+                        self._executor.submit(self._report_offline, miner)
                         continue
                     if result is None and self.config.identity_challenge_required:
                         bt.logging.info(f"Identity UNSUPPORTED for {miner.address[:10]} at {miner.endpoint} — excluding (required mode)")
@@ -2019,7 +2022,8 @@ class ValidatorNeuron:
             # Escalation: too long on probation → report offline on-chain
             if self._db.should_escalate(miner.address, miner.model_index, epoch_number):
                 bt.logging.info(f"Probation ESCALATION for {miner.address[:10]} model_index={miner.model_index} -> reportOffline")
-                self._report_offline(miner)
+                # Background dispatch — chain wait must not block epoch close
+                self._executor.submit(self._report_offline, miner)
 
         # ── Zero undiscovered miners ───────────────────────────────
         # If a miner's lease expired or it wasn't discovered this epoch,
