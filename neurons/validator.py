@@ -2094,15 +2094,28 @@ class ValidatorNeuron:
             receipt_dicts = data.get("receipts", [])
 
             verified = []
+            seen_sigs: set[bytes] = set()
+            duplicates = 0
             for r_dict in receipt_dicts:
                 try:
                     receipt = receipt_from_dict(r_dict)
-                    if verify_service_receipt(receipt, epoch_number):
-                        verified.append(receipt)
+                    if not verify_service_receipt(receipt, epoch_number):
+                        continue
+                    if receipt.validator_signature in seen_sigs:
+                        duplicates += 1
+                        continue
+                    seen_sigs.add(receipt.validator_signature)
+                    verified.append(receipt)
                 except Exception as e:
                     bt.logging.debug(f"Invalid receipt from {miner.address[:10]}: {e}")
 
-            bt.logging.debug(f"Pulled {len(verified)}/{len(receipt_dicts)} valid receipts from {miner.address[:10]}")
+            if duplicates > 0:
+                bt.logging.warning(
+                    f"Receipt dedup from {miner.address[:10]}: dropped {duplicates} duplicate "
+                    f"signature(s) out of {len(receipt_dicts)} pulled"
+                )
+
+            bt.logging.debug(f"Pulled {len(verified)}/{len(receipt_dicts)} valid (unique) receipts from {miner.address[:10]}")
             return verified
 
         except Exception as e:
