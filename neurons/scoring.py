@@ -249,11 +249,13 @@ def compute_epoch_entry_score(
     # Total weighted tokens served this epoch.
     # Output tokens weighted 3× input — decode is sequential (one forward pass
     # per token) while prefill is parallel. Reflects actual GPU cost ratio.
+    # Receipts where proof was requested and failed contribute 0 tokens.
     OUTPUT_WEIGHT = 3
     total_tokens = sum(
         OUTPUT_WEIGHT * r.tokens_generated + r.prompt_tokens
         for r in outcome.all_receipts
         if r.tokens_generated > 0
+        and not (r.proof_requested and not r.proof_verified)
     )
     if total_tokens <= 0:
         return 0.0
@@ -320,7 +322,12 @@ def compute_traffic_volume(
     Volume only — quality (tok/s) is already captured in throughput² scoring.
     Range: 1.0 (no traffic) to 1.5 (heavy traffic).
     """
-    valid = [r for r in all_receipts if r.epoch_number == epoch_number]
+    # Same proof-failure filter as compute_epoch_entry_score.
+    valid = [
+        r for r in all_receipts
+        if r.epoch_number == epoch_number
+        and not (r.proof_requested and not r.proof_verified)
+    ]
     if not valid:
         return 1.0
 

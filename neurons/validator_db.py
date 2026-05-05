@@ -230,6 +230,40 @@ class ValidatorStateDB:
         """)
         self._conn.commit()
 
+        # One-time migration: prune historical duplicate rows then install
+        # the unique index. Wrapped in try/except so a failure (locked DB,
+        # IO error) never crashes startup — receipt-pull dedup in
+        # validator.py prevents new duplicates regardless of this success.
+        # TODO: remove this migration block after all validators have been
+        # restarted with this version (~2 weeks post-deploy is safe).
+        try:
+            cur = self._conn.execute("""
+                DELETE FROM network_receipts
+                WHERE commitment_hash IS NOT NULL
+                  AND id NOT IN (
+                    SELECT MIN(id) FROM network_receipts
+                    WHERE commitment_hash IS NOT NULL
+                    GROUP BY epoch_number, validator_hotkey, commitment_hash
+                  )
+            """)
+            removed = cur.rowcount or 0
+            if removed > 0:
+                bt.logging.debug(
+                    f"network_receipts: pruned {removed} historical duplicate rows"
+                )
+            self._conn.commit()
+        except Exception as e:
+            bt.logging.warning(f"network_receipts duplicate prune failed: {e}")
+
+        try:
+            self._conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uniq_network_receipts_signature
+                    ON network_receipts(epoch_number, validator_hotkey, commitment_hash)
+            """)
+            self._conn.commit()
+        except Exception as e:
+            bt.logging.warning(f"network_receipts unique index creation failed: {e}")
+
         # Ensure schema version is recorded
         existing = self._raw_get_meta("schema_version")
         if existing is None:
@@ -889,8 +923,11 @@ class ValidatorStateDB:
         if not rows:
             return 0
         with self._lock:
+            # INSERT OR IGNORE: skip rows that violate the unique index on
+            # (epoch_number, validator_hotkey, commitment_hash). Falls back
+            # to plain INSERT if the index does not exist.
             self._conn.executemany(
-                """INSERT INTO network_receipts (
+                """INSERT OR IGNORE INTO network_receipts (
                     epoch_number, miner_address, miner_hotkey_ss58, miner_coldkey_ss58,
                     model_id, model_index, validator_hotkey, is_own, is_canary,
                     ttft_ms, tokens_generated, generation_time_ms, tokens_per_sec,

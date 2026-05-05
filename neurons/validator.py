@@ -1263,8 +1263,15 @@ class ValidatorNeuron:
                         )
                         proof_verified = result.passed
                         if not proof_verified:
-                            bt.logging.error(
-                                f"Proof failure | {test.miner_address[:10]} "
+                            # Miner-side fault, not a validator problem — the
+                            # detection + probation flow is the success path.
+                            # DEBUG so prod dashboards don't page on miner faults.
+                            # UID resolved via local SQLite (indexed lookup,
+                            # microseconds) — no RPC.
+                            _uid = self._db.get_uid(test.miner_address)
+                            _uid_str = f"uid={_uid}" if _uid is not None else "uid=?"
+                            bt.logging.debug(
+                                f"Proof failure | {_uid_str} {test.miner_address[:10]} "
                                 f"| model={test.model_id}: {result.message}",
                             )
                             # Mid-epoch cutoff: immediately put on probation
@@ -1642,13 +1649,29 @@ class ValidatorNeuron:
             self.config.epoch_receipt_pull_overall_timeout,
             len(self._epoch_miners) // self.config.max_concurrent_verifications * 3 + 10,
         ))
+        # Cross-pull signature dedup: when a miner registers multiple
+        # model_indices on a single physical server, every endpoint returns
+        # the same receipt buffer. Filter by validator_signature so each
+        # signed receipt counts once across all pulls for the same address.
+        # Multi-server legit operators see no filtering (signatures differ).
+        seen_sigs_by_addr: Dict[str, set] = {}
+        cross_pull_dups = 0
         try:
             for fut in as_completed(receipt_futures, timeout=_rp_timeout):
                 miner = receipt_futures[fut]
                 try:
                     receipts = fut.result()
-                    miner_receipts.setdefault(miner.address, []).extend(receipts)
-                    all_epoch_receipts.extend(receipts)
+                    addr_key = miner.address.lower()
+                    seen = seen_sigs_by_addr.setdefault(addr_key, set())
+                    new_receipts = []
+                    for r in receipts:
+                        if r.validator_signature in seen:
+                            cross_pull_dups += 1
+                            continue
+                        seen.add(r.validator_signature)
+                        new_receipts.append(r)
+                    miner_receipts.setdefault(miner.address, []).extend(new_receipts)
+                    all_epoch_receipts.extend(new_receipts)
                 except Exception as e:
                     bt.logging.debug(f"Receipt pull exception for {miner.address[:10]}: {e}")
         except _FuturesTimeout:
@@ -1663,6 +1686,11 @@ class ValidatorNeuron:
             for f in receipt_futures:
                 if not f.done():
                     f.cancel()
+
+        if cross_pull_dups > 0:
+            bt.logging.info(
+                f"Receipt cross-pull dedup: dropped {cross_pull_dups} duplicate signatures"
+            )
 
         # ── Store all receipts (full network view) ────────────────
         try:
