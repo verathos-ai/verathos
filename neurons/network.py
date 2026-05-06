@@ -223,14 +223,19 @@ def _format_score(score: float) -> str:
     return dim(s)
 
 
-def _format_health(healthy: bool, on_probation: bool) -> str:
-    """Health indicator with optional probation badge."""
+def _format_health(healthy: bool, on_probation: bool, is_blacklisted: bool = False) -> str:
+    """Health indicator with optional probation / sybil badges."""
     if healthy:
         h = green("\u2713")
     else:
         h = red("\u2717")
+    flags = []
     if on_probation:
-        h += " " + yellow("(P)")
+        flags.append("P")
+    if is_blacklisted:
+        flags.append("S")
+    if flags:
+        h += " " + yellow(f"({','.join(flags)})")
     return h
 
 
@@ -308,7 +313,7 @@ def render_network(data: dict) -> None:
         # Column headers.
         hdr = (
             f"  {'UID':>4s}  {'Addr':<9s}  {'Model':<25s}  {'Quant':<6s}  "
-            f"{'Score':>7s}  {'Health':<8s}  {'TEE':<3s}  {'GPU':<16s}  {'Ctx':>4s}"
+            f"{'Score':>7s}  {'Health':<10s}  {'TEE':<3s}  {'GPU':<16s}  {'Ctx':>4s}"
         )
         print(dim(hdr))
         print(dim(f"  {'─' * 4}  {'─' * 9}  {'─' * 25}  {'─' * 6}  "
@@ -322,8 +327,12 @@ def render_network(data: dict) -> None:
             quant = (m.get("quant") or "-")[:6]
             score = _pad(_format_score(m.get("score", 0)), 7, ">")
             health = _pad(
-                _format_health(m.get("healthy", True), m.get("on_probation", False)),
-                8,
+                _format_health(
+                    m.get("healthy", True),
+                    m.get("on_probation", False),
+                    m.get("is_blacklisted", False),
+                ),
+                10,
             )
             tee = _pad(green("\u2713") if m.get("tee_enabled") else " ", 3)
             gpu = _format_gpu(
@@ -339,6 +348,15 @@ def render_network(data: dict) -> None:
                 f"  {uid_str}  {addr:<9s}  {model:<25s}  {quant:<6s}  "
                 f"{score}  {health}  {tee}  {gpu}  {ctx}"
             )
+
+        # Legend for status badges, only when at least one miner is flagged.
+        if any(
+            m.get("on_probation") or m.get("is_blacklisted") for m in miners
+        ):
+            print()
+            print(dim(
+                "  P: On probation  ·  S: Sybil/blacklist  ·  both score 0"
+            ))
 
     print()
 

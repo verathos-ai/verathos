@@ -69,6 +69,9 @@ class ValidatorSharedState:
     # EVM address (lowercase) → {hotkey_ss58, coldkey_ss58} for all known miners.
     # Proxy uses this to resolve SS58 for miners discovered on-chain.
     ss58_map: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    # SubnetConfig blacklist — addresses whose weights the validator zeros.
+    # Proxy reads this to also zero the score in /v1/network/stats.
+    blacklisted_addresses: List[str] = field(default_factory=list)
     updated_at: float = 0.0
 
 
@@ -101,6 +104,7 @@ def write_shared_state(
         "last_weights": {str(k): v for k, v in state.last_weights.items()},
         "demand_scores": state.demand_scores,
         "ss58_map": state.ss58_map,
+        "blacklisted_addresses": list(state.blacklisted_addresses),
         "updated_at": time.time(),
     }
     tmp_path = path + ".tmp"
@@ -155,6 +159,7 @@ def read_shared_state(
             miner_endpoints=miner_endpoints,
             demand_scores=data.get("demand_scores", {}),
             ss58_map=data.get("ss58_map", {}),
+            blacklisted_addresses=data.get("blacklisted_addresses", []),
             updated_at=data.get("updated_at", 0.0),
         )
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):

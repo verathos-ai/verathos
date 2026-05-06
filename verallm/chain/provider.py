@@ -96,6 +96,11 @@ class Web3Provider:
         self._nonce_lock = threading.Lock()
         self._pending_nonce: Dict[str, int] = {}
 
+        # Per-address send lock — serializes full send so a stuck nonce
+        # can't strand higher-nonce txns behind it.
+        self._send_lock_dict_lock = threading.Lock()
+        self._send_lock_by_addr: Dict[str, threading.Lock] = {}
+
         # Public RPCs have aggressive rate limits (~1 req/s).
         # Add inter-call delay and patient retries.
         self._is_public_rpc = any(
@@ -192,6 +197,29 @@ class Web3Provider:
         account = Account.from_key(pk)
         address = account.address
 
+        send_lock = self._get_send_lock(address)
+        with send_lock:
+            return self._send_transaction_locked(
+                contract_fn=contract_fn, pk=pk, address=address, value=value,
+            )
+
+    def _get_send_lock(self, address: str) -> threading.Lock:
+        """Return (and lazily create) the per-address send-lock."""
+        with self._send_lock_dict_lock:
+            lock = self._send_lock_by_addr.get(address)
+            if lock is None:
+                lock = threading.Lock()
+                self._send_lock_by_addr[address] = lock
+            return lock
+
+    def _send_transaction_locked(
+        self,
+        contract_fn,
+        pk: str,
+        address: str,
+        value: int = 0,
+    ) -> str:
+        """Inner send path — caller must hold the per-address send lock."""
         # Check balance before sending (with retry for 429)
         balance = self.call_with_retry(lambda: self.w3.eth.get_balance(address))
         if balance == 0:

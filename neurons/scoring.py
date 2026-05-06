@@ -223,8 +223,18 @@ def compute_epoch_entry_score(
     else:
         _who = outcome.miner_address[:10]
 
+    # Skip scoring below MIN_RECEIPTS_FOR_SCORING — at very low expected the
+    # 1-receipt slop collapses and a single delivery would pass integrity.
+    MIN_RECEIPTS_FOR_SCORING = 5
     if outcome.expected_own_receipt_count > 0:
-        if len(outcome.own_receipts) < outcome.expected_own_receipt_count:
+        if outcome.expected_own_receipt_count < MIN_RECEIPTS_FOR_SCORING:
+            bt.logging.info(
+                f"Skipping score for {_who} model_index={outcome.model_index}: "
+                f"only {outcome.expected_own_receipt_count} canaries acked (< {MIN_RECEIPTS_FOR_SCORING})"
+            )
+            return None
+        threshold = max(1, outcome.expected_own_receipt_count - 1)
+        if len(outcome.own_receipts) < threshold:
             bt.logging.info(f"Receipt integrity failure for {_who} model_index={outcome.model_index}: expected {outcome.expected_own_receipt_count} own receipts, found {len(outcome.own_receipts)} -> score=0")
             return 0.0
 

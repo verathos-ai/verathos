@@ -273,6 +273,7 @@ class ValidatorNeuron:
         self._miner_client = None
         self._subnet_config_client = None
         self._blacklisted_uids: set = set()
+        self._blacklisted_addresses: set = set()  # lowercase EVM addrs
         self._burn_uid: int = 0
         self._scoring = ScoringParams()
         self._bt_module = None
@@ -558,6 +559,8 @@ class ValidatorNeuron:
         if block_number < self._sync_block:
             return
 
+        _wd_t0 = time.monotonic()
+
         epoch_blocks = self.config.epoch_blocks
         blocks_into_epoch = block_number % epoch_blocks
         blocks_until_next = epoch_blocks - blocks_into_epoch
@@ -587,12 +590,11 @@ class ValidatorNeuron:
 
             self._start_new_epoch(block_number)
 
-        # 1b. Retry failed epoch start — if we're past the boundary but the
-        # canary scheduler is stale (e.g. _start_new_epoch threw on the
-        # boundary block), retry with the current epoch's start block.
+        # 1b. Retry failed epoch start — skip while background setup is in flight.
         elif (
             blocks_into_epoch <= 30  # only retry in first ~6 min
             and self._pending_epoch_close is not None
+            and not getattr(self, "_epoch_setup_in_progress", False)
             and (
                 self._canary_scheduler is None
                 or self._canary_scheduler.epoch_number != block_number // epoch_blocks
@@ -641,27 +643,35 @@ class ValidatorNeuron:
                         weights[uid] *= (1.0 - emission_burn)
                     weights[self._burn_uid] = weights.get(self._burn_uid, 0.0) + emission_burn
                     bt.logging.info(f"Emission burn: {emission_burn:.0%} to UID {self._burn_uid}")
-                # Retry weight-setting up to 3 times — a single failure
-                # otherwise means a 72-min gap before the next attempt.
-                for _sw_attempt in range(1, 4):
-                    try:
-                        self._set_weights(weights)
-                        self._last_weights = weights  # for shared state
-                        break
-                    except Exception as _sw_err:
-                        if _sw_attempt == 3:
-                            bt.logging.error(f"set_weights failed after 3 attempts: {_sw_err}")
-                        else:
-                            _sw_delay = 30 * (2 ** (_sw_attempt - 1))
-                            bt.logging.warning(f"set_weights attempt {_sw_attempt}/3 failed: {_sw_err} — retrying in {_sw_delay}s")
-                            time.sleep(_sw_delay)
+                # Run set_weights + retries on executor so this callback returns fast.
+                def _set_weights_with_retry(_w=dict(weights)):
+                    for _sw_attempt in range(1, 4):
+                        try:
+                            self._set_weights(_w)
+                            self._last_weights = _w
+                            return
+                        except Exception as _sw_err:
+                            if _sw_attempt == 3:
+                                bt.logging.error(f"set_weights failed after 3 attempts: {_sw_err}")
+                            else:
+                                _sw_delay = 30 * (2 ** (_sw_attempt - 1))
+                                bt.logging.warning(f"set_weights attempt {_sw_attempt}/3 failed: {_sw_err} — retrying in {_sw_delay}s")
+                                time.sleep(_sw_delay)
+                self._executor.submit(_set_weights_with_retry)
+
+        _wd_elapsed = time.monotonic() - _wd_t0
+        if _wd_elapsed > 12.0:
+            bt.logging.warning(
+                f"on_finalized_block took {_wd_elapsed:.1f}s for block {block_number} "
+                f"(>12s; main loop is falling behind chain)"
+            )
 
     # ------------------------------------------------------------------
     # Epoch lifecycle
     # ------------------------------------------------------------------
 
     def _start_new_epoch(self, epoch_start_block: int):
-        """Start a new epoch: discover miners, plan canary tests."""
+        """Start a new epoch — non-blocking; heavy setup runs on executor."""
         epoch_number = epoch_start_block // self.config.epoch_blocks
         self._current_epoch = epoch_number
         self._epoch_start_block = epoch_start_block
@@ -672,6 +682,28 @@ class ValidatorNeuron:
             epoch_start_block + self.config.epoch_blocks + self.config.epoch_grace_blocks
         )
 
+        # Dispatch no-ops until background sets the scheduler.
+        self._canary_scheduler = None
+
+        if getattr(self, "_epoch_setup_in_progress", False):
+            bt.logging.debug(
+                f"Epoch {epoch_number}: setup already in progress, skipping duplicate _start_new_epoch"
+            )
+            return
+        self._epoch_setup_in_progress = True
+
+        def _setup_and_clear_flag():
+            try:
+                self._do_epoch_setup(epoch_start_block, epoch_number)
+            except Exception as e:
+                bt.logging.error(f"Epoch {epoch_number} setup failed: {e}")
+            finally:
+                self._epoch_setup_in_progress = False
+
+        self._executor.submit(_setup_and_clear_flag)
+
+    def _do_epoch_setup(self, epoch_start_block: int, epoch_number: int):
+        """Heavy epoch setup — runs on a background executor thread."""
         t0 = time.monotonic()
 
         # Discover ALL active miners
@@ -1020,32 +1052,20 @@ class ValidatorNeuron:
         self._write_shared_state()
 
     def _dispatch_canary_tests(self, tests: List[CanaryTest]):
-        """Dispatch canary tests to thread pool for concurrent execution."""
-        futures = {}
+        """Dispatch canary tests to executor — non-blocking; errors via done-callback."""
+        def _on_done(test, future):
+            try:
+                future.result()
+            except Exception as e:
+                bt.logging.info(
+                    f"Canary test failed for {test.miner_address[:10]} model={test.model_id}: {e}"
+                )
+
         for test in tests:
             future = self._executor.submit(
                 self._execute_canary_test, test, self._current_epoch,
             )
-            futures[future] = test
-
-        # Don't block — results are collected at epoch close via receipts.
-        # Wrap in try/except so a timeout doesn't crash the dispatch loop.
-        try:
-            for future in as_completed(futures, timeout=self.config.canary_inference_timeout):
-                test = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    bt.logging.info(f"Canary test failed for {test.miner_address[:10]} model={test.model_id}: {e}")
-        except _FuturesTimeout:
-            stalled = [futures[f].miner_address[:10] for f in futures if not f.done()]
-            bt.logging.warning(
-                f"Canary dispatch timeout after {self.config.canary_inference_timeout}s — "
-                f"{len(stalled)} tests stalled: {stalled}"
-            )
-            for f in futures:
-                if not f.done():
-                    f.cancel()
+            future.add_done_callback(lambda f, t=test: _on_done(t, f))
 
     def _execute_canary_test(self, test: CanaryTest, epoch_number: int):
         """Execute a single canary test: inference + optional proof verify + push receipt.
@@ -1399,8 +1419,8 @@ class ValidatorNeuron:
                     else 0.0
                 )
 
-                # Push signed receipt to miner
-                self._push_receipt_to_miner(
+                # On push failure, drop the expected count so integrity isn't penalized.
+                pushed_ok = self._push_receipt_to_miner(
                     miner_address=test.miner_address,
                     miner_endpoint=test.miner_endpoint,
                     model_id=test.model_id,
@@ -1417,6 +1437,10 @@ class ValidatorNeuron:
                     tee_attestation_verified=tee_attestation_verified,
                     is_canary=True,
                 )
+                if not pushed_ok:
+                    _key_pf = (test.miner_address, test.model_index)
+                    if self._expected_receipts.get(_key_pf, 0) > 0:
+                        self._expected_receipts[_key_pf] -= 1
 
                 _uid_c = self._db.get_uid(test.miner_address)
                 _uid_cs = f"UID {_uid_c}" if _uid_c is not None else "UID ?"
@@ -1457,7 +1481,7 @@ class ValidatorNeuron:
                         commitment_ms=timing.get("commitment_ms"),
                         verify_ms=sum(verify_timing.values()) if verify_timing else None,
                         commitment_hash=commitment.commitment_hash().hex() if commitment else None,
-                        receipt_pushed=1,
+                        receipt_pushed=1 if pushed_ok else 0,
                     )
                 except Exception as _db_err:
                     bt.logging.debug(f"Failed to log canary result: {_db_err}")
@@ -2249,8 +2273,8 @@ class ValidatorNeuron:
         proof_requested: bool = False,
         tee_attestation_verified: object = None,  # None=not tested, True=passed, False=failed
         is_canary: bool = False,
-    ):
-        """Push a signed service receipt to a miner after verified inference."""
+    ) -> bool:
+        """Push signed receipt. Returns True on 200; retries transient transport/5xx."""
         receipt = create_receipt(
             miner_address=miner_address,
             model_id=model_id,
@@ -2271,28 +2295,62 @@ class ValidatorNeuron:
         )
 
         url = f"{miner_endpoint.rstrip('/')}/epoch/receipt"
-        try:
-            import json as _json
-            from neurons.request_signing import sign_request as _sign
-            receipt_body = _json.dumps(receipt_to_dict(receipt)).encode("utf-8")
-            auth_headers = _sign(
-                method="POST", path="/epoch/receipt", body=receipt_body,
-                hotkey_ss58=self._validator_hotkey_ss58,
-                hotkey_seed=self._validator_private_key,
-            )
-            resp = httpx.post(
-                url,
-                content=receipt_body,
-                headers={**auth_headers, "content-type": "application/json"},
-                timeout=self.config.miner_endpoint_timeout,
-                verify=False,
-            )
-            if resp.status_code == 200:
-                bt.logging.debug(f"Pushed receipt to {miner_address[:10]} model_index={model_index} epoch={epoch_number}")
-            else:
-                bt.logging.debug(f"Receipt push to {miner_address[:10]} returned {resp.status_code}")
-        except Exception as e:
-            bt.logging.debug(f"Failed to push receipt to {miner_address[:10]}: {e}")
+        import json as _json
+        import time as _time
+        from neurons.request_signing import sign_request as _sign
+        receipt_body = _json.dumps(receipt_to_dict(receipt)).encode("utf-8")
+        auth_headers = _sign(
+            method="POST", path="/epoch/receipt", body=receipt_body,
+            hotkey_ss58=self._validator_hotkey_ss58,
+            hotkey_seed=self._validator_private_key,
+        )
+        # 5s per attempt × 3 attempts; transient retry only.
+        per_attempt_timeout = min(5.0, self.config.miner_endpoint_timeout)
+        backoffs = [0.5, 1.5]
+        transient_exc = (
+            httpx.TimeoutException, httpx.ReadError, httpx.ConnectError,
+            httpx.RemoteProtocolError, httpx.WriteError,
+        )
+        last_status = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = httpx.post(
+                    url,
+                    content=receipt_body,
+                    headers={**auth_headers, "content-type": "application/json"},
+                    timeout=per_attempt_timeout,
+                    verify=False,
+                )
+                if resp.status_code == 200:
+                    bt.logging.debug(
+                        f"Pushed receipt to {miner_address[:10]} model_index={model_index} "
+                        f"epoch={epoch_number} (attempt {attempt + 1})"
+                    )
+                    return True
+                last_status = resp.status_code
+                if resp.status_code >= 500 and attempt < len(backoffs):
+                    _time.sleep(backoffs[attempt])
+                    continue
+                break  # 4xx — don't retry
+            except transient_exc as e:
+                last_err = e
+                if attempt < len(backoffs):
+                    _time.sleep(backoffs[attempt])
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                break
+        reason = (
+            f"HTTP {last_status}" if last_status is not None
+            else f"{type(last_err).__name__}: {last_err}"
+        )
+        bt.logging.info(
+            f"Receipt push FAILED to {miner_address[:10]} model_index={model_index} "
+            f"epoch={epoch_number} after 3 attempts: {reason}"
+        )
+        return False
 
     def _check_tokenizer_drift(self, model_id: str, spec) -> None:
         """Compare local tokenizer hash to the on-chain anchor.
@@ -2507,6 +2565,7 @@ class ValidatorNeuron:
         ``_close_epoch`` and the empty default lets blacklisted miners through.
         """
         self._blacklisted_uids = set()
+        self._blacklisted_addresses = set()
         if self._subnet_config_client is None or not addresses:
             return
         _bl_futures = {
@@ -2520,6 +2579,7 @@ class ValidatorNeuron:
                 addr = _bl_futures[fut]
                 try:
                     if fut.result():
+                        self._blacklisted_addresses.add(addr.lower())
                         uid = self._resolve_uid(addr)
                         if uid is not None:
                             self._blacklisted_uids.add(uid)
@@ -2618,6 +2678,7 @@ class ValidatorNeuron:
         shared.epoch_start_block = self._epoch_start_block
         shared.last_weights = getattr(self, "_last_weights", {})
         shared.demand_scores = getattr(self, "_last_demand_scores", {})
+        shared.blacklisted_addresses = sorted(self._blacklisted_addresses)
         # Build ss58_map with UIDs so the proxy can resolve UIDs for
         # miners not in miner_endpoints (e.g. inactive/unreachable).
         uid_map_all = self._db.get_all_uids()
