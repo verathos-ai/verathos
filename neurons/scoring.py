@@ -20,18 +20,25 @@ Weight composition:
                   Output weighted 3× input — decode is sequential, prefill is parallel.
                   Sybil defense: N UIDs splitting fixed demand each get 1/N tokens,
                   score per UID = (1/N)², total = N × (1/N)² = 1/N of honest.
+                  Per-receipt output cap: canary receipts are capped at
+                  CANARY_OUTPUT_CAP (matches canary spec max), organic at
+                  ORGANIC_OUTPUT_CAP (matches proxy default).  Defends against
+                  miners that ignore max_tokens to inflate scoring (the proof
+                  system verifies computation correctness but does not bind
+                  output_token_count to the validator's max_tokens request).
 
-    TTFT_FACTOR = min(2.0, sqrt(model_median_ttft / miner_median_ttft))
+    TTFT_FACTOR = min(1.3, sqrt(model_median_ttft / miner_median_ttft))
                   Peer-relative: compares this miner's median TTFT to the median
                   across all miners serving the same model.
-                  Uncapped with soft cap at 2.0:
-                  2× faster → 1.41×, 4× faster → 2.0× (capped).
+                  Soft cap at 1.3 (lowered from 2.0 to bound fast-hardware uplift):
+                  1.7× faster → 1.30× (cap), honest peer → 1.00,
                   2× slower → 0.71×, 4× slower → 0.50×.
 
-    SPEED_FACTOR = min(2.0, sqrt(miner_median_tps / model_median_tps))
+    SPEED_FACTOR = min(1.3, sqrt(miner_median_tps / model_median_tps))
                   Peer-relative: compares this miner's median decode speed (tok/s)
                   to the median across all miners serving the same model.
-                  Same uncapped curve with soft cap at 2.0.
+                  Soft cap at 1.3 (lowered from 2.0).  Combined ttft × speed
+                  uplift is capped at 1.69×, instead of the prior 4×.
 
     DEMAND_BONUS  = 1.0 + (demand_bps / 10000) × demand_bonus_max
                   Per-model demand signal from organic (non-canary) traffic.
@@ -156,20 +163,22 @@ def compute_ttft_factor(
 
     TTFT_FACTOR = sqrt(model_median / miner_median)
 
-    Uncapped — faster miners earn a bonus:
-        2× faster than median: 1.41
-        4× faster:             2.00
+    Faster miners earn a bonus:
+        1.7× faster than median: 1.30× (cap)
+        2× faster:               1.30× (cap)
     Slower miners penalized:
-        2× slower than median: 0.71
-        4× slower:             0.50
+        2× slower than median:   0.71×
+        4× slower:               0.50×
 
-    Soft cap at 2.0 to keep scores reasonable.
+    Soft cap at 1.3 (lowered from 2.0 to bound the fast-hardware uplift —
+    a single B-class GPU otherwise dominates a 4090-tier peer pool by 2×
+    on this factor alone, which compounds with speed_factor and throughput²).
 
     Returns 1.0 if either value is <= 0 (no data / single miner).
     """
     if miner_median_ttft_ms <= 0 or model_median_ttft_ms <= 0:
         return 1.0
-    return min(2.0, math.sqrt(model_median_ttft_ms / miner_median_ttft_ms))
+    return min(1.3, math.sqrt(model_median_ttft_ms / miner_median_ttft_ms))
 
 
 def compute_speed_factor(
@@ -180,20 +189,21 @@ def compute_speed_factor(
 
     SPEED_FACTOR = sqrt(miner_tps / model_median)
 
-    Uncapped — faster miners earn a bonus:
-        2× faster than median: 1.41
-        4× faster:             2.00
+    Faster miners earn a bonus:
+        1.7× faster than median: 1.30× (cap)
+        24× faster:              1.30× (cap)
     Slower miners penalized:
-        2× slower than median: 0.71
-        4× slower:             0.50
+        2× slower than median:   0.71×
+        4× slower:               0.50×
 
-    Soft cap at 2.0 to keep scores reasonable.
+    Soft cap at 1.3 (lowered from 2.0).  Combined with ttft_factor (also
+    capped at 1.3) the total latency-side uplift is bounded at 1.69×.
 
     Returns 1.0 if either value is <= 0 (no data / single miner).
     """
     if miner_median_tps <= 0 or model_median_tps <= 0:
         return 1.0
-    return min(2.0, math.sqrt(miner_median_tps / model_median_tps))
+    return min(1.3, math.sqrt(miner_median_tps / model_median_tps))
 
 
 def compute_epoch_entry_score(
@@ -260,13 +270,51 @@ def compute_epoch_entry_score(
     # Output tokens weighted 3× input — decode is sequential (one forward pass
     # per token) while prefill is parallel. Reflects actual GPU cost ratio.
     # Receipts where proof was requested and failed contribute 0 tokens.
+    #
+    # Per-receipt output cap: defends against miners that ignore the
+    # validator's max_tokens to inflate scoring.  The proof system verifies
+    # computation correctness but does NOT bind output_token_count to the
+    # validator's max_tokens request — a patched server can generate beyond
+    # the limit, commit to the longer count honestly, and proofs still pass.
+    # Cap canary receipts at the canary spec max (small canary 100-300,
+    # full-context 200), and organic receipts at the proxy default
+    # max_new_tokens.  Honest miners are unaffected; cheaters are bounded.
     OUTPUT_WEIGHT = 3
-    total_tokens = sum(
-        OUTPUT_WEIGHT * r.tokens_generated + r.prompt_tokens
-        for r in outcome.all_receipts
-        if r.tokens_generated > 0
-        and not (r.proof_requested and not r.proof_verified)
-    )
+    CANARY_OUTPUT_CAP = 300       # matches max_new_tokens in canary.generate_*
+    ORGANIC_OUTPUT_CAP = 4096     # matches PlaintextChatRequest.max_new_tokens default
+
+    # Canary contribution is capped at "one set's worth" of tokens (12 small
+    # canaries + 1 full-context canary) so that the score is independent of how
+    # many validators are on the network.  Canary seeds hash only
+    # (epoch, miner_address, test_index) — not the validator hotkey — so every
+    # validator generates the SAME prompts for a given (miner, epoch).  Without
+    # the cap, a miner's score would scale linearly with validator count.
+    #
+    # Dynamic per-miner budget — model-agnostic.  Sized to one set's worth
+    # scaled to the miner's actual max_context_len (256k → ~244k, 500k → ~463k,
+    # 1M → ~920k).  Anti-gaming: a miner registering an inflated max_context_len
+    # cannot earn more — they still must actually serve the canaries; the
+    # budget is the MAX they can earn from canaries.
+    fc_prompt = int(outcome.max_context_len * 0.8)  # matches canary.generate_full_context_canary_prompt
+    fc_weighted = fc_prompt + OUTPUT_WEIGHT * 200    # full-context canary worst case
+    smalls_weighted = 12 * (70 + OUTPUT_WEIGHT * 300)  # 12 small canaries
+    canary_tokens_budget = int((fc_weighted + smalls_weighted) * 1.1)  # +10% buffer
+
+    canary_tokens = 0
+    organic_tokens = 0
+    for r in outcome.all_receipts:
+        if r.tokens_generated <= 0:
+            continue
+        if r.proof_requested and not r.proof_verified:
+            continue
+        cap = CANARY_OUTPUT_CAP if r.is_canary else ORGANIC_OUTPUT_CAP
+        weighted = OUTPUT_WEIGHT * min(r.tokens_generated, cap) + r.prompt_tokens
+        if r.is_canary:
+            canary_tokens += weighted
+        else:
+            organic_tokens += weighted
+
+    total_tokens = min(canary_tokens, canary_tokens_budget) + organic_tokens
     if total_tokens <= 0:
         return 0.0
 

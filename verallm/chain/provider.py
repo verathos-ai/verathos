@@ -243,14 +243,21 @@ class Web3Provider:
                 gas_price / 10**9, _GAS_PRICE_WARN_THRESHOLD / 10**9,
             )
 
-        # Get nonce with lock to prevent race conditions (retry for 429)
+        # Get nonce with lock to prevent race conditions (retry for 429).
+        # NOTE: _pending_nonce is only committed AFTER a successful
+        # send_raw_transaction.  Committing here would leak a nonce slot
+        # any time estimate_gas reverts pre-flight (e.g. when a renewModel
+        # call hits an already-expired lease and the contract reverts).
+        # The leaked slot creates a permanent off-by-one gap between the
+        # local counter and the chain's nonce, and every subsequent tx is
+        # submitted at nonce+1 — silently never mining because the gap
+        # below it is never filled.
         with self._nonce_lock:
             on_chain_nonce = self.call_with_retry(
                 lambda: self.w3.eth.get_transaction_count(address)
             )
             pending = self._pending_nonce.get(address, -1)
             nonce = max(on_chain_nonce, pending + 1)
-            self._pending_nonce[address] = nonce
 
         # Build transaction
         tx_params: Dict[str, Any] = {
@@ -269,17 +276,13 @@ class Web3Provider:
 
         # Sign and send (retry for 429)
         signed = self.w3.eth.account.sign_transaction(tx, pk)
-        try:
-            tx_hash = self.call_with_retry(
-                lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            )
-        except Exception:
-            # Send failed — reset pending nonce so next call re-fetches
-            # from chain.  Without this, a dropped tx leaves a stale
-            # pending nonce that blocks all subsequent renewals.
-            with self._nonce_lock:
-                self._pending_nonce.pop(address, None)
-            raise
+        tx_hash = self.call_with_retry(
+            lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        )
+
+        # Commit nonce to pending tracker only after successful broadcast.
+        with self._nonce_lock:
+            self._pending_nonce[address] = nonce
 
         logger.info("Sent tx %s from %s (nonce=%d)", tx_hash.hex(), address, nonce)
 

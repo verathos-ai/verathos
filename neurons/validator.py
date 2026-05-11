@@ -37,6 +37,7 @@ import os
 import signal
 import json
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _FuturesTimeout
 from typing import Dict, List, Optional, Set, Tuple
@@ -82,7 +83,14 @@ logger = logging.getLogger(__name__)
 # Tokenizer cache for input commitment verification
 # ---------------------------------------------------------------------------
 
+# Imported at module scope so transformers' _LazyModule resolves once,
+# single-threaded at startup — concurrent canary worker threads racing
+# `from transformers import AutoTokenizer` previously hit a half-initialized
+# module and raised ImportError ~30% of the time on first canary burst.
+from transformers import AutoTokenizer as _AutoTokenizer
+
 _tokenizer_cache: Dict[str, object] = {}
+_tokenizer_lock = threading.Lock()
 
 
 def _get_tokenizer(model_id: str):
@@ -92,14 +100,13 @@ def _get_tokenizer(model_id: str):
     Cached after first load so repeated canary tests for the same model
     are instant.
     """
-    if model_id in _tokenizer_cache:
-        return _tokenizer_cache[model_id]
-
-    from transformers import AutoTokenizer
-    bt.logging.info(f"Loading tokenizer for input commitment: {model_id}")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    _tokenizer_cache[model_id] = tokenizer
-    return tokenizer
+    with _tokenizer_lock:
+        if model_id in _tokenizer_cache:
+            return _tokenizer_cache[model_id]
+        bt.logging.info(f"Loading tokenizer for input commitment: {model_id}")
+        tokenizer = _AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        _tokenizer_cache[model_id] = tokenizer
+        return tokenizer
 
 
 def _compute_expected_input_commitment(
@@ -986,6 +993,7 @@ class ValidatorNeuron:
         self._busy_skips = {}
         self._busy_skip_probations = {}
         self._canary_errors: Dict[Tuple[str, int], int] = {}
+        self._canary_error_times: Dict[Tuple[str, int], List[int]] = {}
 
         # Check if TEE is enabled on the subnet (feature flag from SubnetConfig)
         _subnet_tee_enabled = False
@@ -1530,9 +1538,12 @@ class ValidatorNeuron:
             # report offline on a single failure.  Decrement expected receipt
             # count so the receipt integrity check at epoch close tolerates
             # the missing receipt (same treatment as 503 busy-skips).
-            # Repeated failures (>3 per epoch) are evaluated at epoch close.
+            # Repeated failures (>3 per epoch) are evaluated at epoch close,
+            # with the error timestamps used to find overlapping organic
+            # receipts (same forgiveness mechanism as the 503 busy-skip path).
             key = (test.miner_address, test.model_index)
             self._canary_errors[key] = self._canary_errors.get(key, 0) + 1
+            self._canary_error_times.setdefault(key, []).append(int(time.time()))
             if key in self._expected_receipts and self._expected_receipts[key] > 0:
                 self._expected_receipts[key] -= 1
             if self._canary_errors[key] > 3:
@@ -2059,17 +2070,72 @@ class ValidatorNeuron:
 
             # ── Canary error evaluation ────────────────────────────
             # Tolerate ≤3 transient errors (network glitches, timeouts).
-            # >3 errors with no legitimate excuse → probation + EMA halve.
+            # Mirror the 503 busy-skip forgiveness — if organic traffic was
+            # flowing during the canary failures, the miner was genuinely busy
+            # (full-context canaries with 167k-token prompts can take >300s on
+            # an overloaded GPU and trip the validator-side httpx timeout).
             canary_errors = self._canary_errors.get(key, 0)
             if canary_errors > 3 and not had_proof_failure:
-                bt.logging.info(
-                    f"Canary error PENALTY for {miner.address[:10]} "
-                    f"model_index={miner.model_index} ({canary_errors} errors "
-                    f"in epoch — exceeds tolerance of 3)"
-                )
-                self._on_proof_failure(
-                    miner.address, miner.model_index,
-                    endpoint=getattr(miner, 'endpoint', ''))
+                error_times = self._canary_error_times.get(key, [])
+                overlap_window = 120  # seconds — same as 503 busy-skip path
+                organic_near_error = [
+                    r for r in all_receipts
+                    if not r.is_canary
+                    and any(
+                        abs(r.timestamp - et) <= overlap_window
+                        for et in error_times
+                    )
+                ]
+                if len(organic_near_error) >= 3:
+                    bt.logging.info(
+                        f"Canary errors FORGIVEN for {miner.address[:10]} "
+                        f"model_index={miner.model_index} ({canary_errors} errors but "
+                        f"{len(organic_near_error)} organic receipts overlapping ±120s windows)"
+                    )
+                else:
+                    bt.logging.info(
+                        f"Canary error PENALTY for {miner.address[:10]} "
+                        f"model_index={miner.model_index} ({canary_errors} errors, "
+                        f"only {len(organic_near_error)} overlapping organic — no busy excuse)"
+                    )
+                    self._on_proof_failure(
+                        miner.address, miner.model_index,
+                        endpoint=getattr(miner, 'endpoint', ''))
+
+            # ── Capability presence check ──────────────────────────
+            # Catches the gap where canary_errors didn't trip 3 (e.g. only
+            # 1-2 timed out per epoch but the same full-context kept failing
+            # silently) yet the miner clearly cannot serve full-context.
+            # Penalize iff: zero full-context succeeded AND no organic excuse.
+            FC_PROMPT_THRESHOLD = 100_000  # tokens — separates full-context from small canaries (~5k)
+            fc_succeeded = sum(
+                1 for r in all_receipts
+                if r.is_canary
+                and r.prompt_tokens > FC_PROMPT_THRESHOLD
+                and r.tokens_generated > 0
+                and not (r.proof_requested and not r.proof_verified)
+            )
+            if (
+                fc_succeeded == 0
+                and not had_proof_failure
+                and not self._probation_tracker.is_on_probation(key)
+            ):
+                organic_count = sum(1 for r in all_receipts if not r.is_canary)
+                if organic_count >= 3:
+                    bt.logging.info(
+                        f"Full-context capability DEFERRED for {miner.address[:10]} "
+                        f"model_index={miner.model_index} ({organic_count} organic "
+                        f"receipts — miner busy with real load)"
+                    )
+                else:
+                    bt.logging.info(
+                        f"Capability FAILURE for {miner.address[:10]} "
+                        f"model_index={miner.model_index}: 0 full-context canaries "
+                        f"succeeded across the network, no organic excuse"
+                    )
+                    self._on_proof_failure(
+                        miner.address, miner.model_index,
+                        endpoint=getattr(miner, 'endpoint', ''))
 
             # Escalation: too long on probation → report offline on-chain
             if self._db.should_escalate(miner.address, miner.model_index, epoch_number):
