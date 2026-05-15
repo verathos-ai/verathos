@@ -333,10 +333,21 @@ class MinerNeuron:
                 bt.logging.warning(f"registerEvm({self.uid}) failed (attempt {attempt}/10): {e} — retrying in {delay:.0f}s")
                 time.sleep(delay)
 
-    def start_server(self, server_args: list[str]):
-        """Start the VeraLLM miner server as a subprocess."""
-        cmd = [sys.executable, "-m", "verallm.api.server"] + server_args
-        # Redact secrets from the logged command line
+    # File the server writes when it auto-tunes max_num_seqs for Mamba/GDN
+    # models (Qwen3.5, Qwen3.6).  See verallm/miner/vllm_backend.py — when
+    # vLLM raises "max_num_seqs exceeds available Mamba cache blocks" on the
+    # first attempt, the worker writes the discovered block count here and
+    # exits with code 42 so we can relaunch with --max-num-seqs N (in-process
+    # retry is impossible because the failed init pins GPU memory we can't
+    # release without a fresh process).
+    _MAMBA_HINT_PATH = "/tmp/verathos_mamba_max_num_seqs"
+    _MAMBA_HINT_EXIT = 42
+
+    def _server_cmd(self, server_args: list[str]) -> list[str]:
+        return [sys.executable, "-m", "verallm.api.server"] + server_args
+
+    @staticmethod
+    def _redact_cmd(cmd: list[str]) -> str:
         _safe = []
         _skip = False
         for a in cmd:
@@ -348,16 +359,114 @@ class MinerNeuron:
                 _skip = True
             else:
                 _safe.append(a)
-        bt.logging.info(f"Starting miner server: {' '.join(_safe)}")
+        return " ".join(_safe)
+
+    def start_server(self, server_args: list[str]):
+        """Start the VeraLLM miner server as a subprocess.
+
+        Auto-handles the Mamba/GDN max_num_seqs auto-tune: if the first
+        launch exits with code 42 and leaves a hint file, we re-spawn the
+        subprocess with --max-num-seqs N where N is the available Mamba
+        cache-block count vLLM reported.  See _MAMBA_HINT_PATH above.
+        This makes Qwen3.5 / Qwen3.6 / any future Mamba-hybrid model start
+        out-of-the-box on any GPU size without operator intervention.
+        """
+        # Clear any stale hint from a previous run (different GPU, different
+        # gpu_memory_utilization, etc. — the hint must match the current
+        # process or we'd apply a stale max_num_seqs).
+        try:
+            import os as _os
+            if _os.path.exists(self._MAMBA_HINT_PATH):
+                _os.remove(self._MAMBA_HINT_PATH)
+        except Exception:
+            pass
+
+        cmd = self._server_cmd(server_args)
+        bt.logging.info(f"Starting miner server: {self._redact_cmd(cmd)}")
         self._server_process = subprocess.Popen(cmd)
 
-    def wait_for_health(self, endpoint: str):
+    def _read_mamba_hint(self) -> Optional[int]:
+        try:
+            with open(self._MAMBA_HINT_PATH) as _hf:
+                _v = _hf.read().strip()
+            return int(_v) if _v else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _apply_max_num_seqs(server_args: list[str], n: int) -> list[str]:
+        """Insert --max-num-seqs <n> into server_args, replacing any prior."""
+        out: list[str] = []
+        skip = False
+        for a in server_args:
+            if skip:
+                skip = False
+                continue
+            if a == "--max-num-seqs":
+                skip = True
+                continue
+            out.append(a)
+        out.extend(["--max-num-seqs", str(n)])
+        return out
+
+    def wait_for_health(
+        self,
+        endpoint: str,
+        server_args: Optional[list[str]] = None,
+        max_mamba_retries: int = 1,
+    ):
         """Poll /health until the server is ready. No timeout — model load + Merkle tree
-        can take 30+ minutes for large models."""
+        can take 30+ minutes for large models.
+
+        If the subprocess exits before /health responds, check whether it
+        emitted a Mamba auto-tune hint (exit 42 + hint file): on the FIRST
+        such occurrence we relaunch the subprocess with --max-num-seqs N
+        and resume polling.  Subsequent unexpected exits raise RuntimeError
+        — PM2 (or whatever supervisor wraps the miner) will then handle
+        the outer-level restart.
+        """
         url = f"{endpoint}/health"
         start = time.monotonic()
         last_log = start
+        _mamba_retries_done = 0
         while True:
+            # Detect subprocess death.  If the server exited cleanly via the
+            # Mamba auto-tune path (exit 42 + hint file), relaunch with
+            # --max-num-seqs N once.  Any other exit -> propagate so the
+            # supervisor can react.
+            if self._server_process is not None and self._server_process.poll() is not None:
+                rc = self._server_process.returncode
+                if (
+                    rc == self._MAMBA_HINT_EXIT
+                    and server_args is not None
+                    and _mamba_retries_done < max_mamba_retries
+                ):
+                    _hint = self._read_mamba_hint()
+                    if _hint is not None and _hint > 0:
+                        bt.logging.warning(
+                            "Server subprocess exited with Mamba auto-tune hint "
+                            "(max_num_seqs=%d).  Relaunching with --max-num-seqs=%d.",
+                            _hint, _hint,
+                        )
+                        try:
+                            import os as _os
+                            _os.remove(self._MAMBA_HINT_PATH)
+                        except Exception:
+                            pass
+                        new_args = self._apply_max_num_seqs(list(server_args), _hint)
+                        # Mutate caller's list in place so any subsequent
+                        # restart (e.g. auto-update) keeps the tuned flag.
+                        server_args[:] = new_args
+                        self.start_server(server_args)
+                        _mamba_retries_done += 1
+                        start = time.monotonic()
+                        last_log = start
+                        continue
+                raise RuntimeError(
+                    f"Miner server subprocess exited (returncode={rc}) before "
+                    f"/health became ready"
+                )
+
             try:
                 resp = httpx.get(url, timeout=5.0)
                 if resp.status_code == 200:
@@ -921,6 +1030,11 @@ def parse_args():
                              "Checks every 30 min, pulls and restarts on new commits.")
     parser.add_argument("--auto-update-interval", type=int, default=1800,
                         help="Auto-update check interval in seconds (default: 1800 = 30 min)")
+    parser.add_argument("--auto-update-jitter", type=int, default=1800,
+                        help="Deterministic stagger window (seconds) before restart on auto-update. "
+                             "Derives a per-hotkey offset in [0, jitter) so simultaneous version bumps "
+                             "don't take every miner offline at the same time. Default 1800 = half an "
+                             "epoch. Set 0 to disable (single-miner / testnet).")
     parser.add_argument("--analytics", action="store_true",
                         help="Enable analytics reporting (request timing, proof stats)")
 
@@ -1330,6 +1444,8 @@ def main():
         updater = AutoUpdater(
             role="miner",
             check_interval=args.auto_update_interval,
+            jitter_seconds=args.auto_update_jitter,
+            jitter_seed=neuron.hotkey_seed,
         )
         updater.start()
 

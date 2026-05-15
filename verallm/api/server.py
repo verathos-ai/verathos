@@ -2628,6 +2628,8 @@ def startup(args):
         vllm_kwargs["max_model_len"] = args.max_model_len
     if attention_backend:
         vllm_kwargs["attention_config"] = {"backend": attention_backend}
+    if getattr(args, "max_num_seqs", None):
+        vllm_kwargs["max_num_seqs"] = args.max_num_seqs
     miner.setup_vllm(
         quant=quant,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -3360,6 +3362,13 @@ def parse_args():
                         help="Disable continuous batching (legacy single-request mode)")
     parser.add_argument("--max-concurrent", type=int, default=None,
                         help="Max concurrent requests in batch mode (None = auto-detect)")
+    parser.add_argument("--max-num-seqs", type=int, default=None,
+                        help="vLLM max_num_seqs (max concurrent decode sequences). "
+                             "None = vLLM default (1024). On Mamba/GDN hybrid models "
+                             "(Qwen3.5, Qwen3.6) the default exceeds the Mamba state "
+                             "block budget; the first launch attempt writes the auto-"
+                             "tuned value to /tmp/verathos_mamba_max_num_seqs and exits "
+                             "with code 42, then the launcher restarts with this flag.")
     parser.add_argument("--proof-threads", type=int, default=None,
                         help="Max concurrent proof threads (None = auto-detect from CPU/VRAM)")
     parser.add_argument("--proof-max-pending", type=int, default=None,

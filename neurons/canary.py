@@ -110,6 +110,7 @@ class CanaryScheduler:
     epoch_start_block: int
     epoch_blocks: int  # total blocks in epoch (e.g. 360)
     validator_hotkey: str = ""  # SS58 or hex address — differentiates validators
+    validator_seed: bytes = b""  # 32-byte Sr25519 secret seed; mixed into prompt hashes
     small_count: int = 12
     full_context_count: int = 1
     proof_sample_rate: float = 0.30
@@ -140,6 +141,7 @@ class CanaryScheduler:
                 target_block = self._target_block(miner.address, test_idx)
                 prompt, max_new_tokens, temperature = generate_small_canary_prompt(
                     self.epoch_number, miner.address, i,
+                    validator_seed=self.validator_seed,
                 )
                 # TEE miners: verify attestation instead of ZK proof
                 verify = False if is_tee else self._should_verify_proof(
@@ -195,6 +197,7 @@ class CanaryScheduler:
                 target_block = self._target_block(miner.address, test_idx)
                 prompt, max_new_tokens, temperature = generate_full_context_canary_prompt(
                     self.epoch_number, miner.address, i, miner.max_context_len,
+                    validator_seed=self.validator_seed,
                 )
 
                 # Full-context canaries are always temp=0.0 (greedy).  Force
@@ -312,17 +315,23 @@ def generate_small_canary_prompt(
     epoch_number: int,
     miner_address: str,
     test_index: int,
+    validator_seed: bytes,
 ) -> tuple[str, int, float]:
     """Generate a small canary prompt that looks like a real user query.
+
+    ``validator_seed`` is the validator's 32-byte Sr25519 secret seed.  Mixing
+    it into the prompt hash makes the prompt unpredictable to miners — they
+    cannot pre-compute the prompt set for the epoch and pre-warm KV caches.
 
     Returns:
         (prompt, max_new_tokens, temperature)
     """
     seed = hashlib.sha256(
-        b"VERATHOS_SMALL_CANARY_V1"
+        b"VERATHOS_SMALL_CANARY_V2"
         + epoch_number.to_bytes(4, "big")
         + miner_address.encode()
         + test_index.to_bytes(2, "big")
+        + validator_seed
     ).digest()
 
     # Select template and topics
@@ -369,17 +378,22 @@ def generate_full_context_canary_prompt(
     miner_address: str,
     test_index: int,
     max_context_len: int,
+    validator_seed: bytes,
 ) -> tuple[str, int, float]:
     """Generate a full-context canary prompt (~80% of max_context_len).
+
+    ``validator_seed`` is the validator's 32-byte Sr25519 secret seed.  Mixing
+    it into the body-generation hash makes the prompt unpredictable to miners.
 
     Returns:
         (prompt, max_new_tokens, temperature)
     """
     seed = hashlib.sha256(
-        b"VERATHOS_FULL_CANARY_V1"
+        b"VERATHOS_FULL_CANARY_V2"
         + epoch_number.to_bytes(4, "big")
         + miner_address.encode()
         + test_index.to_bytes(2, "big")
+        + validator_seed
     ).digest()
 
     fill_tokens = int(max_context_len * 0.8)
@@ -415,8 +429,11 @@ def generate_full_context_canary_prompt(
         question_num += 1
 
     result = "".join(parts)
-    # Trim to approximate target (don't cut mid-word), leaving room for nonce
-    nonce_suffix = f"\n[verification nonce: {seed.hex()[:32]}]"
+    # Trim to approximate target (don't cut mid-word), leaving room for nonce.
+    # Nonce is cryptographically random per call (NOT derived from seed) so
+    # that even if an attacker reconstructed the body, the trailing nonce
+    # still breaks any KV-cache prefix match.
+    nonce_suffix = f"\n[verification nonce: {os.urandom(16).hex()}]"
     trim_target = target_chars - len(nonce_suffix)
     if len(result) > trim_target:
         result = result[:trim_target].rsplit(" ", 1)[0]

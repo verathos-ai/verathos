@@ -89,6 +89,16 @@ logger = logging.getLogger(__name__)
 # module and raised ImportError ~30% of the time on first canary burst.
 from transformers import AutoTokenizer as _AutoTokenizer
 
+# Silence library logs that fire on every tokenizer cache miss
+# (HEAD requests to HuggingFace + verbose config dumps).  Validator
+# operator only cares about actionable events; transformers and hf_hub
+# at INFO/DEBUG produce many lines per canary on cold cache.
+import transformers as _transformers
+_transformers.logging.set_verbosity_error()
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("filelock").setLevel(logging.WARNING)
+
 _tokenizer_cache: Dict[str, object] = {}
 _tokenizer_lock = threading.Lock()
 
@@ -103,7 +113,7 @@ def _get_tokenizer(model_id: str):
     with _tokenizer_lock:
         if model_id in _tokenizer_cache:
             return _tokenizer_cache[model_id]
-        bt.logging.info(f"Loading tokenizer for input commitment: {model_id}")
+        bt.logging.debug(f"Loading tokenizer for input commitment: {model_id}")
         tokenizer = _AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         _tokenizer_cache[model_id] = tokenizer
         return tokenizer
@@ -304,6 +314,14 @@ class ValidatorNeuron:
         self._busy_skip_probations: Dict[Tuple[str, int], List[int]] = {}
         # {model_id: ModelSpec} — cached per epoch, avoids RPC per canary
         self._model_spec_cache: Dict[str, object] = {}
+        # Remote miner_version tracking — opens a forgiveness window after a
+        # release lands in the public repo, so miners restarting to pull the
+        # new code don't get probation for "canary errors" that are really
+        # vLLM-reload downtime.  Window is per-miner one-shot, lasts 2 epochs.
+        self._miner_version_last_seen: int = 0
+        self._miner_version_bump_at: float = 0.0
+        self._miner_version_last_check: float = 0.0
+        self._restart_forgiven: Set[Tuple[str, int]] = set()
         # Epoch close state
         self._pending_epoch_close: Optional[int] = None
         self._auto_updater = None  # Set by main() if --auto-update
@@ -1018,6 +1036,7 @@ class ValidatorNeuron:
             epoch_start_block=epoch_start_block,
             epoch_blocks=self.config.epoch_blocks,
             validator_hotkey=self._wallet.hotkey.ss58_address,
+            validator_seed=self._validator_private_key,
             small_count=self.config.canary_small_count,
             full_context_count=self.config.canary_full_context_count,
             proof_sample_rate=self.config.canary_proof_sample_rate,
@@ -1502,6 +1521,19 @@ class ValidatorNeuron:
             # hasn't retried yet, re-raise so it can retry once.
             if _transport_retry_allowed and isinstance(e, _transport_exc):
                 raise
+            # Validator-side sqlite3 errors must NEVER be attributed to the
+            # miner.  A cross-thread Connection race ("bad parameter or
+            # other API misuse") inside any of our DB helpers would
+            # otherwise be logged as a miner canary failure and count
+            # toward the >3-errors probation threshold.
+            import sqlite3 as _sqlite3
+            if isinstance(e, _sqlite3.Error):
+                bt.logging.warning(
+                    f"Validator-side DB error during canary execution "
+                    f"(NOT attributed to miner {test.miner_address[:10]} "
+                    f"model={test.model_id}): {type(e).__name__}: {e}"
+                )
+                return
             _uid_err = self._db.get_uid(test.miner_address)
             _uid_err_s = f"UID {_uid_err}" if _uid_err is not None else "UID ?"
             _err_msg = str(e).split("\nFor more information")[0]
@@ -1584,6 +1616,71 @@ class ValidatorNeuron:
             bt.logging.warning(f"Epoch {epoch_number} close failed, retrying in {self._epoch_close_backoff:.0f}s: {e}")
             self._epoch_close_backoff = min(self._epoch_close_backoff * 2, 300)
 
+    # Epoch duration in seconds — 360 blocks × 12s = 4320s ≈ 72 min.
+    # Used by the restart-forgiveness window (2 epochs).
+    _EPOCH_DURATION_SEC = 360 * 12
+
+    def _poll_remote_miner_version(self) -> None:
+        """Detect a remote ``miner_version`` bump and open a forgiveness window.
+
+        Called once per ``_close_epoch``.  When the remote (public-repo)
+        ``miner_version`` is higher than the value we last saw, record the
+        timestamp and clear the per-miner forgiveness ledger.  For the next
+        ``2 * _EPOCH_DURATION_SEC`` seconds, miners that would otherwise be
+        sent to probation for canary errors / capability failure get a
+        one-shot pass — exactly the window during which legit auto-update
+        restarts cause `ConnectError`/`ConnectTimeout` canaries.
+
+        Failures (no git remote, fetch error, parse error) are silent —
+        same conservative behaviour as the existing auto-update path.
+        """
+        from neurons.auto_update import fetch_origin, get_remote_version
+        from neurons.version import miner_version as _local_miner_version
+
+        # Rate-limit the git fetch: epoch close is already a hot path
+        # (receipt pulls, scoring, weight set).  The forgiveness window is
+        # 2 epochs = ~144 min — 10-min staleness on the bump signal is
+        # invisible to miners.
+        now = time.time()
+        if now - self._miner_version_last_check < 600:
+            return
+        self._miner_version_last_check = now
+
+        if not fetch_origin():
+            return
+        remote = get_remote_version("miner")
+        if remote is None:
+            return
+        # Seed the baseline lazily — on first call after start-up, treat the
+        # local installed version as "already seen" so a validator that boots
+        # AFTER the bump landed in public doesn't grant blanket forgiveness.
+        if self._miner_version_last_seen == 0:
+            self._miner_version_last_seen = max(remote, _local_miner_version)
+            return
+        if remote > self._miner_version_last_seen:
+            bt.logging.info(
+                f"Remote miner_version bumped {self._miner_version_last_seen} "
+                f"→ {remote}; opening restart-forgiveness window for "
+                f"{2 * self._EPOCH_DURATION_SEC}s"
+            )
+            self._miner_version_last_seen = remote
+            self._miner_version_bump_at = time.time()
+            self._restart_forgiven.clear()
+
+    def _restart_window_grants_pass(self, key: Tuple[str, int]) -> bool:
+        """Return True iff the miner gets a one-shot pass right now.
+
+        Combines the two predicates: are we still inside the 2-epoch window
+        after the most recent miner_version bump, AND has this miner not
+        already used its single forgiveness ticket?  Caller is responsible
+        for adding ``key`` to ``self._restart_forgiven`` after granting.
+        """
+        if self._miner_version_bump_at <= 0:
+            return False
+        if time.time() - self._miner_version_bump_at >= 2 * self._EPOCH_DURATION_SEC:
+            return False
+        return key not in self._restart_forgiven
+
     def _close_epoch(self, epoch_number: int):
         """Close an epoch: pull receipts from all miners, score, update EMAs.
 
@@ -1597,6 +1694,13 @@ class ValidatorNeuron:
         bt.logging.info(
             f"Epoch {epoch_number} closing: pulling receipts from {len(self._epoch_miners)} miners",
         )
+
+        # Detect a remote miner_version bump and (re-)open the restart-
+        # forgiveness window before scoring this epoch's canary errors.
+        try:
+            self._poll_remote_miner_version()
+        except Exception as e:
+            bt.logging.debug(f"miner_version poll failed: {e}")
 
         # ── Build the validator authority snapshot for receipt verification.
         # Done ONCE per epoch close so the per-receipt loop is pure dict +
@@ -2061,6 +2165,16 @@ class ValidatorNeuron:
                     # Existing probation lifecycle is handled above; don't
                     # double-count as an extra pass here.
                     bt.logging.info(f"Busy-skip FORGIVEN for {miner.address[:10]} model_index={miner.model_index} ({len(organic_near_reject)} organic receipts overlapping 503 windows)")
+                elif self._restart_window_grants_pass(key):
+                    # Inside the post-version-bump window — assume this miner
+                    # is reloading vLLM after auto-update.  One-shot per
+                    # miner per bump, see _poll_remote_miner_version.
+                    bt.logging.info(
+                        f"Busy-skip FORGIVEN (restart-window) for {miner.address[:10]} "
+                        f"model_index={miner.model_index} ({len(reject_times)} 503s, "
+                        f"within 2 epochs of miner_version bump)"
+                    )
+                    self._restart_forgiven.add(key)
                 else:
                     # No evidence of legitimate busyness — treat as evasion
                     bt.logging.info(f"Busy-skip EVASION for {miner.address[:10]} model_index={miner.model_index} ({len(reject_times)} 503s, only {len(organic_near_reject)} overlapping organic receipts)")
@@ -2092,6 +2206,13 @@ class ValidatorNeuron:
                         f"model_index={miner.model_index} ({canary_errors} errors but "
                         f"{len(organic_near_error)} organic receipts overlapping ±120s windows)"
                     )
+                elif self._restart_window_grants_pass(key):
+                    bt.logging.info(
+                        f"Canary errors FORGIVEN (restart-window) for {miner.address[:10]} "
+                        f"model_index={miner.model_index} ({canary_errors} errors, "
+                        f"within 2 epochs of miner_version bump)"
+                    )
+                    self._restart_forgiven.add(key)
                 else:
                     bt.logging.info(
                         f"Canary error PENALTY for {miner.address[:10]} "
@@ -2127,6 +2248,12 @@ class ValidatorNeuron:
                         f"model_index={miner.model_index} ({organic_count} organic "
                         f"receipts — miner busy with real load)"
                     )
+                elif self._restart_window_grants_pass(key):
+                    bt.logging.info(
+                        f"Capability FAILURE FORGIVEN (restart-window) for {miner.address[:10]} "
+                        f"model_index={miner.model_index} (within 2 epochs of miner_version bump)"
+                    )
+                    self._restart_forgiven.add(key)
                 else:
                     bt.logging.info(
                         f"Capability FAILURE for {miner.address[:10]} "
@@ -2310,7 +2437,10 @@ class ValidatorNeuron:
                     bt.logging.debug(f"Invalid receipt from {miner.address[:10]}: {e}")
 
             if duplicates > 0:
-                bt.logging.warning(
+                # Demoted from warning — duplicate signatures during pulls are
+                # expected when a miner is polled across multiple paths.  The
+                # dedup itself is the safety net, not a problem.
+                bt.logging.debug(
                     f"Receipt dedup from {miner.address[:10]}: dropped {duplicates} duplicate "
                     f"signature(s) out of {len(receipt_dicts)} pulled"
                 )

@@ -133,6 +133,17 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
             logger.warning("Failed to load validators file: %s", e)
 
     async def dispatch(self, request: Request, call_next):
+        # Dev/test bypass: skip validator auth entirely.  Only honored when
+        # VERATHOS_NO_VALIDATOR_AUTH=1 is explicitly set in the server's
+        # environment.  Default is OFF — production miners NEVER set this
+        # env var, so production behaviour is unchanged.  Used by
+        # scripts/dry_run_new_model.sh so a fresh-pod test can exercise
+        # /v1/chat/completions + proof generation without needing a signed
+        # validator request.  Real validator auth is always exercised by
+        # canaries from registered validators on the subnet.
+        if os.environ.get("VERATHOS_NO_VALIDATOR_AUTH") == "1":
+            return await call_next(request)
+
         # Reload validators periodically
         self._load_validators()
 

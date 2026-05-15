@@ -318,12 +318,29 @@ def compute_epoch_entry_score(
     if total_tokens <= 0:
         return 0.0
 
-    # Extract latency: median TTFT from all receipts.
-    # The caller (validator._close_epoch) filters outcome.all_receipts to
-    # this model_id only, so no cross-model contamination.
-    median_ttft = _median([
-        r.ttft_ms for r in outcome.all_receipts if r.ttft_ms > 0
-    ])
+    # Extract latency: split canary vs organic, take WORSE (max) of the two
+    # medians when both are statistically meaningful.  This neutralizes any
+    # canary preferential treatment (prefill-cache, load-shedding, dedicated
+    # GPU on canary requests, etc.) — a miner cannot benefit from making
+    # canaries artificially faster than organic.  Falls back to whichever
+    # population exists when one is empty (new miners with no organic load,
+    # or miners whose canaries all 503'd / errored).
+    organic_ttfts = [
+        r.ttft_ms for r in outcome.all_receipts
+        if r.ttft_ms > 0 and not r.is_canary
+    ]
+    canary_ttfts = [
+        r.ttft_ms for r in outcome.all_receipts
+        if r.ttft_ms > 0 and r.is_canary
+    ]
+    if len(organic_ttfts) >= 3 and canary_ttfts:
+        median_ttft = max(_median(organic_ttfts), _median(canary_ttfts))
+    elif canary_ttfts:
+        median_ttft = _median(canary_ttfts)
+    elif organic_ttfts:
+        median_ttft = _median(organic_ttfts)
+    else:
+        median_ttft = 0
 
     # UTILITY (unchanged formula)
     quality_params = (
@@ -353,13 +370,29 @@ def compute_epoch_entry_score(
     if peer_medians is not None and median_ttft > 0:
         ttft_factor = compute_ttft_factor(median_ttft, peer_medians.median_ttft_ms)
 
-    # SPEED_FACTOR (peer-relative, uncapped)
+    # SPEED_FACTOR (peer-relative, capped at 1.3)
+    # Split canary vs organic, take WORSE (min) of the two medians when both
+    # are statistically meaningful.  Same defense as the TTFT split above —
+    # any canary speed advantage is neutralized; honest hardware speed (the
+    # min of the two) drives the score.
     speed_factor = 1.0
     if peer_medians is not None:
-        miner_median_tps = _median([
+        organic_tps = [
             r.tokens_per_sec for r in outcome.all_receipts
-            if r.tokens_per_sec > 0
-        ])
+            if r.tokens_per_sec > 0 and not r.is_canary
+        ]
+        canary_tps = [
+            r.tokens_per_sec for r in outcome.all_receipts
+            if r.tokens_per_sec > 0 and r.is_canary
+        ]
+        if len(organic_tps) >= 3 and canary_tps:
+            miner_median_tps = min(_median(organic_tps), _median(canary_tps))
+        elif canary_tps:
+            miner_median_tps = _median(canary_tps)
+        elif organic_tps:
+            miner_median_tps = _median(organic_tps)
+        else:
+            miner_median_tps = 0
         if miner_median_tps > 0:
             speed_factor = compute_speed_factor(
                 miner_median_tps, peer_medians.median_tps,

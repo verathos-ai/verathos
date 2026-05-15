@@ -27,6 +27,7 @@ Each neuron adds ``--auto-update`` to its argparser.  When enabled::
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import bittensor as bt
 import os
@@ -148,6 +149,25 @@ def _parse_version_from_source(source: str, var_name: str) -> Optional[int]:
         return None
 
     return major * 1_000_000 + minor * 1_000 + patch
+
+
+def get_remote_version(role: str) -> Optional[int]:
+    """Return the role's version integer from the remote branch, or None.
+
+    Unlike ``check_remote_version`` this does NOT compare against the local
+    version — it always returns the remote value when readable.  Used by
+    the validator's restart-forgiveness window logic, which needs to detect
+    when the remote miner_version has *changed* (including when remote ==
+    local after the validator itself just upgraded).
+
+    Caller is responsible for running ``fetch_origin()`` first if a fresh
+    value is required.
+    """
+    var_name = "miner_version" if role == "miner" else "validator_version"
+    remote_source = _read_remote_version_file()
+    if remote_source is None:
+        return None
+    return _parse_version_from_source(remote_source, var_name)
 
 
 def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
@@ -340,6 +360,18 @@ class AutoUpdater:
     busy_check:
         Optional callback returning True if the process is busy and should
         NOT be restarted right now (e.g., validator mid-epoch-close).
+    jitter_seconds:
+        Maximum deterministic stagger window before restart (default: 0 =
+        disabled).  Miners pass 1800 (half an epoch) so that simultaneous
+        version bumps don't cause network-wide unavailability while every
+        miner reloads vLLM weights.  Validators and proxies leave this at
+        0 — they restart fast and a global validator restart is operator-
+        observable, not a user-visible outage.
+    jitter_seed:
+        Bytes hashed to derive the stagger offset for this process (default
+        empty).  Miners pass their 32-byte hotkey seed so the delay is
+        reproducible per miner and verifiable by any third party from the
+        public hotkey (no "secret stagger order" to game).
     """
 
     def __init__(
@@ -348,14 +380,29 @@ class AutoUpdater:
         check_interval: int = 1800,
         restart_delay: int = 5,
         busy_check: Optional[Callable[[], bool]] = None,
+        jitter_seconds: int = 0,
+        jitter_seed: bytes = b"",
     ):
         self.role = role if role != "proxy" else "validator"  # proxy uses validator_version
         self.check_interval = check_interval
         self.restart_delay = restart_delay
         self.busy_check = busy_check
+        self.jitter_seconds = max(0, int(jitter_seconds))
+        self.jitter_seed = bytes(jitter_seed) if jitter_seed else b""
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._update_pending = False  # Set when update deferred due to busy
+
+    def _compute_jitter_delay(self) -> int:
+        """Return the deterministic stagger delay (seconds) for this process.
+
+        Uniform over ``[0, jitter_seconds)`` keyed off ``jitter_seed``.  Same
+        seed → same delay every call.  Empty seed or zero window → 0.
+        """
+        if self.jitter_seconds <= 0 or not self.jitter_seed:
+            return 0
+        digest = hashlib.sha256(self.jitter_seed).digest()
+        return int.from_bytes(digest[:4], "big") % self.jitter_seconds
 
     def start(self) -> None:
         """Start the background update checker thread."""
@@ -406,7 +453,25 @@ class AutoUpdater:
             return
         bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
         time.sleep(self.restart_delay)
+        self._stagger_sleep()
         restart_process()
+
+    def _stagger_sleep(self) -> None:
+        """Sleep a deterministic per-process delay before restarting.
+
+        Defeats the simultaneous-restart outage: with N miners on a fixed
+        version bump, each picks a unique offset in [0, jitter_seconds) so
+        that at any instant only a fraction of the network is reloading
+        vLLM weights.  Stop signal interrupts the sleep cleanly.
+        """
+        delay = self._compute_jitter_delay()
+        if delay <= 0:
+            return
+        bt.logging.info(
+            f"Auto-update: deterministic stagger {delay}s before restart "
+            f"(role={self.role}, window={self.jitter_seconds}s)"
+        )
+        self._wait(delay)
 
     def _check_and_update(self) -> None:
         """Single update check cycle."""
@@ -438,4 +503,5 @@ class AutoUpdater:
             self._update_pending = True
             return
 
+        self._stagger_sleep()
         restart_process()

@@ -161,6 +161,24 @@ python -m neurons.miner ... -- --gpu-memory-utilization 0.95
 
 > **Production:** Use PM2 to keep your miner running reliably. See [Production Deployment (PM2)](#production-deployment-pm2) below.
 
+### Hardware-specific knobs (handled automatically)
+
+`setup_miner.sh` and the miner runtime detect your GPU and the model's
+quantisation and configure these for you. They are listed here for
+auditability — you do not need to set them by hand.
+
+| Variable / setting | Scope | Purpose |
+|---|---|---|
+| `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0` | sm_89+ FP8 | Selects the DeepGEMM / CUTLASS FP8 GEMM path. No-op outside the FP8 block-scale path. |
+| `VLLM_USE_DEEP_GEMM=0` | sm_89+ FP8 | Prevents in-place weight requantisation so the on-chain weight Merkle root stays in sync with the runtime weights. No-op outside FP8. |
+| `compilation_config.mode = 1` (`STOCK_TORCH_COMPILE`) | Non-FP8 quantisation on sm_89+ | Required vLLM compile mode for fp16 / bf16 / INT4 / INT8 quantisation on Ada / Hopper / Blackwell. Auto-set by the miner. FP8 and NVFP4 keep the default `VLLM_COMPILE` mode. |
+| FP32 activation hashing | sm_89+ split-mode capture | Required precision for cross-backend activation Merkle root consistency. |
+
+To override the auto-selected compile mode, set
+`VERALLM_COMPILE_LEVEL=<0|1|2|3>` before starting the miner. The integer
+maps to vLLM's `CompilationMode` enum
+(`0=NONE`, `1=STOCK_TORCH_COMPILE`, `2=DYNAMO_TRACE_ONCE`, `3=VLLM_COMPILE`).
+
 ### Endpoint Security
 
 The miner server authenticates all inference requests: only validators registered on the subnet can call `/chat` and `/inference` (Sr25519 signature verification via the metagraph allowlist). Random requests from the public are rejected with 401/403.

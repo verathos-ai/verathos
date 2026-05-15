@@ -117,6 +117,24 @@ def detect_quantization(model: "PreTrainedModel") -> QuantizationInfo:
                 # modelopt NVFP4: quant_method='modelopt', quant_algo='NVFP4'
                 if qm == 'modelopt' and qa == 'NVFP4':
                     return QuantizationInfo(quant_type=QuantizationType.NVFP4, bits=4)
+                # compressed-tensors (HuggingFace llmcompressor / RedHatAI).
+                # Read num_bits from the first weight config_group; our
+                # patcher (`_patch_compressed_tensors_weights`) normalises the
+                # on-disk `weight_packed` to GPTQ-shaped `qweight`, so the
+                # extractor pipeline can drive it as plain GPTQ-INT4 or INT8.
+                if qm == 'compressed-tensors':
+                    cg = qc.get('config_groups', {}) or {}
+                    for group in cg.values():
+                        if not isinstance(group, dict):
+                            continue
+                        weights = group.get('weights') or {}
+                        if not isinstance(weights, dict):
+                            continue
+                        nb = weights.get('num_bits')
+                        if nb == 4:
+                            return QuantizationInfo(quant_type=QuantizationType.GPTQ, bits=4)
+                        if nb == 8:
+                            return QuantizationInfo(quant_type=QuantizationType.GPTQ, bits=8)
 
     # Check for GPTQ/AWQ quantization via module inspection
     for name, module in model.named_modules():
@@ -268,12 +286,25 @@ def detect_layer_quant_mode(layer_module) -> str:
     cls_name = type(layer_module).__name__.lower()
     if ('fp4' in cls_name or 'modeloptfp' in cls_name) and hasattr(layer_module, 'weight'):
         return "nvfp4"
-    # FP8: weight stored as float8_e4m3fn (vLLM fp8 quantization)
+    # FP8: weight stored as float8_e4m3fn (vLLM fp8 quantization).
+    #
+    # On Ampere (sm<89), vLLM's MarlinFp8ScaledMMLinearKernel replaces
+    # layer.weight with an int32-packed Marlin tile layout at load time
+    # (see verallm/miner/vllm_utils.py:_patch_fp8_dense_weights).  The
+    # original float8_e4m3fn weights are stashed on the module as
+    # `_orig_fp8_weight`.  When that attribute is present, treat the
+    # layer as FP8 regardless of `module.weight.dtype` — otherwise we'd
+    # fall through to the fp16-fallback at roots.py:170 and hash
+    # int32-Marlin bytes (backend-specific garbage instead of canonical
+    # disk bytes).
     _fp8_dtype = getattr(torch, 'float8_e4m3fn', None)
-    if _fp8_dtype is not None and hasattr(layer_module, 'weight'):
-        w = getattr(layer_module.weight, 'data', layer_module.weight)
-        if hasattr(w, 'dtype') and w.dtype == _fp8_dtype:
+    if _fp8_dtype is not None:
+        if hasattr(layer_module, '_orig_fp8_weight'):
             return "fp8"
+        if hasattr(layer_module, 'weight'):
+            w = getattr(layer_module.weight, 'data', layer_module.weight)
+            if hasattr(w, 'dtype') and w.dtype == _fp8_dtype:
+                return "fp8"
     return "fp16"
 
 
@@ -1002,16 +1033,35 @@ def get_fp8_weights_as_int8_gpu(layer) -> torch.Tensor:
     the raw bytes — no dequantization or scaling needed.  This is deterministic,
     lossless, and extremely fast (just a dtype view).
 
-    After vLLM's ``process_weights_after_loading()``, the weight is already
-    transposed to ``[in_features, out_features]`` — the correct layout for
-    ``X @ W``.
+    **Backend-agnostic canonical layout (preferred):** if the module carries
+    `_orig_fp8_weight` (populated by `_patch_fp8_dense_weights` from the
+    safetensors checkpoint), return its int8 view.  This is the layout the
+    model author published on disk and yields the same Merkle root regardless
+    of which kernel vLLM picks at load time (CUTLASS native on Hopper/Blackwell,
+    Marlin emulation on Ampere, etc.).
+
+    **Fallback:** if `_orig_fp8_weight` is absent (e.g. the patcher wasn't
+    invoked or the layer is freshly loaded outside the miner pipeline),
+    fall back to `layer.weight` and assert it is still float8_e4m3fn.  The
+    fallback path matches pre-2026-05-12 behaviour for fp16/bf16/AWQ-int4
+    miners (which never carry FP8 weights anyway) and for FP8 backends
+    that do not mutate `layer.weight.dtype` away from float8_e4m3fn.
 
     Args:
-        layer: A vLLM FP8-quantized linear layer.
+        layer: A vLLM FP8-quantized linear layer (possibly wrapped by
+            CaptureLinearWrapper -- attribute lookup falls through).
 
     Returns:
-        W_int8 on GPU, shape [in_features, out_features], dtype=torch.int8
+        W_int8 on the same device as the source tensor, shape
+        [in_features, out_features] when read from `_orig_fp8_weight` (vLLM
+        merge convention is preserved), dtype=torch.int8.
     """
+    orig = getattr(layer, '_orig_fp8_weight', None)
+    if orig is not None:
+        # Canonical disk-bytes layout.  Already on CPU (stashed there by
+        # the patcher to save VRAM); caller .cpu()/.cuda() as needed.
+        return orig.view(torch.int8)
+
     weight = getattr(layer, 'weight', None)
     if weight is None:
         raise ValueError(f"Layer {type(layer).__name__} has no weight attribute")
@@ -1020,7 +1070,8 @@ def get_fp8_weights_as_int8_gpu(layer) -> torch.Tensor:
     if w.dtype != _fp8_dtype:
         raise ValueError(
             f"Expected float8_e4m3fn weight, got {w.dtype} "
-            f"on {type(layer).__name__}"
+            f"on {type(layer).__name__} (and no _orig_fp8_weight stashed; "
+            f"call _patch_fp8_dense_weights at load time to populate it)"
         )
     # Reinterpret FP8 bytes as int8 — both are 1 byte per element.
     return w.view(torch.int8)

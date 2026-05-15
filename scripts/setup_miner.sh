@@ -50,6 +50,58 @@ fi
 export HF_HOME="${HF_HOME:-${WORKSPACE}/huggingface}"
 PYTHON="${PYTHON:-python3}"
 
+# Detect FUSE / network filesystem on WORKSPACE.  Some RunPod-style pods
+# expose /workspace as MooseFS-over-FUSE (mfs#…runpod.net:9421), which is
+# fine for big sequential ops (model downloads, HF cache, compile cache)
+# but DEADLOCKS pip's parallel build-isolation worker pool on the many
+# small concurrent file operations in pip-build-env-*.  Symptom:
+# `python -m pip install` hangs with wchan=request_wait_answer (FUSE
+# userspace daemon wait), zero network activity.  Workaround: keep the
+# big caches on $WORKSPACE (where they belong) but pin TMPDIR to /tmp
+# (local overlay) so pip's transient build env stays off the network FS.
+# Falls back to $WORKSPACE/tmp on non-FUSE hosts (existing behaviour).
+WORKSPACE_FSTYPE=$(stat -f -c %T "$WORKSPACE" 2>/dev/null || echo "")
+case "$WORKSPACE_FSTYPE" in
+    fuseblk|fuse|fuse.*)
+        WORKSPACE_IS_FUSE=1
+        ;;
+    *)
+        # Fallback: check `mount` output for FUSE markers on a parent dir
+        # (`stat -f` may report the FUSE backing fs incorrectly on older
+        # libc; `mount` output is authoritative).
+        if mount 2>/dev/null | awk -v p="$WORKSPACE" '
+            $3 == p && $5 ~ /^fuse/ { found = 1 }
+            END { exit !found }
+        '; then
+            WORKSPACE_IS_FUSE=1
+        else
+            WORKSPACE_IS_FUSE=0
+        fi
+        ;;
+esac
+if [ "${WORKSPACE_IS_FUSE:-0}" = "1" ]; then
+    # Force TMPDIR to a local fs for the rest of this setup AND in the
+    # persisted .env.sh, so future PM2 starts honour it too.  Also redirect
+    # the torch.compile / triton compile caches: vLLM's inductor codegen
+    # path writes thousands of tiny `.py` / `.cubin` / `.ptx` / `.json`
+    # files during CUDA graph capture, and FUSE/MooseFS deadlocks the
+    # same way pip's build-isolation worker pool does — server warmup
+    # hangs in `request_wait_answer` and the dry_run hits its 30 min
+    # ready-timeout without ever finishing.
+    if [ -z "$TMPDIR" ]; then
+        export TMPDIR=/tmp
+    fi
+    if [ -z "$TRITON_CACHE_DIR" ]; then
+        export TRITON_CACHE_DIR=/tmp/.cache/triton
+    fi
+    if [ -z "$TORCHINDUCTOR_CACHE_DIR" ]; then
+        export TORCHINDUCTOR_CACHE_DIR=/tmp/.cache/torchinductor
+    fi
+    mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" 2>/dev/null || true
+    echo "  WORKSPACE on FUSE/network FS — TMPDIR + triton/inductor caches pinned to /tmp"
+    echo "  (avoids pip build-env deadlock AND torch.compile-on-FUSE warmup hang)"
+fi
+
 echo ""
 echo "============================================================"
 echo "  Verathos Miner Environment Setup"
@@ -442,6 +494,53 @@ if [ "$SKIP_INSTALL" = false ]; then
     # (downgrades setuptools — but both work fine at runtime).
     echo "  Installing vLLM + inference deps (this downloads several GB, may take 5-10 min)..."
     $PYTHON -m pip install --no-cache-dir -e ".[api,hashing,vllm]" 2>&1 | tail -20
+
+    # vLLM pins `torch==2.11.0` without a CUDA variant, so the default
+    # PyPI index serves the cu130 wheel — which requires NVIDIA driver
+    # >= 580.  Most cloud GPU hosts (RunPod, Lambda, Vast, OVH) still
+    # ship driver 570.x, where cu130 fails with
+    # `cuda.is_available() == False` and the miner falls back to CPU.
+    # Force-replace the cu130 wheel with the binary-compatible cu128
+    # variant (works on driver 570+ AND 580+).  `--no-deps` keeps the
+    # rest of the resolved env intact.
+    # Per-arch (vLLM, torch) pinning.  Each (sm, vLLM, torch) triple is a
+    # known-good combination empirically validated end-to-end (boot +
+    # proof verify) on real hardware.  Mixing versions across the gate
+    # produces ABI errors (`undefined symbol _ZN3c10...`) or runtime
+    # crashes (`max_shared_mem > 0`, `increment_version expects tensor`).
+    #
+    # Why per-arch:
+    #  - vLLM 0.20.2 PyPI wheel needs CUDA 13 runtime libs (libcudart.so.13).
+    #    Default PyPI torch 2.11.0 ships cu130 deps; driver 570 (the most
+    #    common cloud-GPU driver) only supports CUDA 12.8 -> torch.cuda
+    #    returns False on cu130.  cu128 wheels work on driver 570 AND 580+.
+    #  - vLLM 0.19.1 was built against torch 2.10 (ABI in METADATA).  Pairing
+    #    it with torch 2.11 produces undefined-symbol load errors.
+    #  - vLLM 0.20.2 + Ampere (sm<89) Marlin FP8 path crashes with
+    #    `max_shared_mem == 0` during process_weights_after_loading. vLLM
+    #    0.19.1 + Marlin FP8 + Qwen3.6 is known good (verified A100 cross-
+    #    backend match to Blackwell canonical, session 2026-05-13).
+    #  - vLLM 0.19.1 + Hopper/Ada/Blackwell + FP8 + verallm capture crashes
+    #    on first inference (`increment_version expects each element to be
+    #    a tensor`); these archs need 0.20.2.
+    #
+    # Net selection:
+    #  - sm < 89 (Ampere): vLLM 0.19.1 + torch 2.10.0 + cu128
+    #  - sm >= 89 (Ada / Hopper / Blackwell): vLLM 0.20.2 + torch 2.11.0 + cu128
+    if [ "${GPU_SM:-0}" -lt 89 ] 2>/dev/null; then
+        echo "  Ampere GPU (sm_${GPU_SM}): pinning torch 2.10.0 + cu128 (vLLM 0.19.1 ABI match)..."
+        $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
+            "torch==2.10.0+cu128" "torchvision==0.25.0+cu128" "torchaudio==2.10.0+cu128" \
+            --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5
+        echo "  Ampere GPU: pinning vLLM to 0.19.1 (Marlin FP8 known-good on this arch)..."
+        $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.19.1' 2>&1 | tail -5
+    else
+        echo "  Ada/Hopper/Blackwell (sm_${GPU_SM:-89+}): pinning torch 2.11.0 + cu128 (vLLM 0.20.2 ABI match, driver 570+ compatible)..."
+        $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
+            "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" \
+            --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5
+    fi
+
     echo "  Installing Bittensor + neuron deps..."
     $PYTHON -m pip install --no-cache-dir -e ".[neurons]" 2>&1 | tail -20
     fix_ld_library_path
@@ -554,6 +653,25 @@ except Exception as e:
     fix_ld_library_path
     # zkllm is installed as a wheel — no build needed.
     # The wheel auto-detects the correct torch version at import time.
+    #
+    # Defensive cleanup: if any zkllm_native .so sits in the *source* tree
+    # (e.g. left over from a previous rsync of verathos-core, or from an
+    # aborted JIT build, or from a different Python version's build), it
+    # will shadow the correctly-installed wheel in site-packages because
+    # Python's implicit `sys.path[0]=""` puts the source tree first when
+    # the import runs from `${REPO_DIR}`.  Any cpython-ABI mismatch
+    # (e.g. .so built for py3.12 but loaded by py3.11) crashes the
+    # verify with "Python version mismatch" even though the wheel install
+    # is fine.  Wipe ALL source-tree .so AND .so.torch* alternates here —
+    # the wheel install in site-packages is the authoritative source.
+    # Public deploys won't have these (gitignored + excluded by
+    # sync_to_public.sh), but private-repo rsyncs can carry them along.
+    if [ -d "${REPO_DIR}/zkllm/cuda" ]; then
+        find "${REPO_DIR}/zkllm/cuda" -maxdepth 1 \( \
+            -name "zkllm_native.cpython-*.so" -o \
+            -name "zkllm_native.cpython-*.so.torch*" \
+        \) -delete 2>/dev/null || true
+    fi
     if $PYTHON -c "
 from zkllm.cuda import zkllm_native, HAS_CUDA
 assert zkllm_native is not None, 'zkllm_native not loaded — is the zkllm wheel installed?'
@@ -588,12 +706,49 @@ fi
 
 # ── Persist environment for future SSH sessions ──────────────────────────────
 
+# Pick TMPDIR_DEFAULT based on the FUSE detection done above.
+if [ "${WORKSPACE_IS_FUSE:-0}" = "1" ]; then
+    TMPDIR_DEFAULT="/tmp"
+else
+    TMPDIR_DEFAULT="${WORKSPACE}/tmp"
+fi
+
 ENV_FILE="${REPO_DIR}/.env.sh"
 cat > "$ENV_FILE" <<ENVEOF
 # Auto-generated by setup_miner.sh — source from .bashrc for persistent env
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
 export HF_HOME="${HF_HOME}"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
+# Redirect torch / triton / vLLM compile caches off the small (typically
+# 30 GB) container overlay disk and onto the persistent volume.  Without
+# this, large models (Qwen3.5-9B fp16 trees, Qwen3.6-27B compile cache,
+# anything that exercises FlashInfer / inductor heavily) fill the
+# overlay during miner warmup and crash mid-load with
+# "No space left on device (os error 28)".  Aim for "/workspace" first
+# (RunPod-style persistent volume); fall back to repo-local if the host
+# doesn't expose /workspace.
+#
+# TMPDIR is special: if WORKSPACE lives on a FUSE / network filesystem
+# (RunPod MooseFS pods are a common example), pip's parallel build
+# isolation deadlocks on TMPDIR there.  Setup-time detection pinned
+# TMPDIR=/tmp on those hosts — the line below records the chosen default
+# so future shells inherit it without re-detecting.
+export TMPDIR="\${TMPDIR:-${TMPDIR_DEFAULT}}"
+export TRITON_CACHE_DIR="\${TRITON_CACHE_DIR:-${WORKSPACE}/.cache/triton}"
+export TORCHINDUCTOR_CACHE_DIR="\${TORCHINDUCTOR_CACHE_DIR:-${WORKSPACE}/.cache/torchinductor}"
+export XDG_CACHE_HOME="\${XDG_CACHE_HOME:-${WORKSPACE}/.cache}"
+# sm_89+ (Ada / Hopper / Blackwell) FP8 path workarounds for vLLM 0.20.x:
+#   - FlashInfer 0.6 ships without fp8_blockscale_gemm_sm90 cubins
+#     (flashinfer#2527, vllm#33833); JIT fails during CUDA-graph capture
+#     with "Assertion failed: !cubin.empty()".  Disable that path.
+#   - DeepGEMM E8M0 requantization mutates layer.weight in place, which
+#     desyncs the FP8 weight bytes from the committed Merkle root and
+#     causes W spot-check failures.  Disable.
+# Cheap to set for non-FP8 GPUs/models — both vars are no-ops outside
+# the FP8 blockscale path.
+export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER="\${VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER:-0}"
+export VLLM_USE_DEEP_GEMM="\${VLLM_USE_DEEP_GEMM:-0}"
+mkdir -p "\$TMPDIR" "\$TRITON_CACHE_DIR" "\$TORCHINDUCTOR_CACHE_DIR" "\$XDG_CACHE_HOME" 2>/dev/null || true
 if [ -f "${VENV_DIR}/bin/activate" ]; then
     source "${VENV_DIR}/bin/activate"
 fi

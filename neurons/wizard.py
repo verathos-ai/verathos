@@ -669,10 +669,15 @@ def step_model(net_info: dict) -> dict:
             _t.join()
             if on_chain is not None:
                 on_chain_set = {m.lower() for m in on_chain}
+                # Match by the recommendation's SPECIFIC checkpoint, not by
+                # any sibling checkpoint of the same model family.  The old
+                # `any(tc in r.model.tier_configs)` test surfaced unregistered
+                # quant variants (e.g. AWQ-int4 and NF4 for Qwen3.6-27B when
+                # only the FP8 checkpoint is on-chain), which would then fail
+                # miner startup with a "model not registered" error.
                 filtered = [
                     r for r in recs
-                    if any(tc.checkpoint.lower() in on_chain_set
-                           for tc in r.model.tier_configs)
+                    if r.config.checkpoint.lower() in on_chain_set
                 ]
                 if filtered:
                     recs = filtered

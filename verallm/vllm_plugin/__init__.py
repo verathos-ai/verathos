@@ -30,7 +30,14 @@ def register_verathos_plugin() -> bool:
     if _REGISTERED:
         return True
 
-    from .compat import has_customop_oot
+    from .compat import has_customop_oot, patch_inductor_torchbind_buf_bytes
+
+    # Apply the torch._inductor.ir.TorchBindObject.get_buf_bytes tolerance
+    # patch BEFORE any vLLM compilation happens, so the inductor's
+    # count_bytes pass doesn't trip an AssertionError on vLLM-internal
+    # ScriptObjects that lack __obj_flatten__ (seen on torch 2.11 +
+    # vLLM 0.20 + Qwen3.6).  See compat.patch_inductor_torchbind_buf_bytes.
+    patch_inductor_torchbind_buf_bytes()
 
     if not has_customop_oot():
         logger.warning(

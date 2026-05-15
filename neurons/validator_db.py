@@ -407,15 +407,17 @@ class ValidatorStateDB:
 
     def get_active_entries(self) -> List[dict]:
         """Return all active miner-model entries as dicts."""
-        cursor = self._conn.execute(
-            "SELECT * FROM miner_entries WHERE is_active = 1"
-        )
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM miner_entries WHERE is_active = 1"
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def _get_all_entries(self) -> List[dict]:
         """Return all miner-model entries (active and inactive) as dicts."""
-        cursor = self._conn.execute("SELECT * FROM miner_entries")
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self._conn.execute("SELECT * FROM miner_entries")
+            return [dict(row) for row in cursor.fetchall()]
 
     # ── Scoring ──────────────────────────────────────────────────────
 
@@ -459,21 +461,22 @@ class ValidatorStateDB:
             Dict mapping ``(address, model_index)`` to a dict with keys
             ``model_id``, ``ema_score``, ``total_epochs``, ``scored_epochs``.
         """
-        cursor = self._conn.execute(
-            """SELECT address, model_index, model_id,
-                      ema_score, total_epochs, scored_epochs
-               FROM miner_entries"""
-        )
-        result: Dict[Tuple[str, int], dict] = {}
-        for row in cursor.fetchall():
-            key = (row["address"], row["model_index"])
-            result[key] = {
-                "model_id": row["model_id"],
-                "ema_score": row["ema_score"],
-                "total_epochs": row["total_epochs"],
-                "scored_epochs": row["scored_epochs"],
-            }
-        return result
+        with self._lock:
+            cursor = self._conn.execute(
+                """SELECT address, model_index, model_id,
+                          ema_score, total_epochs, scored_epochs
+                   FROM miner_entries"""
+            )
+            result: Dict[Tuple[str, int], dict] = {}
+            for row in cursor.fetchall():
+                key = (row["address"], row["model_index"])
+                result[key] = {
+                    "model_id": row["model_id"],
+                    "ema_score": row["ema_score"],
+                    "total_epochs": row["total_epochs"],
+                    "scored_epochs": row["scored_epochs"],
+                }
+            return result
 
     # ── Probation ────────────────────────────────────────────────────
 
@@ -608,11 +611,12 @@ class ValidatorStateDB:
     def is_on_probation(self, address: str, model_index: int) -> bool:
         """Check if a miner-model entry is on probation."""
         address = address.lower()
-        row = self._conn.execute(
-            """SELECT probation_entered_epoch FROM miner_entries
-               WHERE address = ? AND model_index = ?""",
-            (address, model_index),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT probation_entered_epoch FROM miner_entries
+                   WHERE address = ? AND model_index = ?""",
+                (address, model_index),
+            ).fetchone()
         return row is not None and row["probation_entered_epoch"] is not None
 
     def should_escalate(
@@ -620,12 +624,13 @@ class ValidatorStateDB:
     ) -> bool:
         """Check if probation has lasted long enough for reportOffline escalation."""
         address = address.lower()
-        row = self._conn.execute(
-            """SELECT probation_entered_epoch, probation_escalation_epochs
-               FROM miner_entries
-               WHERE address = ? AND model_index = ?""",
-            (address, model_index),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT probation_entered_epoch, probation_escalation_epochs
+                   FROM miner_entries
+                   WHERE address = ? AND model_index = ?""",
+                (address, model_index),
+            ).fetchone()
         if row is None or row["probation_entered_epoch"] is None:
             return False
         return (
@@ -634,14 +639,15 @@ class ValidatorStateDB:
 
     def get_probation_addresses(self) -> Dict[str, List[int]]:
         """Get all probation entries grouped by address (for shared state)."""
-        cursor = self._conn.execute(
-            """SELECT address, model_index FROM miner_entries
-               WHERE probation_entered_epoch IS NOT NULL"""
-        )
-        result: Dict[str, List[int]] = {}
-        for row in cursor.fetchall():
-            result.setdefault(row["address"], []).append(row["model_index"])
-        return result
+        with self._lock:
+            cursor = self._conn.execute(
+                """SELECT address, model_index FROM miner_entries
+                   WHERE probation_entered_epoch IS NOT NULL"""
+            )
+            result: Dict[str, List[int]] = {}
+            for row in cursor.fetchall():
+                result.setdefault(row["address"], []).append(row["model_index"])
+            return result
 
     def migrate_probation(
         self, address: str, old_index: int, new_index: int,
@@ -709,10 +715,11 @@ class ValidatorStateDB:
     def get_uid(self, address: str) -> Optional[int]:
         """Look up cached UID for an EVM address (from miner_entries)."""
         address = address.lower()
-        row = self._conn.execute(
-            "SELECT bittensor_uid FROM miner_entries WHERE address = ? AND bittensor_uid IS NOT NULL LIMIT 1",
-            (address,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT bittensor_uid FROM miner_entries WHERE address = ? AND bittensor_uid IS NOT NULL LIMIT 1",
+                (address,),
+            ).fetchone()
         return row["bittensor_uid"] if row is not None else None
 
     def set_uid(self, address: str, uid: int) -> None:
@@ -727,10 +734,11 @@ class ValidatorStateDB:
 
     def get_all_uids(self) -> Dict[str, int]:
         """Return all cached address -> UID mappings (one per unique address)."""
-        cursor = self._conn.execute(
-            "SELECT DISTINCT address, bittensor_uid FROM miner_entries WHERE bittensor_uid IS NOT NULL"
-        )
-        return {row["address"]: row["bittensor_uid"] for row in cursor.fetchall()}
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT DISTINCT address, bittensor_uid FROM miner_entries WHERE bittensor_uid IS NOT NULL"
+            )
+            return {row["address"]: row["bittensor_uid"] for row in cursor.fetchall()}
 
     # ── Epoch log ────────────────────────────────────────────────────
 
@@ -758,7 +766,8 @@ class ValidatorStateDB:
 
     def get_meta(self, key: str) -> Optional[str]:
         """Read a validator metadata value."""
-        return self._raw_get_meta(key)
+        with self._lock:
+            return self._raw_get_meta(key)
 
     def set_meta(self, key: str, value: str) -> None:
         """Write a validator metadata value."""
@@ -830,10 +839,11 @@ class ValidatorStateDB:
             ))
 
         # Look up epoch start block from log
-        row = self._conn.execute(
-            "SELECT start_block FROM epoch_log WHERE epoch_number = ?",
-            (epoch,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT start_block FROM epoch_log WHERE epoch_number = ?",
+                (epoch,),
+            ).fetchone()
         start_block = row["start_block"] if row is not None else 0
 
         return ValidatorSharedState(
@@ -880,14 +890,18 @@ class ValidatorStateDB:
     def log_network_receipts(self, receipts: list, own_hotkey: bytes,
                              network: str, netuid: int,
                              ss58_lookup: dict) -> int:
-        """Bulk-insert OTHER validators' epoch receipts into network_receipts. No-op if analytics disabled.
+        """Bulk-insert all epoch receipts into network_receipts.
 
-        Skips our own receipts (is_own=1) since those are already in the
-        proxy's request_log with richer detail (user, cost, auth).
+        Receipts signed by ``own_hotkey`` are stored with is_own=1; the rest
+        with is_own=0.  Preserves the full network view in analytics —
+        previously own receipts were dropped, leaving the table biased toward
+        other validators' perspective on our own miners.  Scoring does NOT
+        read this table; it reads the in-memory receipt pull (see
+        ``_close_epoch``).
 
         Args:
             receipts: List of ServiceReceipt objects (all validators' receipts).
-            own_hotkey: This validator's 32-byte Ed25519 pubkey (to filter out).
+            own_hotkey: This validator's 32-byte Sr25519 pubkey.
             network: "test" or "finney".
             netuid: Subnet ID.
             ss58_lookup: Dict[str, Dict[str, str]] — address.lower() → {hotkey_ss58, coldkey_ss58}.
@@ -899,10 +913,7 @@ class ValidatorStateDB:
         now = time.time()
         rows = []
         for r in receipts:
-            # Skip our own receipts — organic are in proxy request_log,
-            # canaries are in canary_results, both with richer detail.
-            if r.validator_hotkey == own_hotkey:
-                continue
+            is_own = 1 if r.validator_hotkey == own_hotkey else 0
             addr = r.miner_address.lower()
             ss58 = ss58_lookup.get(addr, {})
             rows.append((
@@ -910,7 +921,7 @@ class ValidatorStateDB:
                 ss58.get("hotkey_ss58", ""), ss58.get("coldkey_ss58", ""),
                 r.model_id, r.model_index,
                 r.validator_hotkey.hex() if isinstance(r.validator_hotkey, bytes) else str(r.validator_hotkey),
-                0,  # is_own = always 0 (we skip our own)
+                is_own,
                 1 if r.is_canary else 0,
                 r.ttft_ms, r.tokens_generated, r.generation_time_ms,
                 r.tokens_per_sec, r.prompt_tokens,
@@ -1017,6 +1028,7 @@ class ValidatorStateDB:
 
     def close(self) -> None:
         """Close the database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None

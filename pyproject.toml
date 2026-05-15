@@ -55,11 +55,14 @@ hashing = [
     # compatibility with existing install commands that reference it.
 ]
 vllm = [
-    # Pin >=0.19 — vLLM 0.18.x has a GDN/FLA crash on Qwen3 GDN models
-    # (vllm#37749), fixed in 0.19 (vllm#37448).  Required for Qwen3.6 /
-    # Gemma 4 support.  See setup_miner.sh for the known sm_89 + AWQ
-    # CUDA-graph capture issue and recovery path.
-    "vllm>=0.19,<0.20",
+    # Pin >=0.20 — vLLM 0.18.x has a GDN/FLA crash on Qwen3 GDN models
+    # (vllm#37749), fixed in 0.19 (vllm#37448).  0.20.2 is required for
+    # Qwen3.6-FP8 on sm_89+ (Ada/Hopper/Blackwell): 0.19.1 triggers
+    # `increment_version expects each element of the iterable to be a tensor`
+    # on the FP8 split-mode CUDA-graph capture path.  Required for Qwen3.6 /
+    # Gemma 4 support.  See setup_miner.sh for the FlashInfer blockscale
+    # FP8 GEMM and DeepGEMM workarounds needed on sm_89+ FP8.
+    "vllm>=0.20,<0.21",
     "bitsandbytes>=0.42",
     "streamlit>=1.30",
     "ninja>=1.11",  # Required by FlashInfer for JIT kernel compilation

@@ -128,10 +128,39 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
                 num_layers, hidden_size, intermediate_size)
     logger.info("Registry: Detected quantization: %s (%s)", quant_mode, mode_desc)
 
-    # Model identity commitment (hash of parameter names + shapes)
+    # Model identity commitment (hash of parameter names + shapes).
+    # For FP8 layers where vLLM has repacked the in-memory weight (Marlin
+    # int32 tiles on Ampere), use the canonical disk shape from the
+    # patcher-stashed `_orig_fp8_weight` so the commitment stays
+    # backend-independent on Ampere/Hopper/Blackwell.  On backends without
+    # the patcher (Hopper/Blackwell for block-wise FP8 — vLLM doesn't
+    # repack), and for fp16/bf16/AWQ/GPTQ paths, param.shape is already
+    # the canonical disk shape so nothing changes.
     commitment_data = []
+    # Map suffix → (stash attr) for FP8 params whose in-memory shape diverges
+    # from disk on backends that repack (Marlin on Ampere repacks BOTH weight
+    # and weight_scale_inv).  On Hopper/Blackwell with block-wise FP8 the
+    # patcher doesn't fire (detector returns False) so the substitution is
+    # a no-op and param.shape is already the canonical disk shape.
+    _FP8_SHAPE_SUBSTITUTIONS = (
+        (".weight",            "_orig_fp8_weight"),
+        (".weight_scale_inv",  "_orig_fp8_weight_scale"),
+        (".weight_scale",      "_orig_fp8_weight_scale"),
+    )
     for name, param in model.named_parameters():
-        param_hash = hashlib.sha256(name.encode() + str(param.shape).encode()).digest()
+        shape = param.shape
+        for suffix, stash_attr in _FP8_SHAPE_SUBSTITUTIONS:
+            if name.endswith(suffix):
+                parent = name[:-len(suffix)]
+                try:
+                    parent_module = model.get_submodule(parent)
+                    orig = getattr(parent_module, stash_attr, None)
+                    if orig is not None:
+                        shape = orig.shape
+                except (AttributeError, KeyError):
+                    pass
+                break
+        param_hash = hashlib.sha256(name.encode() + str(shape).encode()).digest()
         commitment_data.append(param_hash)
     model_commitment = hashlib.sha256(b"".join(commitment_data)).digest()
 
@@ -168,7 +197,29 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
         if W_raw_tensor is not None:
             W_float = (W_raw_tensor.T if W_raw_tensor.shape[0] != hidden_size else W_raw_tensor).float()
         elif gate_proj is not None and hasattr(gate_proj, 'weight'):
-            W_raw = gate_proj.weight.data
+            # Prefer _orig_fp8_weight (canonical disk FP8 bytes in (out,in)
+            # layout) over the in-memory weight.  On Ampere/Marlin the
+            # in-memory layer.weight has been repacked to int32 tiles; using
+            # those bytes here would produce backend-coupled commitments
+            # divergent from Hopper/Blackwell (where layer.weight stays as
+            # the raw disk FP8 bytes for block-wise quant — see
+            # vllm.model_executor.layers.quantization.utils.fp8_utils.process_fp8_weight_block_strategy
+            # which is a no-op on CUDA).  When _orig_fp8_weight is absent
+            # (non-FP8 layers, or FP8 backend without the patcher),
+            # layer.weight.data is already the canonical bytes.
+            # Priority chain: FP8 disk stash > compressed-tensors dense stash >
+            # live `module.weight.data`.  `_orig_dense_weight` is set by
+            # `_patch_compressed_tensors_weights` pre-warmup; without it, on
+            # backends that lazily Marlin-repack `weight.data` during the
+            # first forward, commit (pre-warmup) and proof (post-warmup)
+            # diverge and per-request W spot checks fail at random positions.
+            # NOTE: do NOT use `a or b` on tensors -- multi-element tensors
+            # raise "Boolean value ambiguous" on truth check.
+            W_raw = getattr(gate_proj, '_orig_fp8_weight', None)
+            if W_raw is None:
+                W_raw = getattr(gate_proj, '_orig_dense_weight', None)
+            if W_raw is None:
+                W_raw = gate_proj.weight.data
             W_float = (W_raw.T.contiguous() if W_raw.shape[0] != hidden_size else W_raw).float()
         else:
             W_float = None
@@ -338,10 +389,18 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
                             idx, num_layers, n_experts)
 
             else:
-                # Dense layer
+                # Dense layer.  Recognise linear-like modules by ANY of
+                # weight / qweight / weight_packed (compressed-tensors uses
+                # the last form on modules vLLM hasn't patched into a GPTQ
+                # layout, e.g. Qwen3.6 cyankiwi AWQ-INT4 wrapped under
+                # `language_model.model.layers.*`).  Without recognising
+                # `weight_packed`, those layers fall through to b'\x00'*32
+                # roots and every W spot check rejects.
                 gate_proj_mod = get_gate_proj(mlp) if mlp else None
                 has_weights = gate_proj_mod is not None and (
-                    hasattr(gate_proj_mod, 'weight') or hasattr(gate_proj_mod, 'qweight')
+                    hasattr(gate_proj_mod, 'weight')
+                    or hasattr(gate_proj_mod, 'qweight')
+                    or hasattr(gate_proj_mod, 'weight_packed')
                 )
 
                 if has_weights:
@@ -509,7 +568,14 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
         num_layers=num_layers,
         hidden_dim=hidden_size,
         num_heads=num_heads,
-        head_dim=hidden_size // num_heads,
+        # head_dim is explicit on modern configs (Qwen3.6: 5120/24 doesn't
+        # divide; real head_dim is 256 from config).  Fall back to the divide
+        # only when the config doesn't expose it.
+        head_dim=(
+            getattr(text_config, "head_dim", None)
+            or getattr(model_config, "head_dim", None)
+            or (hidden_size // num_heads)
+        ),
         intermediate_dim=dense_w_cols,
         vocab_size=(
             getattr(model_config, "vocab_size", None)

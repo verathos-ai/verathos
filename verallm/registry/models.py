@@ -1518,37 +1518,34 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
 
     ModelEntry(
         id="qwen3.5-27b-claude-reasoning",
-        name="Qwen3.5-27B Claude Opus Reasoning",
-        base_model="Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled",
+        name="Qwen3.5-27B Claude Opus 4.6 Reasoning v2",
+        base_model="Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-v2",
         architecture="dense",
         categories=(ModelCategory.REASONING, ModelCategory.CODING),
         tier_configs=(
             # Same GDN kernel OOM as base Qwen3.5-27B — min tier GB_48.
             TierConfig(
                 VRAMTier.GB_48,
-                "codgician/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GPTQ-int4",
+                "QuantTrio/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-v2-AWQ",
                 (QuantOption("int4", 85000),),
-                notes="Community GPTQ-Int4 ~16 GiB weights; GDN hybrid attn",
-            ),
-            TierConfig(
-                VRAMTier.GB_80,
-                "mconcat/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-FP8-Dynamic",
-                (QuantOption("fp8", 262144),),
-                notes="FP8 dynamic — full native 256K context",
+                label="Qwen3.5-27B Opus 4.6 Distill v2 AWQ (Dense, Reasoning)",
+                notes="Community AWQ INT4 ~21 GiB weights (data-free, verified HF 2026-05-13); "
+                      "135k dl/30d — canonical Opus-distill quant; GDN hybrid attn; "
+                      "vLLM card recommends --reasoning-parser qwen3 --tool-call-parser qwen3_coder",
             ),
             TierConfig(
                 VRAMTier.GB_141,
-                "Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled",
+                "Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-v2",
                 (QuantOption("bf16", 262144),),
-                notes="BF16 max quality — full native 256K context",
+                notes="BF16 max quality — full native 256K context; Jackrong v2 (632k dl/30d)",
             ),
         ),
         total_params_b=27.0, active_params_b=27.0,
         native_context_len=262144,
         generation_quality=1.0,  # Community LoRA from Claude 4.6 Opus; no formal benchmarks yet
         family="qwen3.5", provider="Community (Jackrong)",
-        notes="LoRA finetune of Qwen3.5-27B on Claude 4.6 Opus reasoning traces; "
-              "GDN hybrid attention; strong agentic/coding behaviour",
+        notes="LoRA finetune of Qwen3.5-27B on Claude 4.6 Opus reasoning traces (v2, "
+              "released 2026-04-05); GDN hybrid attention; strong agentic/coding behaviour",
     ),
 
     ModelEntry(
@@ -1558,13 +1555,22 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
         architecture="moe",
         categories=(ModelCategory.GENERAL, ModelCategory.CODING, ModelCategory.MULTIMODAL),
         tier_configs=(
-            # GB_80 removed: AWQ INT4 ~61 GB weights + CUDA graphs + MoE buffers
+            # GB_80 removed: AWQ/GPTQ INT4 ~61 GB weights + CUDA graphs + MoE buffers
             # leaves zero room for KV cache on 80 GB — OOM even for a single token.
+            TierConfig(
+                VRAMTier.GB_141,
+                "cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit",
+                (QuantOption("int4", 196608),),
+                label="Qwen3.5-122B-A10B AWQ (MoE, 256e, Multimodal)",
+                notes="Community AWQ INT4 ~62 GB weights (verified HF 2026-05-13, "
+                      "85k dl/30d — most popular 122B quant); ample KV headroom on H200; "
+                      "needs VLLM_USE_FLASHINFER_MOE_FP16=1 + --language-model-only for text",
+            ),
             TierConfig(
                 VRAMTier.GB_141,
                 "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
                 (QuantOption("int4", 196608),),
-                notes="Official GPTQ-Int4; ample KV headroom on H200",
+                notes="Official GPTQ-Int4 fallback; ample KV headroom on H200",
             ),
             TierConfig(
                 VRAMTier.GB_192,
@@ -1838,19 +1844,22 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
         architecture="moe",
         categories=(ModelCategory.GENERAL, ModelCategory.CODING, ModelCategory.MULTIMODAL),
         tier_configs=(
-            # NOTE: ~21 GiB GPU weights at INT4 — does NOT fit on 24 GB (same as Qwen3.5).
+            # NOTE: ~24 GiB GPU weights at AWQ INT4 — does NOT fit on 24 GB (same as Qwen3.5).
             TierConfig(
                 VRAMTier.GB_32,
                 "QuantTrio/Qwen3.6-35B-A3B-AWQ",
                 (QuantOption("int4", 40960),),
                 label="Qwen3.6-35B-A3B AWQ (MoE, 256e, Multimodal)",
-                notes="Community AWQ INT4 ~21 GB weights; tight on 32 GB; GDN hybrid attn",
+                notes="Community AWQ INT4 ~24 GB weights (verified HF 2026-05-13); "
+                      "tight on 32 GB; GDN hybrid attn; "
+                      "needs VLLM_USE_FLASHINFER_MOE_FP16=1",
             ),
             TierConfig(
                 VRAMTier.GB_48,
                 "QuantTrio/Qwen3.6-35B-A3B-AWQ",
                 (QuantOption("int4", 262144),),
-                notes="AWQ INT4 — full native 256K context on 48 GB (compact MoE)",
+                notes="AWQ INT4 — full native 256K context on 48 GB (compact MoE); "
+                      "needs VLLM_USE_FLASHINFER_MOE_FP16=1",
             ),
             TierConfig(
                 VRAMTier.GB_80,
@@ -1870,6 +1879,35 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
     ),
 
     ModelEntry(
+        id="qwen3.6-35b-a3b-opus-reasoning",
+        name="Qwen3.6-35B-A3B Claude Opus 4.7 Reasoning",
+        base_model="lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+        architecture="moe",
+        categories=(ModelCategory.REASONING, ModelCategory.CODING),
+        tier_configs=(
+            # BF16-only on HF as of 2026-05-13 — no community AWQ / FP8 yet.
+            # 35B * 2 bytes = ~70 GB weights; GDN scratch + MoE buffers leave
+            # ~zero KV headroom on 80 GB (same constraint as qwen3.5-122b-a10b
+            # at GB_80).  Min tier: GB_141.
+            TierConfig(
+                VRAMTier.GB_141,
+                "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+                (QuantOption("bf16", 262144),),
+                label="Qwen3.6-35B-A3B Opus 4.7 Distill (MoE, Reasoning)",
+                notes="BF16 ~70 GB weights; GDN hybrid attn; full native 256K context on H200",
+            ),
+        ),
+        total_params_b=35.0, active_params_b=3.0, num_experts=256,
+        native_context_len=262144,
+        generation_quality=1.0,  # Community SFT distill; no formal benchmarks yet
+        moe_dense_equivalent=24.0,  # Same base arch as Qwen3.6-35B-A3B
+        family="qwen3.6", provider="Community (lordx64)",
+        notes="SFT distill of Qwen3.6-35B-A3B on ~7.8k Claude Opus 4.7 reasoning traces "
+              "with explicit <think> blocks; GDN hybrid attention; "
+              "256 experts (8 routed + 1 shared); requires vLLM >= 0.19.0",
+    ),
+
+    ModelEntry(
         id="qwen3.6-27b",
         name="Qwen3.6-27B",
         base_model="Qwen/Qwen3.6-27B",
@@ -1880,10 +1918,19 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
             # GDN solve_tril Triton kernel OOMs even at gpu_mem=0.95.  Min tier: GB_48.
             TierConfig(
                 VRAMTier.GB_48,
+                "cyankiwi/Qwen3.6-27B-AWQ-INT4",
+                (QuantOption("int4", 85000),),
+                label="Qwen3.6-27B AWQ (Dense, Multimodal)",
+                notes="Community AWQ INT4 ~19 GB weights (STEM+Agentic calibration, "
+                      "verified HF 2026-05-13); GDN hybrid attn requires ≥48 GB; "
+                      "~85K KV tokens — mirrors Qwen3.5-27B-GPTQ-Int4 headroom",
+            ),
+            TierConfig(
+                VRAMTier.GB_48,
                 "Qwen/Qwen3.6-27B",
                 (QuantOption("nf4", 85000),),
-                notes="NF4 runtime quant via bitsandbytes — GDN kernel requires ≥48 GB; "
-                      "GPTQ-Int4 checkpoint pending (model released 2026-04-22)",
+                notes="NF4 runtime quant via bitsandbytes — fallback when AWQ-INT4 "
+                      "checkpoint unavailable; GDN kernel requires ≥48 GB",
             ),
             TierConfig(
                 VRAMTier.GB_80,
@@ -1905,6 +1952,35 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
         notes="Multimodal (text + image + video); GDN hybrid attention; "
               "flagship-level coding (SWE-Bench 77.2); successor to Qwen3.5-27B; "
               "requires vLLM >= 0.19.0",
+    ),
+
+    ModelEntry(
+        id="qwen3.6-27b-opus-reasoning",
+        name="Qwen3.6-27B Claude Opus 4.6 Reasoning",
+        base_model="rico03/Qwen3.6-27B-Claude-Opus-Reasoning-Distilled",
+        architecture="dense",
+        categories=(ModelCategory.REASONING, ModelCategory.CODING),
+        tier_configs=(
+            # BF16-only on HF as of 2026-05-13 — no community AWQ / FP8 yet.
+            # Same GDN OOM constraint as base Qwen3.6-27B; min tier: GB_141.
+            TierConfig(
+                VRAMTier.GB_141,
+                "rico03/Qwen3.6-27B-Claude-Opus-Reasoning-Distilled",
+                (QuantOption("bf16", 262144),),
+                label="Qwen3.6-27B Opus 4.6 Distill (Dense, Reasoning)",
+                notes="BF16 ~56 GB weights; GDN hybrid attn; full native 256K context on H200; "
+                      "vLLM card recommends --reasoning-parser qwen3; "
+                      "behavioural Opus-style reasoning on top of Qwen3.6 base — "
+                      "for raw benchmarks Qwen3.6-27B base still scores higher",
+            ),
+        ),
+        total_params_b=27.0, active_params_b=27.0,
+        native_context_len=262144,
+        generation_quality=1.0,  # Community LoRA r=64 SFT distill; behavioural not benchmark uplift
+        family="qwen3.6", provider="Community (rico03)",
+        notes="LoRA r=64 SFT distill of Qwen3.6-27B on Claude 4.6 Opus reasoning traces; "
+              "GDN hybrid attention; trained at 8K context (RoPE inherits base 256K but "
+              "quality may degrade past trained range); requires vLLM >= 0.19.0",
     ),
 
     # ================================================================
