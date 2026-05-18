@@ -67,6 +67,12 @@ _CANARY_TOPICS = [
     "knowledge distillation",
 ]
 
+# Cap on full-context canary prompt size.  Larger prompts trigger
+# minute-long prefill on slower GPUs and block concurrent canaries in
+# the same vLLM batch.  32K still validates long-context capability
+# without monopolising the miner.
+FULL_CONTEXT_TOKEN_CAP = 32768
+
 
 @dataclass
 class CanaryTest:
@@ -396,16 +402,7 @@ def generate_full_context_canary_prompt(
         + validator_seed
     ).digest()
 
-    # Cap the full-context prompt at 32K tokens regardless of the model's
-    # advertised max_context_len.  Larger prompts (e.g. 210K for a 256K
-    # native-context FP8 model) cause minute-long prefill on slower GPUs,
-    # which blocks concurrent small canaries in the same vLLM batch and
-    # makes their TPS look broken (~1.2 t/s logged).  32K still validates
-    # the miner can serve non-trivial long-context requests; miners can't
-    # fake their advertised window because the canary is still binding
-    # against the prompt the validator sent.
-    _FULL_CONTEXT_TOKEN_CAP = 32768
-    fill_tokens = int(min(max_context_len * 0.8, _FULL_CONTEXT_TOKEN_CAP))
+    fill_tokens = int(min(max_context_len * 0.8, FULL_CONTEXT_TOKEN_CAP))
     target_chars = fill_tokens * 4  # ~4 chars per token (conservative)
 
     # Build a long prompt from SHARED_PROMPTS + context

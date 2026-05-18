@@ -45,7 +45,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import bittensor as bt
 import httpx
 
-from neurons.canary import CanaryScheduler, CanaryTest
+from neurons.canary import FULL_CONTEXT_TOKEN_CAP, CanaryScheduler, CanaryTest
 from neurons.config import NeuronConfig
 from neurons.discovery import ActiveMiner, discover_active_miners
 from neurons.version import spec_version, version_str, validator_version, validator_version_str
@@ -322,6 +322,11 @@ class ValidatorNeuron:
         self._miner_version_bump_at: float = 0.0
         self._miner_version_last_check: float = 0.0
         self._restart_forgiven: Set[Tuple[str, int]] = set()
+        # Per-key set of (address, model_index) that had zero full-context
+        # canary successes in the previous epoch.  Capability FAILURE only
+        # probates when BOTH the previous and current epoch hit zero, so
+        # one transient validator-side blip doesn't probate the network.
+        self._zero_fc_last_epoch: Set[Tuple[str, int]] = set()
         # Epoch close state
         self._pending_epoch_close: Optional[int] = None
         self._auto_updater = None  # Set by main() if --auto-update
@@ -1198,7 +1203,11 @@ class ValidatorNeuron:
             with ValidatorClient(
                 miner_url=test.miner_endpoint,
                 config=verification_config,
-                timeout=self.config.canary_inference_timeout,
+                timeout=(
+                    self.config.canary_full_context_inference_timeout
+                    if test.test_type == "full_context"
+                    else self.config.canary_inference_timeout
+                ),
                 verify_tls=False,
                 chain_config=self.config if not self.config.mock else None,
                 model_id=test.model_id,
@@ -2227,8 +2236,12 @@ class ValidatorNeuron:
             # Catches the gap where canary_errors didn't trip 3 (e.g. only
             # 1-2 timed out per epoch but the same full-context kept failing
             # silently) yet the miner clearly cannot serve full-context.
-            # Penalize iff: zero full-context succeeded AND no organic excuse.
-            FC_PROMPT_THRESHOLD = 100_000  # tokens — separates full-context from small canaries (~5k)
+            # Two-strike rule: only probate if zero full-context succeeded
+            # in BOTH the previous and current epoch — one validator-side
+            # blip (e.g. RPC slowdown causing FC canary timeouts) must not
+            # cascade-probate the whole network.
+            # Derived from the canary cap so the two can't drift apart again.
+            FC_PROMPT_THRESHOLD = FULL_CONTEXT_TOKEN_CAP // 2
             fc_succeeded = sum(
                 1 for r in all_receipts
                 if r.is_canary
@@ -2236,6 +2249,7 @@ class ValidatorNeuron:
                 and r.tokens_generated > 0
                 and not (r.proof_requested and not r.proof_verified)
             )
+            had_strike_last_epoch = key in self._zero_fc_last_epoch
             if (
                 fc_succeeded == 0
                 and not had_proof_failure
@@ -2254,15 +2268,26 @@ class ValidatorNeuron:
                         f"model_index={miner.model_index} (within 2 epochs of miner_version bump)"
                     )
                     self._restart_forgiven.add(key)
+                elif not had_strike_last_epoch:
+                    bt.logging.info(
+                        f"Capability FAILURE WARNING for {miner.address[:10]} "
+                        f"model_index={miner.model_index}: 0 full-context canaries "
+                        f"this epoch (first strike — will probate if zero again next epoch)"
+                    )
                 else:
                     bt.logging.info(
                         f"Capability FAILURE for {miner.address[:10]} "
                         f"model_index={miner.model_index}: 0 full-context canaries "
-                        f"succeeded across the network, no organic excuse"
+                        f"succeeded across 2 consecutive epochs, no organic excuse"
                     )
                     self._on_proof_failure(
                         miner.address, miner.model_index,
                         endpoint=getattr(miner, 'endpoint', ''))
+            # Update the two-strike tracker for next epoch's decision.
+            if fc_succeeded == 0:
+                self._zero_fc_last_epoch.add(key)
+            else:
+                self._zero_fc_last_epoch.discard(key)
 
             # Escalation: too long on probation → report offline on-chain
             if self._db.should_escalate(miner.address, miner.model_index, epoch_number):
@@ -2278,6 +2303,15 @@ class ValidatorNeuron:
         # discovered) are handled by the canary error penalty path above.
         _discovered_keys = {
             (m.address.lower(), m.model_index) for m in self._epoch_miners
+        }
+        # Prune the two-strike tracker to currently-active miners so
+        # entries for deregistered miners don't accumulate forever.
+        # Keys in _zero_fc_last_epoch are stored with the original-case
+        # address (matching ``key = (miner.address, miner.model_index)``
+        # used in the capability check above), so case-fold for comparison.
+        self._zero_fc_last_epoch = {
+            k for k in self._zero_fc_last_epoch
+            if (k[0].lower(), k[1]) in _discovered_keys
         }
         _zeroed = 0
         for _uid, _mstate in self.scorer.states.items():

@@ -292,12 +292,16 @@ Same as above but returns SSE events with encrypted token chunks. Event types: `
 
 No API key or deposit needed. Pay per request with USDC on Base:
 
-1. Send request without auth; gateway returns HTTP 402 with payment requirements
-2. Sign a USDC payment using x402 client SDK
-3. Resend with `PAYMENT-SIGNATURE` or `X-PAYMENT` header
-4. Inference proceeds, response returned
+1. Send request without auth; gateway returns HTTP 402 with payment requirements (scheme=`upto`, default cap $1.00, 10-minute deadline)
+2. Sign a Permit2 authorisation using the x402 client SDK
+3. Resend with `X-PAYMENT` header
+4. Inference proceeds, response returned. The gateway records per-request consumption against the signed authorisation; the on-chain settlement happens in background batches.
 
-**Note:** x402 uses the `exact` scheme, charging based on `max_tokens` (worst case), not actual output. Set `max_tokens` conservatively. For fair per-token pricing, use the API key + deposit flow.
+**Scheme**: [`upto`](https://github.com/coinbase/x402/blob/main/specs/schemes/upto/scheme_upto.md). The client signs for a maximum, the gateway settles for the actual cost. You only pay for what you consume.
+
+**Session pass**: Reuse the same `X-PAYMENT` header across multiple follow-up requests within the 10-minute deadline. The gateway aggregates consumption into a single on-chain settlement. Recommended for high-frequency / agentic callers — dozens of requests amortise into one settlement, paying the on-chain gas only once. One-off requests on a fresh signature settle at the Coinbase facilitator's gas-economic floor (~$0.01 per settlement). For sub-cent unit pricing, use API key + deposit or reuse signatures.
+
+**One-time wallet setup**: the x402 protocol uses Permit2 for gasless signed transfers. Each payer wallet must approve USDC for the canonical Permit2 contract once: `USDC.approve(0x000000000022D473030F116dDEE9F6B43aC78BA3, max_uint256)`. The x402 client SDK does not do this for you.
 
 ### Rate Limits
 

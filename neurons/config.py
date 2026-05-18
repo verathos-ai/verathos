@@ -33,7 +33,8 @@ class NeuronConfig(ChainConfig):
     canary_small_count: int = 12  # small canary tests per miner per epoch
     canary_full_context_count: int = 1  # full-context canary tests per miner per epoch
     canary_proof_sample_rate: float = 0.30  # probability of ZK proof verification on small canaries
-    canary_inference_timeout: float = 300.0  # per-test inference timeout (seconds)
+    canary_inference_timeout: float = 300.0  # per-small-test inference timeout (seconds)
+    canary_full_context_inference_timeout: float = 900.0
     epoch_receipt_pull_timeout: float = 30.0  # GET /epoch/{n}/receipts per-miner timeout (seconds)
     epoch_receipt_pull_overall_timeout: float = 60.0  # overall budget for all receipt pulls (seconds)
 

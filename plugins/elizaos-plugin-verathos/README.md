@@ -133,7 +133,7 @@ export VERATHOS_X402_TESTNET="true"
 
 Fully automatic — the agent just calls `runtime.useModel()` and gets a response.
 
-**Note:** x402 currently uses the `exact` scheme — the agent pays based on `max_tokens` (worst case). Set `maxTokens` conservatively to avoid overpaying.
+**Scheme:** x402 [`upto`](https://github.com/coinbase/x402/blob/main/specs/schemes/upto/scheme_upto.md) — the agent signs an authorisation for a session cap and the gateway settles for the actual cost after inference. Agents only pay for what they consume. For high-frequency callers, reuse the same `X-PAYMENT` header across requests within the signature's 10-minute deadline to aggregate consumption into a single on-chain settlement.
 
 ## Supported Model Types
 

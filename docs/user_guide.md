@@ -214,17 +214,22 @@ All support `--model`, `--quant`, and `--gateway` flags.
 
 Pay per request with USDC on Base, with no deposit, no API key, and no account needed. Uses the [Coinbase x402 protocol](https://docs.cdp.coinbase.com/x402). Built for autonomous agents: machine-native payment at inference time.
 
-**How it works**: Send a request without auth → gateway returns HTTP 402 with payment requirements → the x402 SDK signs a USDC payment on Base and retransmits → USDC transfers on-chain → inference proceeds.
+**How it works**: Send a request without auth → gateway returns HTTP 402 with payment requirements → the x402 SDK signs a Permit2 authorization on Base and retransmits → inference proceeds. USDC settles on-chain after inference for the actual cost.
 
 **Setup**:
 - `pip install x402 eth-account`
-- Use the `x402HttpxClient` with your EVM wallet private key
+- Use the `x402HttpxClient` (or `x402_requests` wrapper) with your EVM wallet private key
 - The SDK handles the 402 → sign → retry flow automatically
+- One-time per-wallet: approve USDC for the canonical Permit2 contract (`0x000000000022D473030F116dDEE9F6B43aC78BA3`). The x402 client SDK does not do this for you — send one `USDC.approve(Permit2, max_uint256)` tx from your wallet before your first payment.
 - See `examples/x402_client.py` in the repo for a working example
 
 **Requirements**: EVM wallet with USDC + ETH (for gas) on Base. Testnet: Base Sepolia.
 
-**Cost**: x402 uses the `exact` scheme, charging upfront based on `max_tokens` (worst case). Each request is an on-chain transfer with ~$0.001 gas on Base mainnet. For small requests, gas dominates; use API key + deposit instead. Set `max_tokens` conservatively to avoid overpaying.
+**Scheme**: x402 [`upto`](https://github.com/coinbase/x402/blob/main/specs/schemes/upto/scheme_upto.md) — the client signs an authorisation for a maximum amount (cap); the gateway settles for the actual cost after inference. Users only pay for what they consume.
+
+**Session pass for high-frequency callers**: One signed authorisation is valid for 10 minutes and can back many follow-up requests. Reuse the same `X-PAYMENT` header across follow-ups (within the deadline) and the gateway aggregates the consumption into a single on-chain settlement. This is the recommended pattern for agentic workloads: dozens or hundreds of small requests amortise into one settlement, paying the on-chain gas only once. The Python x402 SDK signs a fresh authorisation per request by default — capture the signed header from the first 402 round-trip and attach it manually to follow-ups to get aggregation.
+
+**Cost**: Pay-per-token at the same rates as API-key callers. Settlement gas is paid by the Coinbase facilitator and amortised across the aggregated batch. For one-off requests on a fresh signature, the facilitator's gas-economic floor (~$0.01 per settlement) can dominate — reuse signatures across a session, or use API key + deposit for the lowest unit cost on small requests.
 
 ## TEE Inference (Trusted Execution Environments)
 
