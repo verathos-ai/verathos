@@ -22,7 +22,28 @@ bun add @elizaos/plugin-verathos
 }
 ```
 
-### Option B: x402 with Coinbase CDP Wallet (production)
+### Option B + C: x402 modes — temporarily unavailable
+
+> **Notice:** the x402 paths below (CDP wallet and raw key) are
+> **disabled in this plugin** as of Verathos v0.1.10 because the gateway
+> migrated to the x402 `upto` scheme (Permit2-based, post-inference
+> settlement), and the upstream **TypeScript** x402 SDK does not yet
+> support `upto` (only `exact`).  Calling x402 mode from this plugin
+> will raise a clear error pointing you here.
+>
+> **Workarounds available today:**
+> - Use Option A (API key + USDC deposit) above.
+> - Or call `api.verathos.ai` directly using the **Python** x402 SDK,
+>   which does support upto.  See
+>   [`examples/x402_client.py`](https://github.com/verathos-ai/verathos/blob/main/examples/x402_client.py)
+>   for a complete working reference (including the session-pass
+>   aggregation pattern that lets agents pay per-token instead of
+>   hitting the per-call gas floor).
+>
+> The config below is preserved for reference and will become valid
+> again once the TypeScript SDK lands upto support.
+
+### Option B: x402 with Coinbase CDP Wallet (production) — disabled, see notice above
 
 Signing keys live in a Coinbase MPC TEE — never exposed to your application.
 
@@ -40,7 +61,7 @@ Signing keys live in a Coinbase MPC TEE — never exposed to your application.
 
 Requires `@coinbase/cdp-sdk`: `bun add @coinbase/cdp-sdk`
 
-### Option C: x402 with Raw Key (dev/testnet)
+### Option C: x402 with Raw Key (dev/testnet) — disabled, see notice above
 
 ```json
 {
