@@ -310,6 +310,62 @@
   },
   {
     "type": "function",
+    "name": "getValidatorsPaged",
+    "inputs": [
+      {
+        "name": "offset",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "limit",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "addrs",
+        "type": "address[]",
+        "internalType": "address[]"
+      },
+      {
+        "name": "infos",
+        "type": "tuple[]",
+        "internalType": "struct ValidatorRegistry.ValidatorInfo[]",
+        "components": [
+          {
+            "name": "proxyEndpoint",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "uid",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "registeredAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "updatedAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "active",
+            "type": "bool",
+            "internalType": "bool"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "initialize",
     "inputs": [
       {

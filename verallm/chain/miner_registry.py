@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Sentinel for caching None results (to distinguish "not cached" from "cached as None")
 _NONE_SENTINEL = object()
+_PAGE_SIZE = 200
 
 
 class MinerRegistryClient:
@@ -49,9 +50,27 @@ class MinerRegistryClient:
         if cached is not None:
             return cached
 
-        raw = self._provider.call_with_retry(
-            lambda: self._contract.functions.getMinerModels(addr).call()
-        )
+        try:
+            count = self._provider.call_with_retry(
+                lambda: self._contract.functions.getMinerModelCount(addr).call()
+            )
+            if count > _PAGE_SIZE:
+                raw = []
+                for offset in range(0, count, _PAGE_SIZE):
+                    raw.extend(self._provider.call_with_retry(
+                        lambda offset=offset: self._contract.functions
+                        .getMinerModelsPaged(addr, offset, _PAGE_SIZE)
+                        .call()
+                    ))
+            else:
+                raw = self._provider.call_with_retry(
+                    lambda: self._contract.functions.getMinerModels(addr).call()
+                )
+        except Exception as e:
+            logger.debug("Paged miner model read unavailable, falling back: %s", e)
+            raw = self._provider.call_with_retry(
+                lambda: self._contract.functions.getMinerModels(addr).call()
+            )
         result = [_parse_miner_model(entry) for entry in raw]
         self._cache.set(cache_key, result, ttl=60)
         return result
@@ -71,9 +90,24 @@ class MinerRegistryClient:
         if cached is not None:
             return cached
 
-        result = self._provider.call_with_retry(
-            lambda: self._contract.functions.getProvidersForModel(model_id).call()
-        )
+        try:
+            result = []
+            offset = 0
+            while True:
+                page = self._provider.call_with_retry(
+                    lambda offset=offset: self._contract.functions
+                    .getProvidersForModelPaged(model_id, offset, _PAGE_SIZE)
+                    .call()
+                )
+                result.extend(page)
+                if len(page) < _PAGE_SIZE:
+                    break
+                offset += _PAGE_SIZE
+        except Exception as e:
+            logger.debug("Paged provider read unavailable, falling back: %s", e)
+            result = self._provider.call_with_retry(
+                lambda: self._contract.functions.getProvidersForModel(model_id).call()
+            )
         self._cache.set(cache_key, result)
         return result
 

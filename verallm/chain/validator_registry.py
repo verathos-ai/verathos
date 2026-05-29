@@ -19,6 +19,7 @@ from verallm.chain.provider import Web3Provider
 from verallm.chain.types import OnChainValidatorInfo
 
 logger = logging.getLogger(__name__)
+_PAGE_SIZE = 200
 
 
 class ValidatorRegistryClient:
@@ -66,6 +67,14 @@ class ValidatorRegistryClient:
         if cached is not None:
             return cached
 
+        try:
+            pairs = self._get_validators_paged()
+            result = [(addr, info) for addr, info in pairs if info.active]
+            self._cache.set(cache_key, result)
+            return result
+        except Exception as e:
+            logger.debug("Paged validator read unavailable, falling back: %s", e)
+
         raw_addrs, raw_infos = self._provider.call_with_retry(
             lambda: self._contract.functions.getActiveValidators().call()
         )
@@ -86,6 +95,18 @@ class ValidatorRegistryClient:
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
+
+        try:
+            pairs = self._get_validators_paged()
+            result = [
+                (addr, info)
+                for addr, info in pairs
+                if info.active and len(info.proxy_endpoint) > 0
+            ]
+            self._cache.set(cache_key, result)
+            return result
+        except Exception as e:
+            logger.debug("Paged proxy validator read unavailable, falling back: %s", e)
 
         raw_addrs, raw_infos = self._provider.call_with_retry(
             lambda: self._contract.functions.getProxyValidators().call()
@@ -135,6 +156,21 @@ class ValidatorRegistryClient:
         return self._provider.call_with_retry(
             lambda: self._contract.functions.getValidatorCount().call()
         )
+
+    def _get_validators_paged(self) -> List[Tuple[str, OnChainValidatorInfo]]:
+        count = self.get_validator_count()
+        result: List[Tuple[str, OnChainValidatorInfo]] = []
+        for offset in range(0, count, _PAGE_SIZE):
+            raw_addrs, raw_infos = self._provider.call_with_retry(
+                lambda offset=offset: self._contract.functions
+                .getValidatorsPaged(offset, _PAGE_SIZE)
+                .call()
+            )
+            result.extend(
+                (addr, _parse_validator_info(info))
+                for addr, info in zip(raw_addrs, raw_infos)
+            )
+        return result
 
     # ── Paid writes ──────────────────────────────────────────────
 

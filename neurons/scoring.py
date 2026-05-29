@@ -282,6 +282,8 @@ def compute_epoch_entry_score(
     OUTPUT_WEIGHT = 3
     CANARY_OUTPUT_CAP = 300       # matches max_new_tokens in canary.generate_*
     ORGANIC_OUTPUT_CAP = 4096     # matches PlaintextChatRequest.max_new_tokens default
+    ORGANIC_PROMPT_CAP = 4096
+    ORGANIC_PROMPT_TO_OUTPUT_CAP = 8
 
     # Canary contribution is capped at "one set's worth" of tokens (12 small
     # canaries + 1 full-context canary) so that the score is independent of how
@@ -308,7 +310,16 @@ def compute_epoch_entry_score(
         if r.proof_requested and not r.proof_verified:
             continue
         cap = CANARY_OUTPUT_CAP if r.is_canary else ORGANIC_OUTPUT_CAP
-        weighted = OUTPUT_WEIGHT * min(r.tokens_generated, cap) + r.prompt_tokens
+        output_tokens = min(r.tokens_generated, cap)
+        if r.is_canary:
+            prompt_tokens = r.prompt_tokens
+        else:
+            prompt_tokens = min(
+                r.prompt_tokens,
+                ORGANIC_PROMPT_CAP,
+                ORGANIC_PROMPT_TO_OUTPUT_CAP * output_tokens,
+            )
+        weighted = OUTPUT_WEIGHT * output_tokens + prompt_tokens
         if r.is_canary:
             canary_tokens += weighted
         else:

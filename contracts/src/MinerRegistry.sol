@@ -57,6 +57,11 @@ contract MinerRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     uint64 public constant LEASE_DURATION = 24 hours;
     uint16 public constant OFFLINE_THRESHOLD = 3;
     uint64 public constant CLEANUP_GRACE = 30 days;
+    uint16 public constant MAX_MODELS_PER_MINER = 256;
+    uint16 public constant MAX_PAGE_LIMIT = 256;
+    uint16 public constant MAX_MODEL_ID_BYTES = 256;
+    uint16 public constant MAX_ENDPOINT_BYTES = 1024;
+    uint16 public constant MAX_QUANT_BYTES = 32;
 
     // ── Endpoint ownership (anti-hijacking) ─────────────────────
 
@@ -150,27 +155,53 @@ contract MinerRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     /// @notice Register EVM address → UID mapping with cryptographic proof.
     ///         The caller must provide an SR25519 signature from the hotkey
-    ///         that owns the claimed UID on this subnet.
+    ///         that owns the claimed UID on this subnet. The SR25519 verify
+    ///         against the current substrate hotkey is the only authorization
+    ///         that matters — stale prior bindings are auto-cleaned (forward
+    ///         heal for recycled UIDs, reverse heal for hotkeys that moved
+    ///         slots).
     /// @param uid   The UID to claim on this subnet.
     /// @param sigR  First 32 bytes of the SR25519 signature.
     /// @param sigS  Last 32 bytes of the SR25519 signature.
     function registerEvm(uint16 uid, bytes32 sigR, bytes32 sigS) external {
-        // Verify UID exists on the subnet
         require(uid < META.getUidCount(netuid), "UID does not exist on subnet");
-        // Prevent one address claiming multiple UIDs
-        require(!evmRegistered[msg.sender] || evmToUid[msg.sender] == uid,
-                "Already registered with different UID");
-        // Prevent UID squatting — one UID per address
-        address existing = uidToEvm[uid];
-        require(existing == address(0) || existing == msg.sender,
-                "UID already claimed by another address");
-
-        // Verify hotkey ownership via SR25519 signature
         bytes32 hotkey = META.getHotkey(netuid, uid);
         require(hotkey != bytes32(0), "UID has no hotkey");
+
+        // SR25519 ownership proof against the current substrate hotkey.
+        // This is dispositive: only the current operator can produce a valid sig.
         bytes32 message = keccak256(abi.encodePacked(msg.sender, uid, netuid, address(this)));
         require(ISr25519Verify(SR25519_VERIFY).verify(message, hotkey, sigR, sigS),
                 "Invalid SR25519 signature - caller does not own this hotkey");
+
+        // No-op if already bound to this exact (sender, uid) pair.
+        if (uidToEvm[uid] == msg.sender
+            && evmRegistered[msg.sender]
+            && evmToUid[msg.sender] == uid) {
+            return;
+        }
+
+        // Reverse heal: caller previously bound to a different UID (same EVM
+        // moved slots). Only clear the old uidToEvm[] if we're still the
+        // bound EVM there — otherwise someone else has legitimately taken
+        // over that slot and we must not touch it.
+        if (evmRegistered[msg.sender] && evmToUid[msg.sender] != uid) {
+            uint16 oldUid = evmToUid[msg.sender];
+            if (uidToEvm[oldUid] == msg.sender) {
+                delete uidToEvm[oldUid];
+                emit EvmRegistrationReset(oldUid, msg.sender);
+            }
+        }
+
+        // Forward heal: this UID was held by a different EVM (recycle case).
+        // The SR25519 verify above proves the caller owns the current hotkey,
+        // so the previous EVM is by construction stale.
+        address oldEvm = uidToEvm[uid];
+        if (oldEvm != address(0) && oldEvm != msg.sender) {
+            delete evmRegistered[oldEvm];
+            delete evmToUid[oldEvm];
+            emit EvmRegistrationReset(uid, oldEvm);
+        }
 
         evmToUid[msg.sender] = uid;
         evmRegistered[msg.sender] = true;
@@ -229,6 +260,43 @@ contract MinerRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable {
                 revert("Duplicate active entry - use renewModel() or deactivateModel() first");
             }
         }
+    }
+
+    function _requireMetadataBounds(
+        string calldata modelId,
+        string calldata endpoint,
+        string calldata quant
+    ) internal pure {
+        uint256 modelLen = bytes(modelId).length;
+        uint256 endpointLen = bytes(endpoint).length;
+        uint256 quantLen = bytes(quant).length;
+        require(modelLen > 0 && modelLen <= MAX_MODEL_ID_BYTES, "Invalid modelId length");
+        require(endpointLen > 0 && endpointLen <= MAX_ENDPOINT_BYTES, "Invalid endpoint length");
+        require(quantLen > 0 && quantLen <= MAX_QUANT_BYTES, "Invalid quant length");
+    }
+
+    function _requireNoDuplicateEndpointUpdate(uint256 index, string calldata newEndpoint) internal view {
+        MinerModel[] storage models = minerModels[msg.sender];
+        MinerModel storage current = models[index];
+        bytes32 hModel = keccak256(bytes(current.modelId));
+        bytes32 hEndpoint = keccak256(bytes(newEndpoint));
+        bytes32 hQuant = keccak256(bytes(current.quant));
+
+        for (uint256 i = 0; i < models.length; i++) {
+            if (i == index) continue;
+            if (models[i].active &&
+                models[i].expiresAt > block.timestamp &&
+                keccak256(bytes(models[i].modelId)) == hModel &&
+                keccak256(bytes(models[i].endpoint)) == hEndpoint &&
+                keccak256(bytes(models[i].quant)) == hQuant) {
+                revert("Duplicate active entry - use renewModel() or deactivateModel() first");
+            }
+        }
+    }
+
+    function _pageLimit(uint256 limit) internal pure returns (uint256) {
+        if (limit > MAX_PAGE_LIMIT) return MAX_PAGE_LIMIT;
+        return limit;
     }
 
     /// @dev Find an expired or inactive entry with the same (modelId, endpoint, quant).
@@ -315,14 +383,21 @@ contract MinerRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         string calldata quant,
         uint32 maxContextLen
     ) external onlyRegisteredNeuron {
+        _requireMetadataBounds(modelId, endpoint, quant);
+
         // Prevent duplicate active entries for the same model+endpoint+quant
         _requireNoDuplicate(modelId, endpoint, quant);
-        _claimEndpoint(endpoint);
 
         // Try to reactivate an expired/inactive entry with the same tuple.
         // This preserves the array index (model_index) so the validator's
         // per-(address, model_index) score history stays intact.
         (uint256 reactivateIdx, bool found) = _findReactivatable(modelId, endpoint, quant);
+        if (!found) {
+            require(minerModels[msg.sender].length < MAX_MODELS_PER_MINER, "Too many model entries");
+        }
+
+        _claimEndpoint(endpoint);
+
         if (found) {
             MinerModel storage m = minerModels[msg.sender][reactivateIdx];
             m.modelSpecRef = modelSpecRef;
@@ -381,6 +456,9 @@ contract MinerRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         external onlyRegisteredNeuron
     {
         require(index < minerModels[msg.sender].length, "Invalid index");
+        require(bytes(newEndpoint).length > 0 && bytes(newEndpoint).length <= MAX_ENDPOINT_BYTES,
+                "Invalid endpoint length");
+        _requireNoDuplicateEndpointUpdate(index, newEndpoint);
         _releaseEndpoint(minerModels[msg.sender][index].endpoint);
         _claimEndpoint(newEndpoint);
         minerModels[msg.sender][index].endpoint = newEndpoint;
@@ -503,6 +581,66 @@ contract MinerRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         return minerModels[miner];
     }
 
+    /// @notice Get model entries for a miner by index range.
+    ///         Use with getMinerModelCount() for scalable off-chain polling.
+    function getMinerModelsPaged(address miner, uint256 offset, uint256 limit)
+        external view returns (MinerModel[] memory)
+    {
+        limit = _pageLimit(limit);
+        uint256 total = minerModels[miner].length;
+        if (offset >= total || limit == 0) {
+            return new MinerModel[](0);
+        }
+
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        uint256 count = end - offset;
+
+        MinerModel[] memory result = new MinerModel[](count);
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = minerModels[miner][offset + i];
+        }
+        return result;
+    }
+
+    /// @notice Get active, non-expired model entries for a miner with a raw-index cursor.
+    ///         Returns the next raw cursor to continue from, plus the original indexes.
+    function getActiveMinerModelsPaged(address miner, uint256 cursor, uint256 limit)
+        external view returns (
+            uint256 nextCursor,
+            uint256[] memory indexes,
+            MinerModel[] memory models
+        )
+    {
+        limit = _pageLimit(limit);
+        uint256 total = minerModels[miner].length;
+        if (cursor >= total || limit == 0) {
+            return (total, new uint256[](0), new MinerModel[](0));
+        }
+
+        uint256[] memory tmpIndexes = new uint256[](limit);
+        MinerModel[] memory tmpModels = new MinerModel[](limit);
+        uint256 count = 0;
+        uint256 i = cursor;
+
+        for (; i < total && count < limit; i++) {
+            MinerModel storage m = minerModels[miner][i];
+            if (m.active && m.expiresAt > block.timestamp) {
+                tmpIndexes[count] = i;
+                tmpModels[count] = m;
+                count++;
+            }
+        }
+
+        indexes = new uint256[](count);
+        models = new MinerModel[](count);
+        for (uint256 j = 0; j < count; j++) {
+            indexes[j] = tmpIndexes[j];
+            models[j] = tmpModels[j];
+        }
+        return (i, indexes, models);
+    }
+
     /// @notice Get number of model entries for a miner.
     function getMinerModelCount(address miner) external view returns (uint256) {
         return minerModels[miner].length;
@@ -513,6 +651,38 @@ contract MinerRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         external view returns (address[] memory)
     {
         return _modelProviders[modelId];
+    }
+
+    /// @notice Get number of provider entries for a model, including stale entries.
+    ///         Off-chain discovery should page through this list and filter active leases.
+    function getProviderCountForModel(string calldata modelId)
+        external view returns (uint256)
+    {
+        return _modelProviders[modelId].length;
+    }
+
+    /// @notice Get provider entries for a model by index range.
+    ///         Existing provider arrays are append-only for compatibility; callers
+    ///         must filter active model entries with getMinerModelsPaged()/isModelActive().
+    function getProvidersForModelPaged(string calldata modelId, uint256 offset, uint256 limit)
+        external view returns (address[] memory)
+    {
+        limit = _pageLimit(limit);
+        address[] storage providers = _modelProviders[modelId];
+        uint256 total = providers.length;
+        if (offset >= total || limit == 0) {
+            return new address[](0);
+        }
+
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        uint256 count = end - offset;
+
+        address[] memory result = new address[](count);
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = providers[offset + i];
+        }
+        return result;
     }
 
     /// @notice Check if a specific entry is currently active and not expired.

@@ -1955,6 +1955,32 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
     ),
 
     ModelEntry(
+        id="qwen3.6-27b-abliterated",
+        name="Qwen3.6-27B Abliterated",
+        base_model="huihui-ai/Huihui-Qwen3.6-27B-abliterated",
+        architecture="dense",
+        categories=(ModelCategory.GENERAL, ModelCategory.CODING),
+        tier_configs=(
+            TierConfig(
+                VRAMTier.GB_48,
+                "shawnw3i/Huihui-Qwen3.6-27B-abliterated-AWQ-MTP",
+                (QuantOption("int4", 85000),),
+                label="Qwen3.6-27B Abliterated AWQ (Refusal-removed)",
+                notes="AWQ-INT4 of huihui-ai/Huihui-Qwen3.6-27B-abliterated; "
+                      "refusal direction projected out (abliteration). "
+                      "Generates content base Qwen3.6 refuses",
+            ),
+        ),
+        total_params_b=27.0, active_params_b=27.0,
+        native_context_len=262144,
+        generation_quality=1.05,
+        family="qwen3.6", provider="Community (huihui-ai/shawnw3i)",
+        notes="Abliterated (refusal direction removed) variant of Qwen3.6-27B; "
+              "no built-in safety refusals; same architecture as base; "
+              "requires vLLM >= 0.19.0",
+    ),
+
+    ModelEntry(
         id="qwen3.6-27b-opus-reasoning",
         name="Qwen3.6-27B Claude Opus 4.6 Reasoning",
         base_model="rico03/Qwen3.6-27B-Claude-Opus-Reasoning-Distilled",

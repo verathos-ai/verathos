@@ -155,22 +155,40 @@ contract ValidatorRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable
     // ── EVM registration with hotkey ownership proof ───────────────
 
     /// @notice Register EVM address → UID mapping with SR25519 hotkey proof.
+    ///         Stale prior bindings are auto-cleaned after the caller proves
+    ///         ownership of the current substrate hotkey at `uid`.
     /// @param uid   The UID to claim on this subnet.
     /// @param sigR  First 32 bytes of the SR25519 signature.
     /// @param sigS  Last 32 bytes of the SR25519 signature.
     function registerEvm(uint16 uid, bytes32 sigR, bytes32 sigS) external {
         require(uid < META.getUidCount(netuid), "UID does not exist on subnet");
-        require(!evmRegistered[msg.sender] || evmToUid[msg.sender] == uid,
-                "Already registered with different UID");
-        address existing = uidToEvm[uid];
-        require(existing == address(0) || existing == msg.sender,
-                "UID already claimed by another address");
-
         bytes32 hotkey = META.getHotkey(netuid, uid);
         require(hotkey != bytes32(0), "UID has no hotkey");
+
         bytes32 message = keccak256(abi.encodePacked(msg.sender, uid, netuid, address(this)));
         require(ISr25519Verify(SR25519_VERIFY).verify(message, hotkey, sigR, sigS),
                 "Invalid SR25519 signature - caller does not own this hotkey");
+
+        if (uidToEvm[uid] == msg.sender
+            && evmRegistered[msg.sender]
+            && evmToUid[msg.sender] == uid) {
+            return;
+        }
+
+        if (evmRegistered[msg.sender] && evmToUid[msg.sender] != uid) {
+            uint16 oldUid = evmToUid[msg.sender];
+            if (uidToEvm[oldUid] == msg.sender) {
+                delete uidToEvm[oldUid];
+                emit EvmRegistrationReset(oldUid, msg.sender);
+            }
+        }
+
+        address oldEvm = uidToEvm[uid];
+        if (oldEvm != address(0) && oldEvm != msg.sender) {
+            delete evmRegistered[oldEvm];
+            delete evmToUid[oldEvm];
+            emit EvmRegistrationReset(uid, oldEvm);
+        }
 
         evmToUid[msg.sender] = uid;
         evmRegistered[msg.sender] = true;
@@ -354,6 +372,30 @@ contract ValidatorRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable
                 infos[idx] = validators[addr];
                 idx++;
             }
+        }
+    }
+
+    /// @notice Get validators by raw registration-list index.
+    ///         Use with getValidatorCount() for scalable off-chain polling.
+    function getValidatorsPaged(uint256 offset, uint256 limit) external view returns (
+        address[] memory addrs,
+        ValidatorInfo[] memory infos
+    ) {
+        uint256 total = validatorList.length;
+        if (offset >= total || limit == 0) {
+            return (new address[](0), new ValidatorInfo[](0));
+        }
+
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        uint256 count = end - offset;
+
+        addrs = new address[](count);
+        infos = new ValidatorInfo[](count);
+        for (uint256 i = 0; i < count; i++) {
+            address addr = validatorList[offset + i];
+            addrs[i] = addr;
+            infos[i] = validators[addr];
         }
     }
 

@@ -102,17 +102,42 @@ contract UsageCheckpointRegistry is Initializable, UUPSUpgradeable, OwnableUpgra
 
     function registerEvm(uint16 uid, bytes32 sigR, bytes32 sigS) external {
         require(uid < META.getUidCount(netuid), "UID does not exist on subnet");
-        require(!evmRegistered[msg.sender] || evmToUid[msg.sender] == uid,
-                "Already registered with different UID");
-        address existing = uidToEvm[uid];
-        require(existing == address(0) || existing == msg.sender,
-                "UID already claimed by another address");
-
         bytes32 hotkey = META.getHotkey(netuid, uid);
         require(hotkey != bytes32(0), "UID has no hotkey");
+
+        // SR25519 ownership proof against the current substrate hotkey.
+        // This is dispositive: only the current operator can produce a valid sig.
         bytes32 message = keccak256(abi.encodePacked(msg.sender, uid, netuid, address(this)));
         require(ISr25519Verify(SR25519_VERIFY).verify(message, hotkey, sigR, sigS),
                 "Invalid SR25519 signature - caller does not own this hotkey");
+
+        // No-op if already bound to this exact (sender, uid) pair.
+        if (uidToEvm[uid] == msg.sender
+            && evmRegistered[msg.sender]
+            && evmToUid[msg.sender] == uid) {
+            return;
+        }
+
+        // Reverse heal: caller previously bound to a different UID (same EVM
+        // moved slots). Only clear the old uidToEvm[] if we're still the
+        // bound EVM there.
+        if (evmRegistered[msg.sender] && evmToUid[msg.sender] != uid) {
+            uint16 oldUid = evmToUid[msg.sender];
+            if (uidToEvm[oldUid] == msg.sender) {
+                delete uidToEvm[oldUid];
+                emit EvmRegistrationReset(oldUid, msg.sender);
+            }
+        }
+
+        // Forward heal: this UID was held by a different EVM (recycle case).
+        // The SR25519 verify above proves the caller owns the current hotkey,
+        // so the previous EVM is by construction stale.
+        address oldEvm = uidToEvm[uid];
+        if (oldEvm != address(0) && oldEvm != msg.sender) {
+            delete evmRegistered[oldEvm];
+            delete evmToUid[oldEvm];
+            emit EvmRegistrationReset(uid, oldEvm);
+        }
 
         evmToUid[msg.sender] = uid;
         evmRegistered[msg.sender] = true;
