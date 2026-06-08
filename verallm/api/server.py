@@ -30,7 +30,7 @@ import sys
 import time
 import uuid
 import warnings
-from typing import Optional
+from typing import Any, Optional
 
 # ── Suppress noisy third-party output BEFORE any imports trigger it ──
 # vLLM reconfigures logging on import; prevent that.
@@ -150,8 +150,14 @@ class InferenceRequestBody(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    role: str  # "system", "user", "assistant"
-    content: str
+    role: str
+    content: Optional[Any] = ""
+    tool_calls: Optional[list[dict]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+
+    class Config:
+        extra = "allow"
 
 
 class ChatRequestBody(BaseModel):
@@ -172,6 +178,27 @@ class ChatRequestBody(BaseModel):
     top_k: Optional[int] = None
     top_p: Optional[float] = None
     min_p: Optional[float] = None
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[Any] = None
+    parallel_tool_calls: Optional[bool] = None
+
+
+def _chat_prompt_hash_payload(
+    messages: list[dict],
+    tools: Optional[list[dict]] = None,
+    tool_choice: Any = None,
+    parallel_tool_calls: Optional[bool] = None,
+) -> Any:
+    """Return the chat prompt-hash payload used for input binding."""
+    if tools:
+        return {
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "parallel_tool_calls": parallel_tool_calls,
+        }
+    # Preserve the legacy no-tool hash contract for rolling miner/proxy upgrades.
+    return messages
 
 
 # ============================================================================
@@ -418,6 +445,11 @@ async def health():
         "model": state.model_name,
         "moe": state.moe_config is not None,
         "batch_mode": state.batch_mode,
+        "supported_parameters": [
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+        ],
         "capture_backend": (
             state.activation_tracker.backend
             if state.activation_tracker is not None
@@ -725,12 +757,31 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
 
     # Apply chat template using the miner's tokenizer
     tokenizer = state.miner.tokenizer
-    messages_dicts = [{"role": m.role, "content": m.content} for m in body.messages]
+    def _msg_to_dict(m: ChatMessage) -> dict:
+        if hasattr(m, "model_dump"):
+            d = m.model_dump(exclude_none=True)
+        else:
+            d = m.dict(exclude_none=True)
+        if m.content is None and m.tool_calls:
+            d["content"] = None
+        if "content" not in d and "tool_calls" not in d:
+            d["content"] = ""
+        return d
+
+    messages_dicts = [_msg_to_dict(m) for m in body.messages]
     # Compute prompt_hash from the canonical messages JSON for input integrity.
     # Stored as local var (not on state) to avoid race conditions between
     # concurrent requests — state._current_prompt_hash was shared/mutable.
     import json as _json
-    _prompt_hash_input = _json.dumps(messages_dicts, sort_keys=True, ensure_ascii=False).encode()
+    _prompt_hash_obj = _chat_prompt_hash_payload(
+        messages_dicts,
+        body.tools,
+        body.tool_choice,
+        body.parallel_tool_calls,
+    )
+    _prompt_hash_input = _json.dumps(
+        _prompt_hash_obj, sort_keys=True, ensure_ascii=False
+    ).encode()
     _prompt_hash = hashlib.sha256(_prompt_hash_input).digest()
     bt.logging.debug(
         f"prompt_hash: {_prompt_hash.hex()[:16]} (len={len(_prompt_hash_input)})"
@@ -738,6 +789,9 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
 
     _is_mistral_tok = "MistralTokenizer" in type(tokenizer).__name__
     _extra_kw = _chat_template_kwargs(tokenizer, body.enable_thinking)
+    _template_kw = dict(_extra_kw)
+    if body.tools:
+        _template_kw["tools"] = body.tools
     try:
         if _is_mistral_tok:
             prompt_token_ids = tokenizer.apply_chat_template(
@@ -747,7 +801,7 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
         else:
             formatted_prompt = tokenizer.apply_chat_template(
                 messages_dicts, tokenize=False, add_generation_prompt=True,
-                **_extra_kw,
+                **_template_kw,
             )
             prompt_token_ids = None
     except Exception as e:

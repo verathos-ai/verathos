@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -111,6 +112,40 @@ def _parse_sse_stream(response):
             data_lines = []
 
     # Handle final event without trailing empty line
+    if data_lines:
+        raw = "\n".join(data_lines)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = {"raw": raw}
+        evt = event_type or parsed.get("event", "")
+        if evt:
+            yield evt, parsed
+
+
+async def _parse_sse_stream_async(response):
+    """Async variant of :func:`_parse_sse_stream` for httpx.AsyncClient."""
+    event_type = None
+    data_lines = []
+
+    async for line in response.aiter_lines():
+        if line.startswith("event:"):
+            event_type = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+        elif line == "":
+            if data_lines:
+                raw = "\n".join(data_lines)
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = {"raw": raw}
+                evt = event_type or parsed.get("event", "")
+                if evt:
+                    yield evt, parsed
+            event_type = None
+            data_lines = []
+
     if data_lines:
         raw = "\n".join(data_lines)
         try:
@@ -440,7 +475,11 @@ class ValidatorClient:
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         min_p: Optional[float] = None,
-    ) -> Tuple[str, InferenceCommitment, InferenceProofBundle, bytes, dict]:
+        tools: Optional[list[dict]] = None,
+        tool_choice=None,
+        parallel_tool_calls: Optional[bool] = None,
+        deserialize_proof_bundle: bool = True,
+    ) -> Tuple[str, Optional[InferenceCommitment], Optional[InferenceProofBundle], bytes, dict]:
         """Send chat-style inference request (OpenAI messages format).
 
         Uses POST /chat on the miner, which applies the chat template
@@ -452,6 +491,9 @@ class ValidatorClient:
             do_sample: Whether to use sampling.
             temperature: Sampling temperature.
             stream_callback: Optional callable(token_text) invoked per token.
+            deserialize_proof_bundle: When False, skip converting the final
+                proof_bundle JSON into Python proof objects. Use this only when
+                the caller has already decided not to verify this request.
             enable_thinking: Enable chain-of-thought for models that support it.
             presence_penalty: Penalize repeated tokens (None = server default).
             top_k: Top-k sampling (None = server default).
@@ -481,6 +523,12 @@ class ValidatorClient:
             request_body["top_p"] = top_p
         if min_p is not None:
             request_body["min_p"] = min_p
+        if tools is not None:
+            request_body["tools"] = tools
+        if tool_choice is not None:
+            request_body["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            request_body["parallel_tool_calls"] = parallel_tool_calls
 
         full_text = ""
         commitment = None
@@ -514,7 +562,7 @@ class ValidatorClient:
                         except (TypeError, KeyError):
                             pass
                     _t_commit_deser = time.perf_counter()
-                    if proof_data:
+                    if proof_data and deserialize_proof_bundle:
                         try:
                             proof_bundle = dict_to_proof_bundle(proof_data)
                         except (TypeError, KeyError):
@@ -1983,6 +2031,214 @@ class ValidatorClient:
         logger.info("    Total wall time:    %.1fms\n%s", total, "=" * 70)
 
         return result.passed, full_text, all_timings
+
+
+class AsyncValidatorClient(ValidatorClient):
+    """Async HTTP transport for production proxy/router inference paths.
+
+    The proof verifier remains the canonical synchronous verifier inherited
+    from :class:`ValidatorClient`; callers should run verification in a bounded
+    executor when they do not want CPU work on the event loop.  The miner SSE
+    transport is async so active streams do not require one Python thread each.
+    """
+
+    def __init__(
+        self,
+        miner_url: str,
+        config: Optional[Config] = None,
+        verify_tls: bool = True,
+        timeout: float = 600.0,
+        api_key: Optional[str] = None,
+        chain_config=None,
+        model_id: Optional[str] = None,
+        validator_hotkey_ss58: Optional[str] = None,
+        validator_seed: Optional[bytes] = None,
+    ):
+        self.miner_url = miner_url.rstrip("/")
+        self.config = config or get_config()
+        self.model_spec: Optional[ModelSpec] = None
+        self.moe_config: Optional[MoEConfig] = None
+        self._chain_config = chain_config
+        self._model_id = model_id
+        self._verify_tls = verify_tls
+        self._headers = {}
+        if api_key:
+            self._headers["Authorization"] = f"Bearer {api_key}"
+
+        self._auth = None
+        if validator_hotkey_ss58 and validator_seed:
+            self._auth = ValidatorRequestAuth(validator_hotkey_ss58, validator_seed)
+
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=30.0),
+            verify=verify_tls,
+            headers=self._headers,
+            auth=self._auth,
+        )
+
+    async def aclose(self):
+        await self.client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        await self.aclose()
+
+    def close(self):
+        raise RuntimeError("AsyncValidatorClient.close() is not supported; use await aclose()")
+
+    def __enter__(self):
+        raise RuntimeError("AsyncValidatorClient is async-only; use 'async with'")
+
+    def __exit__(self, *args):
+        raise RuntimeError("AsyncValidatorClient is async-only; use 'async with'")
+
+    def fetch_model_spec(self) -> ModelSpec:
+        """Synchronous compatibility path for cache-miss verification threads."""
+        if self._chain_config is not None:
+            spec = self._fetch_model_spec_from_chain()
+            if spec is not None:
+                self.model_spec = spec
+                self._auto_configure_from_spec(spec)
+                return spec
+            raise RuntimeError(
+                f"Model '{self._model_id}' not found on-chain. "
+                "Cannot fall back to miner (trust anchor must be on-chain)."
+            )
+
+        with httpx.Client(
+            timeout=self.client.timeout,
+            verify=self._verify_tls,
+            headers=self._headers,
+            auth=self._auth,
+        ) as client:
+            resp = client.get(f"{self.miner_url}/model_spec")
+            resp.raise_for_status()
+        self.model_spec = dict_to_model_spec(resp.json())
+        self._auto_configure_from_spec(self.model_spec)
+        return self.model_spec
+
+    async def fetch_model_spec_async(self) -> ModelSpec:
+        if self._chain_config is not None:
+            return self.fetch_model_spec()
+
+        resp = await self.client.get(f"{self.miner_url}/model_spec")
+        resp.raise_for_status()
+        self.model_spec = dict_to_model_spec(resp.json())
+        self._auto_configure_from_spec(self.model_spec)
+        return self.model_spec
+
+    async def run_chat(
+        self,
+        messages: list[dict],
+        max_new_tokens: int = 4096,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        sampling_verification_bps: int = 0,
+        stream_callback=None,
+        enable_thinking: bool = True,
+        presence_penalty: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        min_p: Optional[float] = None,
+        tools: Optional[list[dict]] = None,
+        tool_choice=None,
+        parallel_tool_calls: Optional[bool] = None,
+        deserialize_proof_bundle: bool = True,
+    ) -> Tuple[str, Optional[InferenceCommitment], Optional[InferenceProofBundle], bytes, dict]:
+        nonce = os.urandom(32)
+
+        request_body = {
+            "messages": messages,
+            "validator_nonce": nonce.hex(),
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "sampling_verification_bps": max(0, min(10_000, int(sampling_verification_bps))),
+            "enable_thinking": enable_thinking,
+        }
+        if presence_penalty is not None:
+            request_body["presence_penalty"] = presence_penalty
+        if top_k is not None:
+            request_body["top_k"] = top_k
+        if top_p is not None:
+            request_body["top_p"] = top_p
+        if min_p is not None:
+            request_body["min_p"] = min_p
+        if tools is not None:
+            request_body["tools"] = tools
+        if tool_choice is not None:
+            request_body["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            request_body["parallel_tool_calls"] = parallel_tool_calls
+
+        full_text = ""
+        commitment = None
+        proof_bundle = None
+        timing = {}
+        t_first_token = None
+
+        t0 = time.perf_counter()
+        t_last_tok = time.perf_counter()
+        async with self.client.stream("POST", f"{self.miner_url}/chat", json=request_body) as resp:
+            resp.raise_for_status()
+            async for event_type, data in _parse_sse_stream_async(resp):
+                if event_type == "token":
+                    t_last_tok = time.perf_counter()
+                    if t_first_token is None:
+                        t_first_token = time.perf_counter()
+                    token_text = data.get("text", "")
+                    full_text += token_text
+                    if stream_callback:
+                        maybe_awaitable = stream_callback(token_text)
+                        if inspect.isawaitable(maybe_awaitable):
+                            await maybe_awaitable
+                elif event_type == "done":
+                    t_done_recv = time.perf_counter()
+                    done_gap_ms = (t_done_recv - t_last_tok) * 1000
+                    commit_data = data.get("commitment", {})
+                    proof_data = data.get("proof_bundle", {"layer_proofs": [], "sampling_proofs": []})
+                    if commit_data:
+                        try:
+                            commitment = dict_to_commitment(commit_data)
+                        except (TypeError, KeyError):
+                            pass
+                    t_commit_deser = time.perf_counter()
+                    if proof_data and deserialize_proof_bundle:
+                        try:
+                            proof_bundle = dict_to_proof_bundle(proof_data)
+                        except (TypeError, KeyError):
+                            pass
+                    t_proof_deser = time.perf_counter()
+                    logger.debug(
+                        "ASYNC CLIENT TIMING: last_token→done_recv=%.0fms deser=%.0fms "
+                        "(commit=%.0fms proof=%.0fms)",
+                        done_gap_ms,
+                        (t_proof_deser - t_done_recv) * 1000,
+                        (t_commit_deser - t_done_recv) * 1000,
+                        (t_proof_deser - t_commit_deser) * 1000,
+                    )
+                    timing["inference_ms"] = data.get("inference_ms", 0)
+                    timing["commitment_ms"] = data.get("commitment_ms", 0)
+                    timing["prove_ms"] = data.get("prove_ms", 0)
+                    timing["beacon_ms"] = data.get("beacon_ms", 0)
+                    timing["challenge_ms"] = data.get("challenge_ms", 0)
+                    timing["input_tokens"] = data.get("input_tokens", 0)
+                    timing["output_tokens"] = data.get("output_tokens", 0)
+                elif event_type == "error":
+                    raise RuntimeError(f"Miner error: {data.get('error', data)}")
+
+        timing["round_trip_ms"] = (time.perf_counter() - t0) * 1000
+        if t_first_token is not None:
+            timing["ttft_ms"] = (t_first_token - t0) * 1000
+
+        if commitment is None:
+            commitment = InferenceCommitment.empty()
+        if proof_bundle is None:
+            proof_bundle = InferenceProofBundle.empty()
+
+        return full_text, commitment, proof_bundle, nonce, timing
 
 
 # ============================================================================

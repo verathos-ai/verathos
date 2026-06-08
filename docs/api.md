@@ -36,6 +36,44 @@ curl -X POST https://api.verathos.ai/v1/chat/completions \
 - `top_k`, `top_p`, `min_p`: sampling parameters. These are bound into the proof commitment via `sampler_config_hash`; the gateway verifies the miner used the requested values
 - `presence_penalty`: penalty for repeated tokens
 - `include_proof`: include proof bundle in response (default: true). Set false to save ~50-100 KB bandwidth per request. Verification still happens server-side.
+- `tools`: optional OpenAI-compatible tool definitions. Each entry uses the standard `{"type":"function","function":{...}}` shape.
+- `tool_choice`: optional tool policy. Supports `"auto"`, `"none"`, `"required"`, or a forced function object such as `{"type":"function","function":{"name":"web_search"}}`.
+- `parallel_tool_calls`: optional boolean. Set `false` to request at most one tool call.
+
+Tool calling is available only on model routes that advertise support. Check `GET /v1/models` and look for `supported_parameters` containing `tools`, `tool_choice`, and `parallel_tool_calls`. If no miner for the requested model supports these parameters, the gateway returns `503` instead of silently routing to an old miner.
+
+The API follows the OpenAI tool-calling contract: the model decides whether to return `tool_calls`, but your client executes the tool and sends the result back as a `role: "tool"` message. The hosted Verathos webapp has its own SearXNG-backed `web_search` executor; raw API clients must run their own tool executors.
+
+**Tool-calling example:**
+
+```bash
+curl -X POST https://api.verathos.ai/v1/chat/completions \
+  -H "Authorization: Bearer vrt_sk_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-9b",
+    "messages": [{"role": "user", "content": "Search the web for current Verathos docs"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "Search the web and return relevant source snippets.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string"},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 10}
+          },
+          "required": ["query"]
+        }
+      }
+    }],
+    "tool_choice": "auto",
+    "parallel_tool_calls": false
+  }'
+```
+
+A tool decision response has `finish_reason: "tool_calls"` and an assistant message with `tool_calls`. After executing the tool, append both the assistant tool-call message and a `role: "tool"` result message, then call `/v1/chat/completions` again with `tool_choice: "none"` or without tools for the final answer.
 
 **Response** (non-streaming):
 ```json
@@ -66,6 +104,15 @@ List available models with live USD pricing and current availability.
 ```bash
 curl https://api.verathos.ai/v1/models \
   -H "Authorization: Bearer vrt_sk_..."
+```
+
+Model entries include `supported_parameters`, which tells OpenAI-compatible clients which optional request fields are currently routeable for that model. Tool-capable routes advertise:
+
+```json
+{
+  "id": "qwen3.5-9b",
+  "supported_parameters": ["tools", "tool_choice", "parallel_tool_calls"]
+}
 ```
 
 #### `GET /v1/price`

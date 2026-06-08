@@ -200,6 +200,20 @@ for chunk in response:
 
 Works with any OpenAI-compatible tool. We provide dedicated plugins for [LiteLLM, LangChain, elizaOS, OpenClaw, Hermes, and AutoGen](integrations.md) with features like proof metadata, model discovery, and x402 payments.
 
+### Tool calling
+
+Verathos supports OpenAI-compatible tool-calling fields on routes whose miners advertise tool support. Check `GET /v1/models` first; tool-capable model entries include:
+
+```json
+{
+  "supported_parameters": ["tools", "tool_choice", "parallel_tool_calls"]
+}
+```
+
+When supported, send `tools`, `tool_choice`, and optionally `parallel_tool_calls` to `/v1/chat/completions`. The model may return an assistant message with `tool_calls` and `finish_reason: "tool_calls"`. Your API client executes those tools, appends the assistant tool-call message plus a `role: "tool"` result message, then calls `/v1/chat/completions` again for the final answer.
+
+The hosted Verathos webapp includes a SearXNG-backed `web_search` executor. Raw API clients should provide their own tool executors.
+
 ### Example scripts
 
 Ready-to-run Python scripts in the `examples/` directory:
