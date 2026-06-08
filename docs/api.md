@@ -44,6 +44,8 @@ Tool calling is available only on model routes that advertise support. Check `GE
 
 The API follows the OpenAI tool-calling contract: the model decides whether to return `tool_calls`, but your client executes the tool and sends the result back as a `role: "tool"` message. The hosted Verathos webapp has its own SearXNG-backed `web_search` executor; raw API clients must run their own tool executors.
 
+Tool-decision requests must use `stream: false`. After your client executes the tool, the final answer request may use `stream: true` or `stream: false`.
+
 **Tool-calling example:**
 
 ```bash
@@ -69,7 +71,8 @@ curl -X POST https://api.verathos.ai/v1/chat/completions \
       }
     }],
     "tool_choice": "auto",
-    "parallel_tool_calls": false
+    "parallel_tool_calls": false,
+    "stream": false
   }'
 ```
 

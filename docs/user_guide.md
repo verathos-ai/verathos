@@ -214,6 +214,8 @@ When supported, send `tools`, `tool_choice`, and optionally `parallel_tool_calls
 
 The hosted Verathos webapp includes a SearXNG-backed `web_search` executor. Raw API clients should provide their own tool executors.
 
+Use `stream: false` for the tool-decision request. The final answer request, after adding the tool result, can be streamed normally.
+
 ### Example scripts
 
 Ready-to-run Python scripts in the `examples/` directory:
