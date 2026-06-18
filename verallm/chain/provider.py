@@ -19,6 +19,7 @@ _ABI_DIR = Path(__file__).resolve().parent.parent.parent / "contracts" / "abi"
 
 # Gas price ceiling (100 Gwei) — warn but don't block
 _GAS_PRICE_WARN_THRESHOLD = 100 * 10**9
+_BUILD_TX_GAS_PLACEHOLDER = 1
 
 
 def _load_abi(name: str) -> list:
@@ -265,13 +266,19 @@ class Web3Provider:
             "nonce": nonce,
             "chainId": self.config.chain_id,
             "gasPrice": gas_price,
+            # Prevent web3.py from calling eth_estimateGas inside
+            # build_transaction(). We estimate explicitly below via
+            # call_with_retry so public-RPC 429s are handled consistently.
+            "gas": _BUILD_TX_GAS_PLACEHOLDER,
         }
         if value > 0:
             tx_params["value"] = value
         tx = contract_fn.build_transaction(tx_params)
 
         # Estimate gas with margin (retry for 429)
-        estimated = self.call_with_retry(lambda: self.w3.eth.estimate_gas(tx))
+        estimate_tx = dict(tx)
+        estimate_tx.pop("gas", None)
+        estimated = self.call_with_retry(lambda: self.w3.eth.estimate_gas(estimate_tx))
         tx["gas"] = int(estimated * 1.3)
 
         # Sign and send (retry for 429)
