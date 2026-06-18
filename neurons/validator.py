@@ -355,6 +355,7 @@ class ValidatorNeuron:
         self._expected_receipts: Dict[Tuple[str, int], int] = {}
         # {epoch_number: {(miner_address, model_index): in_flight_count}}
         self._inflight_canaries: Dict[int, Dict[Tuple[str, int], int]] = {}
+        self._closing_inflight_canaries: Dict[int, Dict[Tuple[str, int], int]] = {}
         # {(miner_address, model_index): 503_skip_count} — reset each epoch
         self._busy_skips: Dict[Tuple[str, int], int] = {}
         # Miners that entered probation via busy-skips (not real proof failure)
@@ -830,7 +831,11 @@ class ValidatorNeuron:
     def _effective_expected_receipts(self, epoch_number: int, key: Tuple[str, int]) -> int:
         """Expected receipts minus canaries still in flight at close time."""
         expected = self._expected_receipts.get(key, 0)
-        inflight = self._inflight_canaries.get(epoch_number, {}).get(key, 0)
+        inflight_epoch = self._closing_inflight_canaries.get(
+            epoch_number,
+            self._inflight_canaries.get(epoch_number, {}),
+        )
+        inflight = inflight_epoch.get(key, 0)
         return max(0, expected - inflight)
 
     def _do_epoch_setup(self, epoch_start_block: int, epoch_number: int):
@@ -1797,7 +1802,13 @@ class ValidatorNeuron:
             return  # Still in cooldown from a previous failure
 
         try:
-            self._close_epoch(epoch_number)
+            self._closing_inflight_canaries[epoch_number] = dict(
+                self._inflight_canaries.get(epoch_number, {})
+            )
+            try:
+                self._close_epoch(epoch_number)
+            finally:
+                self._closing_inflight_canaries.pop(epoch_number, None)
             self._pending_epoch_close = None
             self._last_closed_epoch = epoch_number
             self._epoch_close_backoff = 30.0  # Reset on success
