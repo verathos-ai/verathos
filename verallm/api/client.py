@@ -51,7 +51,6 @@ from verallm.challenge.beacon import (
 from verallm.verifier.gemm import GEMMVerifier
 from verallm.crypto.transcript import Transcript
 from verallm.crypto.merkle import verify_merkle_path, verify_flat_chunk_merkle_path, build_block_merkle, MerkleTree
-from verallm.crypto.field import mod_p
 from verallm.moe import (
     MoEConfig,
     derive_moe_challenges,
@@ -70,6 +69,7 @@ from verallm.sampling import (
     verify_quantized_argmax,
     verify_fp16_argmax,
 )
+from verallm.verifier.spot_openings import verify_x_spot_openings
 from verallm.api.serialization import (
     dict_to_model_spec,
     dict_to_commitment,
@@ -909,6 +909,26 @@ class ValidatorClient:
 
         y_tensor = torch.tensor(proved_matrix_rows, dtype=torch.int64)
         y_root = build_block_merkle(y_tensor, self.config.block_size).root
+        sampled_token_indices = [int(t) for t in layer_challenge.sampled_token_indices]
+
+        def map_router_row(local_row: int) -> int:
+            if local_row < 0 or local_row >= len(sampled_token_indices):
+                raise ValueError(
+                    f"router proof row {local_row} outside sampled rows "
+                    f"(count={len(sampled_token_indices)})"
+                )
+            return sampled_token_indices[local_row]
+
+        x_result = verify_x_spot_openings(
+            proof=layer_routing_proof.router_gemm_proof,
+            x_root=proof_bundle.commitment.layer_commitments[layer_idx],
+            num_cols=self.model_spec.hidden_dim,
+            context=f"Layer {layer_idx} router GEMM X",
+            row_mapper=map_router_row,
+        )
+        if not x_result.passed:
+            return VerificationResult.failure(x_result.message)
+
         router_verifier = GEMMVerifier(self.config)
         router_verify = router_verifier.verify(
             proof=layer_routing_proof.router_gemm_proof,
@@ -922,6 +942,7 @@ class ValidatorClient:
                         if router_commitment.num_experts > 0
                         else len(proved_matrix_rows[0])),
             w_chunk_size=self.model_spec.w_merkle_chunk_size,
+            require_w_merkle_proofs=True,
         )
         if not router_verify.passed:
             return VerificationResult.failure(
@@ -1396,37 +1417,18 @@ class ValidatorClient:
                 W_commitment = self.model_spec.weight_merkle_root
                 Y_commitment = gemm_proof.output_root
 
-                # Verify X spot checks with Merkle proofs
-                for block_proof in gemm_proof.block_proofs:
-                    if block_proof.spot_X_with_proofs:
-                        for spot_wp in block_proof.spot_X_with_proofs:
-                            path_valid = verify_merkle_path(
-                                root=X_commitment,
-                                leaf_data=spot_wp.leaf_data,
-                                path=spot_wp.merkle_path,
-                            )
-                            if not path_valid:
-                                return VerificationResult.failure(
-                                    f"X spot check Merkle proof invalid at layer {layer_idx}, "
-                                    f"position ({spot_wp.row}, {spot_wp.col})"
-                                ), timing_details
-
-                            leaf_values = struct.unpack(
-                                f"<{len(spot_wp.leaf_data) // 8}q",
-                                spot_wp.leaf_data,
-                            )
-                            flat_idx = spot_wp.row * hidden_dim + spot_wp.col
-                            block_start = spot_wp.merkle_path.leaf_index * 256
-                            idx_in_block = flat_idx - block_start
-
-                            if 0 <= idx_in_block < len(leaf_values):
-                                expected_value = mod_p(int(leaf_values[idx_in_block]))
-                                if spot_wp.value != expected_value:
-                                    return VerificationResult.failure(
-                                        f"X spot check value mismatch at layer {layer_idx}, "
-                                        f"position ({spot_wp.row}, {spot_wp.col}): "
-                                        f"claimed {spot_wp.value}, leaf has {expected_value}"
-                                    ), timing_details
+                if is_moe_challenge and expert_idx is not None:
+                    x_context = f"Layer {layer_idx} expert {expert_idx} GEMM {gemm_idx} X"
+                else:
+                    x_context = f"Layer {layer_idx} GEMM {gemm_idx} X"
+                x_result = verify_x_spot_openings(
+                    proof=gemm_proof,
+                    x_root=X_commitment,
+                    num_cols=hidden_dim,
+                    context=x_context,
+                )
+                if not x_result.passed:
+                    return VerificationResult.failure(x_result.message), timing_details
 
                 # Lightweight: W verified via Merkle proofs in verifier
                 spot_check_fn = lambda _spot, _matrix_id: True
@@ -1480,6 +1482,7 @@ class ValidatorClient:
                     W_merkle_root=W_merkle_root,
                     W_num_cols=w_cols,
                     w_chunk_size=self.model_spec.w_merkle_chunk_size,
+                    require_w_merkle_proofs=True,
                 )
                 verify_time = (time.perf_counter() - t0) * 1000
 
@@ -1845,6 +1848,15 @@ class ValidatorClient:
                         "reconstructed Y_batch does not match proof output_root"
                     ), timing_details
 
+                x_result = verify_x_spot_openings(
+                    proof=batched_gemm_proof,
+                    x_root=x_tree.root,
+                    num_cols=hidden_dim,
+                    context="Batched lm_head GEMM X",
+                )
+                if not x_result.passed:
+                    return VerificationResult.failure(x_result.message), timing_details
+
                 transcript = Transcript(b"decode_lm_head_gemm_batched")
                 lm_head_verify = verifier.verify(
                     proof=batched_gemm_proof,
@@ -1856,6 +1868,7 @@ class ValidatorClient:
                     W_merkle_root=lm_head_root,
                     W_num_cols=Y_batch.shape[1],
                     w_chunk_size=self.model_spec.w_merkle_chunk_size,
+                    require_w_merkle_proofs=True,
                 )
                 if not lm_head_verify.passed:
                     return VerificationResult.failure(
