@@ -112,7 +112,7 @@ if [ "$SKIP_INSTALL" = false ]; then
     ZKLLM_WHEEL=$(ls "${REPO_DIR}/dist"/zkllm-*-${PY_VER}-*.whl 2>/dev/null | head -1)
     if [ -n "$ZKLLM_WHEEL" ]; then
         echo "  Installing zkllm wheel..."
-        $PYTHON -m pip install --no-cache-dir "$ZKLLM_WHEEL" 2>&1 | tail -5
+        $PYTHON -m pip install --no-cache-dir --force-reinstall "$ZKLLM_WHEEL" 2>&1 | tail -5
     else
         echo "  WARNING: No zkllm wheel found for $PY_VER in dist/"
     fi

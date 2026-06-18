@@ -477,7 +477,7 @@ if [ "$SKIP_INSTALL" = false ]; then
     echo "Step 1/5: Installing zkllm wheel..."
     if ls "$REPO_DIR/dist"/zkllm-*.whl &>/dev/null; then
         # Use --find-links so pip auto-selects the wheel matching this Python version
-        $PYTHON -m pip install --no-cache-dir --find-links "$REPO_DIR/dist" zkllm 2>&1 | tail -5
+        $PYTHON -m pip install --no-cache-dir --force-reinstall --find-links "$REPO_DIR/dist" zkllm 2>&1 | tail -5
     else
         echo "  ERROR: No zkllm wheels found in dist/."
         echo "  The dist/ directory should contain pre-built zkllm wheels."
@@ -686,7 +686,7 @@ print(f'  Kernels: blake3_merkle, sumcheck, field_ops')
         echo "WARNING: zkllm CUDA extension not available or missing GPU kernels."
         echo ""
         echo "  Ensure the zkllm wheel is installed:"
-        echo "    pip install zkllm-*.whl"
+        echo "    pip install --force-reinstall zkllm-*.whl"
         echo ""
         echo "  See INSTALL_ZKLLM.md for download links and troubleshooting."
         echo ""

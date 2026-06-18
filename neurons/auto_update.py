@@ -64,6 +64,56 @@ def _run_git(*args: str, cwd: Optional[Path] = None) -> tuple[int, str]:
         return 1, str(e)
 
 
+def _current_python_tag() -> str:
+    """Return the wheel ABI tag for the running Python minor, e.g. cp312."""
+    return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _find_local_zkllm_wheel(py_tag: Optional[str] = None) -> Optional[Path]:
+    """Find the bundled zkllm wheel matching the running Python minor."""
+    tag = py_tag or _current_python_tag()
+    dist_dir = _REPO_ROOT / "dist"
+    wheels = sorted(dist_dir.glob(f"zkllm-*-{tag}-*.whl"))
+    return wheels[-1] if wheels else None
+
+
+def install_local_zkllm_wheel() -> bool:
+    """Force-install the bundled zkllm wheel for this Python minor."""
+    wheel = _find_local_zkllm_wheel()
+    if wheel is None:
+        bt.logging.error(
+            f"No bundled zkllm wheel found for {_current_python_tag()} in {_REPO_ROOT / 'dist'}"
+        )
+        return False
+
+    bt.logging.info(f"Installing zkllm wheel: {wheel.name}")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--force-reinstall",
+                str(wheel),
+            ],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            bt.logging.error(f"zkllm wheel install failed: {result.stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        bt.logging.error("zkllm wheel install timed out")
+        return False
+
+    bt.logging.info("zkllm wheel installed successfully")
+    return True
+
+
 def get_local_head() -> Optional[str]:
     """Get the current local HEAD commit hash."""
     rc, out = _run_git("rev-parse", "HEAD")
@@ -267,6 +317,8 @@ def pull_and_install() -> bool:
         return False
 
     bt.logging.info("Package reinstalled successfully")
+    if not install_local_zkllm_wheel():
+        return False
     return True
 
 
