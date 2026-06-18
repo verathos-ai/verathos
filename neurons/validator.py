@@ -1241,7 +1241,6 @@ class ValidatorNeuron:
 
                 # Optional proof verification
                 proof_verified = False
-                proof_failure_reason = None
                 verify_timing = {}
                 if test.verify_proof:
                     try:
@@ -1320,7 +1319,6 @@ class ValidatorNeuron:
                         )
                         proof_verified = result.passed
                         if not proof_verified:
-                            proof_failure_reason = result.message
                             # Miner-side fault, not a validator problem — the
                             # detection + probation flow is the success path.
                             # DEBUG so prod dashboards don't page on miner faults.
@@ -1515,7 +1513,6 @@ class ValidatorNeuron:
                         tokens_per_sec=tokens_per_sec,
                         prompt_tokens=input_tokens,
                         proof_verified=1 if proof_verified else (0 if test.verify_proof else None),
-                        proof_failure_reason=proof_failure_reason,
                         prove_ms=timing.get("prove_ms"),
                         commitment_ms=timing.get("commitment_ms"),
                         verify_ms=sum(verify_timing.values()) if verify_timing else None,
@@ -1780,9 +1777,68 @@ class ValidatorNeuron:
                 )
 
         # ── Pass 1: collect all receipts ──────────────────────────
-        miner_receipts, all_epoch_receipts = self._collect_epoch_receipts(
-            epoch_number, receipt_authority,
-        )
+        miner_receipts: Dict[str, List[ServiceReceipt]] = {}  # address -> receipts
+        all_epoch_receipts: List[ServiceReceipt] = []
+
+        # Pull receipts in parallel so one slow/dead miner can't block others.
+        # Per-miner timeout is bounded inside _pull_epoch_receipts.
+        receipt_futures = {}
+        for miner in self._epoch_miners:
+            if not self._running:
+                break
+            receipt_futures[
+                self._executor.submit(
+                    self._pull_epoch_receipts, miner, epoch_number, receipt_authority
+                )
+            ] = miner
+        # Overall budget for all receipt pulls — scales with miner count,
+        # floored by config, capped at 120s.
+        _rp_timeout = min(120, max(
+            self.config.epoch_receipt_pull_overall_timeout,
+            len(self._epoch_miners) // self.config.max_concurrent_verifications * 3 + 10,
+        ))
+        # Cross-pull signature dedup: when a miner registers multiple
+        # model_indices on a single physical server, every endpoint returns
+        # the same receipt buffer. Filter by validator_signature so each
+        # signed receipt counts once across all pulls for the same address.
+        # Multi-server legit operators see no filtering (signatures differ).
+        seen_sigs_by_addr: Dict[str, set] = {}
+        cross_pull_dups = 0
+        try:
+            for fut in as_completed(receipt_futures, timeout=_rp_timeout):
+                miner = receipt_futures[fut]
+                try:
+                    receipts = fut.result()
+                    addr_key = miner.address.lower()
+                    seen = seen_sigs_by_addr.setdefault(addr_key, set())
+                    new_receipts = []
+                    for r in receipts:
+                        if r.validator_signature in seen:
+                            cross_pull_dups += 1
+                            continue
+                        seen.add(r.validator_signature)
+                        new_receipts.append(r)
+                    miner_receipts.setdefault(miner.address, []).extend(new_receipts)
+                    all_epoch_receipts.extend(new_receipts)
+                except Exception as e:
+                    bt.logging.debug(f"Receipt pull exception for {miner.address[:10]}: {e}")
+        except _FuturesTimeout:
+            stalled = [
+                receipt_futures[f].address[:10]
+                for f in receipt_futures if not f.done()
+            ]
+            bt.logging.warning(
+                f"Receipt pull timeout after {_rp_timeout:.0f}s — {len(stalled)} miner(s) stalled: {stalled}. "
+                f"Proceeding with {sum(len(r) for r in miner_receipts.values())} receipts."
+            )
+            for f in receipt_futures:
+                if not f.done():
+                    f.cancel()
+
+        if cross_pull_dups > 0:
+            bt.logging.info(
+                f"Receipt cross-pull dedup: dropped {cross_pull_dups} duplicate signatures"
+            )
 
         # ── Store all receipts (full network view) ────────────────
         try:
@@ -2359,92 +2415,6 @@ class ValidatorNeuron:
 
         elapsed = time.monotonic() - t0
         bt.logging.info(f"Epoch {epoch_number} closed in {elapsed:.1f}s")
-
-    def _collect_epoch_receipts(
-        self,
-        epoch_number: int,
-        receipt_authority: ValidatorAuthority | None,
-    ) -> Tuple[Dict[str, List[ServiceReceipt]], List[ServiceReceipt]]:
-        """Pull epoch receipts without sharing workers with canary execution."""
-        miner_receipts: Dict[str, List[ServiceReceipt]] = {}
-        all_epoch_receipts: List[ServiceReceipt] = []
-        if not self._epoch_miners:
-            return miner_receipts, all_epoch_receipts
-
-        # Receipt close is a scoring-critical phase. Do not submit these jobs
-        # to self._executor: long canaries can occupy every canary worker and
-        # leave all receipt pulls queued until the overall timeout fires.
-        receipt_workers = max(
-            1,
-            min(self.config.max_concurrent_verifications, len(self._epoch_miners)),
-        )
-        receipt_executor = ThreadPoolExecutor(
-            max_workers=receipt_workers,
-            thread_name_prefix="receipt-pull",
-        )
-        receipt_futures = {}
-        try:
-            for miner in self._epoch_miners:
-                if not self._running:
-                    break
-                receipt_futures[
-                    receipt_executor.submit(
-                        self._pull_epoch_receipts, miner, epoch_number, receipt_authority
-                    )
-                ] = miner
-
-            # Overall budget for all receipt pulls — scales with miner count,
-            # floored by config, capped at 120s.
-            _rp_timeout = min(120, max(
-                self.config.epoch_receipt_pull_overall_timeout,
-                len(self._epoch_miners) // self.config.max_concurrent_verifications * 3 + 10,
-            ))
-            # Cross-pull signature dedup: when a miner registers multiple
-            # model_indices on a single physical server, every endpoint returns
-            # the same receipt buffer. Filter by validator_signature so each
-            # signed receipt counts once across all pulls for the same address.
-            # Multi-server legit operators see no filtering (signatures differ).
-            seen_sigs_by_addr: Dict[str, set] = {}
-            cross_pull_dups = 0
-            try:
-                for fut in as_completed(receipt_futures, timeout=_rp_timeout):
-                    miner = receipt_futures[fut]
-                    try:
-                        receipts = fut.result()
-                        addr_key = miner.address.lower()
-                        seen = seen_sigs_by_addr.setdefault(addr_key, set())
-                        new_receipts = []
-                        for r in receipts:
-                            if r.validator_signature in seen:
-                                cross_pull_dups += 1
-                                continue
-                            seen.add(r.validator_signature)
-                            new_receipts.append(r)
-                        miner_receipts.setdefault(miner.address, []).extend(new_receipts)
-                        all_epoch_receipts.extend(new_receipts)
-                    except Exception as e:
-                        bt.logging.debug(f"Receipt pull exception for {miner.address[:10]}: {e}")
-            except _FuturesTimeout:
-                stalled = [
-                    receipt_futures[f].address[:10]
-                    for f in receipt_futures if not f.done()
-                ]
-                bt.logging.warning(
-                    f"Receipt pull timeout after {_rp_timeout:.0f}s — {len(stalled)} miner(s) stalled: {stalled}. "
-                    f"Proceeding with {sum(len(r) for r in miner_receipts.values())} receipts."
-                )
-                for f in receipt_futures:
-                    if not f.done():
-                        f.cancel()
-
-            if cross_pull_dups > 0:
-                bt.logging.info(
-                    f"Receipt cross-pull dedup: dropped {cross_pull_dups} duplicate signatures"
-                )
-        finally:
-            receipt_executor.shutdown(wait=False, cancel_futures=True)
-
-        return miner_receipts, all_epoch_receipts
 
     def _pull_epoch_receipts(
         self,

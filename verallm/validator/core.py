@@ -18,6 +18,7 @@ Full mode (--full):
 import hashlib
 import logging
 import os
+import struct
 import time
 import uuid
 from typing import Dict, Optional, Tuple
@@ -65,7 +66,6 @@ from verallm.sampling import (
     verify_quantized_argmax,
     verify_fp16_argmax,
 )
-from verallm.verifier.spot_openings import verify_x_spot_openings
 
 logger = logging.getLogger(__name__)
 
@@ -317,30 +317,6 @@ class Validator:
 
         y_tensor = torch.tensor(proved_matrix_rows, dtype=torch.int64)
         y_root = build_block_merkle(y_tensor, self.config.block_size).root
-        sampled_token_indices = [int(t) for t in layer_challenge.sampled_token_indices]
-
-        def map_router_row(local_row: int) -> int:
-            if local_row < 0 or local_row >= len(sampled_token_indices):
-                raise ValueError(
-                    f"router proof row {local_row} outside sampled rows "
-                    f"(count={len(sampled_token_indices)})"
-                )
-            return sampled_token_indices[local_row]
-
-        if self.lightweight or any(
-            bp.spot_X_with_proofs
-            for bp in layer_routing_proof.router_gemm_proof.block_proofs
-        ):
-            x_result = verify_x_spot_openings(
-                proof=layer_routing_proof.router_gemm_proof,
-                x_root=proof_bundle.commitment.layer_commitments[layer_idx],
-                num_cols=self.model_spec.hidden_dim,
-                context=f"Layer {layer_idx} router GEMM X",
-                row_mapper=map_router_row,
-            )
-            if not x_result.passed:
-                return VerificationResult.failure(x_result.message)
-
         router_verifier = GEMMVerifier(self.config)
         router_verify = router_verifier.verify(
             proof=layer_routing_proof.router_gemm_proof,
@@ -354,7 +330,6 @@ class Validator:
                         if router_commitment.num_experts > 0
                         else len(proved_matrix_rows[0])),
             w_chunk_size=self.model_spec.w_merkle_chunk_size,
-            require_w_merkle_proofs=self.lightweight,
         )
         if not router_verify.passed:
             return VerificationResult.failure(
@@ -729,21 +704,38 @@ class Validator:
                 W_commitment = self.model_spec.weight_merkle_root
                 Y_commitment = gemm_proof.output_root
 
-                if self.lightweight or any(
-                    bp.spot_X_with_proofs for bp in gemm_proof.block_proofs
-                ):
-                    if is_moe_challenge and expert_idx is not None:
-                        x_context = f"Layer {layer_idx} expert {expert_idx} GEMM {gemm_idx} X"
-                    else:
-                        x_context = f"Layer {layer_idx} GEMM {gemm_idx} X"
-                    x_result = verify_x_spot_openings(
-                        proof=gemm_proof,
-                        x_root=X_commitment,
-                        num_cols=hidden_dim,
-                        context=x_context,
-                    )
-                    if not x_result.passed:
-                        return VerificationResult.failure(x_result.message), timing_details
+                # Verify X spot checks using Merkle proofs
+                for block_proof in gemm_proof.block_proofs:
+                    if block_proof.spot_X_with_proofs:
+                        for spot_with_proof in block_proof.spot_X_with_proofs:
+                            path_valid = verify_merkle_path(
+                                root=X_commitment,
+                                leaf_data=spot_with_proof.leaf_data,
+                                path=spot_with_proof.merkle_path,
+                            )
+                            if not path_valid:
+                                return VerificationResult.failure(
+                                    f"X spot check Merkle proof invalid at layer {layer_idx}, "
+                                    f"position ({spot_with_proof.row}, {spot_with_proof.col})"
+                                ), timing_details
+
+                            leaf_values = struct.unpack(
+                                f"<{len(spot_with_proof.leaf_data) // 8}q",
+                                spot_with_proof.leaf_data
+                            )
+
+                            flat_idx = spot_with_proof.row * hidden_dim + spot_with_proof.col
+                            block_start = spot_with_proof.merkle_path.leaf_index * 256
+                            idx_in_block = flat_idx - block_start
+
+                            if 0 <= idx_in_block < len(leaf_values):
+                                expected_value = mod_p(int(leaf_values[idx_in_block]))
+                                if spot_with_proof.value != expected_value:
+                                    return VerificationResult.failure(
+                                        f"X spot check value mismatch at layer {layer_idx}, "
+                                        f"position ({spot_with_proof.row}, {spot_with_proof.col}): "
+                                        f"claimed {spot_with_proof.value}, leaf has {expected_value}"
+                                    ), timing_details
 
                 # W spot check verification
                 if self.lightweight:
@@ -813,7 +805,6 @@ class Validator:
                     W_merkle_root=W_merkle_root,
                     W_num_cols=w_cols,
                     w_chunk_size=self.model_spec.w_merkle_chunk_size if self.lightweight else 0,
-                    require_w_merkle_proofs=self.lightweight,
                 )
                 verify_time = (time.perf_counter() - t0) * 1000
 
@@ -1039,18 +1030,6 @@ class Validator:
                         "Batched lm_head Y Merkle root mismatch"
                     ), timing_details
 
-                if self.lightweight or any(
-                    bp.spot_X_with_proofs for bp in batched_gemm_proof.block_proofs
-                ):
-                    x_result = verify_x_spot_openings(
-                        proof=batched_gemm_proof,
-                        x_root=x_tree.root,
-                        num_cols=X_batch.shape[1],
-                        context="Batched lm_head GEMM X",
-                    )
-                    if not x_result.passed:
-                        return VerificationResult.failure(x_result.message), timing_details
-
                 transcript = Transcript(b"decode_lm_head_gemm_batched")
                 lm_head_verify = verifier.verify(
                     proof=batched_gemm_proof,
@@ -1062,7 +1041,6 @@ class Validator:
                     W_merkle_root=lm_head_root,
                     W_num_cols=Y_batch.shape[1],
                     w_chunk_size=self.model_spec.w_merkle_chunk_size,
-                    require_w_merkle_proofs=self.lightweight,
                 )
                 if not lm_head_verify.passed:
                     return VerificationResult.failure(

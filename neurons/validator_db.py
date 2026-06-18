@@ -231,48 +231,38 @@ class ValidatorStateDB:
         self._conn.commit()
 
         # One-time migration: prune historical duplicate rows then install
-        # the unique index. Guard it with a DB marker and the actual index
-        # existence check; on production analytics DBs this table can have
-        # millions of rows, so re-running the prune query on every restart
-        # can block validator startup for minutes.
-        dedupe_meta_key = "network_receipts_dedupe_v1"
-        dedupe_index_exists = self._conn.execute(
-            """SELECT 1 FROM sqlite_master
-               WHERE type = 'index' AND name = 'uniq_network_receipts_signature'"""
-        ).fetchone() is not None
-
-        if dedupe_index_exists:
-            if self._raw_get_meta(dedupe_meta_key) != "done":
-                self._raw_set_meta(dedupe_meta_key, "done")
-        else:
-            try:
-                cur = self._conn.execute("""
-                    DELETE FROM network_receipts
+        # the unique index. Wrapped in try/except so a failure (locked DB,
+        # IO error) never crashes startup — receipt-pull dedup in
+        # validator.py prevents new duplicates regardless of this success.
+        # TODO: remove this migration block after all validators have been
+        # restarted with this version (~2 weeks post-deploy is safe).
+        try:
+            cur = self._conn.execute("""
+                DELETE FROM network_receipts
+                WHERE commitment_hash IS NOT NULL
+                  AND id NOT IN (
+                    SELECT MIN(id) FROM network_receipts
                     WHERE commitment_hash IS NOT NULL
-                      AND id NOT IN (
-                        SELECT MIN(id) FROM network_receipts
-                        WHERE commitment_hash IS NOT NULL
-                        GROUP BY epoch_number, validator_hotkey, commitment_hash
-                      )
-                """)
-                removed = cur.rowcount or 0
-                if removed > 0:
-                    bt.logging.debug(
-                        f"network_receipts: pruned {removed} historical duplicate rows"
-                    )
-                self._conn.commit()
-            except Exception as e:
-                bt.logging.warning(f"network_receipts duplicate prune failed: {e}")
+                    GROUP BY epoch_number, validator_hotkey, commitment_hash
+                  )
+            """)
+            removed = cur.rowcount or 0
+            if removed > 0:
+                bt.logging.debug(
+                    f"network_receipts: pruned {removed} historical duplicate rows"
+                )
+            self._conn.commit()
+        except Exception as e:
+            bt.logging.warning(f"network_receipts duplicate prune failed: {e}")
 
-            try:
-                self._conn.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS uniq_network_receipts_signature
-                        ON network_receipts(epoch_number, validator_hotkey, commitment_hash)
-                """)
-                self._conn.commit()
-                self._raw_set_meta(dedupe_meta_key, "done")
-            except Exception as e:
-                bt.logging.warning(f"network_receipts unique index creation failed: {e}")
+        try:
+            self._conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uniq_network_receipts_signature
+                    ON network_receipts(epoch_number, validator_hotkey, commitment_hash)
+            """)
+            self._conn.commit()
+        except Exception as e:
+            bt.logging.warning(f"network_receipts unique index creation failed: {e}")
 
         # Ensure schema version is recorded
         existing = self._raw_get_meta("schema_version")
