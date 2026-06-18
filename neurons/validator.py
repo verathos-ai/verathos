@@ -382,8 +382,14 @@ class ValidatorNeuron:
         self._epoch_close_backoff: float = 30.0  # seconds, doubles on failure
         self._last_known_block: int = 0  # fallback for _get_current_block
 
-        # Thread pool for concurrent canary tests
+        # Thread pool for concurrent canary tests. This pool is reset at epoch
+        # rollover so queued stale canaries cannot occupy the next epoch.
         self._executor = ThreadPoolExecutor(
+            max_workers=config.max_concurrent_verifications,
+        )
+        # Control-plane work must not wait behind canary inference. Epoch setup,
+        # chain reports, blacklist checks, and weight setting use this pool.
+        self._control_executor = ThreadPoolExecutor(
             max_workers=config.max_concurrent_verifications,
         )
 
@@ -734,7 +740,7 @@ class ValidatorNeuron:
                                 _sw_delay = 30 * (2 ** (_sw_attempt - 1))
                                 bt.logging.warning(f"set_weights attempt {_sw_attempt}/3 failed: {_sw_err} — retrying in {_sw_delay}s")
                                 time.sleep(_sw_delay)
-                self._executor.submit(_set_weights_with_retry)
+                self._control_executor.submit(_set_weights_with_retry)
 
         _wd_elapsed = time.monotonic() - _wd_t0
         if _wd_elapsed > 12.0:
@@ -750,6 +756,8 @@ class ValidatorNeuron:
     def _start_new_epoch(self, epoch_start_block: int):
         """Start a new epoch — non-blocking; heavy setup runs on executor."""
         epoch_number = epoch_start_block // self.config.epoch_blocks
+        if epoch_number != self._current_epoch:
+            self._reset_canary_executor()
         self._current_epoch = epoch_number
         self._epoch_start_block = epoch_start_block
 
@@ -777,7 +785,19 @@ class ValidatorNeuron:
             finally:
                 self._epoch_setup_in_progress = False
 
-        self._executor.submit(_setup_and_clear_flag)
+        self._control_executor.submit(_setup_and_clear_flag)
+
+    def _reset_canary_executor(self):
+        """Cancel queued canaries from prior epochs and create a fresh pool."""
+        old_executor = self._executor
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.config.max_concurrent_verifications,
+        )
+        old_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _canary_epoch_active(self, epoch_number: int) -> bool:
+        """Return True while a canary still belongs to the active epoch."""
+        return self._running and epoch_number == self._current_epoch
 
     def _do_epoch_setup(self, epoch_start_block: int, epoch_number: int):
         """Heavy epoch setup — runs on a background executor thread."""
@@ -863,7 +883,7 @@ class ValidatorNeuron:
         # plus a 5s grace.  At 500 entries and 32 workers = ~16 batches ~16s + 5s = 21s.
         alive_miners = []
         tcp_futures = {
-            self._executor.submit(_tcp_alive, m.endpoint): m
+            self._control_executor.submit(_tcp_alive, m.endpoint): m
             for m in self._epoch_miners
         }
         prefilter_dead = 0
@@ -919,7 +939,7 @@ class ValidatorNeuron:
         verified_miners = []
         id_futures = {}
         for miner in self._epoch_miners:
-            future = self._executor.submit(self._verify_miner_identity, miner)
+            future = self._control_executor.submit(self._verify_miner_identity, miner)
             id_futures[future] = miner
 
         # Overall deadline: scales with miner count / pool workers, but capped
@@ -942,7 +962,7 @@ class ValidatorNeuron:
                         # Dispatch chain call to executor — wait_for_transaction_receipt
                         # blocks up to 360s per call (3×120s retries) and would stall the
                         # main loop while we wait.  Background task logs its own outcome.
-                        self._executor.submit(self._report_offline, miner)
+                        self._control_executor.submit(self._report_offline, miner)
                         continue
                     if result is None and self.config.identity_challenge_required:
                         bt.logging.info(f"Identity UNSUPPORTED for {miner.address[:10]} at {miner.endpoint} — excluding (required mode)")
@@ -978,7 +998,7 @@ class ValidatorNeuron:
         # ── Fetch hardware metadata from miner /health (best-effort) ──
         hw_futures = {}
         for miner in self._epoch_miners:
-            future = self._executor.submit(self._fetch_miner_hardware, miner)
+            future = self._control_executor.submit(self._fetch_miner_hardware, miner)
             hw_futures[future] = miner
         hardware_failed = []
         try:
@@ -1015,7 +1035,7 @@ class ValidatorNeuron:
                     gpu_uuids=getattr(miner, "gpu_uuids", []),
                 )
                 self._db.save_score(miner.address, miner.model_index, 0.0, 0, 0)
-                self._executor.submit(self._report_offline, miner)
+                self._control_executor.submit(self._report_offline, miner)
             self._epoch_miners = [m for m in self._epoch_miners if id(m) not in failed_ids]
             bt.logging.info(
                 f"Hardware health: {len(self._epoch_miners)}/{len(self._epoch_miners) + len(hardware_failed)} "
@@ -1135,11 +1155,6 @@ class ValidatorNeuron:
         )
         tests = self._canary_scheduler.plan_epoch(self._epoch_miners)
 
-        # Count expected receipts per (miner, model_index)
-        for test in tests:
-            key = (test.miner_address, test.model_index)
-            self._expected_receipts[key] = self._expected_receipts.get(key, 0) + 1
-
         elapsed = time.monotonic() - t0
         _unique_miners = len({m.address for m in self._epoch_miners})
         _unique_endpoints = len(self._epoch_miners)
@@ -1208,9 +1223,27 @@ class ValidatorNeuron:
             _httpx.ConnectTimeout,
         )
 
+        if not self._canary_epoch_active(epoch_number):
+            bt.logging.debug(
+                f"Skipping stale canary for {test.miner_address[:10]} "
+                f"model_index={test.model_index}: test_epoch={epoch_number}, "
+                f"current_epoch={self._current_epoch}"
+            )
+            return
+
+        key = (test.miner_address, test.model_index)
+        self._expected_receipts[key] = self._expected_receipts.get(key, 0) + 1
+
         max_retries = 3
         last_exc = None
         for attempt in range(max_retries + 1):
+            if not self._canary_epoch_active(epoch_number):
+                bt.logging.debug(
+                    f"Aborting stale canary retry for {test.miner_address[:10]} "
+                    f"model_index={test.model_index}: test_epoch={epoch_number}, "
+                    f"current_epoch={self._current_epoch}"
+                )
+                return
             try:
                 return self._execute_canary_test_once(
                     test, epoch_number, _transport_retry_allowed=True,
@@ -1244,8 +1277,9 @@ class ValidatorNeuron:
 
         # All retries exhausted on 503 — handle as busy skip
         if last_exc is not None:
+            if not self._canary_epoch_active(epoch_number):
+                return
             bt.logging.info(f"Canary failed after {max_retries} retries (miner busy) for {test.miner_address[:10]} model={test.model_id}")
-            key = (test.miner_address, test.model_index)
             reject_ts = int(time.time())
             if key in self._expected_receipts and self._expected_receipts[key] > 0:
                 self._expected_receipts[key] -= 1
@@ -1282,6 +1316,14 @@ class ValidatorNeuron:
         verification_config = Config(block_size=256, spot_checks=25)
 
         try:
+            if not self._canary_epoch_active(epoch_number):
+                bt.logging.debug(
+                    f"Skipping stale canary before inference for {test.miner_address[:10]} "
+                    f"model_index={test.model_index}: test_epoch={epoch_number}, "
+                    f"current_epoch={self._current_epoch}"
+                )
+                return
+
             with ValidatorClient(
                 miner_url=test.miner_endpoint,
                 config=verification_config,
@@ -1320,6 +1362,14 @@ class ValidatorNeuron:
                     top_k=test.top_k,
                     top_p=test.top_p,
                 )
+
+                if not self._canary_epoch_active(epoch_number):
+                    bt.logging.debug(
+                        f"Dropping stale canary result for {test.miner_address[:10]} "
+                        f"model_index={test.model_index}: test_epoch={epoch_number}, "
+                        f"current_epoch={self._current_epoch}"
+                    )
+                    return
 
                 # Optional proof verification
                 proof_verified = False
@@ -1528,6 +1578,14 @@ class ValidatorNeuron:
                         bt.logging.info(f"TEE attestation verification failed for {test.miner_address[:10]}: {e}")
                         tee_attestation_verified = False
 
+                if not self._canary_epoch_active(epoch_number):
+                    bt.logging.debug(
+                        f"Not pushing stale canary receipt for {test.miner_address[:10]} "
+                        f"model_index={test.model_index}: test_epoch={epoch_number}, "
+                        f"current_epoch={self._current_epoch}"
+                    )
+                    return
+
                 # Extract metrics from timing
                 ttft_ms = timing.get("ttft_ms", 0.0)
                 output_tokens = timing.get("output_tokens", 0)
@@ -1608,6 +1666,13 @@ class ValidatorNeuron:
                     bt.logging.debug(f"Failed to log canary result: {_db_err}")
 
         except Exception as e:
+            if not self._canary_epoch_active(epoch_number):
+                bt.logging.debug(
+                    f"Ignoring stale canary error for {test.miner_address[:10]} "
+                    f"model_index={test.model_index}: test_epoch={epoch_number}, "
+                    f"current_epoch={self._current_epoch}: {e}"
+                )
+                return
             # HTTP 503 (miner busy) is handled by the retry wrapper in
             # _execute_canary_test — if we get here it's a real error
             # (connection refused, timeout, non-503 HTTP error, etc.).
@@ -2221,8 +2286,8 @@ class ValidatorNeuron:
             # Tolerate ≤3 transient errors (network glitches, timeouts).
             # Mirror the 503 busy-skip forgiveness — if organic traffic was
             # flowing during the canary failures, the miner was genuinely busy
-            # (full-context canaries with 167k-token prompts can take >300s on
-            # an overloaded GPU and trip the validator-side httpx timeout).
+            # (full-context canaries can still trip validator-side timeouts on
+            # overloaded GPUs).
             canary_errors = self._canary_errors.get(key, 0)
             if canary_errors > 3 and not had_proof_failure:
                 error_times = self._canary_error_times.get(key, [])
@@ -2319,7 +2384,7 @@ class ValidatorNeuron:
             if self._db.should_escalate(miner.address, miner.model_index, epoch_number):
                 bt.logging.info(f"Probation ESCALATION for {miner.address[:10]} model_index={miner.model_index} -> reportOffline")
                 # Background dispatch — chain wait must not block epoch close
-                self._executor.submit(self._report_offline, miner)
+                self._control_executor.submit(self._report_offline, miner)
 
         # ── Zero undiscovered miners ───────────────────────────────
         # If a miner's lease expired or it wasn't discovered this epoch,
@@ -2913,7 +2978,7 @@ class ValidatorNeuron:
         if self._subnet_config_client is None or not addresses:
             return
         _bl_futures = {
-            self._executor.submit(
+            self._control_executor.submit(
                 self._subnet_config_client.is_miner_blacklisted, addr
             ): addr
             for addr in addresses
@@ -3374,6 +3439,7 @@ class ValidatorNeuron:
     def shutdown(self):
         self._running = False
         self._executor.shutdown(wait=False)
+        self._control_executor.shutdown(wait=False)
 
 
 def parse_args():
@@ -3522,7 +3588,7 @@ def main():
         neuron._enrich_miners_from_metagraph(neuron._epoch_miners)
         # Fetch hardware metadata from miners at startup (best-effort)
         from concurrent.futures import as_completed as _as_completed
-        _hw_futs = {neuron._executor.submit(neuron._fetch_miner_hardware, m): m for m in neuron._epoch_miners}
+        _hw_futs = {neuron._control_executor.submit(neuron._fetch_miner_hardware, m): m for m in neuron._epoch_miners}
         for f in _as_completed(_hw_futs, timeout=10):
             try:
                 f.result()

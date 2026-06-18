@@ -67,8 +67,9 @@ _CANARY_TOPICS = [
     "knowledge distillation",
 ]
 
-# Historical full-context threshold used by validator scoring to identify
-# full-context receipts. Prompt generation below remains uncapped.
+# Cap on full-context canary prompt size. Larger prompts can trigger long
+# prefill stalls on miners and make validator-side canary accounting spill
+# across epoch boundaries.
 FULL_CONTEXT_TOKEN_CAP = 32768
 
 
@@ -400,7 +401,7 @@ def generate_full_context_canary_prompt(
         + validator_seed
     ).digest()
 
-    fill_tokens = int(max_context_len * 0.8)
+    fill_tokens = int(min(max_context_len * 0.8, FULL_CONTEXT_TOKEN_CAP))
     target_chars = fill_tokens * 4  # ~4 chars per token (conservative)
 
     # Build a long prompt from SHARED_PROMPTS + context
