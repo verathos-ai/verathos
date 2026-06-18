@@ -35,6 +35,14 @@ DEFAULT_DB_PATH = os.path.join(
 _SCHEMA_VERSION = "1"
 
 
+def _coerce_nonnegative_int(value: object) -> int:
+    """Return a DB-safe non-negative integer for optional miner metadata."""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class ValidatorStateDB:
     """SQLite-backed validator state with thread-safe writes.
 
@@ -313,6 +321,11 @@ class ValidatorStateDB:
         address = address.lower()
         now = time.time()
         model_switched = False
+        tee_platform = tee_platform or ""
+        gpu_name = gpu_name or ""
+        gpu_count = _coerce_nonnegative_int(gpu_count)
+        vram_gb = _coerce_nonnegative_int(vram_gb)
+        compute_capability = compute_capability or ""
         _gpu_uuids_json = json.dumps(gpu_uuids or [])
 
         with self._lock:

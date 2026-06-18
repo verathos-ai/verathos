@@ -79,6 +79,53 @@ from verallm.registry import get_model, MODELS_BY_ID
 
 logger = logging.getLogger(__name__)
 
+
+def _coerce_nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_health_hardware(hw: object) -> tuple[bool, dict[str, object]]:
+    """Validate and normalize optional miner /health hardware metadata."""
+    defaults: dict[str, object] = {
+        "gpu_name": "",
+        "gpu_count": 0,
+        "vram_gb": 0,
+        "compute_capability": "",
+        "gpu_uuids": [],
+    }
+    if hw is None:
+        return True, defaults
+    if not isinstance(hw, dict):
+        return False, defaults
+
+    gpu_count = _coerce_nonnegative_int(hw.get("gpu_count"))
+    vram_gb = _coerce_nonnegative_int(hw.get("vram_gb"))
+    gpu_uuids = hw.get("gpu_uuids") or []
+    if not isinstance(gpu_uuids, list):
+        gpu_uuids = []
+
+    normalized: dict[str, object] = {
+        "gpu_name": hw.get("gpu_name") or "",
+        "gpu_count": gpu_count,
+        "vram_gb": vram_gb,
+        "compute_capability": hw.get("compute_capability") or "",
+        "gpu_uuids": gpu_uuids,
+    }
+    claims_gpu = bool(
+        normalized["gpu_name"]
+        or normalized["compute_capability"]
+        or normalized["gpu_uuids"]
+        or gpu_count > 0
+        or vram_gb > 0
+    )
+    if claims_gpu and (gpu_count <= 0 or vram_gb <= 0):
+        return False, normalized
+    return True, normalized
+
+
 # ---------------------------------------------------------------------------
 # Tokenizer cache for input commitment verification
 # ---------------------------------------------------------------------------
@@ -933,16 +980,51 @@ class ValidatorNeuron:
         for miner in self._epoch_miners:
             future = self._executor.submit(self._fetch_miner_hardware, miner)
             hw_futures[future] = miner
+        hardware_failed = []
         try:
             for future in as_completed(hw_futures, timeout=10):
+                miner = hw_futures[future]
                 try:
-                    future.result()
+                    if future.result() is False:
+                        hardware_failed.append(miner)
                 except Exception:
                     pass  # Non-fatal — hardware metadata is optional
         except _FuturesTimeout:
             for f in hw_futures:
                 if not f.done():
                     f.cancel()
+
+        if hardware_failed:
+            failed_ids = {id(m) for m in hardware_failed}
+            for miner in hardware_failed:
+                bt.logging.info(
+                    f"Hardware health FAILED for {miner.address[:10]} idx={miner.model_index} "
+                    f"at {miner.endpoint}: gpu_count={miner.gpu_count}, vram_gb={miner.vram_gb} — excluding from epoch"
+                )
+                self._db.upsert_entry(
+                    address=miner.address, model_index=miner.model_index,
+                    model_id=miner.model_id, endpoint=miner.endpoint,
+                    quant=miner.quant, max_context_len=miner.max_context_len,
+                    epoch=epoch_number,
+                    hotkey_ss58=getattr(miner, "hotkey_ss58", ""),
+                    coldkey_ss58=getattr(miner, "coldkey_ss58", ""),
+                    gpu_name=getattr(miner, "gpu_name", ""),
+                    gpu_count=getattr(miner, "gpu_count", 0),
+                    vram_gb=getattr(miner, "vram_gb", 0),
+                    compute_capability=getattr(miner, "compute_capability", ""),
+                    gpu_uuids=getattr(miner, "gpu_uuids", []),
+                )
+                self._db.save_score(miner.address, miner.model_index, 0.0, 0, 0)
+                self._executor.submit(self._report_offline, miner)
+            self._epoch_miners = [m for m in self._epoch_miners if id(m) not in failed_ids]
+            bt.logging.info(
+                f"Hardware health: {len(self._epoch_miners)}/{len(self._epoch_miners) + len(hardware_failed)} "
+                f"miners passed, {len(hardware_failed)} excluded"
+            )
+
+        if not self._epoch_miners:
+            self._canary_scheduler = None
+            return
 
         # Persist discovered miners to DB
         for miner in self._epoch_miners:
@@ -2776,7 +2858,7 @@ class ValidatorNeuron:
         bt.logging.info(f"Identity mismatch for {miner.endpoint}: expected {miner.address[:10]}, recovered {recovered[:10]}")
         return False
 
-    def _fetch_miner_hardware(self, miner: ActiveMiner) -> None:
+    def _fetch_miner_hardware(self, miner: ActiveMiner) -> bool:
         """Fetch hardware metadata from a miner's /health endpoint (best-effort).
 
         Populates gpu_name, gpu_count, vram_gb, compute_capability on the
@@ -2789,17 +2871,19 @@ class ValidatorNeuron:
                 timeout=5.0, verify=False,
             )
             if resp.status_code != 200:
-                return
-            hw = resp.json().get("hardware")
-            if not hw:
-                return
-            miner.gpu_name = hw.get("gpu_name", "")
-            miner.gpu_count = hw.get("gpu_count", 0)
-            miner.vram_gb = hw.get("vram_gb", 0)
-            miner.compute_capability = hw.get("compute_capability", "")
-            miner.gpu_uuids = hw.get("gpu_uuids", [])
+                return True
+            data = resp.json()
+            if "hardware" not in data:
+                return True
+            valid, hw = _normalize_health_hardware(data.get("hardware"))
+            miner.gpu_name = hw["gpu_name"]
+            miner.gpu_count = hw["gpu_count"]
+            miner.vram_gb = hw["vram_gb"]
+            miner.compute_capability = hw["compute_capability"]
+            miner.gpu_uuids = hw["gpu_uuids"]
+            return valid
         except Exception:
-            pass  # Non-fatal
+            return True  # Non-fatal
 
     # ------------------------------------------------------------------
     # Discovery + resolution
