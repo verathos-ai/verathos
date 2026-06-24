@@ -2,10 +2,15 @@
 
 Weight composition:
 
-    WEIGHT(uid) = normalize( AGGREGATE )
+    WEIGHT(uid) = logical_model_share × normalize_within_logical_model(ENTRY_EMA)
 
-    AGGREGATE   = Σ entry_ema(model_index)
-                  Additive: more entries with good scores = more weight.
+    LOGICAL_MODEL_SHARE = normalize(max(BASE_UTILITY × DEMAND_BONUS))
+                  across approved logical models.
+
+    Approved quantized variants are eligible inside their logical model's
+    shared bucket, but they do not receive reserved sub-buckets. Empty logical
+    model buckets are left unallocated so the validator can burn that share
+    instead of redistributing it to crowded models.
 
     ENTRY_EMA   = exponential moving average of epoch_scores:
                   - No receipts at all          → None (neutral, keep EMA)
@@ -153,6 +158,23 @@ class PeerMedians:
 
     median_ttft_ms: float  # median TTFT across all miners serving this model
     median_tps: float  # median decode speed across all miners serving this model
+
+
+def compute_model_base_utility(
+    active_params_b: float,
+    max_context_len: int,
+    quant: str,
+    moe_dense_equivalent: float = 0.0,
+    generation_quality: float = 1.0,
+) -> float:
+    """Compute the model-level utility used by scoring and model buckets."""
+    quality_params = (
+        moe_dense_equivalent if moe_dense_equivalent > 0 else active_params_b
+    )
+    utility = math.log2(max(quality_params, 1.0)) ** 1.8
+    ctx_value = math.log2(max(max_context_len / 1024, 1))
+    quant_q = QUANT_QUALITY.get(quant, 0.80)
+    return utility * ctx_value * quant_q * generation_quality
 
 
 def compute_ttft_factor(
@@ -354,14 +376,13 @@ def compute_epoch_entry_score(
         median_ttft = 0
 
     # UTILITY (unchanged formula)
-    quality_params = (
-        moe_dense_equivalent if moe_dense_equivalent > 0 else active_params_b
+    base_utility = compute_model_base_utility(
+        active_params_b=active_params_b,
+        max_context_len=outcome.max_context_len,
+        quant=outcome.quant,
+        moe_dense_equivalent=moe_dense_equivalent,
+        generation_quality=generation_quality,
     )
-    utility = math.log2(max(quality_params, 1.0)) ** 1.8
-    ctx_value = math.log2(max(outcome.max_context_len / 1024, 1))
-    quant_q = QUANT_QUALITY.get(outcome.quant, 0.80)
-    gen_q = generation_quality
-    base_utility = utility * ctx_value * quant_q * gen_q
 
     # THROUGHPUT_SCORE (total tokens served, squared — sybil defense)
     # N sybil UIDs splitting fixed demand: each gets 1/N tokens,
@@ -655,6 +676,12 @@ class CompositeScorer:
             )
 
         entry = state.entries[model_index]
+        if entry.model_id != outcome.model_id:
+            entry.model_id = outcome.model_id
+            entry.ema_score = 0.0
+            entry.total_epochs = 0
+            entry.scored_epochs = 0
+
         epoch_score = compute_epoch_entry_score(
             outcome,
             active_params_b=active_params_b,
@@ -706,6 +733,87 @@ class CompositeScorer:
         if total <= 0:
             return {uid: 0.0 for uid in raw}
         return {uid: s / total for uid, s in raw.items()}
+
+    def get_model_bucket_weights(
+        self,
+        model_budgets: Dict[str, float],
+        model_groups: Optional[Dict[str, str]] = None,
+        group_budgets: Optional[Dict[str, float]] = None,
+    ) -> Tuple[Dict[int, float], float]:
+        """Get UID weights with approved logical-model buckets.
+
+        ``model_budgets`` is a raw, positive budget per approved model. The
+        method normalizes logical-model groups, then distributes each group
+        among UIDs with positive EMA for any approved variant in that group.
+        Approved quantized variants are eligible but do not get reserved
+        sub-buckets. If a logical group has no positive-scoring endpoints,
+        its share is returned as ``unallocated`` so the validator can burn it.
+        """
+        weights: Dict[int, float] = {uid: 0.0 for uid in self.states}
+        budgets = {
+            model_id: float(value)
+            for model_id, value in model_budgets.items()
+            if value > 0
+        }
+        if not budgets:
+            return weights, 0.0
+        groups = model_groups or {}
+
+        if group_budgets is None:
+            logical_budgets: Dict[str, float] = {}
+            for model_id, budget in budgets.items():
+                group_id = groups.get(model_id) or model_id
+                logical_budgets[group_id] = max(
+                    logical_budgets.get(group_id, 0.0),
+                    budget,
+                )
+        else:
+            logical_budgets = {
+                group_id: float(value)
+                for group_id, value in group_budgets.items()
+                if value > 0
+            }
+
+        logical_total = sum(logical_budgets.values())
+        if logical_total <= 0:
+            return weights, 0.0
+
+        approved_groups: Dict[str, Set[str]] = {}
+        for model_id, budget in budgets.items():
+            group_id = groups.get(model_id) or model_id
+            if group_id not in logical_budgets:
+                continue
+            approved_groups.setdefault(group_id, set()).add(model_id)
+
+        entries_by_group: Dict[str, List[Tuple[int, float]]] = {}
+        for uid, state in self.states.items():
+            for entry in state.entries.values():
+                if entry.model_id not in budgets:
+                    continue
+                group_id = groups.get(entry.model_id) or entry.model_id
+                if entry.model_id not in approved_groups.get(group_id, set()):
+                    continue
+                score = entry.ema_score
+                if score < 1e-6:
+                    score = 0.0
+                if score <= 0:
+                    continue
+                entries_by_group.setdefault(group_id, []).append((uid, score))
+
+        unallocated = 0.0
+        for group_id, logical_budget in logical_budgets.items():
+            logical_share = logical_budget / logical_total
+            entries = entries_by_group.get(group_id, [])
+            group_score_total = sum(score for _uid, score in entries)
+            if group_score_total <= 0:
+                unallocated += logical_share
+                continue
+            for uid, score in entries:
+                weights[uid] = weights.get(uid, 0.0) + (
+                    logical_share * score / group_score_total
+                )
+
+        return weights, min(max(unallocated, 0.0), 1.0)
 
     def halve_ema(self, address: str, model_index: int) -> None:
         """Halve the EMA score for a miner-model entry on proof failure.

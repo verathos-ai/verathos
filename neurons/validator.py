@@ -64,6 +64,7 @@ from neurons.scoring import (
     MinerScoreState,
     ProbationTracker,
     compute_demand_bonus,
+    compute_model_base_utility,
     compute_model_demand,
     compute_peer_medians,
 )
@@ -340,6 +341,10 @@ class ValidatorNeuron:
         self._blacklisted_addresses: set = set()  # lowercase EVM addrs
         self._burn_uid: int = 0
         self._scoring = ScoringParams()
+        self._last_model_emission_budgets: Dict[str, float] = {}
+        self._last_model_emission_groups: Dict[str, str] = {}
+        self._last_model_group_budgets: Dict[str, float] = {}
+        self._last_model_bucket_burn: float = 0.0
         self._bt_module = None
         self.__subtensor = None
 
@@ -711,24 +716,68 @@ class ValidatorNeuron:
 
         # 4. Weight-setting boundary
         if block_number % self.config.set_weights_epoch_blocks == 0:
-            weights = self.scorer.get_weights()
-            if weights:
-                # Zero out blacklisted miners before weight normalization
-                if self._blacklisted_uids:
-                    for uid in self._blacklisted_uids:
-                        if uid in weights:
-                            weights[uid] = 0.0
-                    # Re-normalize after zeroing
-                    total = sum(weights.values())
-                    if total > 0:
-                        weights = {uid: s / total for uid, s in weights.items()}
-                # Apply emission burn: redirect a fraction of weight to burn UID
-                emission_burn = self._scoring.emission_burn
-                if emission_burn > 0:
-                    for uid in list(weights.keys()):
-                        weights[uid] *= (1.0 - emission_burn)
-                    weights[self._burn_uid] = weights.get(self._burn_uid, 0.0) + emission_burn
-                    bt.logging.info(f"Emission burn: {emission_burn:.0%} to UID {self._burn_uid}")
+            model_budgets = getattr(self, "_last_model_emission_budgets", {})
+            model_bucket_mode = bool(model_budgets)
+            model_unallocated = 0.0
+            if model_bucket_mode:
+                weights, model_unallocated = self.scorer.get_model_bucket_weights(
+                    model_budgets,
+                    model_groups=getattr(self, "_last_model_emission_groups", {}),
+                    group_budgets=getattr(self, "_last_model_group_budgets", {}),
+                )
+            else:
+                weights = self.scorer.get_weights()
+
+            if weights or (model_bucket_mode and model_unallocated > 0):
+                emission_burn = max(0.0, min(1.0, self._scoring.emission_burn))
+                if model_bucket_mode:
+                    # In bucket mode, blacklisted and unserved model shares are
+                    # burned. Renormalizing them would leak that budget back to
+                    # already-served models.
+                    if self._blacklisted_uids:
+                        for uid in self._blacklisted_uids:
+                            removed = weights.get(uid, 0.0)
+                            if removed > 0:
+                                model_unallocated += removed
+                                weights[uid] = 0.0
+
+                    miner_share = sum(weights.values())
+                    model_unallocated = min(
+                        1.0,
+                        max(model_unallocated, 1.0 - miner_share),
+                    )
+                    miner_scale = 1.0 - emission_burn
+                    if miner_scale < 1.0:
+                        for uid in list(weights.keys()):
+                            weights[uid] *= miner_scale
+                    burn_weight = emission_burn + miner_scale * model_unallocated
+                    if burn_weight > 0:
+                        weights[self._burn_uid] = (
+                            weights.get(self._burn_uid, 0.0) + burn_weight
+                        )
+                    self._last_model_bucket_burn = burn_weight
+                    if burn_weight > 0:
+                        bt.logging.info(
+                            f"Emission burn: {emission_burn:.0%} global + "
+                            f"{model_unallocated:.1%} unallocated model buckets "
+                            f"to UID {self._burn_uid}"
+                        )
+                else:
+                    # Zero out blacklisted miners before weight normalization
+                    if self._blacklisted_uids:
+                        for uid in self._blacklisted_uids:
+                            if uid in weights:
+                                weights[uid] = 0.0
+                        # Re-normalize after zeroing
+                        total = sum(weights.values())
+                        if total > 0:
+                            weights = {uid: s / total for uid, s in weights.items()}
+                    # Apply emission burn: redirect a fraction of weight to burn UID
+                    if emission_burn > 0:
+                        for uid in list(weights.keys()):
+                            weights[uid] *= (1.0 - emission_burn)
+                        weights[self._burn_uid] = weights.get(self._burn_uid, 0.0) + emission_burn
+                        bt.logging.info(f"Emission burn: {emission_burn:.0%} to UID {self._burn_uid}")
                 # Run set_weights + retries on executor so this callback returns fast.
                 def _set_weights_with_retry(_w=dict(weights)):
                     for _sw_attempt in range(1, 4):
@@ -2037,6 +2086,10 @@ class ValidatorNeuron:
         self.scorer.ema_alpha = self._scoring.ema_alpha
         self.scorer.throughput_power = self._scoring.throughput_power
 
+        self._last_model_emission_budgets = self._build_model_emission_budgets(
+            demand_scores,
+        )
+
         # Refresh blacklist from SubnetConfig (parallel RPC per address, cached 5min).
         self._refresh_blacklist({m.address for m in self._epoch_miners})
 
@@ -3009,6 +3062,166 @@ class ValidatorNeuron:
 
         # Fallback: use local registry
         return list(MODELS_BY_ID.keys())
+
+    def _get_model_bucket_ids(self) -> List[str]:
+        """Get approved model IDs for emission buckets.
+
+        Bucket burn is based on on-chain approval. If the registry read fails,
+        fall back to currently served known models only; using the full local
+        catalogue would burn against models that may not be approved on chain.
+        """
+        if self._model_client is not None:
+            try:
+                return self._model_client.get_model_list()
+            except Exception as e:
+                bt.logging.warning(
+                    f"Failed to read ModelRegistry for emission buckets: {e}"
+                )
+        served = {
+            m.model_id
+            for m in getattr(self, "_epoch_miners", [])
+            if get_model(m.model_id) is not None
+        }
+        if served:
+            bt.logging.info(
+                "Model emission buckets: using served-model fallback "
+                "(ModelRegistry unavailable)"
+            )
+        return sorted(served)
+
+    def _best_registry_model_runtime(self, model_entry) -> Tuple[int, str]:
+        """Return the registry quant/context pair with highest bucket utility."""
+        best_score = 0.0
+        best_ctx = 0
+        best_quant = ""
+        for tier_config in getattr(model_entry, "tier_configs", ()):
+            for quant_option in getattr(tier_config, "quant_configs", ()):
+                ctx = int(
+                    getattr(quant_option, "max_model_len", 0)
+                    or getattr(model_entry, "native_context_len", 0)
+                    or 0
+                )
+                quant = getattr(quant_option, "quant", "") or ""
+                if ctx <= 0 or not quant:
+                    continue
+                score = compute_model_base_utility(
+                    active_params_b=model_entry.active_params_b,
+                    max_context_len=ctx,
+                    quant=quant,
+                    moe_dense_equivalent=model_entry.moe_dense_equivalent,
+                    generation_quality=model_entry.generation_quality,
+                )
+                if score > best_score:
+                    best_score = score
+                    best_ctx = ctx
+                    best_quant = quant
+        return best_ctx, best_quant
+
+    def _observed_model_runtimes(self) -> Dict[str, Tuple[int, str]]:
+        """Return best observed quant/context pair per model this epoch."""
+        observed: Dict[str, Tuple[int, str]] = {}
+        observed_score: Dict[str, float] = {}
+        for miner in getattr(self, "_epoch_miners", []):
+            model_entry = get_model(miner.model_id)
+            if model_entry is None:
+                continue
+            ctx = int(getattr(miner, "max_context_len", 0) or 0)
+            quant = getattr(miner, "quant", "") or ""
+            if ctx <= 0 or not quant:
+                continue
+            score = compute_model_base_utility(
+                active_params_b=model_entry.active_params_b,
+                max_context_len=ctx,
+                quant=quant,
+                moe_dense_equivalent=model_entry.moe_dense_equivalent,
+                generation_quality=model_entry.generation_quality,
+            )
+            if score > observed_score.get(miner.model_id, 0.0):
+                observed_score[miner.model_id] = score
+                observed[miner.model_id] = (ctx, quant)
+        return observed
+
+    def _model_emission_group(self, model_entry) -> str:
+        """Return logical model bucket key for a registry entry."""
+        return (
+            getattr(model_entry, "base_model", "")
+            or getattr(model_entry, "id", "")
+        )
+
+    def _build_model_emission_budgets(
+        self,
+        demand_scores: Dict[str, int],
+    ) -> Dict[str, float]:
+        """Build raw model-level emission budgets for approved models."""
+        model_ids = self._get_model_bucket_ids()
+        observed = self._observed_model_runtimes()
+        budgets: Dict[str, float] = {}
+        groups: Dict[str, str] = {}
+        group_budgets: Dict[str, float] = {}
+        skipped_unknown = 0
+
+        for model_id in model_ids:
+            model_entry = get_model(model_id)
+            if model_entry is None:
+                skipped_unknown += 1
+                continue
+
+            ctx, quant = observed.get(model_id, (0, ""))
+            if ctx <= 0 or not quant:
+                ctx, quant = self._best_registry_model_runtime(model_entry)
+            if ctx <= 0 or not quant:
+                continue
+
+            base_utility = compute_model_base_utility(
+                active_params_b=model_entry.active_params_b,
+                max_context_len=ctx,
+                quant=quant,
+                moe_dense_equivalent=model_entry.moe_dense_equivalent,
+                generation_quality=model_entry.generation_quality,
+            )
+            if base_utility <= 0:
+                continue
+
+            demand_bonus = 1.0
+            if self.config.demand_bonus_enabled:
+                demand_bonus = compute_demand_bonus(
+                    demand_scores.get(model_id, 0),
+                    self._scoring.demand_bonus_max,
+                )
+            variant_budget = base_utility * demand_bonus
+            budgets[model_id] = variant_budget
+            group_id = self._model_emission_group(model_entry) or model_id
+            groups[model_id] = group_id
+            group_budgets[group_id] = max(
+                group_budgets.get(group_id, 0.0),
+                variant_budget,
+            )
+
+        if skipped_unknown:
+            bt.logging.info(
+                f"Model emission buckets: skipped {skipped_unknown} approved "
+                "model(s) missing from local registry"
+            )
+        if budgets:
+            group_total = sum(group_budgets.values())
+            group_top = {
+                group_id: f"{value / group_total:.1%}"
+                for group_id, value in sorted(
+                    group_budgets.items(), key=lambda item: -item[1]
+                )[:5]
+            } if group_total > 0 else {}
+            variant_total = sum(budgets.values())
+            top = {
+                model_id: f"{value / variant_total:.1%}"
+                for model_id, value in sorted(
+                    budgets.items(), key=lambda item: -item[1]
+                )[:5]
+            } if variant_total > 0 else {}
+            bt.logging.info(f"Logical model emission bucket shares: {group_top}")
+            bt.logging.info(f"Approved variant budget weights: {top}")
+        self._last_model_emission_groups = groups
+        self._last_model_group_budgets = group_budgets
+        return budgets
 
     def _refresh_blacklist(self, addresses) -> None:
         """Populate ``self._blacklisted_uids`` from SubnetConfig for the given addresses.
