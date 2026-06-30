@@ -488,7 +488,8 @@ class ValidatorStateDB:
             cursor = self._conn.execute(
                 """SELECT address, model_index, model_id,
                           ema_score, total_epochs, scored_epochs
-                   FROM miner_entries"""
+                   FROM miner_entries
+                   WHERE is_active = 1"""
             )
             result: Dict[Tuple[str, int], dict] = {}
             for row in cursor.fetchall():

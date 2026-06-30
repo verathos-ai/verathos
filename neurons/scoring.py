@@ -667,6 +667,13 @@ class CompositeScorer:
             self.states[uid] = MinerScoreState(uid=uid, address=address)
 
         state = self.states[uid]
+        if state.address.lower() != address.lower():
+            bt.logging.info(
+                f"UID {uid} EVM address changed {state.address[:10]} -> "
+                f"{address[:10]}; resetting stale score state"
+            )
+            state = MinerScoreState(uid=uid, address=address)
+            self.states[uid] = state
 
         # Ensure entry exists
         if model_index not in state.entries:
