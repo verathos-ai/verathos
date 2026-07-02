@@ -6,8 +6,9 @@ Three independent version numbers control update behavior:
     On-chain weight gating.  Passed as ``version_key`` to
     ``subtensor.set_weights()``.  Must match the subnet's
     ``weights_version`` hyperparameter or the chain **rejects** the
-    extrinsic.  Bump on protocol-breaking changes that require all
-    participants to upgrade simultaneously.
+    extrinsic.  From now on this is derived as
+    ``max(miner_version, validator_version)`` so any role release can set
+    weights after the subnet owner updates the on-chain version key.
 
 ``miner_version``
     Miner-side code version.  The auto-updater on miners only restarts
@@ -20,8 +21,8 @@ Three independent version numbers control update behavior:
     higher.  Bump when validator, proxy, scoring, or canary code changes.
 
 This means a validator-only bug fix (bump ``validator_version``) does NOT
-force miners to restart (and vice versa).  A protocol change bumps
-``spec_version`` + both role versions to force everyone.
+force miners to restart (and vice versa).  The subnet ``weights_version`` must
+track ``spec_version``, which is always the higher role version.
 
 Encoding
 --------
@@ -38,12 +39,12 @@ Examples::
 
 Bump workflow
 -------------
-1. Edit the relevant ``VERSION_*`` constants below.
+1. Edit the relevant role version constants below.
 2. Commit and push.
 3. Miners/validators with ``--auto-update`` will pull and restart
    **only if their role's version increased**.
-4. If ``spec_version`` changed, the subnet owner must also update the
-   on-chain ``weights_version``::
+4. If either role version changed, the subnet owner must also update the
+   on-chain ``weights_version`` to the derived ``spec_version``::
 
        subtensor.sudo_set_weights_version_key(
            netuid=405, weights_version_key=spec_version,
@@ -63,18 +64,11 @@ def _version_str(major: int, minor: int, patch: int) -> str:
     return f"{major}.{minor}.{patch}"
 
 
-# ── Subnet protocol version (on-chain weight gating) ─────────────
-#
-# Bump on breaking protocol changes that REQUIRE all participants
-# (miners + validators) to upgrade at once.  The subnet owner must
-# then call sudo_set_weights_version_key() to match.
-
-SPEC_MAJOR = 0
-SPEC_MINOR = 1
-SPEC_PATCH = 0
-
-spec_version: int = _encode(SPEC_MAJOR, SPEC_MINOR, SPEC_PATCH)
-version_str: str = _version_str(SPEC_MAJOR, SPEC_MINOR, SPEC_PATCH)
+def _decode(version: int) -> tuple[int, int, int]:
+    major = version // (_VERSION_BASE * _VERSION_BASE)
+    minor = (version // _VERSION_BASE) % _VERSION_BASE
+    patch = version % _VERSION_BASE
+    return major, minor, patch
 
 
 # ── Miner version ────────────────────────────────────────────────
@@ -102,3 +96,14 @@ VALIDATOR_PATCH = 18
 
 validator_version: int = _encode(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)
 validator_version_str: str = _version_str(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)
+
+
+# ── Subnet protocol version (on-chain weight gating) ─────────────
+#
+# The subnet weight version tracks the highest role version.  This keeps
+# validator-only and miner-only releases compatible with Bittensor weight
+# gating without forcing the other role's auto-updater to restart.
+
+spec_version: int = max(miner_version, validator_version)
+SPEC_MAJOR, SPEC_MINOR, SPEC_PATCH = _decode(spec_version)
+version_str: str = _version_str(SPEC_MAJOR, SPEC_MINOR, SPEC_PATCH)

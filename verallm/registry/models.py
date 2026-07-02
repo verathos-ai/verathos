@@ -1948,6 +1948,7 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
         total_params_b=27.0, active_params_b=27.0,
         native_context_len=262144,
         generation_quality=1.10,  # MMLU-Pro 86.2, GPQA 87.8, SWE-Bench 77.2 — surpasses Qwen3.5-397B
+        verified_inference=True,
         family="qwen3.6", provider="Qwen",
         notes="Multimodal (text + image + video); GDN hybrid attention; "
               "flagship-level coding (SWE-Bench 77.2); successor to Qwen3.5-27B; "
@@ -2308,16 +2309,15 @@ def resolve_model_for_tier(
         available = ", ".join(sorted(MODELS_BY_ID))
         raise KeyError(f"Unknown model ID {model_id!r}. Available: {available}")
 
-    # Collect all configs that fit this tier (tier <= requested).
+    # Collect all configs that fit this tier (tier <= requested), then apply
+    # explicit checkpoint/quant narrowing before choosing the highest tier.
+    # This matters for models with a high-tier fp16 config and an inherited
+    # lower-tier quantized checkpoint: an explicit AWQ checkpoint on GB_80 must
+    # resolve to the AWQ config, not the unrelated GB_80 fp16 config.
     candidates: list[TierConfig] = []
-    best_tier_val = -1
     for tc in model.tier_configs:
         if tc.tier <= tier:
-            if tc.tier.value > best_tier_val:
-                best_tier_val = tc.tier.value
-                candidates = [tc]
-            elif tc.tier.value == best_tier_val:
-                candidates.append(tc)
+            candidates.append(tc)
 
     if not candidates:
         min_tier = min(tc.tier for tc in model.tier_configs)
@@ -2331,12 +2331,22 @@ def resolve_model_for_tier(
         filtered = [c for c in candidates if c.checkpoint.lower() == checkpoint.lower()]
         if filtered:
             candidates = filtered
-    if quant and len(candidates) > 1:
+        else:
+            raise ValueError(
+                f"Checkpoint {checkpoint!r} is not available for model "
+                f"{model_id!r} on tier {tier.name} or lower."
+            )
+    if quant:
         filtered = [c for c in candidates if any(qo.quant == quant for qo in c.quant_configs)]
         if filtered:
             candidates = filtered
+        else:
+            raise ValueError(
+                f"Quant {quant!r} is not available for model {model_id!r} "
+                f"on tier {tier.name} or lower."
+            )
 
-    best = candidates[0]
+    best = max(candidates, key=lambda c: c.tier.value)
     return TierMatch(model=model, config=best, native=(best.tier == tier))
 
 

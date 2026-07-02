@@ -23,7 +23,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from neurons.shared_state import MinerEntry, ValidatorSharedState
+from neurons.shared_state import AuditDrain, MinerEntry, ValidatorSharedState
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +235,127 @@ class ValidatorStateDB:
                 created_at          REAL NOT NULL,
                 PRIMARY KEY (epoch_number, miner_address, model_index)
             );
+
+            CREATE TABLE IF NOT EXISTS capacity_audit_windows (
+                audit_id             TEXT PRIMARY KEY,
+                epoch_number         INTEGER NOT NULL,
+                selection_block      INTEGER NOT NULL,
+                audit_block          INTEGER NOT NULL,
+                proof_challenge_block INTEGER NOT NULL DEFAULT 0,
+                selection_block_hash TEXT NOT NULL DEFAULT '',
+                audit_block_hash     TEXT NOT NULL DEFAULT '',
+                proof_challenge_block_hash TEXT NOT NULL DEFAULT '',
+                cohort_seed          TEXT NOT NULL DEFAULT '',
+                status               TEXT NOT NULL DEFAULT 'scheduled',
+                chain_status         TEXT NOT NULL DEFAULT 'pending',
+                audit_start_observed_at REAL,
+                proof_challenge_observed_at REAL,
+                selection_finalized_at REAL,
+                audit_finalized_at REAL,
+                proof_challenge_finalized_at REAL,
+                created_at           REAL NOT NULL,
+                updated_at           REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_capacity_audit_windows_epoch
+                ON capacity_audit_windows(epoch_number);
+
+            CREATE TABLE IF NOT EXISTS capacity_audit_slots (
+                audit_id             TEXT NOT NULL,
+                miner_address        TEXT NOT NULL,
+                model_index          INTEGER NOT NULL,
+                miner_uid            INTEGER,
+                endpoint             TEXT NOT NULL,
+                model_id             TEXT NOT NULL,
+                quant                TEXT NOT NULL DEFAULT '',
+                max_context_len      INTEGER NOT NULL DEFAULT 0,
+                gpu_name             TEXT NOT NULL DEFAULT '',
+                gpu_count            INTEGER NOT NULL DEFAULT 0,
+                vram_gb              INTEGER NOT NULL DEFAULT 0,
+                group_key            TEXT NOT NULL DEFAULT '',
+                slot_id              TEXT NOT NULL,
+                lease_id             TEXT NOT NULL,
+                claimed_gpu_class    TEXT NOT NULL DEFAULT '',
+                pass_count           INTEGER NOT NULL DEFAULT 0,
+                deadline_s           REAL NOT NULL DEFAULT 0.0,
+                transport_grace_s    REAL NOT NULL DEFAULT 0.0,
+                payload_deadline_s   REAL NOT NULL DEFAULT 0.0,
+                drain_until_ts       REAL NOT NULL DEFAULT 0.0,
+                pass0_received_at    REAL,
+                final_received_at    REAL,
+                proof_received_at    REAL,
+                pass0_root           TEXT NOT NULL DEFAULT '',
+                final_root           TEXT NOT NULL DEFAULT '',
+                transcript_root      TEXT NOT NULL DEFAULT '',
+                timing_status        TEXT NOT NULL DEFAULT 'pending',
+                proof_status         TEXT NOT NULL DEFAULT 'pending',
+                proof_verify_ms      REAL,
+                verdict              TEXT NOT NULL DEFAULT 'pending',
+                failure_reason       TEXT,
+                pass0_artifact       TEXT,
+                final_artifact       TEXT,
+                proof_artifact_path  TEXT,
+                created_at           REAL NOT NULL,
+                updated_at           REAL NOT NULL,
+                PRIMARY KEY (audit_id, miner_address, model_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_capacity_audit_slot
+                ON capacity_audit_slots(miner_address, model_index, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_capacity_audit_verdict
+                ON capacity_audit_slots(verdict, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_capacity_audit_drains
+                ON capacity_audit_slots(drain_until_ts, verdict);
         """)
         self._conn.commit()
+
+        self._ensure_column(
+            "capacity_audit_windows",
+            "audit_start_observed_at",
+            "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "proof_challenge_block",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "proof_challenge_block_hash",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "proof_challenge_observed_at",
+            "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "chain_status",
+            "TEXT NOT NULL DEFAULT 'pending'",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "selection_finalized_at",
+            "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "audit_finalized_at",
+            "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "proof_challenge_finalized_at",
+            "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_slots",
+            "proof_verify_ms",
+            "REAL",
+        )
 
         # One-time migration: prune historical duplicate rows then install
         # the unique index. Guard it with a DB marker and the actual index
@@ -427,6 +546,18 @@ class ValidatorStateDB:
         if count:
             bt.logging.info(f"Marked {count} entries inactive (not seen epoch {current_epoch})")
         return count
+
+    def mark_entry_inactive(self, address: str, model_index: int) -> bool:
+        """Mark a single miner-model entry inactive locally."""
+        address = address.lower()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE miner_entries SET is_active = 0, updated_at = ?
+                   WHERE address = ? AND model_index = ? AND is_active = 1""",
+                (time.time(), address, model_index),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
 
     def get_active_entries(self) -> List[dict]:
         """Return all active miner-model entries as dicts."""
@@ -813,6 +944,1021 @@ class ValidatorStateDB:
         )
         self._conn.commit()
 
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        """Add a column to an existing SQLite table if it is missing."""
+        existing = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column in existing:
+            return
+        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        self._conn.commit()
+
+    # ── Hot-capacity audit state ──────────────────────────────────────
+
+    def create_capacity_audit_window(
+        self,
+        *,
+        audit_id: str,
+        epoch_number: int,
+        selection_block: int,
+        audit_block: int,
+        selection_block_hash: str,
+        cohort_seed: str,
+        slots: List[dict],
+        proof_challenge_block: int = 0,
+    ) -> None:
+        """Insert one audit window and its selected endpoint slots."""
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO capacity_audit_windows (
+                    audit_id, epoch_number, selection_block, audit_block, proof_challenge_block,
+                    selection_block_hash, cohort_seed, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)""",
+                (
+                    audit_id,
+                    int(epoch_number),
+                    int(selection_block),
+                    int(audit_block),
+                    int(proof_challenge_block),
+                    selection_block_hash,
+                    cohort_seed,
+                    now,
+                    now,
+                ),
+            )
+            for slot in slots:
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO capacity_audit_slots (
+                        audit_id, miner_address, model_index, miner_uid, endpoint,
+                        model_id, quant, max_context_len, gpu_name, gpu_count,
+                        vram_gb, group_key, slot_id, lease_id, claimed_gpu_class,
+                        pass_count, deadline_s, transport_grace_s,
+                        payload_deadline_s, drain_until_ts, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        audit_id,
+                        str(slot["miner_address"]).lower(),
+                        int(slot["model_index"]),
+                        slot.get("miner_uid"),
+                        str(slot.get("endpoint", "")),
+                        str(slot.get("model_id", "")),
+                        str(slot.get("quant", "")),
+                        int(slot.get("max_context_len", 0) or 0),
+                        str(slot.get("gpu_name", "")),
+                        int(slot.get("gpu_count", 0) or 0),
+                        int(slot.get("vram_gb", 0) or 0),
+                        str(slot.get("group_key", "")),
+                        str(slot["slot_id"]),
+                        str(slot["lease_id"]),
+                        str(slot.get("claimed_gpu_class", "")),
+                        int(slot.get("pass_count", 0) or 0),
+                        float(slot.get("deadline_s", 0.0) or 0.0),
+                        float(slot.get("transport_grace_s", 0.0) or 0.0),
+                        float(slot.get("payload_deadline_s", 0.0) or 0.0),
+                        float(slot.get("drain_until_ts", 0.0) or 0.0),
+                        now,
+                        now,
+                    ),
+                )
+            self._conn.commit()
+
+    def set_capacity_audit_block_hash(
+        self,
+        audit_id: str,
+        audit_block_hash: str,
+        *,
+        observed_at: Optional[float] = None,
+    ) -> None:
+        ts = time.time() if observed_at is None else float(observed_at)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE capacity_audit_windows
+                   SET audit_block_hash = ?,
+                       audit_start_observed_at = ?,
+                       status = 'started',
+                       updated_at = ?
+                   WHERE audit_id = ?""",
+                (audit_block_hash, ts, ts, audit_id),
+            )
+            self._conn.commit()
+
+    def set_capacity_audit_proof_challenge_hash(
+        self,
+        audit_id: str,
+        proof_challenge_block_hash: str,
+        *,
+        observed_at: Optional[float] = None,
+    ) -> None:
+        ts = time.time() if observed_at is None else float(observed_at)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE capacity_audit_windows
+                   SET proof_challenge_block_hash = ?,
+                       proof_challenge_observed_at = ?,
+                       updated_at = ?
+                   WHERE audit_id = ?""",
+                (proof_challenge_block_hash, ts, ts, audit_id),
+            )
+            self._conn.commit()
+
+    def resolve_capacity_audit_pending_start(
+        self,
+        audit_id: str,
+        *,
+        observed_at: Optional[float] = None,
+    ) -> int:
+        """Resolve final receipts that arrived before B_start was observed.
+
+        Miners may observe the chain block and finish the proof before a polling
+        validator processes that same block. Such receipts are judged once the
+        validator records its B_start observation time.
+        """
+        ts = time.time() if observed_at is None else float(observed_at)
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET timing_status = 'pass',
+                       verdict = CASE
+                           WHEN verdict = 'hard_proof_miss' THEN verdict
+                           ELSE 'timing_pass'
+                       END,
+                       failure_reason = CASE
+                           WHEN verdict = 'hard_proof_miss' THEN failure_reason
+                           ELSE ''
+                       END,
+                       updated_at = ?
+                   WHERE audit_id = ?
+                     AND timing_status = 'pending_start'
+                     AND final_received_at IS NOT NULL
+                     AND final_received_at <= ? + deadline_s + transport_grace_s""",
+                (ts, audit_id, ts),
+            )
+            updated = cur.rowcount or 0
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET timing_status = 'miss',
+                       verdict = CASE
+                           WHEN verdict = 'hard_proof_miss' THEN verdict
+                           ELSE 'timing_miss'
+                       END,
+                       failure_reason = CASE
+                           WHEN verdict = 'hard_proof_miss' THEN failure_reason
+                           ELSE COALESCE(NULLIF(failure_reason, ''), 'deadline_exceeded')
+                       END,
+                       updated_at = ?
+                   WHERE audit_id = ?
+                     AND timing_status = 'pending_start'
+                     AND final_received_at IS NOT NULL
+                     AND final_received_at > ? + deadline_s + transport_grace_s""",
+                (ts, audit_id, ts),
+            )
+            updated += cur.rowcount or 0
+            self._conn.commit()
+        return updated
+
+    def get_capacity_audit_windows_for_start(self, audit_block: int) -> List[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM capacity_audit_windows
+                   WHERE audit_block <= ? AND status = 'scheduled'
+                   ORDER BY audit_block ASC, created_at ASC""",
+                (int(audit_block),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_capacity_audit_window_stale(
+        self,
+        audit_id: str,
+        *,
+        reason: str = "validator_start_missed",
+        released_at: Optional[float] = None,
+    ) -> int:
+        ts = time.time() if released_at is None else float(released_at)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE capacity_audit_windows
+                   SET status = 'stale',
+                       updated_at = ?
+                   WHERE audit_id = ?
+                     AND status = 'scheduled'""",
+                (ts, audit_id),
+            )
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET verdict = 'stale_window',
+                       timing_status = 'not_observed',
+                       failure_reason = ?,
+                       drain_until_ts = CASE
+                           WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
+                       END,
+                       updated_at = ?
+                   WHERE audit_id = ?
+                     AND verdict IN (
+                       'pending', 'pass0_seen', 'timing_pass',
+                       'timing_miss', 'no_show'
+                     )""",
+                (reason, ts, ts, ts, audit_id),
+            )
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    def get_capacity_audit_windows_for_proof_challenge(self, block_number: int) -> List[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM capacity_audit_windows
+                   WHERE proof_challenge_block > 0
+                     AND proof_challenge_block <= ?
+                     AND proof_challenge_block_hash = ''
+                   ORDER BY proof_challenge_block ASC, created_at ASC""",
+                (int(block_number),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_capacity_audit_windows_for_finalization(self, finalized_block: int) -> List[dict]:
+        """Return windows whose current-head block hashes can now be finalized."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT *
+                   FROM capacity_audit_windows
+                   WHERE chain_status != 'reorged'
+                     AND (
+                       (selection_finalized_at IS NULL AND selection_block <= ?)
+                       OR (audit_finalized_at IS NULL AND audit_block_hash != '' AND audit_block <= ?)
+                       OR (
+                         proof_challenge_block > 0
+                         AND proof_challenge_block_hash != ''
+                         AND proof_challenge_finalized_at IS NULL
+                         AND proof_challenge_block <= ?
+                       )
+                     )
+                   ORDER BY selection_block ASC, created_at ASC""",
+                (int(finalized_block), int(finalized_block), int(finalized_block)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_capacity_audit_finalization(
+        self,
+        audit_id: str,
+        *,
+        selection_confirmed: Optional[bool] = None,
+        audit_confirmed: Optional[bool] = None,
+        proof_confirmed: Optional[bool] = None,
+        observed_at: Optional[float] = None,
+    ) -> None:
+        """Record finalized-chain confirmation for current-head audit hashes."""
+        ts = time.time() if observed_at is None else float(observed_at)
+        checks = [v for v in (selection_confirmed, audit_confirmed, proof_confirmed) if v is not None]
+        with self._lock:
+            if any(v is False for v in checks):
+                self._conn.execute(
+                    """UPDATE capacity_audit_windows
+                       SET chain_status = 'reorged',
+                           updated_at = ?
+                       WHERE audit_id = ?""",
+                    (ts, audit_id),
+                )
+                self._conn.execute(
+                    """UPDATE capacity_audit_slots
+                       SET verdict = CASE
+                             WHEN verdict IN ('pending', 'pass0_seen', 'timing_pass', 'timing_miss', 'no_show', 'hard_proof_miss')
+                             THEN 'chain_reorged'
+                             ELSE verdict
+                           END,
+                           failure_reason = CASE
+                             WHEN verdict IN ('pending', 'pass0_seen', 'timing_pass', 'timing_miss', 'no_show', 'hard_proof_miss')
+                             THEN 'audit_block_reorged'
+                             ELSE failure_reason
+                           END,
+                           drain_until_ts = CASE
+                             WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
+                           END,
+                           updated_at = ?
+                       WHERE audit_id = ?""",
+                    (ts, ts, ts, audit_id),
+                )
+                self._conn.commit()
+                return
+
+            updates = ["updated_at = ?"]
+            params: list = [ts]
+            if selection_confirmed is True:
+                updates.append("selection_finalized_at = COALESCE(selection_finalized_at, ?)")
+                params.append(ts)
+            if audit_confirmed is True:
+                updates.append("audit_finalized_at = COALESCE(audit_finalized_at, ?)")
+                params.append(ts)
+            if proof_confirmed is True:
+                updates.append("proof_challenge_finalized_at = COALESCE(proof_challenge_finalized_at, ?)")
+                params.append(ts)
+            params.append(audit_id)
+            self._conn.execute(
+                f"""UPDATE capacity_audit_windows
+                    SET {', '.join(updates)}
+                    WHERE audit_id = ?""",
+                params,
+            )
+            row = self._conn.execute(
+                """SELECT selection_finalized_at, audit_finalized_at,
+                          proof_challenge_block, proof_challenge_block_hash,
+                          proof_challenge_finalized_at
+                   FROM capacity_audit_windows
+                   WHERE audit_id = ?""",
+                (audit_id,),
+            ).fetchone()
+            if row is not None:
+                proof_needed = (
+                    int(row["proof_challenge_block"] or 0) > 0
+                    and str(row["proof_challenge_block_hash"] or "") != ""
+                )
+                proof_ok = (not proof_needed) or row["proof_challenge_finalized_at"] is not None
+                if (
+                    row["selection_finalized_at"] is not None
+                    and row["audit_finalized_at"] is not None
+                    and proof_ok
+                ):
+                    self._conn.execute(
+                        """UPDATE capacity_audit_windows
+                           SET chain_status = 'confirmed',
+                               updated_at = ?
+                           WHERE audit_id = ? AND chain_status != 'reorged'""",
+                        (ts, audit_id),
+                    )
+            self._conn.commit()
+
+    def expire_capacity_audit_misses(
+        self,
+        now: Optional[float] = None,
+        *,
+        require_proof_payload: bool = False,
+        return_slots: bool = False,
+    ) -> int | List[dict]:
+        """Mark audit misses after validator deadlines.
+
+        The miner worker emits signed pass0/final timing roots plus a deferred
+        fixed-workspace proof payload. Missing payloads become hard proof misses
+        only when explicitly required by rollout config.
+        """
+        ts = time.time() if now is None else float(now)
+        expired_slots: List[dict] = []
+        with self._lock:
+            if return_slots:
+                rows = self._conn.execute(
+                    """SELECT s.audit_id, s.miner_address, s.model_index,
+                              s.endpoint, 'no_show' AS verdict,
+                              COALESCE(s.failure_reason, 'missing_final_receipt') AS failure_reason
+                       FROM capacity_audit_slots s
+                       JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                       WHERE s.verdict IN ('pending', 'pass0_seen')
+                         AND w.audit_start_observed_at IS NOT NULL
+                         AND ? > w.audit_start_observed_at + s.deadline_s + s.transport_grace_s""",
+                    (ts,),
+                ).fetchall()
+                expired_slots.extend(dict(r) for r in rows)
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET timing_status = 'missing_final',
+                       verdict = 'no_show',
+                       failure_reason = COALESCE(failure_reason, 'missing_final_receipt'),
+                       updated_at = ?
+                   WHERE verdict IN ('pending', 'pass0_seen')
+                     AND audit_id IN (
+                       SELECT audit_id
+                       FROM capacity_audit_windows
+                       WHERE audit_start_observed_at IS NOT NULL
+                     )
+                     AND ? > (
+                       SELECT w.audit_start_observed_at
+                       FROM capacity_audit_windows w
+                       WHERE w.audit_id = capacity_audit_slots.audit_id
+                     ) + deadline_s + transport_grace_s""",
+                (ts, ts),
+            )
+            updated = cur.rowcount or 0
+            if require_proof_payload:
+                if return_slots:
+                    rows = self._conn.execute(
+                        """SELECT s.audit_id, s.miner_address, s.model_index,
+                                  s.endpoint, 'hard_proof_miss' AS verdict,
+                                  COALESCE(s.failure_reason, 'missing_proof_payload') AS failure_reason
+                           FROM capacity_audit_slots s
+                           JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                           WHERE s.verdict = 'timing_pass'
+                             AND s.proof_status = 'pending'
+                             AND s.final_received_at IS NOT NULL
+                             AND ? > (
+                               CASE
+                                 WHEN COALESCE(
+                                   w.proof_challenge_observed_at,
+                                   w.proof_challenge_finalized_at,
+                                   s.final_received_at
+                                 ) > s.final_received_at
+                                 THEN COALESCE(
+                                   w.proof_challenge_observed_at,
+                                   w.proof_challenge_finalized_at,
+                                   s.final_received_at
+                                 )
+                                 ELSE s.final_received_at
+                               END
+                             ) + s.payload_deadline_s""",
+                        (ts,),
+                    ).fetchall()
+                    expired_slots.extend(dict(r) for r in rows)
+                cur = self._conn.execute(
+                    """UPDATE capacity_audit_slots
+                       SET proof_status = 'missing_payload',
+                           verdict = 'hard_proof_miss',
+                           failure_reason = COALESCE(failure_reason, 'missing_proof_payload'),
+                           updated_at = ?
+                       WHERE verdict = 'timing_pass'
+                         AND proof_status = 'pending'
+                         AND final_received_at IS NOT NULL
+                         AND ? > (
+                           SELECT
+                             CASE
+                               WHEN COALESCE(
+                                 w.proof_challenge_observed_at,
+                                 w.proof_challenge_finalized_at,
+                                 capacity_audit_slots.final_received_at
+                               ) > capacity_audit_slots.final_received_at
+                               THEN COALESCE(
+                                 w.proof_challenge_observed_at,
+                                 w.proof_challenge_finalized_at,
+                                 capacity_audit_slots.final_received_at
+                               )
+                               ELSE capacity_audit_slots.final_received_at
+                             END
+                           FROM capacity_audit_windows w
+                           WHERE w.audit_id = capacity_audit_slots.audit_id
+                         ) + payload_deadline_s""",
+                    (ts, ts),
+                )
+                updated += cur.rowcount or 0
+            self._conn.commit()
+        return expired_slots if return_slots else updated
+
+    def get_capacity_audit_slot(self, audit_id: str, address: str, model_index: int) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT s.*, w.epoch_number, w.selection_block, w.audit_block,
+                          w.proof_challenge_block,
+                          w.selection_block_hash, w.audit_block_hash,
+                          w.proof_challenge_block_hash, w.cohort_seed,
+                          w.status, w.chain_status,
+                          w.audit_start_observed_at, w.proof_challenge_observed_at,
+                          w.selection_finalized_at, w.audit_finalized_at,
+                          w.proof_challenge_finalized_at
+                   FROM capacity_audit_slots s
+                   JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                   WHERE s.audit_id = ? AND s.miner_address = ? AND s.model_index = ?""",
+                (audit_id, address.lower(), int(model_index)),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_capacity_audit_pass0(
+        self,
+        *,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        pass0_root: str,
+        artifact: dict,
+        received_at: Optional[float] = None,
+    ) -> None:
+        ts = time.time() if received_at is None else float(received_at)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET pass0_received_at = COALESCE(pass0_received_at, ?),
+                       pass0_root = ?,
+                       pass0_artifact = ?,
+                       verdict = CASE WHEN verdict = 'pending' THEN 'pass0_seen' ELSE verdict END,
+                       updated_at = ?
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                (
+                    ts,
+                    pass0_root,
+                    json.dumps(artifact, sort_keys=True),
+                    ts,
+                    audit_id,
+                    address.lower(),
+                    int(model_index),
+                ),
+            )
+            self._conn.commit()
+
+    def record_capacity_audit_final(
+        self,
+        *,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        final_root: str,
+        transcript_root: str,
+        artifact: dict,
+        timing_status: str,
+        verdict: str,
+        failure_reason: str = "",
+        received_at: Optional[float] = None,
+    ) -> None:
+        ts = time.time() if received_at is None else float(received_at)
+        pass0_root = str(artifact.get("pass0_root") or "")
+        with self._lock:
+            self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET final_received_at = COALESCE(final_received_at, ?),
+                       pass0_root = CASE
+                           WHEN pass0_root = '' THEN ? ELSE pass0_root
+                       END,
+                       final_root = ?,
+                       transcript_root = ?,
+                       final_artifact = ?,
+                       timing_status = ?,
+                       verdict = ?,
+                       failure_reason = COALESCE(NULLIF(?, ''), failure_reason),
+                       updated_at = ?
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                (
+                    ts,
+                    pass0_root,
+                    final_root,
+                    transcript_root,
+                    json.dumps(artifact, sort_keys=True),
+                    timing_status,
+                    verdict,
+                    failure_reason,
+                    ts,
+                    audit_id,
+                    address.lower(),
+                    int(model_index),
+                ),
+            )
+            self._conn.commit()
+
+    def record_capacity_audit_proof_verdict(
+        self,
+        *,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        proof_status: str,
+        verdict: str,
+        failure_reason: str = "",
+        proof_artifact_path: str = "",
+        proof_verify_ms: Optional[float] = None,
+        received_at: Optional[float] = None,
+    ) -> None:
+        ts = time.time() if received_at is None else float(received_at)
+        verify_ms = None if proof_verify_ms is None else max(0.0, float(proof_verify_ms))
+        with self._lock:
+            self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET proof_received_at = COALESCE(proof_received_at, ?),
+                       proof_status = ?,
+                       proof_verify_ms = COALESCE(?, proof_verify_ms),
+                       verdict = ?,
+                       failure_reason = COALESCE(NULLIF(?, ''), failure_reason),
+                       proof_artifact_path = COALESCE(NULLIF(?, ''), proof_artifact_path),
+                       updated_at = ?
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                (
+                    ts,
+                    proof_status,
+                    verify_ms,
+                    verdict,
+                    failure_reason,
+                    proof_artifact_path,
+                    ts,
+                    audit_id,
+                    address.lower(),
+                    int(model_index),
+                ),
+            )
+            self._conn.commit()
+
+    def record_capacity_audit_proof_received(
+        self,
+        *,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        received_at: Optional[float] = None,
+    ) -> None:
+        ts = time.time() if received_at is None else float(received_at)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET proof_received_at = COALESCE(proof_received_at, ?),
+                       proof_status = CASE
+                           WHEN proof_status = 'pending' THEN 'verify_pending'
+                           ELSE proof_status
+                       END,
+                       updated_at = ?
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                (
+                    ts,
+                    ts,
+                    audit_id,
+                    address.lower(),
+                    int(model_index),
+                ),
+            )
+            self._conn.commit()
+
+    def release_capacity_audit_drain(
+        self,
+        *,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        released_at: Optional[float] = None,
+    ) -> int:
+        """Release a selected endpoint from proxy drain after audit evidence is complete."""
+        ts = time.time() if released_at is None else float(released_at)
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET drain_until_ts = CASE
+                           WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
+                       END,
+                       updated_at = ?
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                (
+                    ts,
+                    ts,
+                    ts,
+                    audit_id,
+                    address.lower(),
+                    int(model_index),
+                ),
+            )
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    def release_capacity_audit_completed_drains(
+        self,
+        audit_id: str,
+        *,
+        require_proof_payload: bool,
+        released_at: Optional[float] = None,
+    ) -> int:
+        """Release drains for slots whose evidence is complete after start catch-up."""
+        ts = time.time() if released_at is None else float(released_at)
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET drain_until_ts = CASE
+                           WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
+                       END,
+                       updated_at = ?
+                   WHERE audit_id = ?
+                     AND verdict = 'timing_pass'
+                     AND (
+                       ? = 0
+                       OR proof_status IN ('proof_verified', 'combined_proof_verified')
+                     )""",
+                (
+                    ts,
+                    ts,
+                    ts,
+                    audit_id,
+                    1 if require_proof_payload else 0,
+                ),
+            )
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    def recent_capacity_failures(
+        self,
+        address: str,
+        model_index: int,
+        *,
+        since_epoch: int,
+        verdicts: Tuple[str, ...] = ("timing_miss", "hard_proof_miss", "no_show"),
+        require_chain_confirmed: bool = False,
+    ) -> int:
+        placeholders = ",".join("?" for _ in verdicts)
+        confirmation_clause = ""
+        if require_chain_confirmed:
+            confirmation_clause = (
+                " AND w.selection_finalized_at IS NOT NULL"
+                " AND w.audit_finalized_at IS NOT NULL"
+                " AND ("
+                "   w.proof_challenge_block <= 0"
+                "   OR ("
+                "     w.proof_challenge_block_hash != ''"
+                "     AND w.proof_challenge_finalized_at IS NOT NULL"
+                "   )"
+                " )"
+                " AND w.chain_status != 'reorged'"
+            )
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT COUNT(*) AS n
+                    FROM capacity_audit_slots s
+                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                    WHERE s.miner_address = ?
+                      AND s.model_index = ?
+                      AND w.epoch_number >= ?
+                      AND s.verdict IN ({placeholders})
+                      {confirmation_clause}""",
+                (address.lower(), int(model_index), int(since_epoch), *verdicts),
+            ).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def recent_capacity_failures_for_uid(
+        self,
+        uid: int,
+        *,
+        since_epoch: int,
+        verdicts: Tuple[str, ...] = ("timing_miss", "hard_proof_miss", "no_show"),
+        require_chain_confirmed: bool = False,
+    ) -> int:
+        placeholders = ",".join("?" for _ in verdicts)
+        confirmation_clause = ""
+        if require_chain_confirmed:
+            confirmation_clause = (
+                " AND w.selection_finalized_at IS NOT NULL"
+                " AND w.audit_finalized_at IS NOT NULL"
+                " AND ("
+                "   w.proof_challenge_block <= 0"
+                "   OR ("
+                "     w.proof_challenge_block_hash != ''"
+                "     AND w.proof_challenge_finalized_at IS NOT NULL"
+                "   )"
+                " )"
+                " AND w.chain_status != 'reorged'"
+            )
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT COUNT(*) AS n
+                    FROM capacity_audit_slots s
+                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                    WHERE w.epoch_number >= ?
+                      AND s.verdict IN ({placeholders})
+                      AND (
+                        s.miner_uid = ?
+                        OR s.miner_address IN (
+                          SELECT address FROM miner_entries WHERE bittensor_uid = ?
+                        )
+                      )
+                      {confirmation_clause}""",
+                (int(since_epoch), *verdicts, int(uid), int(uid)),
+            ).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def get_capacity_audit_slots_for_epoch(
+        self,
+        epoch_number: int,
+        *,
+        address: str = "",
+        model_index: Optional[int] = None,
+        verdicts: Tuple[str, ...] = ("timing_miss", "no_show"),
+    ) -> List[dict]:
+        placeholders = ",".join("?" for _ in verdicts)
+        params: list = [int(epoch_number), *verdicts]
+        address_clause = ""
+        if address:
+            address_clause = " AND s.miner_address = ?"
+            params.append(address.lower())
+        model_clause = ""
+        if model_index is not None:
+            model_clause = " AND s.model_index = ?"
+            params.append(int(model_index))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT s.*, w.epoch_number, w.selection_block, w.audit_block,
+                          w.proof_challenge_block, w.chain_status,
+                          w.audit_start_observed_at, w.proof_challenge_observed_at,
+                          w.selection_finalized_at, w.audit_finalized_at,
+                          w.proof_challenge_finalized_at
+                   FROM capacity_audit_slots s
+                   JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                   WHERE w.epoch_number = ?
+                     AND s.verdict IN ({placeholders})
+                     {address_clause}
+                     {model_clause}
+                   ORDER BY w.audit_block ASC, s.updated_at ASC""",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_capacity_audit_timing_excused(
+        self,
+        *,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        reason: str,
+        released_at: Optional[float] = None,
+    ) -> int:
+        """Neutralize a timing/no-show audit miss using signed overlap evidence."""
+        ts = time.time() if released_at is None else float(released_at)
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET verdict = 'timing_excused',
+                       timing_status = CASE
+                           WHEN timing_status IN ('miss', 'missing_final') THEN 'excused'
+                           ELSE timing_status
+                       END,
+                       failure_reason = ?,
+                       drain_until_ts = CASE
+                           WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
+                       END,
+                       updated_at = ?
+                   WHERE audit_id = ?
+                     AND miner_address = ?
+                     AND model_index = ?
+                     AND verdict IN ('timing_miss', 'no_show')""",
+                (
+                    reason,
+                    ts,
+                    ts,
+                    ts,
+                    audit_id,
+                    address.lower(),
+                    int(model_index),
+                ),
+            )
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    def get_capacity_drains(self, now: Optional[float] = None) -> List[AuditDrain]:
+        ts = time.time() if now is None else float(now)
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT audit_id, miner_address, model_index, endpoint, drain_until_ts
+                   FROM capacity_audit_slots
+                   WHERE drain_until_ts > ?
+                     AND verdict IN ('pending', 'pass0_seen', 'timing_pass')""",
+                (ts,),
+            ).fetchall()
+        return [
+            AuditDrain(
+                audit_id=row["audit_id"],
+                address=row["miner_address"],
+                model_index=int(row["model_index"]),
+                endpoint=row["endpoint"],
+                until_ts=float(row["drain_until_ts"]),
+            )
+            for row in rows
+        ]
+
+    def get_capacity_audit_selection_busy_slots(
+        self,
+        *,
+        selection_block: int,
+        cooldown_blocks: int = 1,
+    ) -> List[tuple[str, int]]:
+        """Return slots that cannot fairly accept a new B_select yet.
+
+        Miners reserve a local endpoint through B_proof and may still be
+        publishing/cleaning up on the immediately following head.  The
+        validator must not create a new timed obligation for the same slot in
+        that short block window, otherwise an honest miner can correctly skip
+        the slot locally while the validator records a no-show.
+        """
+        cutoff = int(selection_block) - max(0, int(cooldown_blocks))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT DISTINCT s.miner_address, s.model_index
+                   FROM capacity_audit_slots s
+                   JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                   WHERE w.proof_challenge_block >= ?
+                     AND s.verdict IN (
+                       'pending', 'pass0_seen', 'timing_pass',
+                       'timing_miss', 'no_show', 'hard_proof_miss'
+                     )
+                     AND w.chain_status != 'reorged'""",
+                (cutoff,),
+            ).fetchall()
+        return [(str(row["miner_address"]).lower(), int(row["model_index"])) for row in rows]
+
+    def compact_capacity_audit_storage(
+        self,
+        *,
+        current_epoch: int,
+        retain_failure_epochs: int,
+        retain_artifacts: bool = False,
+    ) -> dict[str, int]:
+        if retain_artifacts:
+            return {
+                "artifact_files_deleted": 0,
+                "artifact_rows_cleared": 0,
+                "success_rows_deleted": 0,
+                "old_failure_rows_deleted": 0,
+                "empty_windows_deleted": 0,
+            }
+        final_proof_statuses = (
+            "combined_proof_verified",
+            "proof_verified",
+            "invalid_payload",
+            "verify_error",
+            "missing_payload",
+        )
+        failure_verdicts = ("timing_miss", "hard_proof_miss", "no_show")
+        keep_from_epoch = max(
+            0,
+            int(current_epoch) - max(1, int(retain_failure_epochs)) + 1,
+        )
+        with self._lock:
+            path_rows = self._conn.execute(
+                f"""SELECT DISTINCT s.proof_artifact_path AS path
+                    FROM capacity_audit_slots s
+                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                    WHERE w.epoch_number <= ?
+                      AND COALESCE(s.proof_artifact_path, '') != ''
+                      AND (
+                        s.proof_status IN ({','.join('?' for _ in final_proof_statuses)})
+                        OR s.verdict IN ({','.join('?' for _ in failure_verdicts)})
+                        OR s.verdict IN ('timing_excused', 'stale_window', 'chain_reorged')
+                      )""",
+                (int(current_epoch), *final_proof_statuses, *failure_verdicts),
+            ).fetchall()
+        files_deleted = 0
+        for row in path_rows:
+            path = str(row["path"] or "")
+            if not path:
+                continue
+            try:
+                os.remove(path)
+                files_deleted += 1
+                parent = os.path.dirname(path)
+                if parent:
+                    try:
+                        os.rmdir(parent)
+                    except OSError:
+                        pass
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                bt.logging.debug(f"Capacity audit artifact cleanup skipped {path}: {exc}")
+
+        with self._lock:
+            artifact_cur = self._conn.execute(
+                f"""UPDATE capacity_audit_slots
+                    SET pass0_artifact = NULL,
+                        final_artifact = NULL,
+                        proof_artifact_path = NULL,
+                        updated_at = ?
+                    WHERE audit_id IN (
+                        SELECT audit_id
+                        FROM capacity_audit_windows
+                        WHERE epoch_number <= ?
+                    )
+                      AND (
+                        pass0_artifact IS NOT NULL
+                        OR final_artifact IS NOT NULL
+                        OR proof_artifact_path IS NOT NULL
+                      )
+                      AND (
+                        final_received_at IS NOT NULL
+                        OR proof_status IN ({','.join('?' for _ in final_proof_statuses)})
+                        OR verdict IN ({','.join('?' for _ in failure_verdicts)})
+                        OR verdict IN ('timing_excused', 'stale_window', 'chain_reorged')
+                      )""",
+                (time.time(), int(current_epoch), *final_proof_statuses, *failure_verdicts),
+            )
+            success_cur = self._conn.execute(
+                """DELETE FROM capacity_audit_slots
+                   WHERE audit_id IN (
+                       SELECT audit_id
+                       FROM capacity_audit_windows
+                       WHERE epoch_number <= ?
+                   )
+                     AND verdict IN ('timing_pass', 'timing_excused')
+                     AND proof_status IN ('combined_proof_verified', 'proof_verified')""",
+                (int(current_epoch),),
+            )
+            failure_cur = self._conn.execute(
+                f"""DELETE FROM capacity_audit_slots
+                    WHERE audit_id IN (
+                        SELECT audit_id
+                        FROM capacity_audit_windows
+                        WHERE epoch_number < ?
+                    )
+                      AND verdict IN ({','.join('?' for _ in failure_verdicts)})""",
+                (keep_from_epoch, *failure_verdicts),
+            )
+            window_cur = self._conn.execute(
+                """DELETE FROM capacity_audit_windows
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM capacity_audit_slots s
+                       WHERE s.audit_id = capacity_audit_windows.audit_id
+                   )"""
+            )
+            self._conn.commit()
+        return {
+            "artifact_files_deleted": files_deleted,
+            "artifact_rows_cleared": artifact_cur.rowcount or 0,
+            "success_rows_deleted": success_cur.rowcount or 0,
+            "old_failure_rows_deleted": failure_cur.rowcount or 0,
+            "empty_windows_deleted": window_cur.rowcount or 0,
+        }
+
     # ── Shared state derivation ──────────────────────────────────────
 
     def derive_shared_state(self, epoch: int) -> ValidatorSharedState:
@@ -825,6 +1971,7 @@ class ValidatorStateDB:
         all_entries = self._get_all_entries()
         uids = self.get_all_uids()
         probation = self.get_probation_addresses()
+        audit_drains = self.get_capacity_drains()
 
         # Build per-address, per-model_index scores from ALL entries
         # (active + inactive).  Inactive entries appear with ema_score=0.0
@@ -839,7 +1986,9 @@ class ValidatorStateDB:
             if addr not in miner_scores:
                 miner_scores[addr] = {}
             score = e["ema_score"]
-            if score == 0 and e.get("is_active"):
+            if not e.get("is_active"):
+                score = 0.0
+            elif score == 0:
                 score = 0.01  # active but not yet scored — allow routing
             miner_scores[addr][idx_str] = score
 
@@ -876,6 +2025,7 @@ class ValidatorStateDB:
             miner_scores=miner_scores,
             probation_miners=probation,
             miner_endpoints=miner_endpoints,
+            audit_drains=audit_drains,
             updated_at=time.time(),
         )
 

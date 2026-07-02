@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import bittensor as bt
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +31,117 @@ class ResolvedModel:
     context_source: str  # "cli", "registry"
 
 
+@dataclass(frozen=True)
+class RecommendedCapacityModel:
+    model_id: str
+    quant: str
+    max_context_len: int
+    tier_name: str
+    registry_id: str
+
+
+def vram_tier_for_gb(vram_gb: int):
+    from verallm.registry import VRAMTier
+
+    real_tiers = sorted(
+        (t for t in VRAMTier if t != VRAMTier.MULTI_GPU),
+        key=lambda t: t.value,
+    )
+    best = None
+    for tier in real_tiers:
+        if tier.value <= int(vram_gb or 0):
+            best = tier
+    return best
+
+
+def capacity_gate_vram_gb(gpu_info: dict) -> int:
+    tier = gpu_info.get("tier")
+    tier_value = getattr(tier, "value", None)
+    if tier_value is not None:
+        return int(tier_value)
+    return int(gpu_info.get("vram_gb") or 0)
+
+
+def _filter_capacity_recommendations(recs, on_chain_models: Optional[Iterable[str]]):
+    if on_chain_models is None:
+        return list(recs)
+    on_chain_set = {str(m).lower() for m in on_chain_models}
+    return [
+        r for r in recs
+        if str(r.config.checkpoint).lower() in on_chain_set
+    ]
+
+
+def recommended_capacity_model_for_vram(
+    vram_gb: int,
+    *,
+    on_chain_models: Optional[Iterable[str]] = None,
+) -> RecommendedCapacityModel | None:
+    from verallm.registry import recommend_models
+
+    tier = vram_tier_for_gb(int(vram_gb or 0))
+    if tier is None:
+        return None
+    recs = recommend_models(tier, verified_only=True)
+    recs = _filter_capacity_recommendations(recs, on_chain_models)
+    if not recs:
+        return None
+    best = recs[0]
+    return RecommendedCapacityModel(
+        model_id=str(best.config.checkpoint),
+        quant=str(best.quant),
+        max_context_len=int(best.est_context or 0),
+        tier_name=str(tier.name),
+        registry_id=str(best.model.id),
+    )
+
+
+def validate_capacity_recommended_model(
+    *,
+    model_id: str,
+    quant: str,
+    max_context_len: int,
+    vram_gb: int,
+    on_chain_models: Optional[Iterable[str]] = None,
+) -> tuple[bool, str, RecommendedCapacityModel | None]:
+    expected = recommended_capacity_model_for_vram(
+        int(vram_gb or 0),
+        on_chain_models=on_chain_models,
+    )
+    if expected is None:
+        return False, f"no verified recommended model for {int(vram_gb or 0)}GB VRAM", None
+    if str(model_id or "").lower() != expected.model_id.lower():
+        return (
+            False,
+            f"capacity audit requires {expected.model_id} on {expected.tier_name}",
+            expected,
+        )
+    if str(quant or "").lower() != expected.quant.lower():
+        return (
+            False,
+            f"capacity audit requires quant={expected.quant} for {expected.model_id}",
+            expected,
+        )
+    if int(max_context_len or 0) < int(expected.max_context_len or 0):
+        return (
+            False,
+            f"capacity audit requires max_context_len>={expected.max_context_len} "
+            f"for {expected.model_id}",
+            expected,
+        )
+    return True, "", expected
+
+
 def _get_on_chain_models(chain_config_path: str, subtensor_network: Optional[str] = None) -> Optional[list[str]]:
     """Query on-chain ModelRegistry for registered model IDs.
 
     Returns a list of model ID strings, or None on error (RPC failure, etc.).
     Cached for the process lifetime after first call.
     """
-    if hasattr(_get_on_chain_models, "_cache"):
-        return _get_on_chain_models._cache
+    cache_key = (str(chain_config_path or ""), str(subtensor_network or ""))
+    cache = getattr(_get_on_chain_models, "_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
 
     try:
         from verallm.chain.config import ChainConfig
@@ -52,11 +155,13 @@ def _get_on_chain_models(chain_config_path: str, subtensor_network: Optional[str
         model_client, _, _ = create_clients(cc)
         models = model_client.get_model_list()
         bt.logging.info(f"On-chain ModelSpec: {len(models)} models registered")
-        _get_on_chain_models._cache = models
+        cache[cache_key] = models
+        _get_on_chain_models._cache = cache
         return models
     except Exception as e:
         bt.logging.warning(f"Failed to query on-chain ModelRegistry: {e}")
-        _get_on_chain_models._cache = None
+        cache[cache_key] = None
+        _get_on_chain_models._cache = cache
         return None
 
 
@@ -69,6 +174,7 @@ def resolve_model_config(
     category: Optional[str] = None,
     chain_config: Optional[str] = None,
     subtensor_network: Optional[str] = None,
+    capacity_audit_required: bool = False,
 ) -> ResolvedModel:
     """Resolve a miner's model configuration with cascading fallback.
 
@@ -108,6 +214,9 @@ def resolve_model_config(
     # --- GPU detection (always needed for registry lookups) ---
     gpu_info = detect_gpu_info()
     if not gpu_info["available"]:
+        if capacity_audit_required:
+            bt.logging.error("Capacity audit is enabled but no CUDA GPU was detected")
+            sys.exit(1)
         if model_id and quant and max_context_len:
             # All explicit — no GPU needed for resolution
             bt.logging.warning("No GPU detected, using explicit config")
@@ -132,18 +241,24 @@ def resolve_model_config(
         auto = True
     if auto or model_id is None:
         cat = ModelCategory(category) if category else None
-        recs = recommend_models(tier, category=cat)
+        recs = recommend_models(
+            tier,
+            category=cat,
+            verified_only=bool(capacity_audit_required),
+        )
 
         # Filter by on-chain ModelSpec availability (if chain config provided)
         if chain_config and recs:
             on_chain_models = _get_on_chain_models(chain_config, subtensor_network)
+            if on_chain_models is None and capacity_audit_required:
+                bt.logging.error(
+                    "Capacity audit is enabled but on-chain ModelRegistry "
+                    "recommendations could not be loaded"
+                )
+                sys.exit(1)
             if on_chain_models is not None:
                 on_chain_set = {m.lower() for m in on_chain_models}
-                filtered = [
-                    r for r in recs
-                    if any(tc.checkpoint.lower() in on_chain_set
-                           for tc in r.model.tier_configs)
-                ]
+                filtered = _filter_capacity_recommendations(recs, on_chain_set)
                 if filtered:
                     bt.logging.info(f"Filtered to {len(filtered)}/{len(recs)} models with on-chain ModelSpec")
                     recs = filtered
@@ -220,6 +335,33 @@ def resolve_model_config(
 
     # If all three are explicit, return immediately — no registry needed.
     if quant is not None and max_context_len is not None:
+        if capacity_audit_required:
+            on_chain_models = (
+                _get_on_chain_models(chain_config, subtensor_network)
+                if chain_config else None
+            )
+            if chain_config and on_chain_models is None:
+                bt.logging.error(
+                    "Capacity audit is enabled but on-chain ModelRegistry "
+                    "recommendations could not be loaded"
+                )
+                sys.exit(1)
+            ok, reason, expected = validate_capacity_recommended_model(
+                model_id=resolved_model_id,
+                quant=quant,
+                max_context_len=max_context_len,
+                vram_gb=capacity_gate_vram_gb(gpu_info),
+                on_chain_models=on_chain_models,
+            )
+            if not ok:
+                expected_text = ""
+                if expected is not None:
+                    expected_text = (
+                        f" expected model={expected.model_id} "
+                        f"quant={expected.quant} ctx>={expected.max_context_len}"
+                    )
+                bt.logging.error(f"{reason}.{expected_text}")
+                sys.exit(1)
         return ResolvedModel(
             model_id=resolved_model_id,
             quant=quant,
@@ -304,6 +446,34 @@ def resolve_model_config(
             context_source = "registry(estimated)"
 
     bt.logging.info(f"Resolved: model={resolved_model_id} (cli={model_id}) quant={resolved_quant} (src={quant_source}) ctx={resolved_context} (src={context_source})")
+
+    if capacity_audit_required:
+        on_chain_models = (
+            _get_on_chain_models(chain_config, subtensor_network)
+            if chain_config else None
+        )
+        if chain_config and on_chain_models is None:
+            bt.logging.error(
+                "Capacity audit is enabled but on-chain ModelRegistry "
+                "recommendations could not be loaded"
+            )
+            sys.exit(1)
+        ok, reason, expected = validate_capacity_recommended_model(
+            model_id=resolved_model_id,
+            quant=resolved_quant,
+            max_context_len=int(resolved_context or 0),
+            vram_gb=capacity_gate_vram_gb(gpu_info),
+            on_chain_models=on_chain_models,
+        )
+        if not ok:
+            expected_text = ""
+            if expected is not None:
+                expected_text = (
+                    f" expected model={expected.model_id} "
+                    f"quant={expected.quant} ctx>={expected.max_context_len}"
+                )
+            bt.logging.error(f"{reason}.{expected_text}")
+            sys.exit(1)
 
     return ResolvedModel(
         model_id=resolved_model_id,

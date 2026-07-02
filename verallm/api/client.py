@@ -218,7 +218,7 @@ class ValidatorRequestAuth(httpx.Auth):
         self._hotkey_ss58 = hotkey_ss58
         self._hotkey_seed = hotkey_seed
 
-    def auth_flow(self, request: httpx.Request):
+    def _sign_request(self, request: httpx.Request) -> httpx.Request:
         from neurons.request_signing import sign_request
         from urllib.parse import urlparse
 
@@ -233,7 +233,13 @@ class ValidatorRequestAuth(httpx.Auth):
         )
         for k, v in headers.items():
             request.headers[k] = v
-        yield request
+        return request
+
+    def auth_flow(self, request: httpx.Request):
+        yield self._sign_request(request)
+
+    async def async_auth_flow(self, request: httpx.Request):
+        yield self._sign_request(request)
 
 
 # ============================================================================
@@ -461,8 +467,10 @@ class ValidatorClient:
         t_first_token = None
         t_last_token = None
         t_done_recv = None
+        t_request_end_wall = None
 
         t0 = time.perf_counter()
+        t0_wall = time.time()
         with self.client.stream("POST", f"{self.miner_url}/inference",
                                 json=request_body) as resp:
             resp.raise_for_status()
@@ -490,6 +498,7 @@ class ValidatorClient:
                             proof_bundle = dict_to_proof_bundle(proof_data)
                         except (TypeError, KeyError):
                             pass
+                    t_request_end_wall = time.time()
                     _remember_miner_inference_ms(timing, data.get("inference_ms"))
                     timing["commitment_ms"] = data.get("commitment_ms", 0)
                     timing["prove_ms"] = data.get("prove_ms", 0)
@@ -500,6 +509,11 @@ class ValidatorClient:
                 elif event_type == "error":
                     raise RuntimeError(f"Miner error: {data.get('error', data)}")
 
+        if t_request_end_wall is None:
+            t_request_end_wall = time.time()
+        timing["validator_request_start_ts"] = t0_wall
+        timing["validator_request_end_ts"] = t_request_end_wall
+        timing["validator_request_ms"] = (t_request_end_wall - t0_wall) * 1000
         _finalize_validator_timing(
             timing, t0, t_first_token, t_last_token,
             response_done_at=t_done_recv,
@@ -588,8 +602,10 @@ class ValidatorClient:
         t_first_token = None
         t_last_token = None
         t_done_recv = None
+        t_request_end_wall = None
 
         t0 = time.perf_counter()
+        t0_wall = time.time()
         _t_last_tok = None
         with self.client.stream("POST", f"{self.miner_url}/chat",
                                 json=request_body) as resp:
@@ -606,6 +622,7 @@ class ValidatorClient:
                         stream_callback(token_text)
                 elif event_type == "done":
                     _t_done_recv = time.perf_counter()
+                    t_request_end_wall = time.time()
                     t_done_recv = _t_done_recv
                     _done_gap_ms = (
                         (_t_done_recv - _t_last_tok) * 1000
@@ -644,6 +661,11 @@ class ValidatorClient:
                 elif event_type == "error":
                     raise RuntimeError(f"Miner error: {data.get('error', data)}")
 
+        if t_request_end_wall is None:
+            t_request_end_wall = time.time()
+        timing["validator_request_start_ts"] = t0_wall
+        timing["validator_request_end_ts"] = t_request_end_wall
+        timing["validator_request_ms"] = (t_request_end_wall - t0_wall) * 1000
         _finalize_validator_timing(
             timing, t0, t_first_token, t_last_token,
             response_done_at=t_done_recv,
@@ -703,7 +725,9 @@ class ValidatorClient:
         t_first_token = None
         t_last_token = None
         t_done_recv = None
+        t_request_end_wall = None
         t0 = time.perf_counter()
+        t0_wall = time.time()
 
         with self.client.stream("POST", f"{self.miner_url}/tee/chat",
                                 json=request_body) as resp:
@@ -741,6 +765,7 @@ class ValidatorClient:
                             "encrypted_output": data["encrypted_output"],
                             "encrypted_output_nonce": data["encrypted_output_nonce"],
                         }
+                    t_request_end_wall = time.time()
                     # Timing may be nested under "timing" key or flat
                     t = data.get("timing", data)
                     _remember_miner_inference_ms(timing, t.get("inference_ms"))
@@ -752,6 +777,11 @@ class ValidatorClient:
                 elif event_type == "error":
                     raise RuntimeError(f"Miner error: {data.get('error', data)}")
 
+        if t_request_end_wall is None:
+            t_request_end_wall = time.time()
+        timing["validator_request_start_ts"] = t0_wall
+        timing["validator_request_end_ts"] = t_request_end_wall
+        timing["validator_request_ms"] = (t_request_end_wall - t0_wall) * 1000
         _finalize_validator_timing(
             timing, t0, t_first_token, t_last_token,
             response_done_at=t_done_recv,
@@ -2262,8 +2292,10 @@ class AsyncValidatorClient(ValidatorClient):
         t_first_token = None
         t_last_token = None
         t_done_recv = None
+        t_request_end_wall = None
 
         t0 = time.perf_counter()
+        t0_wall = time.time()
         t_last_tok = None
         async with self.client.stream("POST", f"{self.miner_url}/chat", json=request_body) as resp:
             resp.raise_for_status()
@@ -2281,6 +2313,7 @@ class AsyncValidatorClient(ValidatorClient):
                             await maybe_awaitable
                 elif event_type == "done":
                     t_done_recv = time.perf_counter()
+                    t_request_end_wall = time.time()
                     done_gap_ms = (
                         (t_done_recv - t_last_tok) * 1000
                         if t_last_tok is not None else 0.0
@@ -2317,6 +2350,11 @@ class AsyncValidatorClient(ValidatorClient):
                 elif event_type == "error":
                     raise RuntimeError(f"Miner error: {data.get('error', data)}")
 
+        if t_request_end_wall is None:
+            t_request_end_wall = time.time()
+        timing["validator_request_start_ts"] = t0_wall
+        timing["validator_request_end_ts"] = t_request_end_wall
+        timing["validator_request_ms"] = (t_request_end_wall - t0_wall) * 1000
         _finalize_validator_timing(
             timing, t0, t_first_token, t_last_token,
             response_done_at=t_done_recv,

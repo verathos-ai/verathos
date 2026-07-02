@@ -141,11 +141,11 @@ contracts/      Smart contracts (Foundry/Solidity) – UUPS proxies on Bittensor
 plugins/        Framework plugins – LiteLLM, LangChain, elizaOS, OpenClaw
 scripts/        Setup scripts – setup_miner.sh, setup_validator.sh
 examples/       Client examples – OpenAI, streaming, x402
-dist/           Pre-built wheels – zkllm (CUDA kernels)
+dist/           Pre-built wheels – zkllm and hot-capacity CUDA kernels
 docs/           Documentation
 ```
 
-`zkllm` (cryptographic primitives, field arithmetic, Merkle trees, sumcheck, CUDA kernels) is distributed as a pre-built wheel in `dist/`. The setup scripts install it automatically.
+`zkllm` and the hot-capacity audit CUDA runtime are distributed as pre-built wheels in `dist/`. The setup scripts install them automatically.
 
 ## Documentation
 

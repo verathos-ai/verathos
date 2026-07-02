@@ -9,6 +9,7 @@
 #   bash scripts/setup_https.sh                 # port 443 → localhost:8000
 #   bash scripts/setup_https.sh --port 13998    # port 13998 → localhost:8000
 #   bash scripts/setup_https.sh --port 13998 --backend-port 9000
+#   bash scripts/setup_https.sh --port 8000 --public-port 14704 --backend-port 8001
 #
 # After setup, register your miner with:
 #   --endpoint https://<YOUR_IP>:<PORT>
@@ -17,12 +18,14 @@
 set -e
 
 HTTPS_PORT=443
+PUBLIC_PORT=""
 BACKEND_PORT=8000
 APPEND=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port) HTTPS_PORT="$2"; shift 2 ;;
+        --public-port) PUBLIC_PORT="$2"; shift 2 ;;
         --backend-port) BACKEND_PORT="$2"; shift 2 ;;
         --append) APPEND=1; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
@@ -30,12 +33,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || echo "YOUR_IP")
+PUBLIC_PORT="${PUBLIC_PORT:-$HTTPS_PORT}"
 
 echo ""
 echo "============================================================"
 echo "  Verathos HTTPS Setup (self-signed)"
 echo "============================================================"
 echo "  HTTPS port:    $HTTPS_PORT"
+if [ "$PUBLIC_PORT" != "$HTTPS_PORT" ]; then
+    echo "  Public port:   $PUBLIC_PORT"
+fi
 echo "  Backend port:  $BACKEND_PORT (miner server)"
 echo "  Public IP:     $PUBLIC_IP"
 echo "============================================================"
@@ -231,7 +238,7 @@ echo "  HTTPS reverse proxy ready!"
 echo "============================================================"
 echo ""
 echo "  Register your miner with:"
-echo "    --endpoint https://$PUBLIC_IP:$HTTPS_PORT"
+echo "    --endpoint https://$PUBLIC_IP:$PUBLIC_PORT"
 echo ""
 echo "  Test locally:"
 echo "    curl -sk https://localhost:$HTTPS_PORT/health"

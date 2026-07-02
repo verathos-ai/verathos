@@ -12,7 +12,7 @@ boundary, validators pull the complete receipt batch from each miner via
 GET /epoch/{n}/receipts.  Every validator receives the SAME receipt set,
 computes the SAME scores, and produces IDENTICAL weights (Yuma consensus).
 
-Verification is anchored to on-chain identity (single path, no fallback):
+Verification is anchored to on-chain identity (single Sr25519 authority path):
 
 1. The 32-byte ``validator_hotkey`` field is the raw Sr25519 public key
    (== the bytes underlying the SS58 address).
@@ -25,9 +25,9 @@ Verification is anchored to on-chain identity (single path, no fallback):
    forgery hole where a miner could mint receipts with freshly-generated
    keypairs.
 
-There is intentionally no Ed25519 fallback path: keeping one would let a
-miner forge receipts with locally-generated keys (no identity binding) and
-the whole on-chain anchor would be moot.
+There is intentionally no Ed25519 or unauthenticated identity fallback path:
+keeping one would let a miner forge receipts with locally-generated keys (no
+identity binding) and the whole on-chain anchor would be moot.
 """
 
 from __future__ import annotations
@@ -60,6 +60,15 @@ class ServiceReceipt:
     proof_requested: bool = False  # was proof verification ATTEMPTED? (distinguishes "not tested" from "failed")
     tee_attestation_verified: object = None  # None = not tested, True = passed, False = failed
     is_canary: bool = False  # was this a canary test (vs organic user traffic)?
+
+    # Timing provenance. Version 1 receipts did not bind timing provenance and
+    # may contain miner-reported generation_time_ms. Version 2 receipts bind
+    # validator-observed request timing in the primary receipt signature.
+    receipt_version: int = 1
+    timing_source: str = "legacy"
+    observed_start_ts: float = 0.0
+    observed_end_ts: float = 0.0
+    timing_signature: bytes = b""  # legacy v2 migration only; new receipts leave this empty
 
     # Validator identity
     validator_hotkey: bytes = b""  # 32-byte Sr25519 public key (same bytes underlying the SS58 address)
@@ -133,11 +142,11 @@ class ValidatorAuthority:
         return uid
 
 
-def encode_receipt_message(receipt: ServiceReceipt) -> bytes:
-    """Encode receipt fields into a canonical byte string for signing/verification.
+def _encode_receipt_message_v1(receipt: ServiceReceipt) -> bytes:
+    """Encode legacy v1 receipt fields into a canonical byte string.
 
-    Field order is fixed and unambiguous.  All strings are length-prefixed,
-    all integers are big-endian 8-byte, all floats are big-endian double.
+    Version 1 is kept for old receipt verification. It intentionally does not
+    include the v2 timing provenance fields.
     """
     parts = []
 
@@ -179,6 +188,56 @@ def encode_receipt_message(receipt: ServiceReceipt) -> bytes:
     return b"".join(parts)
 
 
+def _encode_receipt_message_v2(receipt: ServiceReceipt) -> bytes:
+    """Encode canonical v2 receipt fields for primary signing/verification."""
+    parts = [
+        b"VERATHOS_SERVICE_RECEIPT_V2",
+        _encode_receipt_message_v1(receipt),
+        struct.pack(">q", int(receipt.receipt_version)),
+    ]
+    timing_source = str(receipt.timing_source or "")
+    encoded = timing_source.encode("utf-8")
+    parts.append(struct.pack(">I", len(encoded)))
+    parts.append(encoded)
+    parts.append(struct.pack(">d", float(receipt.observed_start_ts or 0.0)))
+    parts.append(struct.pack(">d", float(receipt.observed_end_ts or 0.0)))
+    return b"".join(parts)
+
+
+def encode_receipt_message(receipt: ServiceReceipt) -> bytes:
+    """Encode receipt fields into the canonical signed byte string.
+
+    V1 receipts use the historical field set. V2 receipts sign the historical
+    field set plus timing provenance in the primary signature; no separate
+    timing signature is needed for newly-created receipts.
+    """
+    if int(getattr(receipt, "receipt_version", 1) or 1) >= 2:
+        return _encode_receipt_message_v2(receipt)
+    return _encode_receipt_message_v1(receipt)
+
+
+def encode_receipt_timing_message(receipt: ServiceReceipt) -> bytes:
+    """Encode the legacy v2 timing-provenance side signature message.
+
+    This exists only to verify receipts created during the short migration
+    window before v2 timing fields were moved into the primary receipt
+    signature. New receipts leave ``timing_signature`` empty.
+    """
+    parts = [
+        b"VERATHOS_RECEIPT_TIMING_V2",
+        _encode_receipt_message_v1(receipt),
+        receipt.validator_signature,
+        struct.pack(">q", int(receipt.receipt_version)),
+    ]
+    timing_source = str(receipt.timing_source or "")
+    encoded = timing_source.encode("utf-8")
+    parts.append(struct.pack(">I", len(encoded)))
+    parts.append(encoded)
+    parts.append(struct.pack(">d", float(receipt.observed_start_ts or 0.0)))
+    parts.append(struct.pack(">d", float(receipt.observed_end_ts or 0.0)))
+    return b"".join(parts)
+
+
 def sign_receipt(receipt: ServiceReceipt, hotkey_seed: bytes) -> ServiceReceipt:
     """Sign a receipt with the validator's Sr25519 hotkey.
 
@@ -198,7 +257,6 @@ def sign_receipt(receipt: ServiceReceipt, hotkey_seed: bytes) -> ServiceReceipt:
     signature = keypair.sign(message)
     if not isinstance(signature, bytes):
         signature = bytes.fromhex(signature[2:] if signature.startswith("0x") else signature)
-
     return ServiceReceipt(
         miner_address=receipt.miner_address,
         model_id=receipt.model_id,
@@ -215,6 +273,11 @@ def sign_receipt(receipt: ServiceReceipt, hotkey_seed: bytes) -> ServiceReceipt:
         proof_requested=receipt.proof_requested,
         tee_attestation_verified=receipt.tee_attestation_verified,
         is_canary=receipt.is_canary,
+        receipt_version=receipt.receipt_version,
+        timing_source=receipt.timing_source,
+        observed_start_ts=receipt.observed_start_ts,
+        observed_end_ts=receipt.observed_end_ts,
+        timing_signature=b"",
         validator_hotkey=receipt.validator_hotkey,
         validator_signature=signature,
     )
@@ -228,7 +291,7 @@ def verify_service_receipt(
 ) -> bool:
     """Verify a service receipt's signature, freshness, and validator identity.
 
-    Single-path verification — Sr25519 anchored to the on-chain validator set:
+    Sr25519 verification anchored to the on-chain validator set:
 
     1. Treat ``validator_hotkey`` as a 32-byte Sr25519 public key, encode to
        SS58, look up against ``authority`` (must be on metagraph,
@@ -236,9 +299,10 @@ def verify_service_receipt(
        Sr25519 signature.  Receipts from random keypairs fail because their
        pubkey is not on the metagraph.
 
-    There is no Ed25519 fallback.  A fallback that accepted any Ed25519 sig
-    against the embedded pubkey would let a miner forge receipts with
-    locally-generated keys and bypass the on-chain identity anchor entirely.
+    There is no Ed25519 identity fallback. A fallback that accepted any
+    Ed25519 sig against the embedded pubkey would let a miner forge receipts
+    with locally-generated keys and bypass the on-chain identity anchor
+    entirely.
 
     Args:
         receipt: deserialized receipt to verify.
@@ -266,8 +330,6 @@ def verify_service_receipt(
     if authority is None:
         return False
 
-    message = encode_receipt_message(receipt)
-
     try:
         from scalecodec.utils.ss58 import ss58_encode
         from substrateinterface import Keypair
@@ -276,7 +338,48 @@ def verify_service_receipt(
         if authority.lookup(ss58) is None:
             return False
         kp = Keypair(ss58_address=ss58)
-        return bool(kp.verify(message, receipt.validator_signature))
+        if bool(kp.verify(encode_receipt_message(receipt), receipt.validator_signature)):
+            return True
+
+        # Migration fallback for receipts produced by the short-lived v2
+        # side-signature format. New v2 receipts are verified only by the
+        # canonical primary signature above.
+        if (
+            int(getattr(receipt, "receipt_version", 1) or 1) >= 2
+            and len(getattr(receipt, "timing_signature", b"") or b"") == 64
+            and bool(kp.verify(_encode_receipt_message_v1(receipt), receipt.validator_signature))
+            and verify_receipt_timing_signature(receipt)
+        ):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def verify_receipt_timing_signature(receipt: ServiceReceipt) -> bool:
+    """Verify the legacy v2 validator-observed timing side signature.
+
+    New receipts do not use this. For canonical v2 receipts, use
+    ``verify_service_receipt``; the primary receipt signature already binds
+    validator-observed timing.
+    """
+    if int(getattr(receipt, "receipt_version", 1) or 1) < 2:
+        return False
+    if str(getattr(receipt, "timing_source", "") or "") != "validator_observed":
+        return False
+    if len(getattr(receipt, "validator_hotkey", b"") or b"") != 32:
+        return False
+    if len(getattr(receipt, "validator_signature", b"") or b"") != 64:
+        return False
+    if len(getattr(receipt, "timing_signature", b"") or b"") != 64:
+        return False
+    try:
+        from scalecodec.utils.ss58 import ss58_encode
+        from substrateinterface import Keypair
+
+        ss58 = ss58_encode(receipt.validator_hotkey)
+        kp = Keypair(ss58_address=ss58)
+        return bool(kp.verify(encode_receipt_timing_message(receipt), receipt.timing_signature))
     except Exception:
         return False
 
@@ -298,6 +401,10 @@ def create_receipt(
     proof_requested: bool = False,
     tee_attestation_verified: object = None,
     is_canary: bool = False,
+    timestamp: int | None = None,
+    observed_start_ts: float | None = None,
+    observed_end_ts: float | None = None,
+    timing_source: str = "validator_observed",
 ) -> ServiceReceipt:
     """Convenience: build and sign a receipt in one call.
 
@@ -306,13 +413,20 @@ def create_receipt(
     the 32-byte hotkey seed.  Both are derived from the Bittensor wallet at
     validator startup.
     """
+    ts = int(time.time()) if timestamp is None else int(timestamp)
+    end_ts = float(observed_end_ts) if observed_end_ts is not None else float(ts)
+    if observed_start_ts is None:
+        start_ts = end_ts - max(0.0, float(generation_time_ms or 0.0)) / 1000.0
+    else:
+        start_ts = float(observed_start_ts)
+
     receipt = ServiceReceipt(
         miner_address=miner_address,
         model_id=model_id,
         model_index=model_index,
         epoch_number=epoch_number,
         commitment_hash=commitment_hash,
-        timestamp=int(time.time()),
+        timestamp=ts,
         ttft_ms=ttft_ms,
         tokens_generated=tokens_generated,
         generation_time_ms=generation_time_ms,
@@ -322,6 +436,10 @@ def create_receipt(
         proof_requested=proof_requested,
         tee_attestation_verified=tee_attestation_verified,
         is_canary=is_canary,
+        receipt_version=2,
+        timing_source=timing_source,
+        observed_start_ts=start_ts,
+        observed_end_ts=end_ts,
         validator_hotkey=validator_hotkey,
     )
     return sign_receipt(receipt, validator_private_key)
@@ -345,6 +463,11 @@ def receipt_to_dict(receipt: ServiceReceipt) -> dict:
         "proof_requested": receipt.proof_requested,
         "tee_attestation_verified": receipt.tee_attestation_verified,
         "is_canary": receipt.is_canary,
+        "receipt_version": receipt.receipt_version,
+        "timing_source": receipt.timing_source,
+        "observed_start_ts": receipt.observed_start_ts,
+        "observed_end_ts": receipt.observed_end_ts,
+        "timing_signature": receipt.timing_signature.hex(),
         "validator_hotkey": receipt.validator_hotkey.hex(),
         "validator_signature": receipt.validator_signature.hex(),
     }
@@ -368,6 +491,57 @@ def receipt_from_dict(d: dict) -> ServiceReceipt:
         proof_requested=d.get("proof_requested", False),
         tee_attestation_verified=d.get("tee_attestation_verified"),
         is_canary=d.get("is_canary", False),
+        receipt_version=d.get("receipt_version", 1),
+        timing_source=d.get("timing_source", "legacy"),
+        observed_start_ts=d.get("observed_start_ts", 0.0),
+        observed_end_ts=d.get("observed_end_ts", 0.0),
+        timing_signature=bytes.fromhex(d.get("timing_signature", "")),
         validator_hotkey=bytes.fromhex(d["validator_hotkey"]),
         validator_signature=bytes.fromhex(d["validator_signature"]),
     )
+
+
+def validator_observed_timing(timing: dict) -> tuple[float, float, float]:
+    """Return validator-observed request start/end/duration from client timing.
+
+    Falls back to round-trip timing only for local callers that predate the
+    explicit timestamp fields. The returned duration is milliseconds.
+    """
+    end_ts = float(timing.get("validator_request_end_ts") or time.time())
+    duration_ms = float(
+        timing.get("validator_request_ms")
+        or timing.get("round_trip_ms")
+        or timing.get("inference_ms")
+        or timing.get("generation_time_ms")
+        or 0.0
+    )
+    start_ts = float(timing.get("validator_request_start_ts") or (end_ts - max(0.0, duration_ms) / 1000.0))
+    if duration_ms <= 0 and end_ts >= start_ts:
+        duration_ms = (end_ts - start_ts) * 1000.0
+    return start_ts, end_ts, max(0.0, duration_ms)
+
+
+def receipt_has_validator_observed_timing(receipt: ServiceReceipt) -> bool:
+    """True iff the receipt declares validator-observed request timing.
+
+    Callers must first verify the primary service receipt signature. In the
+    audit reconciliation path, receipts are pulled through
+    ``verify_service_receipt`` before this helper is evaluated.
+    """
+    return (
+        int(getattr(receipt, "receipt_version", 1) or 1) >= 2
+        and str(getattr(receipt, "timing_source", "") or "") == "validator_observed"
+        and float(getattr(receipt, "observed_end_ts", 0.0) or 0.0) > 0.0
+        and float(getattr(receipt, "observed_start_ts", 0.0) or 0.0) > 0.0
+    )
+
+
+def receipt_observed_interval(receipt: ServiceReceipt) -> tuple[float, float] | None:
+    """Return the signed validator-observed request interval for v2 receipts."""
+    if not receipt_has_validator_observed_timing(receipt):
+        return None
+    start = float(receipt.observed_start_ts)
+    end = float(receipt.observed_end_ts)
+    if end < start:
+        return None
+    return start, end

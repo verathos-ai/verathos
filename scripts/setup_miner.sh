@@ -22,10 +22,13 @@
 # =============================================================================
 
 set -e
+set -o pipefail
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 
 SKIP_INSTALL=false
+FORCE_VLLM_SOURCE_REBUILD="${VERATHOS_FORCE_VLLM_SOURCE_REBUILD:-0}"
+INSTALL_GPTQMODEL="${VERATHOS_INSTALL_GPTQMODEL:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,6 +52,20 @@ if [ -z "$WORKSPACE" ]; then
 fi
 export HF_HOME="${HF_HOME:-${WORKSPACE}/huggingface}"
 PYTHON="${PYTHON:-python3}"
+
+can_run_privileged() {
+    [ "$(id -u)" -eq 0 ] || { command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; }
+}
+
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo "$@"
+    else
+        return 127
+    fi
+}
 
 # Detect FUSE / network filesystem on WORKSPACE.  Some RunPod-style pods
 # expose /workspace as MooseFS-over-FUSE (mfs#…runpod.net:9421), which is
@@ -97,7 +114,10 @@ if [ "${WORKSPACE_IS_FUSE:-0}" = "1" ]; then
     if [ -z "$TORCHINDUCTOR_CACHE_DIR" ]; then
         export TORCHINDUCTOR_CACHE_DIR=/tmp/.cache/torchinductor
     fi
-    mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" 2>/dev/null || true
+    if [ -z "$XDG_CACHE_HOME" ]; then
+        export XDG_CACHE_HOME=/tmp/.cache
+    fi
+    mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME" 2>/dev/null || true
     echo "  WORKSPACE on FUSE/network FS — TMPDIR + triton/inductor caches pinned to /tmp"
     echo "  (avoids pip build-env deadlock AND torch.compile-on-FUSE warmup hang)"
 fi
@@ -109,6 +129,37 @@ echo "============================================================"
 echo "  Workspace: $WORKSPACE"
 echo "  HF cache:  $HF_HOME"
 echo "============================================================"
+
+detect_memory_gb() {
+    local candidates=()
+    local f val
+
+    # cgroup v2 common path inside containers.
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        candidates+=("/sys/fs/cgroup/memory.max")
+    fi
+    # cgroup v1 fallback.
+    if [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        candidates+=("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    fi
+
+    for f in "${candidates[@]}"; do
+        val=$(cat "$f" 2>/dev/null || true)
+        case "$val" in
+            ""|"max") continue ;;
+        esac
+        if [ "$val" -gt 0 ] 2>/dev/null; then
+            # Ignore effectively unlimited cgroup values; use host MemTotal
+            # below in that case.
+            if [ "$val" -lt 9000000000000000000 ] 2>/dev/null; then
+                echo $(( val / 1024 / 1024 / 1024 ))
+                return 0
+            fi
+        fi
+    done
+
+    awk '/MemTotal/ {print int($2 / 1024 / 1024)}' /proc/meminfo 2>/dev/null || echo 0
+}
 
 # ── Early GPU check (fail fast before installing anything) ───────────────────
 if ! command -v nvidia-smi &>/dev/null; then
@@ -207,6 +258,11 @@ fi
 
 cd "$REPO_DIR"
 
+GPU_VRAM_GB=$(( (GPU_VRAM + 512) / 1024 ))
+if ! "$PYTHON" scripts/check_capacity_audit_gpu.py --gpu-name "$GPU_NAME" --vram-gb "$GPU_VRAM_GB"; then
+    exit 1
+fi
+
 # ── LD_LIBRARY_PATH: find pip-installed NVIDIA libs ──────────────────────────
 # torch 2.9+ (from vLLM pip) needs libcusparseLt.so.0 which lives in
 # site-packages/nvidia/*/lib/ — not on the default search path.
@@ -237,11 +293,53 @@ print(':'.join(d for d in dirs if os.path.isdir(d)))
 
 fix_ld_library_path
 
+ensure_proof_cuda12_libraries() {
+    local missing_packages
+    missing_packages=$($PYTHON - <<'PY'
+import glob
+import os
+import site
+
+def has_lib(name: str) -> bool:
+    for sp in site.getsitepackages():
+        if glob.glob(os.path.join(sp, "nvidia", "*", "lib", name)):
+            return True
+    for pattern in ("/usr/local/cuda*/targets/x86_64-linux/lib", "/usr/local/cuda*/lib64"):
+        for d in glob.glob(pattern):
+            if os.path.exists(os.path.join(d, name)):
+                return True
+    return False
+
+packages = []
+if not has_lib("libcudart.so.12"):
+    packages.append("nvidia-cuda-runtime-cu12==12.8.90")
+if not has_lib("libcublas.so.12"):
+    packages.append("nvidia-cublas-cu12==12.8.4.1")
+print(" ".join(packages))
+PY
+    )
+    if [ -z "$missing_packages" ]; then
+        return 0
+    fi
+
+    echo "  Installing CUDA 12 compatibility libraries for proof wheels..."
+    # shellcheck disable=SC2086
+    $PYTHON -m pip install --no-cache-dir $missing_packages 2>&1 | tail -5
+    fix_ld_library_path
+}
+
 # ── vLLM CUDA kernel compatibility check ─────────────────────────────────────
 
 check_vllm_cuda_compat() {
     $PYTHON -c "
 import torch, subprocess, site, glob, os, sys
+
+try:
+    import vllm  # noqa: F401
+    import vllm._C  # noqa: F401
+except Exception as e:
+    print(f'vLLM binary import failed: {e}')
+    sys.exit(1)
 
 cc = torch.cuda.get_device_capability(0)
 sm = cc[0] * 10 + cc[1]
@@ -306,33 +404,80 @@ else:
         sys.exit(1)
 
 try:
+    import vllm._custom_ops as vllm_ops
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
         marlin_permute_scales,
     )
     s = torch.ones(1, 128, dtype=torch.float16, device='cuda')
     marlin_permute_scales(s, size_k=128, size_n=128, group_size=128)
     torch.cuda.synchronize()
+    # Compressed-tensors INT4 models use the GPTQ Marlin repack op during
+    # weight loading. Some binary wheels import and pass the scale-permute
+    # smoke but fail here with max_shared_mem errors on Ada/Hopper hosts,
+    # so exercise the exact kernel setup before declaring the wheel usable.
+    q = torch.zeros((16, 128), dtype=torch.int32, device='cuda')
+    vllm_ops.gptq_marlin_repack(
+        q,
+        perm=torch.empty(0, dtype=torch.int32, device='cuda'),
+        size_k=128,
+        size_n=128,
+        num_bits=4,
+        is_a_8bit=False,
+    )
+    torch.cuda.synchronize()
 except Exception as e:
     err = str(e).lower()
-    if 'ptx' in err or 'unsupported' in err or 'toolchain' in err:
+    if (
+        'ptx' in err
+        or 'unsupported' in err
+        or 'toolchain' in err
+        or 'max_shared_mem' in err
+    ):
         print(f'Marlin kernel broken on {sm_str}: {e}')
         sys.exit(1)
 
-# For very new GPUs (sm_120+), pre-built wheels often have PTX compiled
-# with an older CUDA toolkit that fails at runtime even though cuobjdump
-# shows the arch. Force a source rebuild to be safe.
+# For very new GPUs (sm_120+), older CUDA 12 wheels can carry PTX that imports
+# but fails at runtime. CUDA 13 wheels are the intended Blackwell path and pass
+# the import + Marlin smoke above, so do not force a source build there.
 if sm >= 120:
-    import vllm, os
-    vllm_dir = os.path.dirname(vllm.__file__)
-    # If vLLM was built from source on this machine, there will be a
-    # build marker or the .so will have native SASS (not just PTX)
-    native_sos = glob.glob(f'{vllm_dir}/**/*sm_{sm}*', recursive=True)
-    if not native_sos:
-        print(f'{sm_str} is very new — forcing source rebuild for full kernel compatibility')
+    cuda = str(getattr(torch.version, 'cuda', '') or '')
+    if not cuda.startswith('13.'):
+        print(f'{sm_str} on CUDA {cuda or \"unknown\"} requires CUDA 13 wheel path or source rebuild')
         sys.exit(1)
 
 sys.exit(0)
 " 2>/dev/null
+}
+
+torch_pin_ready() {
+    local expected="$1"
+    local cuda_prefix="${2:-12.8}"
+    $PYTHON - "$expected" "$cuda_prefix" <<'PY' >/dev/null 2>&1
+import sys
+expected = sys.argv[1]
+cuda_prefix = sys.argv[2]
+import torch
+if torch.__version__ != expected:
+    raise SystemExit(1)
+if not torch.version.cuda or not torch.version.cuda.startswith(cuda_prefix):
+    raise SystemExit(1)
+if not torch.cuda.is_available():
+    raise SystemExit(1)
+torch.zeros(1, device="cuda")
+torch.cuda.synchronize()
+PY
+}
+
+vllm_pin_ready() {
+    local expected="$1"
+    $PYTHON - "$expected" <<'PY' >/dev/null 2>&1
+import importlib.metadata
+import sys
+expected = sys.argv[1]
+if importlib.metadata.version("vllm") != expected:
+    raise SystemExit(1)
+import vllm  # noqa: F401
+PY
 }
 
 rebuild_vllm_from_source() {
@@ -340,7 +485,11 @@ rebuild_vllm_from_source() {
     # would let the outer script exit 0 with a broken install.
     set -e
 
-    local BUILD_DIR="${WORKSPACE}/vllm-build"
+    local BUILD_PARENT="${WORKSPACE}"
+    if [ "${WORKSPACE_IS_FUSE:-0}" = "1" ]; then
+        BUILD_PARENT="${TMPDIR:-/tmp}"
+    fi
+    local BUILD_DIR="${BUILD_PARENT}/vllm-build"
     if ! mkdir -p "$BUILD_DIR" 2>/dev/null; then
         echo "  ERROR: cannot create build dir $BUILD_DIR (WORKSPACE=$WORKSPACE not writable)"
         set +e
@@ -374,16 +523,25 @@ except Exception:
     print(out.strip().split('\n')[0])
 ")
 
-    local NJOBS=$(( $(nproc) < 32 ? $(nproc) : 32 ))
+    local MEM_GB
+    MEM_GB=$(detect_memory_gb)
+    local DEFAULT_JOBS=8
+    if [ "${MEM_GB:-0}" -gt 0 ] && [ "$MEM_GB" -lt 96 ]; then
+        DEFAULT_JOBS=4
+    elif [ "${MEM_GB:-0}" -ge 192 ]; then
+        DEFAULT_JOBS=16
+    fi
+    local NJOBS="${VERATHOS_VLLM_BUILD_JOBS:-$DEFAULT_JOBS}"
 
     echo "  CUDA_HOME=$CUDA_HOME_PATH"
     echo "  TORCH_CUDA_ARCH_LIST=$ARCH_LIST"
-    echo "  MAX_JOBS=$NJOBS ($(nproc) CPUs available)"
+    echo "  MAX_JOBS=$NJOBS ($(nproc) CPUs, ${MEM_GB:-unknown}GB RAM available)"
 
     rm -rf "$BUILD_DIR"
-    # Pin to v0.19.1 tag — matches the [vllm] extra range in pyproject.toml.
-    # Avoids breaking changes on main branch.
-    git clone --depth 1 --branch v0.19.1 https://github.com/vllm-project/vllm.git "$BUILD_DIR"
+    # Pin to the runtime-selected vLLM tag.  Avoids breaking changes on main
+    # branch and keeps the rebuilt binary ABI-compatible with the torch pin.
+    local VLLM_TAG="${VLLM_SOURCE_TAG:-v0.20.2}"
+    git clone --depth 1 --branch "$VLLM_TAG" https://github.com/vllm-project/vllm.git "$BUILD_DIR"
     cd "$BUILD_DIR"
 
     export PATH="${CUDA_HOME_PATH}/bin:$PATH"
@@ -422,30 +580,114 @@ except Exception:
 # ── Venv setup ───────────────────────────────────────────────────────────────
 
 VENV_DIR="${REPO_DIR}/.venv-vllm"
+VENV_ON_LOCAL=0
+if [ "${WORKSPACE_IS_FUSE:-0}" = "1" ]; then
+    VENV_ON_LOCAL=1
+    VENV_LINK="$VENV_DIR"
+    LOCAL_INSTALL_ROOT="${VERATHOS_LOCAL_INSTALL_ROOT:-/opt/verathos-local}"
+    if ! mkdir -p "${LOCAL_INSTALL_ROOT}/venvs" 2>/dev/null; then
+        LOCAL_INSTALL_ROOT="${TMPDIR:-/tmp}/verathos-local"
+        mkdir -p "${LOCAL_INSTALL_ROOT}/venvs"
+    fi
+    REPO_HASH=$(printf '%s' "$REPO_DIR" | sha256sum | awk '{print substr($1, 1, 12)}')
+    VENV_REAL="${LOCAL_INSTALL_ROOT}/venvs/$(basename "$REPO_DIR")-${REPO_HASH}-venv-vllm"
+    if [ -e "$VENV_LINK" ] && [ ! -L "$VENV_LINK" ]; then
+        echo "  Existing FUSE-backed venv directory found — moving venv to local disk"
+        rm -rf "$VENV_LINK"
+    fi
+    mkdir -p "$VENV_REAL"
+    ln -sfnT "$VENV_REAL" "$VENV_LINK"
+    VENV_DIR="$VENV_REAL"
+    echo "  WORKSPACE on FUSE/network FS — venv stored on local disk: $VENV_REAL"
+fi
 
 # ── System dependencies ────────────────────────────────────────────────────
 # ninja-build: required by FlashInfer JIT compilation on Hopper/Blackwell (sm_90+)
 if ! command -v ninja &>/dev/null; then
-    if sudo -n true 2>/dev/null; then
+    if can_run_privileged; then
         if command -v apt-get &>/dev/null; then
-            sudo apt-get install -y -qq ninja-build >/dev/null 2>&1 || true
+            run_privileged apt-get install -y -qq ninja-build >/dev/null 2>&1 || true
         elif command -v dnf &>/dev/null; then
-            sudo dnf install -y ninja-build >/dev/null 2>&1 || true
+            run_privileged dnf install -y ninja-build >/dev/null 2>&1 || true
         fi
     fi
     # If system install failed, pip fallback happens after venv activation below
 fi
 
+install_pm2_if_missing() {
+    if command -v pm2 &>/dev/null; then
+        return 0
+    fi
+
+    echo "  Installing PM2 process manager..."
+    local SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+        if sudo -n true 2>/dev/null; then
+            SUDO="sudo"
+        else
+            echo "  ERROR: pm2 is not installed and sudo is unavailable."
+            echo "  Install Node.js/npm and PM2, then rerun this setup:"
+            echo "    npm install -g pm2"
+            exit 1
+        fi
+    fi
+
+    if ! command -v npm &>/dev/null; then
+        if command -v apt-get &>/dev/null; then
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq nodejs npm 2>&1 | tail -3
+        elif command -v dnf &>/dev/null; then
+            $SUDO dnf install -y nodejs npm 2>&1 | tail -3
+        else
+            echo "  ERROR: npm not found and no supported system package manager detected."
+            echo "  Install Node.js/npm and PM2, then rerun this setup:"
+            echo "    npm install -g pm2"
+            exit 1
+        fi
+    fi
+
+    if ! command -v npm &>/dev/null; then
+        echo "  ERROR: npm install failed or npm is still not on PATH."
+        exit 1
+    fi
+    $SUDO npm install -g pm2 >/dev/null
+    if ! command -v pm2 &>/dev/null; then
+        echo "  ERROR: PM2 installation completed but pm2 is not on PATH."
+        exit 1
+    fi
+    echo "  PM2 installed: $(pm2 -v)"
+}
+
+install_pm2_if_missing
+
+NEED_CREATE_VENV=0
+if [ -d "$VENV_DIR" ] && { [ ! -f "$VENV_DIR/bin/activate" ] || [ ! -x "$VENV_DIR/bin/python" ]; }; then
+    echo ""
+    echo "  Existing venv is incomplete — recreating: $VENV_DIR"
+    if [ "$VENV_ON_LOCAL" = "1" ]; then
+        rm -rf "$VENV_REAL"
+        mkdir -p "$VENV_REAL"
+        ln -sfnT "$VENV_REAL" "$VENV_LINK"
+    else
+        rm -rf "$VENV_DIR"
+    fi
+    NEED_CREATE_VENV=1
+fi
+
 if [ ! -d "$VENV_DIR" ]; then
+    NEED_CREATE_VENV=1
+fi
+
+if [ "$NEED_CREATE_VENV" = "1" ]; then
     echo ""
     echo "  Creating venv with --system-site-packages..."
     if ! $PYTHON -m venv "$VENV_DIR" --system-site-packages 2>/dev/null; then
         echo "  python3-venv not installed — installing..."
         PY_VER=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
         if command -v apt-get &>/dev/null; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq "python${PY_VER}-venv" 2>&1 | tail -3
+            run_privileged apt-get update -qq && run_privileged apt-get install -y -qq "python${PY_VER}-venv" 2>&1 | tail -3
         elif command -v dnf &>/dev/null; then
-            sudo dnf install -y "python${PY_VER}-venv" 2>&1 | tail -3
+            run_privileged dnf install -y "python${PY_VER}-venv" 2>&1 | tail -3
         else
             echo "  ERROR: Cannot install python3-venv automatically."
             echo "  Please install it manually: apt install python${PY_VER}-venv"
@@ -474,7 +716,7 @@ fi
 if [ "$SKIP_INSTALL" = false ]; then
 
     echo ""
-    echo "Step 1/5: Installing zkllm wheel..."
+    echo "Step 1/6: Installing zkllm wheel..."
     if ls "$REPO_DIR/dist"/zkllm-*.whl &>/dev/null; then
         # Use --find-links so pip auto-selects the wheel matching this Python version
         $PYTHON -m pip install --no-cache-dir --force-reinstall --find-links "$REPO_DIR/dist" zkllm 2>&1 | tail -5
@@ -485,24 +727,19 @@ if [ "$SKIP_INSTALL" = false ]; then
     fi
 
     echo ""
-    echo "Step 2/5: Installing Python dependencies..."
+    echo "Step 2/6: Installing Python dependencies..."
     # Upgrade pip + setuptools first — Ubuntu 22.04's system setuptools (59.x) is
     # too old for PEP 660 editable installs (needs >=64).
     $PYTHON -m pip install --no-cache-dir --upgrade pip setuptools 2>&1 | tail -5
-    # Install in two passes to avoid setuptools conflict between bittensor (~=70)
-    # and vllm (>=77). Install vllm first (upgrades setuptools), then bittensor
-    # (downgrades setuptools — but both work fine at runtime).
-    echo "  Installing vLLM + inference deps (this downloads several GB, may take 5-10 min)..."
-    $PYTHON -m pip install --no-cache-dir -e ".[api,hashing,vllm]" 2>&1 | tail -20
+    VLLM_RUNTIME_DEPS=(
+        "bitsandbytes>=0.42"
+        "streamlit>=1.30"
+        "ninja>=1.11"
+        "kernels>=0.12,<0.13"
+    )
 
-    # vLLM pins `torch==2.11.0` without a CUDA variant, so the default
-    # PyPI index serves the cu130 wheel — which requires NVIDIA driver
-    # >= 580.  Most cloud GPU hosts (RunPod, Lambda, Vast, OVH) still
-    # ship driver 570.x, where cu130 fails with
-    # `cuda.is_available() == False` and the miner falls back to CPU.
-    # Force-replace the cu130 wheel with the binary-compatible cu128
-    # variant (works on driver 570+ AND 580+).  `--no-deps` keeps the
-    # rest of the resolved env intact.
+    # Install the arch-specific vLLM + torch pair before installing Verathos.
+    # This avoids resolving a generic torch/vLLM stack that is replaced below.
     # Per-arch (vLLM, torch) pinning.  Each (sm, vLLM, torch) triple is a
     # known-good combination empirically validated end-to-end (boot +
     # proof verify) on real hardware.  Mixing versions across the gate
@@ -510,10 +747,10 @@ if [ "$SKIP_INSTALL" = false ]; then
     # crashes (`max_shared_mem > 0`, `increment_version expects tensor`).
     #
     # Why per-arch:
-    #  - vLLM 0.20.2 PyPI wheel needs CUDA 13 runtime libs (libcudart.so.13).
-    #    Default PyPI torch 2.11.0 ships cu130 deps; driver 570 (the most
-    #    common cloud-GPU driver) only supports CUDA 12.8 -> torch.cuda
-    #    returns False on cu130.  cu128 wheels work on driver 570 AND 580+.
+    #  - vLLM 0.20.2 PyPI wheels are CUDA 13-linked. On Blackwell with a CUDA
+    #    13-capable driver/image, use the coherent default cu130 torch/vLLM
+    #    stack. Forcing cu128 there is unnecessary and can trigger a slow
+    #    source rebuild path.
     #  - vLLM 0.19.1 was built against torch 2.10 (ABI in METADATA).  Pairing
     #    it with torch 2.11 produces undefined-symbol load errors.
     #  - vLLM 0.20.2 + Ampere (sm<89) Marlin FP8 path crashes with
@@ -526,20 +763,92 @@ if [ "$SKIP_INSTALL" = false ]; then
     #
     # Net selection:
     #  - sm < 89 (Ampere): vLLM 0.19.1 + torch 2.10.0 + cu128
-    #  - sm >= 89 (Ada / Hopper / Blackwell): vLLM 0.20.2 + torch 2.11.0 + cu128
+    #  - sm >= 120 with driver >= 580: vLLM 0.20.2 + torch 2.11.0 + cu130
+    #  - sm >= 89 otherwise: vLLM 0.20.2 + torch 2.11.0 + cu128
     if [ "${GPU_SM:-0}" -lt 89 ] 2>/dev/null; then
-        echo "  Ampere GPU (sm_${GPU_SM}): pinning torch 2.10.0 + cu128 (vLLM 0.19.1 ABI match)..."
-        $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
-            "torch==2.10.0+cu128" "torchvision==0.25.0+cu128" "torchaudio==2.10.0+cu128" \
-            --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5
+        VLLM_SOURCE_TAG="v0.19.1"
+        echo "  Ampere GPU (sm_${GPU_SM}): installing vLLM 0.19.1 + torch 2.10.0+cu128..."
+        TORCH_CONSTRAINT="$(mktemp)"
+        {
+            echo "torch==2.10.0+cu128"
+            echo "torchvision==0.25.0+cu128"
+            echo "torchaudio==2.10.0+cu128"
+        } > "$TORCH_CONSTRAINT"
+        $PYTHON -m pip install --no-cache-dir \
+            --extra-index-url https://download.pytorch.org/whl/cu128 \
+            -c "$TORCH_CONSTRAINT" \
+            "vllm==0.19.1" "${VLLM_RUNTIME_DEPS[@]}" 2>&1 | tail -20
+        rm -f "$TORCH_CONSTRAINT"
+        echo "  Verifying Ampere torch/vLLM pins..."
+        if torch_pin_ready "2.10.0+cu128" "12.8"; then
+            echo "  torch 2.10.0+cu128 already installed"
+        else
+            $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
+                "torch==2.10.0+cu128" "torchvision==0.25.0+cu128" "torchaudio==2.10.0+cu128" \
+                --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5
+        fi
         echo "  Ampere GPU: pinning vLLM to 0.19.1 (Marlin FP8 known-good on this arch)..."
-        $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.19.1' 2>&1 | tail -5
+        if vllm_pin_ready "0.19.1"; then
+            echo "  vLLM 0.19.1 already installed"
+        else
+            $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.19.1' 2>&1 | tail -5
+        fi
+    elif [ "${GPU_SM:-0}" -ge 120 ] 2>/dev/null && [ "${GPU_DRIVER_MAJOR:-0}" -ge 580 ] 2>/dev/null; then
+        VLLM_SOURCE_TAG="v0.20.2"
+        echo "  Blackwell GPU (sm_${GPU_SM}) on driver ${GPU_DRIVER}: installing vLLM 0.20.2 + torch 2.11.0+cu130..."
+        $PYTHON -m pip install --no-cache-dir \
+            "vllm==0.20.2" "${VLLM_RUNTIME_DEPS[@]}" 2>&1 | tail -20
+        echo "  Verifying Blackwell torch/vLLM pins..."
+        if torch_pin_ready "2.11.0+cu130" "13."; then
+            echo "  torch 2.11.0+cu130 already installed"
+        else
+            $PYTHON -m pip install --no-cache-dir --force-reinstall \
+                "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" 2>&1 | tail -10
+            if ! torch_pin_ready "2.11.0+cu130" "13."; then
+                echo "  ERROR: expected torch 2.11.0+cu130 on Blackwell/CUDA 13, but verification failed."
+                echo "  Use a CUDA 13-capable image/driver or retry on a newer host."
+                exit 1
+            fi
+        fi
+        if vllm_pin_ready "0.20.2"; then
+            echo "  vLLM 0.20.2 already installed"
+        else
+            $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.20.2' 2>&1 | tail -5
+        fi
     else
-        echo "  Ada/Hopper/Blackwell (sm_${GPU_SM:-89+}): pinning torch 2.11.0 + cu128 (vLLM 0.20.2 ABI match, driver 570+ compatible)..."
-        $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
-            "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" \
-            --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5
+        VLLM_SOURCE_TAG="v0.20.2"
+        echo "  Ada/Hopper/Blackwell (sm_${GPU_SM:-89+}): installing vLLM 0.20.2 + torch 2.11.0+cu128..."
+        TORCH_CONSTRAINT="$(mktemp)"
+        {
+            echo "torch==2.11.0+cu128"
+            echo "torchvision==0.26.0+cu128"
+            echo "torchaudio==2.11.0+cu128"
+        } > "$TORCH_CONSTRAINT"
+        $PYTHON -m pip install --no-cache-dir \
+            --extra-index-url https://download.pytorch.org/whl/cu128 \
+            -c "$TORCH_CONSTRAINT" \
+            "vllm==0.20.2" "${VLLM_RUNTIME_DEPS[@]}" 2>&1 | tail -20
+        rm -f "$TORCH_CONSTRAINT"
+        echo "  Verifying Ada/Hopper/Blackwell torch/vLLM pins..."
+        if torch_pin_ready "2.11.0+cu128" "12.8"; then
+            echo "  torch 2.11.0+cu128 already installed"
+        else
+            $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
+                "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" \
+                --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5
+        fi
+        if vllm_pin_ready "0.20.2"; then
+            echo "  vLLM 0.20.2 already installed"
+        else
+            $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.20.2' 2>&1 | tail -5
+        fi
+        if [ "${GPU_DRIVER_MAJOR:-0}" -lt 580 ] 2>/dev/null; then
+            echo "  Driver ${GPU_DRIVER} is < 580: using cu128 torch and validating the vLLM wheel before any rebuild."
+        fi
     fi
+
+    echo "  Installing Verathos API deps..."
+    $PYTHON -m pip install --no-cache-dir -e ".[api,hashing]" 2>&1 | tail -20
 
     echo "  Installing Bittensor + neuron deps..."
     $PYTHON -m pip install --no-cache-dir -e ".[neurons]" 2>&1 | tail -20
@@ -561,9 +870,26 @@ if [ "$SKIP_INSTALL" = false ]; then
     echo "  Pinning kernels<0.13 (upstream 0.13.0 import-time crash)..."
     $PYTHON -m pip install --no-cache-dir 'kernels>=0.12,<0.13' 2>&1 | tail -3
 
+    ensure_proof_cuda12_libraries
+
     echo ""
     echo "  Checking vLLM CUDA kernel compatibility..."
-    if ! check_vllm_cuda_compat; then
+    if [ "${FORCE_VLLM_SOURCE_REBUILD:-0}" = "1" ]; then
+        echo "  vLLM source rebuild forced for this GPU/driver combination."
+        if ! rebuild_vllm_from_source; then
+            echo ""
+            echo "  ERROR: vLLM source rebuild failed — cannot continue."
+            echo "  The miner will not start without working CUDA kernels."
+            exit 1
+        fi
+        fix_ld_library_path
+        if ! check_vllm_cuda_compat; then
+            echo ""
+            echo "  ERROR: rebuilt vLLM still failed CUDA compatibility check."
+            echo "  The miner will not start without a working vLLM binary."
+            exit 1
+        fi
+    elif ! check_vllm_cuda_compat; then
         echo "  vLLM wheel's CUDA kernels don't support this GPU — rebuilding from source..."
         echo "  (This compiles Marlin/quantization kernels for your GPU. May take 10-20 min.)"
         if ! rebuild_vllm_from_source; then
@@ -573,32 +899,42 @@ if [ "$SKIP_INSTALL" = false ]; then
             exit 1
         fi
         fix_ld_library_path
+        if ! check_vllm_cuda_compat; then
+            echo ""
+            echo "  ERROR: rebuilt vLLM still failed CUDA compatibility check."
+            echo "  The miner will not start without a working vLLM binary."
+            exit 1
+        fi
     else
         echo "  vLLM CUDA kernels: compatible"
     fi
 
     echo ""
-    echo "Step 3/5: Installing gptqmodel (GPTQ quantization support)..."
-    echo "  This compiles CUDA kernels from source — may take 5-10 minutes."
-    echo "  (Only needed for GPTQ models; AWQ/fp16/fp8 work without it.)"
-    # gptqmodel needs setuptools>=77 (bittensor downgrades to ~70).
-    # After install, pin back transformers/protobuf/huggingface_hub to
-    # versions compatible with vLLM — gptqmodel works fine at runtime
-    # with older versions despite its pip constraints.
-    $PYTHON -m pip install --no-cache-dir "setuptools>=77,<81" 2>&1 | tail -3
-    $PYTHON -m pip install --no-build-isolation --no-cache-dir "gptqmodel>=0.9,<6.0" 2>&1 | tail -10 || {
-        echo "  WARNING: gptqmodel install failed — GPTQ models will not be available."
-        echo "  (Non-fatal; AWQ/fp16/fp8 models still work. Retry manually if needed:"
-        echo "   pip install --no-build-isolation 'gptqmodel>=0.9,<6.0')"
-    }
-    # Restore deps that gptqmodel upgraded beyond vLLM's constraints.
-    # gptqmodel works fine at runtime with these pinned versions.
-    $PYTHON -m pip install --no-cache-dir \
-        "transformers>=4.56,<5" "protobuf>=5.0,<7" "huggingface_hub>=0.28,<1.0" \
-        2>&1 | tail -3
+    echo "Step 3/6: GPTQ quantization support..."
+    if [ "$INSTALL_GPTQMODEL" = "1" ]; then
+        echo "  Installing gptqmodel (may compile CUDA kernels from source)."
+        # gptqmodel needs setuptools>=77 (bittensor downgrades to ~70).
+        # After install, pin back transformers/protobuf/huggingface_hub to
+        # versions compatible with vLLM — gptqmodel works fine at runtime
+        # with older versions despite its pip constraints.
+        $PYTHON -m pip install --no-cache-dir "setuptools>=77,<81" 2>&1 | tail -3
+        $PYTHON -m pip install --no-build-isolation --no-cache-dir "gptqmodel>=0.9,<6.0" 2>&1 | tail -10 || {
+            echo "  WARNING: gptqmodel install failed — GPTQ models will not be available."
+            echo "  (Non-fatal; AWQ/fp16/fp8 models still work. Retry manually if needed:"
+            echo "   VERATHOS_INSTALL_GPTQMODEL=1 bash scripts/public_overlay/setup_miner.sh)"
+        }
+        # Restore deps that gptqmodel upgraded beyond vLLM's constraints.
+        # gptqmodel works fine at runtime with these pinned versions.
+        $PYTHON -m pip install --no-cache-dir \
+            "transformers>=4.56,<5" "protobuf>=5.0,<7" "huggingface_hub>=0.28,<1.0" \
+            2>&1 | tail -3
+    else
+        echo "  Skipping optional gptqmodel install."
+        echo "  Set VERATHOS_INSTALL_GPTQMODEL=1 before setup only if serving GPTQ models."
+    fi
 
     echo ""
-    echo "Step 4/5: Verifying torch + CUDA..."
+    echo "Step 4/6: Verifying torch + CUDA..."
     $PYTHON -c "
 import torch, subprocess
 assert torch.cuda.is_available(), 'CUDA not available!'
@@ -649,7 +985,7 @@ except Exception as e:
     }
 
     echo ""
-    echo "Step 5/5: Verifying zkllm CUDA extension..."
+    echo "Step 5/6: Verifying zkllm CUDA extension..."
     fix_ld_library_path
     # zkllm is installed as a wheel — no build needed.
     # The wheel auto-detects the correct torch version at import time.
@@ -699,6 +1035,69 @@ print(f'  Kernels: blake3_merkle, sumcheck, field_ops')
     fi
 
     echo ""
+    echo "Step 6/6: Verifying hot-capacity audit workspace extension..."
+    HOT_CAPACITY_READY=0
+    CAPACITY_AUDIT_REQUESTED="${VERATHOS_SETUP_CAPACITY_AUDIT:-${VERATHOS_CAPACITY_AUDIT_ENABLED:-1}}"
+    CAPACITY_AUDIT_MODE="${VERATHOS_SETUP_CAPACITY_AUDIT_MODE:-${VERATHOS_CAPACITY_AUDIT_MODE:-observe}}"
+    CAPACITY_AUDIT_REQUIRES_WORKSPACE="${VERATHOS_REQUIRE_CAPACITY_AUDIT_WORKSPACE:-}"
+    if [ -z "$CAPACITY_AUDIT_REQUIRES_WORKSPACE" ]; then
+        case "$(printf '%s' "$CAPACITY_AUDIT_REQUESTED" | tr '[:upper:]' '[:lower:]')" in
+            1|true|yes|on|score_gate|soft_gate|enforce)
+                if [ "$(printf '%s' "$CAPACITY_AUDIT_MODE" | tr '[:upper:]' '[:lower:]')" != "observe" ]; then
+                    CAPACITY_AUDIT_REQUIRES_WORKSPACE=1
+                fi
+                ;;
+        esac
+    fi
+    if ls "$REPO_DIR/dist"/hot_capacity_workspace_cuda-*.whl &>/dev/null; then
+        # Install after torch/vLLM pinning so the import smoke catches ABI issues
+        # against the final runtime torch version.
+        $PYTHON -m pip install --no-cache-dir --force-reinstall --find-links "$REPO_DIR/dist" hot_capacity_workspace_cuda 2>&1 | tail -5
+    else
+        echo "  WARNING: No hot-capacity workspace wheel found in dist/."
+    fi
+    if $PYTHON -c "
+import hot_capacity_workspace_cuda
+from hot_capacity_workspace.bench_combined import main
+" 2>/dev/null; then
+        HOT_CAPACITY_READY=1
+        echo "  hot_capacity_workspace_cuda wheel: OK"
+    else
+        echo ""
+        echo "WARNING: hot-capacity audit wheel is not importable."
+        echo "  Capacity audits require the pre-built hot_capacity_workspace_cuda wheel."
+        echo "  Rebuild private release wheels with:"
+        echo "    bash scripts/build_hot_capacity_workspace_wheel.sh"
+    fi
+    if [ "$HOT_CAPACITY_READY" = "1" ]; then
+        HOT_CAPACITY_SMOKE_DIR="${TMPDIR:-/tmp}/verathos-hot-capacity-smoke-$$"
+        if timeout 60 "$PYTHON" -c "from hot_capacity_workspace.bench_combined import main; main()" \
+            --capacity-passes 1 \
+            --capacity-rounds 1 \
+            --capacity-warmup-passes 0 \
+            --capacity-tail-passes 0 \
+            --fp64-passes 0 \
+            --spot-checks 1 \
+            --b-proof-hex 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+            --out-dir "$HOT_CAPACITY_SMOKE_DIR" >/dev/null 2>&1; then
+            rm -rf "$HOT_CAPACITY_SMOKE_DIR" 2>/dev/null || true
+            echo "  Hot-capacity audit smoke: OK"
+        else
+            echo ""
+            echo "WARNING: hot-capacity audit smoke failed."
+            echo "  The miner can start in observe mode, but enforced capacity audits will fail."
+            HOT_CAPACITY_READY=0
+        fi
+    fi
+    if [ "$HOT_CAPACITY_READY" != "1" ]; then
+        if [ "${CAPACITY_AUDIT_REQUIRES_WORKSPACE:-}" = "1" ]; then
+            echo "ERROR: enforced hot-capacity audit mode requires a working hot_capacity_workspace_cuda wheel."
+            exit 1
+        fi
+        echo "  Continuing because enforced hot-capacity audit mode is not enabled."
+    fi
+
+    echo ""
     echo "Installation complete."
 else
     echo "  Skipping install (--skip-install)"
@@ -706,11 +1105,21 @@ fi
 
 # ── Persist environment for future SSH sessions ──────────────────────────────
 
-# Pick TMPDIR_DEFAULT based on the FUSE detection done above.
+# Pick runtime cache defaults based on the FUSE detection done above.
 if [ "${WORKSPACE_IS_FUSE:-0}" = "1" ]; then
-    TMPDIR_DEFAULT="/tmp"
+    TMPDIR_DEFAULT="${TMPDIR:-/tmp}"
+    TRITON_CACHE_DEFAULT="${TRITON_CACHE_DIR:-/tmp/.cache/triton}"
+    TORCHINDUCTOR_CACHE_DEFAULT="${TORCHINDUCTOR_CACHE_DIR:-/tmp/.cache/torchinductor}"
+    XDG_CACHE_DEFAULT="${XDG_CACHE_HOME:-/tmp/.cache}"
+    VERATHOS_MODEL_ROOT_CACHE_DEFAULT="${VERATHOS_MODEL_ROOT_CACHE_DIR:-${LOCAL_INSTALL_ROOT:-/tmp/verathos-local}/cache/model_root}"
+    VERATHOS_MERKLE_TREE_CACHE_DEFAULT="${VERATHOS_MERKLE_TREE_CACHE_DIR:-${LOCAL_INSTALL_ROOT:-/tmp/verathos-local}/cache/merkle_tree}"
 else
-    TMPDIR_DEFAULT="${WORKSPACE}/tmp"
+    TMPDIR_DEFAULT="${TMPDIR:-${WORKSPACE}/tmp}"
+    TRITON_CACHE_DEFAULT="${TRITON_CACHE_DIR:-${WORKSPACE}/.cache/triton}"
+    TORCHINDUCTOR_CACHE_DEFAULT="${TORCHINDUCTOR_CACHE_DIR:-${WORKSPACE}/.cache/torchinductor}"
+    XDG_CACHE_DEFAULT="${XDG_CACHE_HOME:-${WORKSPACE}/.cache}"
+    VERATHOS_MODEL_ROOT_CACHE_DEFAULT="${VERATHOS_MODEL_ROOT_CACHE_DIR:-${REPO_DIR}/.model_root_cache}"
+    VERATHOS_MERKLE_TREE_CACHE_DEFAULT="${VERATHOS_MERKLE_TREE_CACHE_DIR:-${REPO_DIR}/.merkle_tree_cache}"
 fi
 
 ENV_FILE="${REPO_DIR}/.env.sh"
@@ -718,25 +1127,19 @@ cat > "$ENV_FILE" <<ENVEOF
 # Auto-generated by setup_miner.sh — source from .bashrc for persistent env
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
 export HF_HOME="${HF_HOME}"
+export PATH="${REPO_DIR}/.venv-vllm/bin:\${PATH}"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-# Redirect torch / triton / vLLM compile caches off the small (typically
-# 30 GB) container overlay disk and onto the persistent volume.  Without
-# this, large models (Qwen3.5-9B fp16 trees, Qwen3.6-27B compile cache,
-# anything that exercises FlashInfer / inductor heavily) fill the
-# overlay during miner warmup and crash mid-load with
-# "No space left on device (os error 28)".  Aim for "/workspace" first
-# (RunPod-style persistent volume); fall back to repo-local if the host
-# doesn't expose /workspace.
-#
-# TMPDIR is special: if WORKSPACE lives on a FUSE / network filesystem
-# (RunPod MooseFS pods are a common example), pip's parallel build
-# isolation deadlocks on TMPDIR there.  Setup-time detection pinned
-# TMPDIR=/tmp on those hosts — the line below records the chosen default
-# so future shells inherit it without re-detecting.
+export TORCHINDUCTOR_COMPILE_THREADS="\${TORCHINDUCTOR_COMPILE_THREADS:-\${VERATHOS_TORCHINDUCTOR_COMPILE_THREADS:-4}}"
+# Runtime cache paths are persisted from setup-time detection.  On normal
+# local filesystems they can live under the workspace.  On FUSE / network
+# workspaces, setup pins TMPDIR plus Triton/Inductor/XDG caches to /tmp to
+# avoid warmup stalls while vLLM compiles many small kernels.
 export TMPDIR="\${TMPDIR:-${TMPDIR_DEFAULT}}"
-export TRITON_CACHE_DIR="\${TRITON_CACHE_DIR:-${WORKSPACE}/.cache/triton}"
-export TORCHINDUCTOR_CACHE_DIR="\${TORCHINDUCTOR_CACHE_DIR:-${WORKSPACE}/.cache/torchinductor}"
-export XDG_CACHE_HOME="\${XDG_CACHE_HOME:-${WORKSPACE}/.cache}"
+export TRITON_CACHE_DIR="\${TRITON_CACHE_DIR:-${TRITON_CACHE_DEFAULT}}"
+export TORCHINDUCTOR_CACHE_DIR="\${TORCHINDUCTOR_CACHE_DIR:-${TORCHINDUCTOR_CACHE_DEFAULT}}"
+export XDG_CACHE_HOME="\${XDG_CACHE_HOME:-${XDG_CACHE_DEFAULT}}"
+export VERATHOS_MODEL_ROOT_CACHE_DIR="\${VERATHOS_MODEL_ROOT_CACHE_DIR:-${VERATHOS_MODEL_ROOT_CACHE_DEFAULT}}"
+export VERATHOS_MERKLE_TREE_CACHE_DIR="\${VERATHOS_MERKLE_TREE_CACHE_DIR:-${VERATHOS_MERKLE_TREE_CACHE_DEFAULT}}"
 # sm_89+ (Ada / Hopper / Blackwell) FP8 path workarounds for vLLM 0.20.x:
 #   - FlashInfer 0.6 ships without fp8_blockscale_gemm_sm90 cubins
 #     (flashinfer#2527, vllm#33833); JIT fails during CUDA-graph capture
@@ -748,7 +1151,7 @@ export XDG_CACHE_HOME="\${XDG_CACHE_HOME:-${WORKSPACE}/.cache}"
 # the FP8 blockscale path.
 export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER="\${VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER:-0}"
 export VLLM_USE_DEEP_GEMM="\${VLLM_USE_DEEP_GEMM:-0}"
-mkdir -p "\$TMPDIR" "\$TRITON_CACHE_DIR" "\$TORCHINDUCTOR_CACHE_DIR" "\$XDG_CACHE_HOME" 2>/dev/null || true
+mkdir -p "\$TMPDIR" "\$TRITON_CACHE_DIR" "\$TORCHINDUCTOR_CACHE_DIR" "\$XDG_CACHE_HOME" "\$VERATHOS_MODEL_ROOT_CACHE_DIR" "\$VERATHOS_MERKLE_TREE_CACHE_DIR" 2>/dev/null || true
 if [ -f "${VENV_DIR}/bin/activate" ]; then
     source "${VENV_DIR}/bin/activate"
 fi
@@ -779,7 +1182,7 @@ echo "============================================================"
 echo ""
 echo "  0. Activate the environment:"
 echo "     cd $(pwd)"
-echo "     source .venv-vllm/bin/activate"
+echo "     source .env.sh"
 echo ""
 echo "  1. Set up wallet (on your local machine, then copy to this server):"
 echo "     btcli wallet create --wallet.name miner"

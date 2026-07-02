@@ -74,6 +74,50 @@ class NeuronConfig(ChainConfig):
     # Shared state between validator and proxy processes
     shared_state_path: str = "/tmp/verathos_validator_state.json"
 
+    # Public subnet runtime config. This becomes the ground truth for runtime
+    # tuning params once deployed; chain scoring remains fallback only.
+    subnet_config_url: str = "https://api.verathos.ai/v1/subnet-config"
+    subnet_config_refresh_seconds: float = 120.0
+    subnet_config_timeout_seconds: float = 5.0
+    subnet_config_cache_path: str = ""
+    subnet_config_disable: bool = False
+
+    # Hot-capacity audit windows. Enabled by default; observe mode records
+    # receipts/verdicts without affecting endpoint score.
+    capacity_audit_enabled: bool = True
+    capacity_audit_mode: str = "observe"  # observe | score_gate | soft_gate | enforce
+    capacity_audit_ingest_host: str = "0.0.0.0"
+    capacity_audit_ingest_port: int = 8091
+    capacity_audit_public_url: str = ""  # validator-owned public ingest URL published through axon metadata
+    capacity_audit_serve_axon: bool = True  # publish direct ingest IP:port via Bittensor axon metadata
+    capacity_audit_validator_urls: str = ""  # emergency manual override for miner artifact targets
+    capacity_audit_worker_poll_s: float = 2.0
+    capacity_audit_cohort_min: int = 100
+    capacity_audit_cohort_fraction: float = 0.025
+    capacity_audit_cohort_max: int = 250
+    capacity_audit_windows_per_epoch: int = 30
+    capacity_audit_max_drain_fraction: float = 0.05
+    capacity_audit_group_stress_fraction: float = 0.35
+    capacity_audit_group_stress_min_size: int = 2
+    capacity_audit_group_stress_slots_per_group: int = 2
+    capacity_audit_beacon_hash_count: int = 1
+    capacity_audit_min_registration_age_s: float = 0.0
+    capacity_audit_lead_blocks: int = 5
+    capacity_audit_proof_challenge_delay_blocks: int = 4
+    capacity_audit_drain_seconds: float = 30.0
+    capacity_audit_deadline_s: float = 30.0
+    capacity_audit_transport_grace_s: float = 3.0
+    capacity_audit_payload_deadline_s: float = 60.0
+    capacity_audit_max_proof_payload_bytes: int = 32 * 1024 * 1024
+    capacity_audit_require_proof_payload: bool = True
+    capacity_audit_repeat_window_epochs: int = 20
+    capacity_audit_timing_misses_for_zero_score: int = 2
+    capacity_audit_hard_proof_misses_for_zero_score: int = 2
+    capacity_audit_allow_timing_only_score_gate: bool = True
+    capacity_audit_slot_refresh_blocks: int = 0
+    capacity_audit_slot_snapshot_stale_blocks: int = 0
+    capacity_audit_proof_verify_workers: int = 4
+
     @classmethod
     def from_env(cls, **overrides) -> NeuronConfig:
         """Build config from environment variables."""
@@ -107,21 +151,85 @@ class NeuronConfig(ChainConfig):
             "x402_gateway_address": "VERATHOS_X402_GATEWAY",
             "x402_base_rpc_url": "VERATHOS_X402_BASE_RPC",
             "shared_state_path": "VERATHOS_SHARED_STATE_PATH",
+            "subnet_config_url": "VERATHOS_SUBNET_CONFIG_URL",
+            "subnet_config_refresh_seconds": "VERATHOS_SUBNET_CONFIG_REFRESH_SECONDS",
+            "subnet_config_timeout_seconds": "VERATHOS_SUBNET_CONFIG_TIMEOUT_SECONDS",
+            "subnet_config_cache_path": "VERATHOS_SUBNET_CONFIG_CACHE_PATH",
+            "subnet_config_disable": "VERATHOS_SUBNET_CONFIG_DISABLE",
+            "capacity_audit_enabled": "VERATHOS_CAPACITY_AUDIT_ENABLED",
+            "capacity_audit_mode": "VERATHOS_CAPACITY_AUDIT_MODE",
+            "capacity_audit_ingest_host": "VERATHOS_CAPACITY_AUDIT_INGEST_HOST",
+            "capacity_audit_ingest_port": "VERATHOS_CAPACITY_AUDIT_INGEST_PORT",
+            "capacity_audit_public_url": "VERATHOS_CAPACITY_AUDIT_PUBLIC_URL",
+            "capacity_audit_serve_axon": "VERATHOS_CAPACITY_AUDIT_SERVE_AXON",
+            "capacity_audit_validator_urls": "VERATHOS_CAPACITY_AUDIT_VALIDATOR_URLS",
+            "capacity_audit_worker_poll_s": "VERATHOS_CAPACITY_AUDIT_WORKER_POLL_S",
+            "capacity_audit_cohort_min": "VERATHOS_CAPACITY_AUDIT_COHORT_MIN",
+            "capacity_audit_cohort_fraction": "VERATHOS_CAPACITY_AUDIT_COHORT_FRACTION",
+            "capacity_audit_cohort_max": "VERATHOS_CAPACITY_AUDIT_COHORT_MAX",
+            "capacity_audit_windows_per_epoch": "VERATHOS_CAPACITY_AUDIT_WINDOWS_PER_EPOCH",
+            "capacity_audit_max_drain_fraction": "VERATHOS_CAPACITY_AUDIT_MAX_DRAIN_FRACTION",
+            "capacity_audit_group_stress_fraction": "VERATHOS_CAPACITY_AUDIT_GROUP_STRESS_FRACTION",
+            "capacity_audit_group_stress_min_size": "VERATHOS_CAPACITY_AUDIT_GROUP_STRESS_MIN_SIZE",
+            "capacity_audit_group_stress_slots_per_group": "VERATHOS_CAPACITY_AUDIT_GROUP_STRESS_SLOTS_PER_GROUP",
+            "capacity_audit_beacon_hash_count": "VERATHOS_CAPACITY_AUDIT_BEACON_HASH_COUNT",
+            "capacity_audit_min_registration_age_s": "VERATHOS_CAPACITY_AUDIT_MIN_REGISTRATION_AGE_S",
+            "capacity_audit_lead_blocks": "VERATHOS_CAPACITY_AUDIT_LEAD_BLOCKS",
+            "capacity_audit_proof_challenge_delay_blocks": "VERATHOS_CAPACITY_AUDIT_PROOF_CHALLENGE_DELAY_BLOCKS",
+            "capacity_audit_drain_seconds": "VERATHOS_CAPACITY_AUDIT_DRAIN_SECONDS",
+            "capacity_audit_deadline_s": "VERATHOS_CAPACITY_AUDIT_DEADLINE_S",
+            "capacity_audit_transport_grace_s": "VERATHOS_CAPACITY_AUDIT_TRANSPORT_GRACE_S",
+            "capacity_audit_payload_deadline_s": "VERATHOS_CAPACITY_AUDIT_PAYLOAD_DEADLINE_S",
+            "capacity_audit_max_proof_payload_bytes": "VERATHOS_CAPACITY_AUDIT_MAX_PROOF_PAYLOAD_BYTES",
+            "capacity_audit_require_proof_payload": "VERATHOS_CAPACITY_AUDIT_REQUIRE_PROOF_PAYLOAD",
+            "capacity_audit_repeat_window_epochs": "VERATHOS_CAPACITY_AUDIT_REPEAT_WINDOW_EPOCHS",
+            "capacity_audit_timing_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_TIMING_MISSES_FOR_ZERO_SCORE",
+            "capacity_audit_hard_proof_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_HARD_PROOF_MISSES_FOR_ZERO_SCORE",
+            "capacity_audit_allow_timing_only_score_gate": "VERATHOS_CAPACITY_AUDIT_ALLOW_TIMING_ONLY_SCORE_GATE",
+            "capacity_audit_slot_refresh_blocks": "VERATHOS_CAPACITY_AUDIT_SLOT_REFRESH_BLOCKS",
+            "capacity_audit_slot_snapshot_stale_blocks": "VERATHOS_CAPACITY_AUDIT_SLOT_SNAPSHOT_STALE_BLOCKS",
+            "capacity_audit_proof_verify_workers": "VERATHOS_CAPACITY_AUDIT_PROOF_VERIFY_WORKERS",
         }
 
         _float_fields = {
             "ema_alpha", "heartbeat_interval_sec",
             "throughput_power", "canary_proof_sample_rate",
             "demand_bonus_max", "tao_usd_fallback", "verified_multiplier",
+            "capacity_audit_cohort_fraction", "capacity_audit_drain_seconds",
+            "capacity_audit_deadline_s", "capacity_audit_transport_grace_s",
+            "capacity_audit_payload_deadline_s",
+            "capacity_audit_max_drain_fraction",
+            "capacity_audit_group_stress_fraction",
+            "capacity_audit_min_registration_age_s",
+            "capacity_audit_worker_poll_s",
+            "subnet_config_refresh_seconds", "subnet_config_timeout_seconds",
         }
         _int_fields = {
             "epoch_blocks", "canary_small_count",
             "canary_full_context_count", "set_weights_epoch_blocks",
             "price_feed_cache_ttl",
             "probation_required_passes", "probation_escalation_epochs",
+            "capacity_audit_ingest_port", "capacity_audit_cohort_min",
+            "capacity_audit_cohort_max", "capacity_audit_windows_per_epoch",
+            "capacity_audit_group_stress_min_size",
+            "capacity_audit_group_stress_slots_per_group",
+            "capacity_audit_beacon_hash_count",
+            "capacity_audit_lead_blocks",
+            "capacity_audit_proof_challenge_delay_blocks",
+            "capacity_audit_repeat_window_epochs",
+            "capacity_audit_timing_misses_for_zero_score",
+            "capacity_audit_hard_proof_misses_for_zero_score",
+            "capacity_audit_slot_refresh_blocks",
+            "capacity_audit_slot_snapshot_stale_blocks",
+            "capacity_audit_proof_verify_workers",
+            "capacity_audit_max_proof_payload_bytes",
         }
         _bool_fields = {
             "demand_bonus_enabled", "x402_testnet",
+            "capacity_audit_enabled", "capacity_audit_require_proof_payload",
+            "capacity_audit_allow_timing_only_score_gate",
+            "capacity_audit_serve_axon",
+            "subnet_config_disable",
         }
 
         for attr, env_var in neuron_env.items():

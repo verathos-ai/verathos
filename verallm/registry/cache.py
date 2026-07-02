@@ -6,6 +6,7 @@ to avoid recomputation during development and testing.
 """
 
 import logging
+import os
 import pickle
 from pathlib import Path
 from typing import Optional
@@ -14,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 # Cache directories at repo root
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-CACHE_DIR = _REPO_ROOT / ".model_root_cache"
-MERKLE_CACHE_DIR = _REPO_ROOT / ".merkle_tree_cache"
+CACHE_DIR = Path(os.environ.get("VERATHOS_MODEL_ROOT_CACHE_DIR", _REPO_ROOT / ".model_root_cache")).expanduser()
+MERKLE_CACHE_DIR = Path(os.environ.get("VERATHOS_MERKLE_TREE_CACHE_DIR", _REPO_ROOT / ".merkle_tree_cache")).expanduser()
 
 
 # ============================================================================

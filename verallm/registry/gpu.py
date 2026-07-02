@@ -88,7 +88,7 @@ def detect_gpu_info(device: int = 0) -> dict:
         return {"available": False}
 
     props = torch.cuda.get_device_properties(device)
-    vram_gb = round(props.total_memory / (1024 ** 3))
+    vram_gb = detect_vram_gb(device)
     tier = detect_vram_tier(device)
     return {
         "available": True,

@@ -69,24 +69,25 @@ def _current_python_tag() -> str:
     return f"cp{sys.version_info.major}{sys.version_info.minor}"
 
 
-def _find_local_zkllm_wheel(py_tag: Optional[str] = None) -> Optional[Path]:
-    """Find the bundled zkllm wheel matching the running Python minor."""
+def _find_local_wheel(prefix: str, py_tag: Optional[str] = None) -> Optional[Path]:
+    """Find the bundled wheel matching the running Python minor."""
     tag = py_tag or _current_python_tag()
     dist_dir = _REPO_ROOT / "dist"
-    wheels = sorted(dist_dir.glob(f"zkllm-*-{tag}-*.whl"))
+    wheels = sorted(dist_dir.glob(f"{prefix}-*-{tag}-*.whl"))
     return wheels[-1] if wheels else None
 
 
-def install_local_zkllm_wheel() -> bool:
-    """Force-install the bundled zkllm wheel for this Python minor."""
-    wheel = _find_local_zkllm_wheel()
+def install_local_wheel(prefix: str, *, required: bool = True) -> bool:
+    """Force-install a bundled wheel for this Python minor."""
+    wheel = _find_local_wheel(prefix)
     if wheel is None:
-        bt.logging.error(
-            f"No bundled zkllm wheel found for {_current_python_tag()} in {_REPO_ROOT / 'dist'}"
+        log_fn = bt.logging.error if required else bt.logging.warning
+        log_fn(
+            f"No bundled {prefix} wheel found for {_current_python_tag()} in {_REPO_ROOT / 'dist'}"
         )
-        return False
+        return not required
 
-    bt.logging.info(f"Installing zkllm wheel: {wheel.name}")
+    bt.logging.info(f"Installing {prefix} wheel: {wheel.name}")
     try:
         result = subprocess.run(
             [
@@ -104,14 +105,24 @@ def install_local_zkllm_wheel() -> bool:
             timeout=300,
         )
         if result.returncode != 0:
-            bt.logging.error(f"zkllm wheel install failed: {result.stderr}")
+            bt.logging.error(f"{prefix} wheel install failed: {result.stderr}")
             return False
     except subprocess.TimeoutExpired:
-        bt.logging.error("zkllm wheel install timed out")
+        bt.logging.error(f"{prefix} wheel install timed out")
         return False
 
-    bt.logging.info("zkllm wheel installed successfully")
+    bt.logging.info(f"{prefix} wheel installed successfully")
     return True
+
+
+def install_local_zkllm_wheel() -> bool:
+    """Force-install the bundled zkllm wheel for this Python minor."""
+    return install_local_wheel("zkllm")
+
+
+def install_local_hot_capacity_workspace_wheel(*, required: bool = True) -> bool:
+    """Force-install the bundled hot-capacity workspace wheel for this Python minor."""
+    return install_local_wheel("hot_capacity_workspace_cuda", required=required)
 
 
 def get_local_head() -> Optional[str]:
@@ -175,12 +186,17 @@ def _parse_version_from_source(source: str, var_name: str) -> Optional[int]:
     We parse the MAJOR/MINOR/PATCH constants for each role prefix and
     compute the encoded integer.
     """
-    # Determine prefix: miner_version → MINER_, validator_version → VALIDATOR_,
-    # spec_version → SPEC_
+    if var_name == "spec_version":
+        miner = _parse_version_from_source(source, "miner_version")
+        validator = _parse_version_from_source(source, "validator_version")
+        if miner is None or validator is None:
+            return None
+        return max(miner, validator)
+
+    # Determine prefix: miner_version → MINER_, validator_version → VALIDATOR_
     prefix_map = {
         "miner_version": "MINER_",
         "validator_version": "VALIDATOR_",
-        "spec_version": "SPEC_",
     }
     prefix = prefix_map.get(var_name)
     if not prefix:
@@ -274,7 +290,7 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
     return None
 
 
-def pull_and_install() -> bool:
+def pull_and_install(*, install_extras: str = "neurons") -> bool:
     """Pull latest code and reinstall the package.
 
     Returns True on success, False on failure.
@@ -299,11 +315,15 @@ def pull_and_install() -> bool:
     _head = new_head[:8] if new_head else "unknown"
     bt.logging.info(f"Pulled to {_head}")
 
-    # Reinstall package (editable mode, same extras)
-    bt.logging.info("Reinstalling package...")
+    # Reinstall package in editable mode with the same public setup extras.
+    # This picks up newly added optional dependencies instead of relying on
+    # whatever extras happened to be installed in the old venv.
+    extras = str(install_extras or "").strip()
+    editable_target = f".[{extras}]" if extras else "."
+    bt.logging.info(f"Reinstalling package ({editable_target})...")
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", ".", "--quiet"],
+            [sys.executable, "-m", "pip", "install", "-e", editable_target, "--quiet"],
             cwd=_REPO_ROOT,
             capture_output=True,
             text=True,
@@ -319,6 +339,7 @@ def pull_and_install() -> bool:
     bt.logging.info("Package reinstalled successfully")
     if not install_local_zkllm_wheel():
         return False
+    install_local_hot_capacity_workspace_wheel(required=False)
     return True
 
 
@@ -419,11 +440,14 @@ class AutoUpdater:
         miner reloads vLLM weights.  Validators and proxies leave this at
         0 — they restart fast and a global validator restart is operator-
         observable, not a user-visible outage.
-    jitter_seed:
+        jitter_seed:
         Bytes hashed to derive the stagger offset for this process (default
         empty).  Miners pass their 32-byte hotkey seed so the delay is
         reproducible per miner and verifiable by any third party from the
         public hotkey (no "secret stagger order" to game).
+    install_extras:
+        Optional extras passed to ``pip install -e`` during update.  Defaults
+        mirror the public setup paths without reinstalling GPU-heavy vLLM.
     """
 
     def __init__(
@@ -434,8 +458,15 @@ class AutoUpdater:
         busy_check: Optional[Callable[[], bool]] = None,
         jitter_seconds: int = 0,
         jitter_seed: bytes = b"",
+        install_extras: Optional[str] = None,
     ):
-        self.role = role if role != "proxy" else "validator"  # proxy uses validator_version
+        requested_role = str(role or "validator")
+        self.role = requested_role if requested_role != "proxy" else "validator"  # proxy uses validator_version
+        self.install_extras = (
+            str(install_extras).strip()
+            if install_extras is not None
+            else self._default_install_extras(requested_role)
+        )
         self.check_interval = check_interval
         self.restart_delay = restart_delay
         self.busy_check = busy_check
@@ -444,6 +475,15 @@ class AutoUpdater:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._update_pending = False  # Set when update deferred due to busy
+
+    @staticmethod
+    def _default_install_extras(role: str) -> str:
+        normalized = str(role or "").strip().lower()
+        if normalized == "miner":
+            return "neurons,api,hashing"
+        if normalized == "proxy":
+            return "neurons,x402"
+        return "neurons"
 
     def _compute_jitter_delay(self) -> int:
         """Return the deterministic stagger delay (seconds) for this process.
@@ -500,7 +540,7 @@ class AutoUpdater:
             return
         bt.logging.info("Deferred update ready — applying now")
         self._update_pending = False
-        if not pull_and_install():
+        if not pull_and_install(install_extras=self.install_extras):
             bt.logging.error("Deferred update failed — will retry next cycle")
             return
         bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
@@ -543,7 +583,7 @@ class AutoUpdater:
             return
 
         self._update_pending = False
-        if not pull_and_install():
+        if not pull_and_install(install_extras=self.install_extras):
             bt.logging.error("Update failed — will retry next cycle")
             return
 

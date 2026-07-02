@@ -68,6 +68,11 @@ cd "$REPO_DIR"
 
 VENV_DIR="${REPO_DIR}/.venv-validator"
 
+if [ -d "$VENV_DIR" ] && { [ ! -f "$VENV_DIR/bin/activate" ] || [ ! -x "$VENV_DIR/bin/python" ]; }; then
+    echo "  Existing validator venv is incomplete — recreating: $VENV_DIR"
+    rm -rf "$VENV_DIR"
+fi
+
 if [ ! -d "$VENV_DIR" ]; then
     echo ""
     echo "  Creating venv..."
@@ -115,6 +120,19 @@ if [ "$SKIP_INSTALL" = false ]; then
         $PYTHON -m pip install --no-cache-dir --force-reinstall "$ZKLLM_WHEEL" 2>&1 | tail -5
     else
         echo "  WARNING: No zkllm wheel found for $PY_VER in dist/"
+    fi
+
+    HOT_CAPACITY_WHEEL=$(ls "${REPO_DIR}/dist"/hot_capacity_workspace_cuda-*-${PY_VER}-*.whl 2>/dev/null | head -1)
+    if [ -n "$HOT_CAPACITY_WHEEL" ]; then
+        echo "  Installing hot-capacity audit wheel..."
+        $PYTHON -m pip install --no-cache-dir --force-reinstall "$HOT_CAPACITY_WHEEL" 2>&1 | tail -5
+        if $PYTHON -c "from hot_capacity_workspace import bench_fp64_identity; assert hasattr(bench_fp64_identity, 'verify_fp64_identity_proof')" 2>/dev/null; then
+            echo "  hot-capacity verifier wheel: OK"
+        else
+            echo "  WARNING: hot-capacity verifier wheel installed but verifier import failed"
+        fi
+    else
+        echo "  WARNING: No hot-capacity audit wheel found for $PY_VER in dist/"
     fi
 
     echo ""

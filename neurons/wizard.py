@@ -115,6 +115,167 @@ def _confirm(msg: str, default: bool = True) -> bool:
     return val in ("y", "yes")
 
 
+_CAPACITY_AUDIT_PROFILE_DEFAULTS: tuple[tuple[str, str], ...] = (
+    ("VERATHOS_CAPACITY_AUDIT_WINDOWS_PER_EPOCH", "30"),
+    ("VERATHOS_CAPACITY_AUDIT_COHORT_MIN", "100"),
+    ("VERATHOS_CAPACITY_AUDIT_COHORT_FRACTION", "0.025"),
+    ("VERATHOS_CAPACITY_AUDIT_COHORT_MAX", "250"),
+    ("VERATHOS_CAPACITY_AUDIT_MAX_DRAIN_FRACTION", "0.05"),
+    ("VERATHOS_CAPACITY_AUDIT_GROUP_STRESS_FRACTION", "0.35"),
+    ("VERATHOS_CAPACITY_AUDIT_BEACON_HASH_COUNT", "1"),
+    ("VERATHOS_CAPACITY_AUDIT_MIN_REGISTRATION_AGE_S", "0"),
+    ("VERATHOS_CAPACITY_AUDIT_SLOT_REFRESH_BLOCKS", "0"),
+    ("VERATHOS_CAPACITY_AUDIT_SLOT_SNAPSHOT_STALE_BLOCKS", "0"),
+    ("VERATHOS_CAPACITY_AUDIT_PROOF_VERIFY_WORKERS", "4"),
+    ("VERATHOS_CAPACITY_AUDIT_LEAD_BLOCKS", "5"),
+    ("VERATHOS_CAPACITY_AUDIT_DRAIN_SECONDS", "30"),
+    ("VERATHOS_CAPACITY_AUDIT_DEADLINE_S", "30"),
+    ("VERATHOS_CAPACITY_AUDIT_TRANSPORT_GRACE_S", "3"),
+    ("VERATHOS_CAPACITY_AUDIT_PAYLOAD_DEADLINE_S", "60"),
+    ("VERATHOS_CAPACITY_AUDIT_REQUIRE_PROOF_PAYLOAD", "1"),
+    ("VERATHOS_CAPACITY_AUDIT_REPEAT_WINDOW_EPOCHS", "20"),
+    ("VERATHOS_CAPACITY_AUDIT_TIMING_MISSES_FOR_ZERO_SCORE", "2"),
+    ("VERATHOS_CAPACITY_AUDIT_HARD_PROOF_MISSES_FOR_ZERO_SCORE", "2"),
+    ("VERATHOS_CAPACITY_AUDIT_ALLOW_TIMING_ONLY_SCORE_GATE", "1"),
+    ("VERATHOS_CAPACITY_AUDIT_WORKER_POLL_S", "2"),
+)
+
+
+def _env_value(name: str, default: str = "") -> str:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "y", "on", "score_gate", "observe"}
+
+
+def _capacity_mode_from_text(value: str, default: str = "score_gate") -> str:
+    raw = value.strip().lower().replace("-", "_")
+    if raw in {"", "0", "false", "no", "n", "off", "disabled"}:
+        return ""
+    if raw in {"1", "true", "yes", "y", "on", "s", "score", "score_gate"}:
+        return default
+    if raw in {"o", "observe"}:
+        return "observe"
+    if raw in {"soft", "soft_gate"}:
+        return "soft_gate"
+    if raw in {"e", "enforce"}:
+        return "enforce"
+    return ""
+
+
+def _capacity_audit_env_for_role(role: str, mode: str) -> dict[str, str]:
+    env = {
+        "VERATHOS_CAPACITY_AUDIT_ENABLED": "1",
+        "VERATHOS_CAPACITY_AUDIT_MODE": mode,
+    }
+    for name, default in _CAPACITY_AUDIT_PROFILE_DEFAULTS:
+        env[name] = _env_value(name, default)
+
+    if role == "miner":
+        manual_urls = _env_value(
+            "VERATHOS_CAPACITY_AUDIT_VALIDATOR_URLS",
+            "",
+        )
+        if manual_urls:
+            env["VERATHOS_CAPACITY_AUDIT_VALIDATOR_URLS"] = manual_urls
+    elif role == "validator":
+        env["VERATHOS_CAPACITY_AUDIT_INGEST_HOST"] = _env_value(
+            "VERATHOS_CAPACITY_AUDIT_INGEST_HOST",
+            "0.0.0.0",
+        )
+        env["VERATHOS_CAPACITY_AUDIT_INGEST_PORT"] = _env_value(
+            "VERATHOS_CAPACITY_AUDIT_INGEST_PORT",
+            "8091",
+        )
+        public_url = _env_value("VERATHOS_CAPACITY_AUDIT_PUBLIC_URL", "")
+        if public_url:
+            env["VERATHOS_CAPACITY_AUDIT_PUBLIC_URL"] = public_url
+        env["VERATHOS_CAPACITY_AUDIT_SERVE_AXON"] = _env_value(
+            "VERATHOS_CAPACITY_AUDIT_SERVE_AXON",
+            "1",
+        )
+    return env
+
+
+def _capacity_audit_disabled_env() -> dict[str, str]:
+    return {"VERATHOS_CAPACITY_AUDIT_ENABLED": "0"}
+
+
+def _capacity_audit_env_disabled(env: dict[str, str]) -> bool:
+    return env.get("VERATHOS_CAPACITY_AUDIT_ENABLED", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _capacity_audit_env_from_setup_env(role: str) -> Optional[dict[str, str]]:
+    setup_value = os.environ.get("VERATHOS_SETUP_CAPACITY_AUDIT")
+    enabled_value = os.environ.get("VERATHOS_CAPACITY_AUDIT_ENABLED")
+    if setup_value is None and enabled_value is None:
+        return None
+
+    raw = setup_value if setup_value is not None else enabled_value or ""
+    mode = _capacity_mode_from_text(raw)
+    if not mode and not _truthy(raw):
+        return _capacity_audit_disabled_env()
+    if not mode:
+        mode = _env_value("VERATHOS_SETUP_CAPACITY_AUDIT_MODE", "") or _env_value(
+            "VERATHOS_CAPACITY_AUDIT_MODE",
+            "score_gate",
+        )
+        mode = _capacity_mode_from_text(mode, default=mode) or "score_gate"
+    return _capacity_audit_env_for_role(role, mode)
+
+
+def _prompt_capacity_audit(role: str) -> dict[str, str]:
+    configured = _capacity_audit_env_from_setup_env(role)
+    from_env = configured is not None
+    if configured is not None:
+        if _capacity_audit_env_disabled(configured):
+            print("  Hot-capacity audit: disabled by environment")
+            return _capacity_audit_disabled_env()
+        mode = configured.get("VERATHOS_CAPACITY_AUDIT_MODE", "score_gate")
+        print(f"  Hot-capacity audit: {green(mode)} (from environment)")
+    else:
+        print()
+        print("  Hot-capacity audit:")
+        print(f"    [Enter] Observe mode")
+        print(f"    [O]     Observe mode")
+        print(f"    [S]     Score-gate mode")
+        print(f"    [D]     Disabled")
+        choice = _prompt("Capacity audit", "")
+        if not choice:
+            configured = _capacity_audit_env_for_role(role, "observe")
+        elif choice.strip().lower() in {"d", "disable", "disabled", "off", "0", "false", "no"}:
+            return _capacity_audit_disabled_env()
+        else:
+            mode = _capacity_mode_from_text(choice)
+            if not mode:
+                print(yellow("  Unknown capacity-audit choice — disabled."))
+                return _capacity_audit_disabled_env()
+            configured = _capacity_audit_env_for_role(role, mode)
+
+    if role == "validator":
+        host = configured.get("VERATHOS_CAPACITY_AUDIT_INGEST_HOST", "0.0.0.0")
+        port = configured.get("VERATHOS_CAPACITY_AUDIT_INGEST_PORT", "8091")
+        public_url = configured.get("VERATHOS_CAPACITY_AUDIT_PUBLIC_URL", "")
+        if not from_env:
+            host = _prompt("Capacity ingest host", host)
+            port = _prompt("Capacity ingest port", port)
+            public_url = _prompt("Capacity public URL", public_url)
+        configured["VERATHOS_CAPACITY_AUDIT_INGEST_HOST"] = host
+        configured["VERATHOS_CAPACITY_AUDIT_INGEST_PORT"] = port
+        if public_url:
+            configured["VERATHOS_CAPACITY_AUDIT_PUBLIC_URL"] = public_url
+    return configured
+
+
 def _header(step: int, total: int, title: str) -> None:
     print()
     print(bold(f"  [{step}/{total}] {title}"))
@@ -476,7 +637,8 @@ def _detect_https_config() -> Optional[dict]:
                 # Extract port from "listen <PORT> ssl"
                 m = re.search(r"listen\s+(\d+)\s+ssl", text)
                 port = int(m.group(1)) if m else 443
-                return {"port": port, "config_path": str(path)}
+                backend = _extract_nginx_backend_port(text)
+                return {"port": port, "backend_port": backend, "config_path": str(path)}
             except Exception:
                 pass
     # Check inline nginx.conf for verathos pattern
@@ -487,10 +649,39 @@ def _detect_https_config() -> Optional[dict]:
             if "miner" in text and "ssl" in text:
                 m = re.search(r"listen\s+(\d+)\s+ssl", text)
                 port = int(m.group(1)) if m else 443
-                return {"port": port, "config_path": str(nginx_conf)}
+                backend = _extract_nginx_backend_port(text)
+                return {"port": port, "backend_port": backend, "config_path": str(nginx_conf)}
         except Exception:
             pass
     return None
+
+
+def _extract_nginx_backend_port(text: str) -> str:
+    m = re.search(r"proxy_pass\s+http://127\.0\.0\.1:(\d+)", text)
+    return m.group(1) if m else ""
+
+
+def _port_from_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return ""
+    if value.isdigit() and 1 <= int(value) <= 65535:
+        return value
+    print(yellow(f"  Ignoring invalid {name}={value!r} (expected port 1-65535)."))
+    return ""
+
+
+def _default_backend_port_for_https_listen(listen_port: int, requested_backend: str = "") -> str:
+    """Return the backend vLLM port to pass through nginx.
+
+    Empty string means the miner keeps its historical default backend port
+    (8000), and no explicit ``--port`` is written to PM2.  If nginx itself
+    listens on 8000, choose 8001 so the backend can bind successfully in
+    container/cloud port-mapping setups.
+    """
+    if requested_backend:
+        return requested_backend
+    return "8001" if listen_port == 8000 else ""
 
 
 def step_https(repo: Path, add_mode: bool = False,
@@ -506,18 +697,33 @@ def step_https(repo: Path, add_mode: bool = False,
     ``existing_ports`` are rejected at the prompt (the new HTTPS port
     must differ from any miner already configured).
     """
+    force_https = _truthy(os.environ.get("VERATHOS_SETUP_FORCE_HTTPS", ""))
+    listen_override = _port_from_env("VERATHOS_SETUP_HTTPS_LISTEN_PORT")
+    backend_override = _port_from_env("VERATHOS_SETUP_MINER_BACKEND_PORT")
     existing = _detect_https_config()
     public_ip = _detect_public_ip()
     blocked_ports = existing_ports or set()
 
-    if existing and not add_mode:
+    if existing and not add_mode and not force_https and not listen_override and not backend_override:
         endpoint = f"https://{public_ip}:{existing['port']}" if public_ip else f"https://YOUR_IP:{existing['port']}"
         print(f"  HTTPS already configured (port {existing['port']})")
         print(f"  Endpoint: {endpoint}")
         if public_ip:
-            return {"endpoint": endpoint, "port": existing["port"], "host": public_ip}
+            return {
+                "endpoint": endpoint,
+                "port": existing["port"],
+                "listen_port": existing["port"],
+                "host": public_ip,
+                "backend_port": existing.get("backend_port", ""),
+            }
         host = _prompt("Public IP or domain", public_ip or "")
-        return {"endpoint": f"https://{host}:{existing['port']}", "port": existing["port"], "host": host}
+        return {
+            "endpoint": f"https://{host}:{existing['port']}",
+            "port": existing["port"],
+            "listen_port": existing["port"],
+            "host": host,
+            "backend_port": existing.get("backend_port", ""),
+        }
 
     if add_mode and blocked_ports:
         print(dim(f"  Existing miner port(s): {sorted(blocked_ports)} — choose a different port for this endpoint."))
@@ -555,6 +761,20 @@ def step_https(repo: Path, add_mode: bool = False,
         print(red(f"  Port {port} collides with an existing miner. Aborting HTTPS setup."))
         return {"endpoint": f"https://{host}:{port}", "port": port, "host": host}
 
+    listen_default = listen_override or str(port)
+    listen_str = _prompt("Local HTTPS listen port", listen_default).strip()
+    if not (listen_str.isdigit() and 1 <= int(listen_str) <= 65535):
+        print(yellow(f"  Invalid local listen port {listen_str!r} — using {listen_default}."))
+        listen_str = listen_default
+    listen_port = int(listen_str)
+
+    backend_port = _default_backend_port_for_https_listen(
+        listen_port,
+        requested_backend=backend_port or backend_override,
+    )
+    if backend_port:
+        print(f"  Backend port: {backend_port}")
+
     endpoint = f"https://{host}:{port}" if port != 443 else f"https://{host}"
     print(f"  Endpoint: {endpoint}")
 
@@ -564,7 +784,9 @@ def step_https(repo: Path, add_mode: bool = False,
         return {"endpoint": endpoint, "port": port, "host": host}
 
     if _confirm("Set up HTTPS now (nginx + self-signed cert)?"):
-        script_args = ["bash", str(setup_script), "--port", str(port)]
+        script_args = ["bash", str(setup_script), "--port", str(listen_port)]
+        if port != listen_port:
+            script_args.extend(["--public-port", str(port)])
         if backend_port:
             script_args.extend(["--backend-port", backend_port])
         if add_mode:
@@ -586,7 +808,9 @@ def step_https(repo: Path, add_mode: bool = False,
             print(f"  You can re-run manually: {sudo_hint}{display}")
     else:
         sudo_hint = "sudo " if (os.geteuid() != 0 and shutil.which("sudo")) else ""
-        manual = f"bash scripts/setup_https.sh --port {port}"
+        manual = f"bash scripts/setup_https.sh --port {listen_port}"
+        if port != listen_port:
+            manual += f" --public-port {port}"
         if backend_port:
             manual += f" --backend-port {backend_port}"
         if add_mode:
@@ -594,16 +818,25 @@ def step_https(repo: Path, add_mode: bool = False,
         print(yellow("  Skipped HTTPS setup. Run later:"))
         print(f"    {sudo_hint}{manual}")
 
-    return {"endpoint": endpoint, "port": port, "host": host}
+    return {
+        "endpoint": endpoint,
+        "port": port,
+        "listen_port": listen_port,
+        "host": host,
+        "backend_port": backend_port,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Step 6: Model selection
 # ---------------------------------------------------------------------------
 
-def step_model(net_info: dict) -> dict:
+def step_model(net_info: dict, capacity_audit_env: Optional[dict[str, str]] = None) -> dict:
     """Show model recommendations and let user pick."""
     import threading
+    capacity_audit_required = bool(capacity_audit_env) and not _capacity_audit_env_disabled(
+        capacity_audit_env or {}
+    )
 
     # Import registry + detect GPU in background (torch init is slow)
     _done = threading.Event()
@@ -644,7 +877,7 @@ def step_model(net_info: dict) -> dict:
     print()
 
     # Get recommendations
-    recs = recommend_models(tier)
+    recs = recommend_models(tier, verified_only=capacity_audit_required)
 
     # Filter by on-chain models if chain config available
     chain_config_path = net_info.get("config_path", "")
@@ -688,6 +921,19 @@ def step_model(net_info: dict) -> dict:
     if not recs:
         print(yellow("  No models found for this GPU tier."))
         return {"model_id": "auto", "category": None}
+
+    if capacity_audit_required:
+        r = recs[0]
+        print("  Hot-capacity audit eligible model:")
+        print(
+            f"    {r.model.name} ({r.quant}, ctx={r.est_context:,}, "
+            f"checkpoint={r.config.checkpoint})"
+        )
+        return {
+            "model_id": r.config.checkpoint,
+            "quant": r.quant,
+            "category": None,
+        }
 
     # Show top recommendations
     print(f"  Recommended models:")
@@ -897,6 +1143,10 @@ def step_options(role: str) -> dict:
 
     result = {"chain_endpoint": chain_endpoint, "evm_rpc_url": evm_rpc_url, "log_level": log_level}
 
+    capacity_audit_env = _prompt_capacity_audit(role)
+    if capacity_audit_env:
+        result["capacity_audit_env"] = capacity_audit_env
+
     # Validator-specific options
     if role == "validator":
         print()
@@ -991,6 +1241,30 @@ def _get_pm2_processes() -> list[dict]:
     return []
 
 
+def _format_env_block(env: dict[str, str], indent: str = "      ") -> str:
+    """Format a PM2 env object with JSON-escaped string values."""
+    clean = {str(k): str(v) for k, v in env.items() if v is not None and str(v) != ""}
+    if not clean:
+        return ""
+    lines = [f"{indent}env: {{"]
+    for key, value in clean.items():
+        lines.append(f"{indent}  {json.dumps(key)}: {json.dumps(value)},")
+    lines.append(f"{indent}}},")
+    return "\n" + "\n".join(lines)
+
+
+def _runtime_path_with_venv(repo_root: str, venv_name: str = ".venv-vllm") -> str:
+    base_path = os.environ.get(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    )
+    venv_bin = str(Path(repo_root) / venv_name / "bin")
+    parts = [p for p in base_path.split(os.pathsep) if p]
+    if venv_bin not in parts:
+        parts.insert(0, venv_bin)
+    return os.pathsep.join(parts)
+
+
 def _generate_miner_entry(
     name: str,
     wallet: str,
@@ -1007,6 +1281,7 @@ def _generate_miner_entry(
     log_level: str = "",
     evm_rpc_url: str = "",
     vllm_port: str = "",
+    capacity_audit_env: Optional[dict[str, str]] = None,
 ) -> str:
     """Generate a single PM2 miner app entry as JS text.
 
@@ -1032,12 +1307,11 @@ def _generate_miner_entry(
     if extra_args:
         args += f" {extra_args}"
 
-    env_block = ""
+    env = dict(capacity_audit_env or {})
+    env.setdefault("PATH", _runtime_path_with_venv(repo_root))
     if cuda_device:
-        env_block = f"""
-      env: {{
-        CUDA_VISIBLE_DEVICES: "{cuda_device}",
-      }},"""
+        env["CUDA_VISIBLE_DEVICES"] = cuda_device
+    env_block = _format_env_block(env)
 
     return f"""    {{
       name: "{name}",
@@ -1066,6 +1340,7 @@ def _generate_validator_entry(
     retain_backups: bool = False,
     hf_token: str = "",
     no_evm: bool = False,
+    capacity_audit_env: Optional[dict[str, str]] = None,
 ) -> str:
     """Generate a PM2 validator app entry as JS text."""
     net_flag = f"--subtensor-network {network}"
@@ -1081,14 +1356,14 @@ def _generate_validator_entry(
         f"--netuid {netuid} {net_flag}{chain_flag}{evm_flag} "
         f"--auto-update{analytics_flag}{retain_flag}{no_evm_flag}{log_flag}"
     )
+    env = {"HF_TOKEN": hf_token}
+    env.update(capacity_audit_env or {})
+    env_block = _format_env_block(env)
     return f"""    {{
       name: "validator",
       script: ".venv-validator/bin/python",
       args: "{args}",
-      cwd: "{repo_root}",
-      env: {{
-        HF_TOKEN: "{hf_token}",
-      }},
+      cwd: "{repo_root}",{env_block}
       autorestart: true,
       max_restarts: 5,
       min_uptime: "60s",
@@ -1213,6 +1488,7 @@ def step_config(
     chain_endpoint = opts.get("chain_endpoint", "")
     evm_rpc_url = opts.get("evm_rpc_url", "")
     log_level = opts.get("log_level", "")
+    capacity_audit_env = opts.get("capacity_audit_env", {})
 
     if role == "validator":
         entry = _generate_validator_entry(
@@ -1228,6 +1504,7 @@ def step_config(
             retain_backups=opts.get("retain_backups", False),
             hf_token=opts.get("hf_token", ""),
             no_evm=opts.get("no_evm", False),
+            capacity_audit_env=capacity_audit_env,
         )
         if config_path.exists() and existing_miners:
             # Append validator to existing config
@@ -1255,10 +1532,19 @@ def step_config(
         if n_gpus > 1:
             cuda_device = _pick_free_gpu_index(existing_miners, n_gpus)
             if cuda_device is None:
+                allow_overcommit = os.environ.get(
+                    "VERATHOS_SETUP_ALLOW_GPU_OVERCOMMIT",
+                    "",
+                ).lower() in {"1", "true", "yes", "on"}
+                if not allow_overcommit:
+                    print(red(
+                        f"  All {n_gpus} GPUs are already assigned to existing miners. "
+                        "Set VERATHOS_SETUP_ALLOW_GPU_OVERCOMMIT=1 only if this is intentional."
+                    ))
+                    return {"config_generated": False, "pm2_name": ""}
                 print(yellow(
-                    f"  Warning: all {n_gpus} GPUs already assigned to existing "
-                    f"miners — new entry will not be GPU-isolated. Free a GPU or "
-                    f"set --gpu-index N manually."
+                    f"  Warning: all {n_gpus} GPUs already assigned; proceeding due to "
+                    "VERATHOS_SETUP_ALLOW_GPU_OVERCOMMIT=1."
                 ))
             else:
                 try:
@@ -1277,6 +1563,10 @@ def step_config(
     # 8000 (backward compatible with all current single-miner configs).
     # Accept a precomputed value from the caller (run_wizard pre-computes
     # so step_https can pass it as --backend-port to nginx).
+    if not vllm_port:
+        https_backend_port = str(https_info.get("backend_port", "") or "")
+        if https_backend_port and https_backend_port != "8000":
+            vllm_port = https_backend_port
     if not vllm_port and add_mode and existing_miners:
         vllm_port = _pick_free_internal_port(existing_miners)
     if vllm_port:
@@ -1297,6 +1587,7 @@ def step_config(
         log_level=log_level,
         cuda_device=cuda_device or "",
         vllm_port=vllm_port,
+        capacity_audit_env=capacity_audit_env,
     )
 
     print()
@@ -1310,6 +1601,9 @@ def step_config(
         print(dim(f"    subtensor: {chain_endpoint}"))
     if log_level:
         print(dim(f"    log level: {log_level}"))
+    if capacity_audit_env:
+        _mode = capacity_audit_env.get("VERATHOS_CAPACITY_AUDIT_MODE", "enabled")
+        print(dim(f"    capacity audit: {_mode}"))
     print()
 
     if add_mode and existing_miners and config_path.exists():
@@ -1799,9 +2093,14 @@ def _quick_start(repo: Path, pm2_name: str) -> None:
             return
     procs = _get_pm2_processes()
 
-    # Check if this exact process is already running
-    running = [p for p in procs if p.get("name") == pm2_name
-               and p.get("pm2_env", {}).get("status") == "online"]
+    # PM2 keeps stopped processes by name. If a prior setup used the same
+    # process name from another repo, `pm2 start ecosystem.config.js --only X`
+    # may restart that stale entry instead of the current config.
+    same_name = [p for p in procs if p.get("name") == pm2_name]
+    running = [
+        p for p in same_name
+        if p.get("pm2_env", {}).get("status") == "online"
+    ]
     if running:
         pid = running[0].get("pid", "?")
         print(f"  {pm2_name} is already running (pid {pid})")
@@ -1811,6 +2110,8 @@ def _quick_start(repo: Path, pm2_name: str) -> None:
             print(f"  Check logs: pm2 logs {pm2_name} --lines 50")
             print()
             return
+    elif same_name:
+        subprocess.run(["pm2", "delete", pm2_name], capture_output=True)
 
     # Check for OTHER miner processes whose GPU index actually overlaps with
     # ours. Multi-miner setups with distinct CUDA_VISIBLE_DEVICES per process
@@ -2035,7 +2336,8 @@ def _change_model(repo: Path, miners: list[dict]) -> None:
             net_info["config_path"] = str(p)
             break
 
-    model_info = step_model(net_info)
+    capacity_env = _capacity_audit_env_from_setup_env("miner") or {}
+    model_info = step_model(net_info, capacity_audit_env=capacity_env)
     new_model = model_info.get("model_id", "auto")
     new_quant = model_info.get("quant", "")
 
@@ -2137,7 +2439,15 @@ def run_wizard(role: str = "miner") -> None:
                     print(yellow(f"  Warning: {n_gpus} GPU{'s' if n_gpus != 1 else ''} detected, "
                                  f"{len(existing_miners)} endpoint{'s' if len(existing_miners) != 1 else ''} already configured."))
                     print("  Each model endpoint needs its own GPU.")
-                    if not _confirm("Continue anyway?", default=False):
+                    allow_overcommit = os.environ.get(
+                        "VERATHOS_SETUP_ALLOW_GPU_OVERCOMMIT",
+                        "",
+                    ).lower() in {"1", "true", "yes", "on"}
+                    if not allow_overcommit:
+                        print(red(
+                            "  Add a GPU or set VERATHOS_SETUP_ALLOW_GPU_OVERCOMMIT=1 "
+                            "only if this is intentional."
+                        ))
                         return
                 elif n_gpus > 1:
                     print()
@@ -2219,17 +2529,20 @@ def run_wizard(role: str = "miner") -> None:
             backend_port=new_vllm_port,
         )
 
-        # Step 6: Model Selection
-        _header(6, total_steps, "Model Selection")
-        model_info = step_model(net_info)
-
-        # Step 7: PM2
-        _header(7, total_steps, "PM2 Process Manager")
-        pm2_info = step_pm2()
-
-        # Step 8: Options (subtensor, logging)
-        _header(8, total_steps, "Options")
+        # Step 6: Options (subtensor, logging, capacity audit)
+        _header(6, total_steps, "Options")
         options = step_options(role)
+
+        # Step 7: Model Selection
+        _header(7, total_steps, "Model Selection")
+        model_info = step_model(
+            net_info,
+            capacity_audit_env=options.get("capacity_audit_env", {}),
+        )
+
+        # Step 8: PM2
+        _header(8, total_steps, "PM2 Process Manager")
+        pm2_info = step_pm2()
 
         # Step 9: Config
         _header(9, total_steps, "ecosystem.config.js")

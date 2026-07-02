@@ -22,6 +22,8 @@ class ActiveMiner:
     quant: str
     max_context_len: int
     model_index: int  # index in miner's model array
+    expires_at: int = 0
+    registered_at: int = 0
     hotkey_ss58: str = ""
     coldkey_ss58: str = ""
 
@@ -123,6 +125,8 @@ def _collect_active(
             quant=m.quant,
             max_context_len=m.max_context_len,
             model_index=i,
+            expires_at=int(getattr(m, "expires_at", 0) or 0),
+            registered_at=max(0, int(getattr(m, "expires_at", 0) or 0) - 24 * 3600),
         )
         # Enrich with TEE capability (best-effort, don't block discovery)
         try:

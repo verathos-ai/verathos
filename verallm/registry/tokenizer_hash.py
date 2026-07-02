@@ -4,9 +4,12 @@ The hash is anchored on-chain in ``ModelRegistry.ModelSpec.tokenizerHash``
 so validators can detect drift between their local tokenizer files and
 what the subnet owner registered.
 
-The hash binds:
+The preferred hash binds:
 - ``tokenizer.json`` raw bytes (vocab, merges, special tokens, pre/post-processors)
 - ``chat_template`` field from ``tokenizer_config.json`` (UTF-8)
+
+Legacy tokenizers that do not ship ``tokenizer.json`` are hashed from their
+canonical tokenizer artifact set (for example ``vocab.json`` + ``merges.txt``).
 
 Per-request commitments do NOT include this hash — token-level
 correctness is enforced separately via ``input_commitment`` (the validator
@@ -21,12 +24,25 @@ import json
 from pathlib import Path
 
 
+_TOKENIZER_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("tokenizer.json",),
+    ("tokenizer.model",),
+    ("sentencepiece.bpe.model",),
+    ("vocab.json", "merges.txt"),
+    ("vocab.txt",),
+)
+
+
 def compute_tokenizer_hash(model_id_or_path: str) -> bytes:
     """Compute a deterministic 32-byte hash of a model's tokenizer files.
 
     Hash format::
 
         SHA256("VERILLM_TOKENIZER_V1" || tokenizer.json_bytes || 0x00 || chat_template_utf8)
+
+    For tokenizers without ``tokenizer.json``::
+
+        SHA256("VERILLM_TOKENIZER_V2" || repeated(name || 0x00 || len || raw) || 0x00 || chat_template_utf8)
 
     The chat_template is read from ``tokenizer_config.json`` (or ``chat_template.jinja``
     if present).  Models without a chat_template default to empty string.
@@ -39,7 +55,7 @@ def compute_tokenizer_hash(model_id_or_path: str) -> bytes:
         32-byte SHA256 digest.
 
     Raises:
-        FileNotFoundError: if tokenizer.json cannot be located on disk.
+        FileNotFoundError: if no canonical tokenizer artifact can be located on disk.
         Exception: anything else (network failure, parse error) — fail
             closed so the caller knows there's a problem.
     """
@@ -48,14 +64,6 @@ def compute_tokenizer_hash(model_id_or_path: str) -> bytes:
     tokenizer_json = src / "tokenizer.json"
     tokenizer_config = src / "tokenizer_config.json"
     chat_template_jinja = src / "chat_template.jinja"
-
-    if not tokenizer_json.exists():
-        raise FileNotFoundError(
-            f"tokenizer.json not found at {tokenizer_json} "
-            f"for model {model_id_or_path}"
-        )
-
-    raw_tokenizer = tokenizer_json.read_bytes()
 
     chat_template = ""
     # Newer HF tokenizers may store the chat template as a separate
@@ -83,8 +91,24 @@ def compute_tokenizer_hash(model_id_or_path: str) -> bytes:
                 parts.append(ct[key] or "")
             chat_template = "\x1e".join(parts)
 
-    h = hashlib.sha256(b"VERILLM_TOKENIZER_V1")
-    h.update(raw_tokenizer)
+    if tokenizer_json.exists():
+        # Preserve the original V1 hash for already-registered tokenizer.json
+        # models.  The V2 fallback is only for legacy tokenizer layouts.
+        h = hashlib.sha256(b"VERILLM_TOKENIZER_V1")
+        h.update(tokenizer_json.read_bytes())
+        h.update(b"\x00")
+        h.update(chat_template.encode("utf-8"))
+        return h.digest()
+
+    tokenizer_files = _select_tokenizer_files(src)
+    h = hashlib.sha256(b"VERILLM_TOKENIZER_V2")
+    for path in tokenizer_files:
+        name = path.name.encode("utf-8")
+        raw = path.read_bytes()
+        h.update(name)
+        h.update(b"\x00")
+        h.update(len(raw).to_bytes(8, "big"))
+        h.update(raw)
     h.update(b"\x00")
     h.update(chat_template.encode("utf-8"))
     return h.digest()
@@ -113,9 +137,12 @@ def _resolve_tokenizer_dir(model_id_or_path: str) -> Path:
         "chat_template.jinja",
         "special_tokens_map.json",
         "added_tokens.json",
+        "tokenizer.model",
+        "sentencepiece.bpe.model",
         # Legacy tokenizers (BPE merges + vocab):
         "vocab.json",
         "merges.txt",
+        "vocab.txt",
     ]
 
     try:
@@ -124,10 +151,34 @@ def _resolve_tokenizer_dir(model_id_or_path: str) -> Path:
             allow_patterns=allow,
             local_files_only=True,
         )
+        if _has_tokenizer_artifacts(Path(path)):
+            return Path(path)
     except Exception:
-        # Not in cache — download only the tokenizer-related files.
-        path = snapshot_download(
-            model_id_or_path,
-            allow_patterns=allow,
-        )
+        pass
+
+    # Not in cache, or the cache entry is incomplete because only model weights
+    # were previously downloaded. Fetch only tokenizer-related files.
+    path = snapshot_download(
+        model_id_or_path,
+        allow_patterns=allow,
+    )
     return Path(path)
+
+
+def _select_tokenizer_files(src: Path) -> list[Path]:
+    for group in _TOKENIZER_GROUPS:
+        paths = [src / name for name in group]
+        if all(path.exists() for path in paths):
+            return paths
+    expected = ", ".join("+".join(group) for group in _TOKENIZER_GROUPS)
+    raise FileNotFoundError(
+        f"no canonical tokenizer artifact found in {src}; expected one of: {expected}"
+    )
+
+
+def _has_tokenizer_artifacts(src: Path) -> bool:
+    try:
+        _select_tokenizer_files(src)
+        return True
+    except FileNotFoundError:
+        return False

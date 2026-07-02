@@ -243,10 +243,48 @@ class MinerState:
         self.gpu_count: int = 0
         self.vram_gb: int = 0
         self.compute_capability: str = ""
+        self.capacity_audit_state_file: str = ""
 
 
 state = MinerState()
 app = FastAPI(title="VeraLLM Miner", version="0.1.0")
+
+
+def _capacity_audit_gate() -> Optional[JSONResponse]:
+    """Reject normal inference while this miner is inside a local audit drain."""
+    path = state.capacity_audit_state_file
+    if not path:
+        return None
+    try:
+        with open(path, "r") as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        bt.logging.warning(f"Capacity audit state file unreadable: {exc}")
+        return None
+    if not isinstance(payload, dict) or not payload.get("active"):
+        return None
+    now = time.time()
+    try:
+        until_ts = float(payload.get("until_ts") or 0.0)
+    except Exception:
+        until_ts = 0.0
+    if until_ts > 0.0 and until_ts <= now:
+        return None
+    retry_after = 5
+    if until_ts > now:
+        retry_after = max(1, min(120, int(until_ts - now)))
+    audit_id = str(payload.get("audit_id") or "")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "Miner temporarily unavailable: capacity audit in progress",
+            "audit_id": audit_id,
+            "retry_after_ms": retry_after * 1000,
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 @app.on_event("startup")
@@ -423,6 +461,65 @@ async def _on_shutdown():
 from verallm.api.auth import APIKeyMiddleware  # noqa: E402
 from verallm.api.validator_auth import ValidatorAuthMiddleware  # noqa: E402
 
+_AWQ_GEMM_HINT_PATH = "/tmp/verathos_awq_gemm_fallback"
+_AWQ_GEMM_HINT_EXIT = 43
+
+
+def _quant_method_from_config(qcfg) -> str:
+    if qcfg is None:
+        return ""
+    keys = (
+        "quant_method",
+        "quantization_method",
+        "quantization",
+        "format",
+        "load_format",
+    )
+    if isinstance(qcfg, dict):
+        for key in keys:
+            val = qcfg.get(key)
+            if isinstance(val, str) and val:
+                return val.lower().replace("_", "-")
+        for nested in ("config_groups", "quantization_config"):
+            val = qcfg.get(nested)
+            if isinstance(val, dict):
+                nested_method = _quant_method_from_config(next(iter(val.values()), val))
+                if nested_method:
+                    return nested_method
+        return ""
+    for key in keys:
+        val = getattr(qcfg, key, None)
+        if isinstance(val, str) and val:
+            return val.lower().replace("_", "-")
+    return ""
+
+
+def _model_quant_method(model_name: str) -> str:
+    if not model_name:
+        return ""
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        method = _quant_method_from_config(getattr(cfg, "quantization_config", None))
+        if method:
+            return method
+    except Exception:
+        pass
+    try:
+        from transformers import PretrainedConfig
+
+        cfg_dict, _ = PretrainedConfig.get_config_dict(
+            model_name,
+            trust_remote_code=True,
+        )
+        if isinstance(cfg_dict, dict):
+            return _quant_method_from_config(cfg_dict.get("quantization_config"))
+    except Exception:
+        pass
+    return ""
+
+
 # Validator auth: verifies Sr25519 signature against metagraph allowlist.
 # Blocks non-public requests when no validators file exists (deny by default).
 app.add_middleware(ValidatorAuthMiddleware)
@@ -593,7 +690,7 @@ def _chat_template_kwargs(tokenizer, enable_thinking: bool = True) -> dict:
     import inspect
     try:
         src = inspect.getsource(tokenizer.apply_chat_template)
-    except (TypeError, OSError):
+    except (AttributeError, TypeError, OSError):
         src = ""
     # Also check the Jinja template string itself (HF fast tokenizers store it)
     tpl = getattr(tokenizer, "chat_template", "") or ""
@@ -653,6 +750,9 @@ async def run_inference(body: InferenceRequestBody, request: Request = None):
     """
     if state.miner is None:
         return JSONResponse(status_code=503, content={"error": "Model not loaded"})
+    audit_gate = _capacity_audit_gate()
+    if audit_gate is not None:
+        return audit_gate
 
     nonce = bytes.fromhex(body.validator_nonce)
 
@@ -749,6 +849,9 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
     """
     if state.miner is None:
         return JSONResponse(status_code=503, content={"error": "Model not loaded"})
+    audit_gate = _capacity_audit_gate()
+    if audit_gate is not None:
+        return audit_gate
 
     # Extract validator hotkey for logging (set by ValidatorAuthMiddleware)
     _vali_hotkey = getattr(getattr(request, "state", None), "validator_hotkey", "") if request else ""
@@ -976,6 +1079,9 @@ async def tee_chat(body: TEEChatRequestBody, request: Request):
         return JSONResponse(status_code=404, content={"error": "TEE not enabled"})
     if state.miner is None:
         return JSONResponse(status_code=503, content={"error": "Model not loaded"})
+    audit_gate = _capacity_audit_gate()
+    if audit_gate is not None:
+        return audit_gate
 
     from verallm.tee.crypto import decrypt_payload, encrypt_payload
     from verallm.tee.types import EncryptedEnvelope
@@ -1189,6 +1295,11 @@ class EpochReceiptBody(BaseModel):
     proof_requested: bool = False
     tee_attestation_verified: Optional[bool] = None  # None=not tested, True=passed, False=failed
     is_canary: bool = False
+    receipt_version: int = 1
+    timing_source: str = "legacy"
+    observed_start_ts: float = 0.0
+    observed_end_ts: float = 0.0
+    timing_signature: str = ""
     validator_hotkey: str  # hex
     validator_signature: str  # hex
 
@@ -2534,6 +2645,7 @@ def startup(args):
     and serves them directly via GET /model_spec.
     """
     _preflight_gpu_check(skip=getattr(args, 'skip_gpu_check', False))
+    state.capacity_audit_state_file = str(getattr(args, "capacity_audit_state_file", "") or "")
 
     # Check CUDA extension is available — CPU fallback is 10-50x slower
     from zkllm.crypto.merkle import _HAS_CUDA_BLAKE3
@@ -2567,9 +2679,16 @@ def startup(args):
 
     state.model_name = model_name
 
-    is_gptq = "gptq" in model_name.lower() or "int4" in model_name.lower()
-    is_awq = "awq" in model_name.lower()
+    configured_quant_method = _model_quant_method(model_name)
+    model_name_l = model_name.lower()
+    is_gptq = configured_quant_method == "gptq" or (
+        not configured_quant_method and "gptq" in model_name_l
+    )
+    is_awq = configured_quant_method == "awq" or (
+        not configured_quant_method and "awq" in model_name_l
+    )
     is_fp8 = "fp8" in model_name.lower()
+    setattr(args, "_configured_quant_method", configured_quant_method)
     if quant == "auto":
         if is_gptq or is_awq:
             quant = "int4"
@@ -2689,6 +2808,7 @@ def startup(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         is_gptq=is_gptq,
         is_awq=is_awq,
+        force_awq_gemm_fallback=getattr(args, "awq_gemm_fallback", False),
         **vllm_kwargs,
     )
 
@@ -2706,6 +2826,9 @@ def startup(args):
 
     detected_quant = detect_quantization(miner.model)
     detected_mode = detected_quant.quant_mode
+    root_cache_mode = detected_mode
+    if detected_mode == "int4" and getattr(args, "awq_gemm_fallback", False):
+        root_cache_mode = "int4-awq-gemm"
 
     # TEE-only mode: skip Merkle root computation entirely — attestation
     # replaces proofs, so weight trees are not needed.  We still need a
@@ -2732,7 +2855,7 @@ def startup(args):
         # NOTE: In production, ModelSpec comes from on-chain registry.
         # Miner computes its own roots and compares as a self-check.
         model_spec = None if args.no_cache else load_cached_model_spec(
-            model_name, config.w_merkle_chunk_size, detected_mode)
+            model_name, config.w_merkle_chunk_size, root_cache_mode)
         if model_spec is None:
             bt.logging.info(
                 "Computing weight Merkle roots (no cache found, may take a few minutes). "
@@ -2741,7 +2864,7 @@ def startup(args):
             model_spec = compute_model_roots(
                 miner.model, model_name, chunk_size=config.w_merkle_chunk_size,
             )
-            save_model_spec_to_cache(model_spec, config.w_merkle_chunk_size, detected_mode)
+            save_model_spec_to_cache(model_spec, config.w_merkle_chunk_size, root_cache_mode)
         else:
             bt.logging.info("Using cached ModelSpec (from .model_root_cache/)")
 
@@ -3290,6 +3413,29 @@ def _chain_self_check(args, local_spec):
 
     model_client, _, _ = create_clients(chain_config)
 
+    def _request_awq_gemm_fallback(reason: str) -> None:
+        if getattr(args, "awq_gemm_fallback", False):
+            return
+        model_arg = str(getattr(args, "model", "") or getattr(args, "model_id", "") or "")
+        quant_arg = str(getattr(args, "quant", "") or "").lower()
+        spec_quant = str(getattr(local_spec, "quant_mode", "") or "").lower()
+        configured_quant = str(getattr(args, "_configured_quant_method", "") or "").lower()
+        if spec_quant != "int4":
+            return
+        if configured_quant and configured_quant != "awq":
+            return
+        if "awq" not in model_arg.lower() and quant_arg != "int4":
+            return
+        try:
+            with open(_AWQ_GEMM_HINT_PATH, "w") as f:
+                f.write("1")
+        except Exception as e:
+            bt.logging.warning(f"Could not write AWQ GEMM fallback hint: {e}")
+        bt.logging.warning(
+            f"{reason}. Requesting restart with --awq-gemm-fallback before failing hard."
+        )
+        sys.exit(_AWQ_GEMM_HINT_EXIT)
+
     try:
         chain_spec = model_client.get_model_spec(local_spec.model_id)
     except Exception as e:
@@ -3322,6 +3468,7 @@ def _chain_self_check(args, local_spec):
         if args.force:
             bt.logging.warning(f"{msg} Continuing (--force).")
             return
+        _request_awq_gemm_fallback(msg)
         bt.logging.error(f"{msg} Aborting. Use --force to override.")
         sys.exit(1)
 
@@ -3335,6 +3482,7 @@ def _chain_self_check(args, local_spec):
         if args.force:
             bt.logging.warning(f"{msg} Continuing (--force).")
             return
+        _request_awq_gemm_fallback(msg)
         bt.logging.error(f"{msg} Aborting. Use --force to override.")
         sys.exit(1)
 
@@ -3423,6 +3571,10 @@ def parse_args():
                              "block budget; the first launch attempt writes the auto-"
                              "tuned value to /tmp/verathos_mamba_max_num_seqs and exits "
                              "with code 42, then the launcher restarts with this flag.")
+    parser.add_argument("--awq-gemm-fallback", action="store_true",
+                        help="Force vLLM plain AWQ GEMM instead of AWQ-Marlin. "
+                             "Used automatically when the first AWQ-Marlin model "
+                             "load fails with a known backend error.")
     parser.add_argument("--proof-threads", type=int, default=None,
                         help="Max concurrent proof threads (None = auto-detect from CPU/VRAM)")
     parser.add_argument("--proof-max-pending", type=int, default=None,
@@ -3452,6 +3604,8 @@ def parse_args():
     parser.add_argument("--tee-skip-proofs", action="store_true", default=None,
                         help="Skip VeraLLM proof generation (use hardware attestation instead). "
                              "Default: True when --tee-enabled is set.")
+    parser.add_argument("--capacity-audit-state-file", default=None,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--log-level", default="info",
                         choices=["debug", "info", "warning"],
                         help="Logging level (default: info)")

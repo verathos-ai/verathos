@@ -47,6 +47,18 @@ class MinerEntry:
 
 
 @dataclass
+class AuditDrain:
+    """Temporary endpoint routing exclusion for a capacity audit window."""
+
+    audit_id: str
+    address: str
+    model_index: int
+    endpoint: str
+    until_ts: float
+    reason: str = "capacity_audit"
+
+
+@dataclass
 class ValidatorSharedState:
     """State shared from the validator process to the proxy process."""
 
@@ -60,6 +72,10 @@ class ValidatorSharedState:
     probation_miners: Dict[str, List[int]] = field(default_factory=dict)
     # Discovered miner endpoints (proxy fallback when chain RPC is unavailable).
     miner_endpoints: List[MinerEntry] = field(default_factory=list)
+    # Temporary audit drains consumed by public proxies. These are not verdicts
+    # and do not imply punishment; they only avoid routing user work into the
+    # timed audit window.
+    audit_drains: List[AuditDrain] = field(default_factory=list)
     # Last normalized weights sent to set_weights() (uid -> weight).
     # Includes burn UID. Empty until first weight-setting boundary.
     last_weights: Dict[int, float] = field(default_factory=dict)
@@ -101,6 +117,12 @@ def write_shared_state(
              "gpu_uuids": m.gpu_uuids}
             for m in state.miner_endpoints
         ],
+        "audit_drains": [
+            {"audit_id": d.audit_id, "address": d.address,
+             "model_index": d.model_index, "endpoint": d.endpoint,
+             "until_ts": d.until_ts, "reason": d.reason}
+            for d in state.audit_drains
+        ],
         "last_weights": {str(k): v for k, v in state.last_weights.items()},
         "demand_scores": state.demand_scores,
         "ss58_map": state.ss58_map,
@@ -139,6 +161,11 @@ def read_shared_state(
                           if k in MinerEntry.__dataclass_fields__})
             for m in data.get("miner_endpoints", [])
         ]
+        audit_drains = [
+            AuditDrain(**{k: v for k, v in d.items()
+                          if k in AuditDrain.__dataclass_fields__})
+            for d in data.get("audit_drains", [])
+        ]
         # Migrate old flat scores (address -> float) to per-model format
         raw_scores = data.get("miner_scores", {})
         miner_scores: Dict[str, Dict[str, float]] = {}
@@ -157,6 +184,7 @@ def read_shared_state(
             miner_scores=miner_scores,
             probation_miners=data.get("probation_miners", {}),
             miner_endpoints=miner_endpoints,
+            audit_drains=audit_drains,
             demand_scores=data.get("demand_scores", {}),
             ss58_map=data.get("ss58_map", {}),
             blacklisted_addresses=data.get("blacklisted_addresses", []),

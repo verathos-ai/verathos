@@ -90,6 +90,29 @@ class ReceiptStore:
                     total, len(self._cache),
                 )
 
+    def _load_epoch_locked(self, epoch: int) -> None:
+        """Load one epoch into cache. Caller must hold _lock."""
+        cursor = self._conn.execute(
+            "SELECT receipt_json FROM receipts WHERE epoch = ?",
+            (epoch,),
+        )
+        self._cache[epoch] = [
+            json.loads(row[0]) for row in cursor.fetchall()
+        ]
+
+    @staticmethod
+    def _gc_comparable_epoch(epoch: int, current_epoch: int) -> bool:
+        """Return whether two epochs are safe to compare for retention.
+
+        Older rollout code used a different epoch divisor, producing epoch
+        numbers roughly 6x larger than the current subnet tempo epoch. A
+        receipt from that older scheme must not make the miner delete current
+        epoch receipts just because its integer value is larger.
+        """
+        if current_epoch < 1024 or epoch < 1024:
+            return True
+        return epoch >= current_epoch // 2
+
     def add(self, epoch: int, receipt_dict: dict) -> int:
         """Add a receipt and persist to disk. Returns count for this epoch."""
         with self._lock:
@@ -107,23 +130,35 @@ class ReceiptStore:
     def get(self, epoch: int) -> List[dict]:
         """Get all receipts for an epoch."""
         with self._lock:
+            if epoch not in self._cache:
+                self._load_epoch_locked(epoch)
             return list(self._cache.get(epoch, []))
 
     def count(self, epoch: int) -> int:
         """Get receipt count for an epoch."""
         with self._lock:
+            if epoch not in self._cache:
+                self._load_epoch_locked(epoch)
             return len(self._cache.get(epoch, []))
 
     def gc(self, current_epoch: int) -> None:
         """Remove receipts older than current_epoch - _KEEP_EPOCHS."""
         cutoff = current_epoch - _KEEP_EPOCHS
         with self._lock:
-            stale = [e for e in self._cache if e < cutoff]
+            stale = [
+                e for e in self._cache
+                if e < cutoff and self._gc_comparable_epoch(e, current_epoch)
+            ]
             for e in stale:
                 del self._cache[e]
 
             self._conn.execute(
-                "DELETE FROM receipts WHERE epoch < ?", (cutoff,),
+                """
+                DELETE FROM receipts
+                 WHERE epoch < ?
+                   AND (? < 1024 OR epoch < 1024 OR epoch >= ?)
+                """,
+                (cutoff, current_epoch, current_epoch // 2),
             )
             self._conn.commit()
 

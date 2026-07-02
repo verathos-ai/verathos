@@ -40,7 +40,12 @@ import bittensor as bt
 import httpx
 
 from neurons.config import NeuronConfig
-from neurons.model_resolve import add_model_args, resolve_model_config
+from neurons.model_resolve import (
+    add_model_args,
+    capacity_gate_vram_gb,
+    resolve_model_config,
+    validate_capacity_recommended_model,
+)
 from neurons.version import spec_version, version_str, miner_version, miner_version_str
 from verallm.chain.config import ChainConfig
 from verallm.chain.miner_registry import MinerRegistryClient
@@ -50,13 +55,59 @@ from verallm.chain.wallet import derive_evm_private_key, derive_evm_address
 logger = logging.getLogger(__name__)
 
 
-def _check_external_port(endpoint: str) -> None:
+def _capacity_audit_worker_poll_interval(config) -> float:
+    raw_value = getattr(config, "capacity_audit_worker_poll_s", 2.0)
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        value = 2.0
+    return max(0.1, value)
+
+
+def _normalize_server_args(server_args: list[str]) -> list[str]:
+    """Keep wrapper-only argparse leftovers out of the inner miner server."""
+    out: list[str] = []
+    for arg in server_args:
+        if arg == "--":
+            continue
+        if arg.startswith("--logging."):
+            continue
+        out.append(arg)
+    return out
+
+
+def _set_server_arg(server_args: list[str], flag: str, value: str) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for arg in server_args:
+        if skip:
+            skip = False
+            continue
+        if arg == flag:
+            skip = True
+            continue
+        out.append(arg)
+    out.extend([flag, value])
+    return out
+
+
+def _capacity_audit_state_path(evm_address: str | None, port: int) -> str:
+    address = "".join(
+        c for c in str(evm_address or "unknown").lower()
+        if c.isalnum() or c in ("x",)
+    )[:48] or "unknown"
+    return f"/tmp/verathos_capacity_audit_{address}_{int(port)}.json"
+
+
+def _check_external_port(endpoint: str, local_bind_port: int | None = None) -> None:
     """Verify the miner's endpoint port is reachable from the internet.
 
-    Starts a temporary TCP listener on the port, asks external services
-    to probe it, then shuts it down — all before vLLM loads. If a service
-    confirms the port is closed, abort with a clear error. If all services
-    are unreachable, log a warning and continue (skip).
+    Starts a temporary TCP listener on the local server port, asks external
+    services to probe the public endpoint port, then shuts it down — all before
+    vLLM loads. The local bind port can differ from the public endpoint port on
+    providers such as RunPod that forward a public port to container port 8000.
+    If a service confirms the public port is closed, abort with a clear error.
+    If all services are unreachable, log a warning and continue (skip).
     """
     from urllib.parse import urlparse
     import socket as _socket
@@ -66,12 +117,15 @@ def _check_external_port(endpoint: str) -> None:
     parsed = urlparse(endpoint)
     host = parsed.hostname
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    bind_port = int(local_bind_port or port)
 
     if not host:
         bt.logging.warning("Cannot parse endpoint host — skipping external port check")
         return
 
     bt.logging.info(f"Checking if port {port} on {host} is reachable from the internet...")
+    if bind_port != port:
+        bt.logging.info(f"External port check: binding temporary local listener on port {bind_port}")
 
     # Start a temporary HTTP server so external services have something to connect to.
     # Runs in a background thread, shut down after the check.
@@ -86,7 +140,7 @@ def _check_external_port(endpoint: str) -> None:
     tmp_server = None
     tmp_thread = None
     try:
-        tmp_server = HTTPServer(("0.0.0.0", port), _SilentHandler)
+        tmp_server = HTTPServer(("0.0.0.0", bind_port), _SilentHandler)
         tmp_thread = _threading.Thread(target=tmp_server.serve_forever, daemon=True)
         tmp_thread.start()
         time.sleep(0.5)  # let it bind
@@ -198,6 +252,7 @@ class MinerNeuron:
         self._provider: Optional[Web3Provider] = None
         self._miner_client: Optional[MinerRegistryClient] = None
         self._server_process: Optional[subprocess.Popen] = None
+        self._capacity_audit_worker = None
         self._running = True
 
         self.evm_pk = ""
@@ -342,6 +397,8 @@ class MinerNeuron:
     # release without a fresh process).
     _MAMBA_HINT_PATH = "/tmp/verathos_mamba_max_num_seqs"
     _MAMBA_HINT_EXIT = 42
+    _AWQ_GEMM_HINT_PATH = "/tmp/verathos_awq_gemm_fallback"
+    _AWQ_GEMM_HINT_EXIT = 43
 
     def _server_cmd(self, server_args: list[str]) -> list[str]:
         return [sys.executable, "-m", "verallm.api.server"] + server_args
@@ -361,6 +418,17 @@ class MinerNeuron:
                 _safe.append(a)
         return " ".join(_safe)
 
+    @staticmethod
+    def _server_preexec():
+        try:
+            import ctypes
+            import signal as _signal
+
+            libc = ctypes.CDLL("libc.so.6")
+            libc.prctl(1, _signal.SIGTERM)
+        except Exception:
+            pass
+
     def start_server(self, server_args: list[str]):
         """Start the VeraLLM miner server as a subprocess.
 
@@ -378,12 +446,18 @@ class MinerNeuron:
             import os as _os
             if _os.path.exists(self._MAMBA_HINT_PATH):
                 _os.remove(self._MAMBA_HINT_PATH)
+            if _os.path.exists(self._AWQ_GEMM_HINT_PATH):
+                _os.remove(self._AWQ_GEMM_HINT_PATH)
         except Exception:
             pass
 
         cmd = self._server_cmd(server_args)
         bt.logging.info(f"Starting miner server: {self._redact_cmd(cmd)}")
-        self._server_process = subprocess.Popen(cmd)
+        self._server_process = subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            preexec_fn=self._server_preexec if os.name == "posix" else None,
+        )
 
     def _read_mamba_hint(self) -> Optional[int]:
         try:
@@ -409,11 +483,31 @@ class MinerNeuron:
         out.extend(["--max-num-seqs", str(n)])
         return out
 
+    def _read_awq_gemm_hint(self) -> bool:
+        try:
+            with open(self._AWQ_GEMM_HINT_PATH) as _hf:
+                return _hf.read().strip() == "1"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _apply_awq_gemm_fallback(server_args: list[str]) -> list[str]:
+        out = list(server_args)
+        if "--awq-gemm-fallback" not in out:
+            out.append("--awq-gemm-fallback")
+        # AWQ-Marlin and plain AWQ GEMM can expose different loaded-weight
+        # layouts to root computation. Recompute the ModelSpec on fallback
+        # instead of reusing a cache produced by the failed backend.
+        if "--no-cache" not in out:
+            out.append("--no-cache")
+        return out
+
     def wait_for_health(
         self,
         endpoint: str,
         server_args: Optional[list[str]] = None,
         max_mamba_retries: int = 1,
+        max_awq_gemm_retries: int = 1,
     ):
         """Poll /health until the server is ready. No timeout — model load + Merkle tree
         can take 30+ minutes for large models.
@@ -429,6 +523,7 @@ class MinerNeuron:
         start = time.monotonic()
         last_log = start
         _mamba_retries_done = 0
+        _awq_gemm_retries_done = 0
         while True:
             # Detect subprocess death.  If the server exited cleanly via the
             # Mamba auto-tune path (exit 42 + hint file), relaunch with
@@ -462,6 +557,28 @@ class MinerNeuron:
                         start = time.monotonic()
                         last_log = start
                         continue
+                if (
+                    rc == self._AWQ_GEMM_HINT_EXIT
+                    and server_args is not None
+                    and _awq_gemm_retries_done < max_awq_gemm_retries
+                    and self._read_awq_gemm_hint()
+                ):
+                    bt.logging.warning(
+                        "Server subprocess exited with AWQ GEMM fallback hint. "
+                        "Relaunching with --awq-gemm-fallback."
+                    )
+                    try:
+                        import os as _os
+                        _os.remove(self._AWQ_GEMM_HINT_PATH)
+                    except Exception:
+                        pass
+                    new_args = self._apply_awq_gemm_fallback(list(server_args))
+                    server_args[:] = new_args
+                    self.start_server(server_args)
+                    _awq_gemm_retries_done += 1
+                    start = time.monotonic()
+                    last_log = start
+                    continue
                 raise RuntimeError(
                     f"Miner server subprocess exited (returncode={rc}) before "
                     f"/health became ready"
@@ -693,6 +810,43 @@ class MinerNeuron:
             bt.logging.warning(f"Failed to parse model index from receipt: {e}")
         return None
 
+    def _find_registered_model_index(
+        self,
+        model_id: str,
+        endpoint: str,
+        quant: str,
+        max_context_len: int,
+    ) -> Optional[int]:
+        """Find this exact active model slot from chain state.
+
+        Public RPCs can lag immediately after a successful registration tx:
+        the tx submission path may return before ``eth_getTransactionReceipt``
+        can serve the receipt, and a raw ``count - 1`` read can be stale.  The
+        capacity-audit worker needs the exact on-chain model index, so fall
+        back to querying the miner's model array and matching the slot fields
+        validators also use for discovery.
+        """
+        try:
+            models = self._miner_client.get_miner_models(self.evm_addr)
+        except Exception as e:
+            bt.logging.warning(f"Could not resolve registered model index from chain state: {e}")
+            return None
+
+        match: Optional[int] = None
+        for i, m in enumerate(models):
+            if not getattr(m, "active", False):
+                continue
+            if m.model_id != model_id:
+                continue
+            if m.endpoint != endpoint:
+                continue
+            if m.quant != quant:
+                continue
+            if not self._ctx_close_enough(m.max_context_len, max_context_len):
+                continue
+            match = i
+        return match
+
     def register_on_chain(
         self,
         model_id: str,
@@ -746,11 +900,19 @@ class MinerNeuron:
                 if event_index is not None:
                     bt.logging.info(f"Model index from tx receipt: {event_index}")
                     return event_index
-                # Fallback: if event parsing fails (shouldn't happen),
-                # use count - 1 as last resort.
-                bt.logging.warning("Could not parse model index from tx receipt — using count-1 fallback")
-                count = self._miner_client.get_miner_model_count(self.evm_addr)
-                return count - 1
+                bt.logging.warning("Could not parse model index from tx receipt — resolving slot from chain state")
+                for _ in range(10):
+                    resolved_index = self._find_registered_model_index(
+                        model_id, endpoint, quant, max_context_len,
+                    )
+                    if resolved_index is not None:
+                        bt.logging.info(f"Model index from chain state: {resolved_index}")
+                        return resolved_index
+                    time.sleep(2)
+                raise RuntimeError(
+                    "Could not resolve registered model index after registration tx; "
+                    "refusing to start capacity-audit worker with an inferred index"
+                )
             except Exception as e:
                 err_str = str(e)
                 # "Duplicate active entry" means the model was already registered
@@ -1007,9 +1169,24 @@ class MinerNeuron:
     def shutdown(self):
         """Clean shutdown."""
         self._running = False
-        if self._server_process:
-            self._server_process.terminate()
-            self._server_process.wait(timeout=10)
+        if self._capacity_audit_worker is not None:
+            self._capacity_audit_worker.stop()
+        proc = self._server_process
+        if proc:
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                bt.logging.warning("Server process did not stop after SIGTERM; killing")
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+                proc.wait(timeout=5)
             bt.logging.info("Server process terminated")
 
 
@@ -1023,6 +1200,9 @@ def parse_args():
     parser.add_argument("--subtensor-chain-endpoint", default=None,
                         help="Explicit Substrate+EVM RPC endpoint (e.g. http://localhost:9944 for local subtensor).")
     parser.add_argument("--endpoint", required=True, help="Public miner endpoint URL")
+    parser.add_argument("--skip-external-port-check", action="store_true",
+                        help="Skip the public endpoint reachability preflight. "
+                             "Use only for controlled local/tunneled tests.")
     parser.add_argument("--no-autorestart", action="store_true",
                         help="Don't auto-restart the server subprocess on crash")
     parser.add_argument("--auto-update", action="store_true",
@@ -1037,6 +1217,35 @@ def parse_args():
                              "epoch. Set 0 to disable (single-miner / testnet).")
     parser.add_argument("--analytics", action="store_true",
                         help="Enable analytics reporting (request timing, proof stats)")
+    parser.add_argument("--capacity-audit", action="store_true",
+                        help="Enable miner-side hot-capacity audit worker.")
+    parser.add_argument("--capacity-audit-validator-urls", default=None,
+                        help="Emergency override for capacity artifact targets. "
+                             "By default miners discover validator audit endpoints from chain state.")
+    parser.add_argument("--capacity-audit-windows-per-epoch", type=int, default=None,
+                        help="Number of deterministic capacity-audit windows per subnet epoch.")
+    parser.add_argument("--capacity-audit-max-drain-fraction", type=float, default=None,
+                        help="Maximum active endpoint fraction drained in one audit window.")
+    parser.add_argument("--capacity-audit-group-stress-fraction", type=float, default=None,
+                        help="Share of each audit-window budget reserved for related-slot group stress.")
+    parser.add_argument("--capacity-audit-beacon-hash-count", type=int, default=None,
+                        help="Number of prior chain-head hashes mixed into the audit selection beacon.")
+    parser.add_argument("--capacity-audit-min-registration-age-s", type=float, default=None,
+                        help="Minimum endpoint lease age before it can enter capacity-audit cohorts.")
+    parser.add_argument("--capacity-audit-lead-blocks", type=int, default=None,
+                        help="Blocks between audit selection and audit start.")
+    parser.add_argument("--capacity-audit-proof-challenge-delay-blocks", type=int, default=None,
+                        help="Blocks between audit start and deferred proof challenge.")
+    parser.add_argument("--capacity-audit-drain-seconds", type=float, default=None,
+                        help="Nominal endpoint drain period before the timing deadline.")
+    parser.add_argument("--capacity-audit-deadline-s", type=float, default=None,
+                        help="Timing deadline, in seconds, measured from observed B_start.")
+    parser.add_argument("--capacity-audit-transport-grace-s", type=float, default=None,
+                        help="Additional final-receipt transport grace after the timing deadline.")
+    parser.add_argument("--capacity-audit-payload-deadline-s", type=float, default=None,
+                        help="Deferred proof payload timeout after the final timing receipt.")
+    parser.add_argument("--capacity-audit-worker-poll-s", type=float, default=None,
+                        help="Miner-side capacity-audit chain polling interval in seconds.")
 
     # TEE (Trusted Execution Environment)
     tee_group = parser.add_argument_group("tee")
@@ -1070,7 +1279,7 @@ def parse_args():
 
     # Everything after -- is passed to the miner server
     args, server_args = parser.parse_known_args()
-    return args, server_args
+    return args, _normalize_server_args(server_args)
 
 
 def _extract_code_measurement(platform: str, attestation_report: bytes, Web3) -> bytes:
@@ -1236,6 +1445,14 @@ def main():
         sys.exit(1)
     args.chain_config = resolved_chain_path  # update for downstream use
 
+    config = NeuronConfig.from_env(
+        wallet_name=args.wallet or "default",
+        hotkey_name=args.hotkey,
+        netuid=args.netuid,
+    )
+    if getattr(args, "capacity_audit", False):
+        config.capacity_audit_enabled = True
+
     # Resolve model configuration (auto or explicit)
     resolved = resolve_model_config(
         model_id=args.model_id,
@@ -1245,14 +1462,9 @@ def main():
         category=args.category,
         chain_config=resolved_chain_path,
         subtensor_network=args.subtensor_network,
+        capacity_audit_required=bool(getattr(config, "capacity_audit_enabled", False)),
     )
     bt.logging.info(f"Model config: {resolved.model_id} quant={resolved.quant} ctx={resolved.max_context_len}")
-
-    config = NeuronConfig.from_env(
-        wallet_name=args.wallet or "default",
-        hotkey_name=args.hotkey,
-        netuid=args.netuid,
-    )
 
     # Resolve EVM RPC URL: explicit endpoint > network default > JSON default
     rpc_override = ChainConfig.resolve_rpc_url(
@@ -1282,28 +1494,63 @@ def main():
     # Transfer --update-endpoint to config for registration logic
     if getattr(args, "update_endpoint", False):
         config.update_endpoint = True
+    if getattr(args, "capacity_audit", False):
+        config.capacity_audit_enabled = True
+    if getattr(args, "capacity_audit_validator_urls", None):
+        config.capacity_audit_validator_urls = args.capacity_audit_validator_urls
+    if getattr(args, "capacity_audit_windows_per_epoch", None) is not None:
+        config.capacity_audit_windows_per_epoch = args.capacity_audit_windows_per_epoch
+    if getattr(args, "capacity_audit_max_drain_fraction", None) is not None:
+        config.capacity_audit_max_drain_fraction = args.capacity_audit_max_drain_fraction
+    if getattr(args, "capacity_audit_group_stress_fraction", None) is not None:
+        config.capacity_audit_group_stress_fraction = args.capacity_audit_group_stress_fraction
+    if getattr(args, "capacity_audit_beacon_hash_count", None) is not None:
+        config.capacity_audit_beacon_hash_count = args.capacity_audit_beacon_hash_count
+    if getattr(args, "capacity_audit_min_registration_age_s", None) is not None:
+        config.capacity_audit_min_registration_age_s = args.capacity_audit_min_registration_age_s
+    if getattr(args, "capacity_audit_lead_blocks", None) is not None:
+        config.capacity_audit_lead_blocks = args.capacity_audit_lead_blocks
+    if getattr(args, "capacity_audit_proof_challenge_delay_blocks", None) is not None:
+        config.capacity_audit_proof_challenge_delay_blocks = args.capacity_audit_proof_challenge_delay_blocks
+    if getattr(args, "capacity_audit_drain_seconds", None) is not None:
+        config.capacity_audit_drain_seconds = args.capacity_audit_drain_seconds
+    if getattr(args, "capacity_audit_deadline_s", None) is not None:
+        config.capacity_audit_deadline_s = args.capacity_audit_deadline_s
+    if getattr(args, "capacity_audit_transport_grace_s", None) is not None:
+        config.capacity_audit_transport_grace_s = args.capacity_audit_transport_grace_s
+    if getattr(args, "capacity_audit_payload_deadline_s", None) is not None:
+        config.capacity_audit_payload_deadline_s = args.capacity_audit_payload_deadline_s
+    if getattr(args, "capacity_audit_worker_poll_s", None) is not None:
+        config.capacity_audit_worker_poll_s = args.capacity_audit_worker_poll_s
 
     # ── Early on-chain model check ───────────────────────────────
     # Verify the resolved model is registered on-chain BEFORE loading
     # it into GPU. This avoids wasting ~60s on model load + root
     # computation only to fail at _chain_self_check in the server.
+    on_chain_models: list[str] | None = None
     if chain_config.model_registry_address:
         try:
             from verallm.chain.model_registry import ModelRegistryClient
             model_client = ModelRegistryClient(chain_config)
-            on_chain = model_client.get_model_list()
-            on_chain_lower = {m.lower() for m in (on_chain or [])}
-            if on_chain is not None and resolved.model_id.lower() not in on_chain_lower:
+            on_chain_models = model_client.get_model_list()
+            on_chain_lower = {m.lower() for m in (on_chain_models or [])}
+            if on_chain_models is not None and resolved.model_id.lower() not in on_chain_lower:
                 bt.logging.error(
                     f"Model '{resolved.model_id}' is not registered on-chain. "
                     f"Miners can only serve models registered on the ModelRegistry contract. "
                     f"ModelRegistry: {chain_config.model_registry_address} | "
-                    f"Registered models: {sorted(on_chain) if on_chain else '(none)'}"
+                    f"Registered models: {sorted(on_chain_models) if on_chain_models else '(none)'}"
                 )
                 sys.exit(1)
-            elif on_chain is not None:
+            elif on_chain_models is not None:
                 bt.logging.info(f"On-chain model check passed: '{resolved.model_id}' is registered")
         except Exception as e:
+            if getattr(config, "capacity_audit_enabled", False):
+                bt.logging.error(
+                    f"Capacity audit model gate requires ModelRegistry access; "
+                    f"startup aborted after RPC error: {e}"
+                )
+                sys.exit(1)
             bt.logging.warning(
                 f"On-chain model check skipped (RPC error: {e}). "
                 f"The server will re-check after model load."
@@ -1314,6 +1561,7 @@ def main():
     def signal_handler(sig, _frame):
         bt.logging.info(f"Received signal {sig}, shutting down")
         neuron.shutdown()
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -1368,6 +1616,23 @@ def main():
         server_args.append("--tee-enabled")
         server_args.extend(["--tee-platform", args.tee_platform])
 
+    capacity_audit_state_file = ""
+    if getattr(config, "capacity_audit_enabled", False):
+        capacity_audit_state_file = _capacity_audit_state_path(
+            neuron.evm_addr,
+            _extract_server_port(server_args),
+        )
+        server_args = _set_server_arg(
+            server_args,
+            "--capacity-audit-state-file",
+            capacity_audit_state_file,
+        )
+        try:
+            if os.path.exists(capacity_audit_state_file):
+                os.remove(capacity_audit_state_file)
+        except Exception as exc:
+            bt.logging.warning(f"Could not clear stale capacity audit state: {exc}")
+
     # Write validator allowlist before starting server to avoid open-access window.
     # Only in wallet mode — Anvil mode has no metagraph.
     if args.wallet:
@@ -1380,7 +1645,13 @@ def main():
     # Verify the endpoint port is reachable from outside BEFORE loading vLLM
     # (which takes 10+ min). Starts a temporary TCP listener on the port,
     # asks external services to probe it, then shuts it down.
-    _check_external_port(args.endpoint)
+    if args.skip_external_port_check or os.environ.get("VERATHOS_SKIP_EXTERNAL_PORT_CHECK") == "1":
+        bt.logging.warning(
+            "Skipping external port reachability check. This is intended only "
+            "for controlled local/tunneled tests."
+        )
+    else:
+        _check_external_port(args.endpoint, local_bind_port=_extract_server_port(server_args))
 
     neuron.start_server(server_args)
 
@@ -1388,7 +1659,7 @@ def main():
     # that isn't reachable from inside the container. Parse the server's actual
     # port from server_args (mirrors the server's own --port default of 8000).
     local_health_url = f"http://localhost:{_extract_server_port(server_args)}"
-    neuron.wait_for_health(local_health_url)
+    neuron.wait_for_health(local_health_url, server_args=server_args)
 
     # Start background refresh loop (periodic updates)
     if args.wallet:
@@ -1406,6 +1677,38 @@ def main():
     else:
         bt.logging.warning(f"Could not query actual context from server — using registry value {resolved.max_context_len}")
         reg_context = resolved.max_context_len
+
+    if getattr(config, "capacity_audit_enabled", False):
+        if on_chain_models is None:
+            bt.logging.error(
+                "Capacity audit model gate requires an on-chain ModelRegistry model list"
+            )
+            sys.exit(1)
+        try:
+            from verallm.registry.gpu import detect_gpu_info
+
+            gpu_info = detect_gpu_info()
+            ok, reason, expected = validate_capacity_recommended_model(
+                model_id=resolved.model_id,
+                quant=resolved.quant,
+                max_context_len=int(reg_context or 0),
+                vram_gb=capacity_gate_vram_gb(gpu_info),
+                on_chain_models=on_chain_models,
+            )
+            if not ok:
+                expected_text = ""
+                if expected is not None:
+                    expected_text = (
+                        f" expected model={expected.model_id} "
+                        f"quant={expected.quant} ctx>={expected.max_context_len}"
+                    )
+                bt.logging.error(f"{reason}.{expected_text}")
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            bt.logging.error(f"Capacity audit recommended-model check failed: {exc}")
+            sys.exit(1)
 
     # Store registration params so heartbeat_loop can re-register on lease expiry
     neuron._model_id = resolved.model_id
@@ -1436,6 +1739,42 @@ def main():
                 bt.logging.success("TEE attestation revoked on-chain")
         except Exception as e:
             bt.logging.warning(f"Could not check/revoke TEE registration: {e}")
+
+    if getattr(config, "capacity_audit_enabled", False):
+        validator_urls = tuple(
+            u.strip()
+            for u in str(getattr(config, "capacity_audit_validator_urls", "") or "").split(",")
+            if u.strip()
+        )
+        try:
+            from neurons.capacity_audit_miner import CapacityAuditMinerWorker
+            from verallm.chain.model_registry import ModelRegistryClient
+
+            model_client = ModelRegistryClient(config)
+            neuron._capacity_audit_worker = CapacityAuditMinerWorker(
+                config=config,
+                miner_client=neuron._miner_client,
+                model_client=model_client,
+                evm_address=neuron.evm_addr,
+                evm_private_key=neuron.evm_pk,
+                endpoint=args.endpoint,
+                model_id=resolved.model_id,
+                model_index=model_index,
+                quant=resolved.quant,
+                max_context_len=reg_context,
+                validator_urls=validator_urls,
+                local_health_url=local_health_url,
+                audit_state_file=capacity_audit_state_file,
+                poll_interval_s=_capacity_audit_worker_poll_interval(config),
+            )
+            neuron._capacity_audit_worker.start()
+        except Exception as e:
+            mode = str(getattr(config, "capacity_audit_mode", "observe") or "observe")
+            if mode != "observe":
+                raise RuntimeError(
+                    f"Capacity audit miner worker failed to start in {mode} mode"
+                ) from e
+            bt.logging.warning(f"Capacity audit miner worker failed to start in observe mode: {e}")
 
     # ── Auto-updater ──
     if args.auto_update:

@@ -3,7 +3,7 @@
 
 Lifecycle:
 1. Ensure hotkey is linked (for reportOffline access).
-2. Subscribe to finalized block headers via WebSocket.
+2. Subscribe to current-head block headers via WebSocket.
 3. On epoch boundary (every ``epoch_blocks``):
    a. Discover ALL active miners from MinerRegistry.
    b. Plan canary tests: ``canary_small_count`` small + ``canary_full_context_count``
@@ -40,21 +40,57 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _FuturesTimeout
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
+import ipaddress
 
 import bittensor as bt
 import httpx
 
 from neurons.canary import FULL_CONTEXT_TOKEN_CAP, CanaryScheduler, CanaryTest
+from neurons.capacity_audit import (
+    CapacityAuditRuntimeConfig,
+    CapacitySlot,
+    PROTOCOL_VERSION,
+    build_capacity_slot_group_key,
+    capacity_audit_window_fits_epoch,
+    capacity_audit_window_triggered,
+    capacity_gpu_pass_count,
+    derive_audit_id,
+    derive_audit_seed,
+    derive_audit_seed_from_hashes,
+    derive_proof_challenge_seed,
+    derive_proof_seed,
+    lease_id,
+    match_gpu_class,
+    select_capacity_audit_slots,
+    slot_id,
+    verify_artifact_signature,
+    window_cohort_budget,
+)
+from neurons.capacity_audit_combined import (
+    COMBINED_PROOF_FORMAT,
+    verify_combined_proof_payload,
+)
 from neurons.config import NeuronConfig
 from neurons.discovery import ActiveMiner, discover_active_miners
+from neurons.subnet_runtime_config import (
+    RuntimeSubnetConfigClient,
+    apply_runtime_config_to_neuron_config,
+    capacity_audit_config_from_neuron_config,
+)
+from neurons.model_resolve import validate_capacity_recommended_model
 from neurons.version import spec_version, version_str, validator_version, validator_version_str
 from neurons.receipts import (
     ServiceReceipt,
     ValidatorAuthority,
     create_receipt,
     receipt_from_dict,
+    receipt_observed_interval,
+    receipt_has_validator_observed_timing,
     receipt_to_dict,
+    validator_observed_timing,
     verify_service_receipt,
 )
 from neurons.scoring import (
@@ -79,6 +115,16 @@ from verallm.config import Config
 from verallm.registry import get_model, MODELS_BY_ID
 
 logger = logging.getLogger(__name__)
+
+
+def _validator_probation_state_path() -> str:
+    explicit = os.environ.get("VERATHOS_PROBATION_STATE_PATH", "").strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    data_dir = os.environ.get("VERALLM_DATA_DIR", "").strip()
+    if data_dir:
+        return os.path.join(os.path.expanduser(data_dir), "verathos_probation.json")
+    return "/tmp/verathos_probation.json"
 
 
 def _coerce_nonnegative_int(value: object) -> int:
@@ -331,6 +377,7 @@ class ValidatorNeuron:
         self._probation_tracker = ProbationTracker(
             required_passes=config.probation_required_passes,
             escalation_epochs=config.probation_escalation_epochs,
+            state_path=_validator_probation_state_path(),
         )
 
         # SQLite-backed validator state database
@@ -367,13 +414,15 @@ class ValidatorNeuron:
         self._current_epoch: int = 0
         self._epoch_start_block: int = 0
         self._canary_scheduler: Optional[CanaryScheduler] = None
+        self._canary_scheduler_lock = threading.Lock()
         self._epoch_miners: List[ActiveMiner] = []
-        # {(miner_address, model_index): expected_receipt_count}
+        self._epoch_miners_discovery_valid: bool = False
+        # {(lowercase miner_address, model_index): expected_receipt_count}
         self._expected_receipts: Dict[Tuple[str, int], int] = {}
         # {epoch_number: {(miner_address, model_index): in_flight_count}}
         self._inflight_canaries: Dict[int, Dict[Tuple[str, int], int]] = {}
         self._closing_inflight_canaries: Dict[int, Dict[Tuple[str, int], int]] = {}
-        # {(miner_address, model_index): 503_skip_count} — reset each epoch
+        # {(lowercase miner_address, model_index): 503_skip_count} — reset each epoch
         self._busy_skips: Dict[Tuple[str, int], int] = {}
         # Miners that entered probation via busy-skips (not real proof failure)
         # — maps to list of unix timestamps when 503s occurred, used to verify
@@ -401,6 +450,25 @@ class ValidatorNeuron:
         self._epoch_close_retry_after: float = 0.0  # monotonic time
         self._epoch_close_backoff: float = 30.0  # seconds, doubles on failure
         self._last_known_block: int = 0  # fallback for _get_current_block
+        self._last_block_hash_warning_at: float = 0.0
+        self._capacity_audit_server = None
+        self._capacity_audit_server_thread = None
+        self._capacity_audit_schedule_lock = threading.Lock()
+        self._capacity_audit_slot_snapshot_lock = threading.Lock()
+        self._capacity_audit_slot_snapshot: list[tuple[CapacitySlot, object]] = []
+        self._capacity_audit_slot_snapshot_block: int = 0
+        self._capacity_audit_slot_snapshot_updated_at: float = 0.0
+        self._capacity_audit_slot_snapshot_refreshing = False
+        self._capacity_audit_slot_snapshot_last_error = ""
+        self._capacity_audit_verifier_unhealthy = False
+        self._capacity_audit_verifier_last_error = ""
+        self._capacity_audit_cfg = capacity_audit_config_from_neuron_config(config)
+        self._subnet_runtime_config_client = RuntimeSubnetConfigClient.from_config(
+            config,
+            log=bt.logging,
+        )
+        self._subnet_runtime_config_key: tuple[int, Optional[int], str] | None = None
+        self._subnet_runtime_config_authoritative = False
 
         # Thread pool for concurrent canary tests. This pool is reset at epoch
         # rollover so queued stale canaries cannot occupy the next epoch.
@@ -412,6 +480,69 @@ class ValidatorNeuron:
         self._control_executor = ThreadPoolExecutor(
             max_workers=config.max_concurrent_verifications,
         )
+        # Capacity-audit scheduling must not queue behind epoch identity checks:
+        # short drain windows are intentionally only a few blocks long. Keep
+        # scheduling serialized so adjacent hash-triggered windows observe each
+        # other's freshly written drains before selecting endpoint slots.
+        self._capacity_audit_executor = ThreadPoolExecutor(max_workers=1)
+        self._capacity_audit_discovery_executor = ThreadPoolExecutor(max_workers=1)
+        proof_workers = max(
+            1,
+            int(getattr(config, "capacity_audit_proof_verify_workers", 4) or 4),
+        )
+        self._capacity_audit_proof_executor = ThreadPoolExecutor(max_workers=proof_workers)
+
+    def _refresh_subnet_runtime_config(
+        self,
+        *,
+        current_epoch: int | None = None,
+        force: bool = False,
+    ) -> bool:
+        client = getattr(self, "_subnet_runtime_config_client", None)
+        if client is None:
+            return False
+        runtime = client.get(current_epoch=current_epoch, force=force)
+        if runtime is None:
+            self._subnet_runtime_config_authoritative = False
+            return False
+        authoritative = bool(getattr(client, "last_authoritative", False))
+        key = runtime.cache_key
+        if key == self._subnet_runtime_config_key:
+            self._subnet_runtime_config_authoritative = authoritative
+            return True
+
+        previous_proof_workers = int(
+            getattr(self.config, "capacity_audit_proof_verify_workers", 4) or 4
+        )
+        apply_runtime_config_to_neuron_config(runtime, self.config)
+        self._scoring = runtime.scoring
+        self._last_good_scoring = runtime.scoring
+        self._capacity_audit_cfg = runtime.capacity_audit
+        self._probation_tracker.required_passes = runtime.scoring.probation_required_passes
+        self._probation_tracker.escalation_epochs = runtime.probation_escalation_epochs
+        for state in getattr(self._probation_tracker, "_probation", {}).values():
+            state.required_passes = runtime.scoring.probation_required_passes
+            state.escalation_epochs = runtime.probation_escalation_epochs
+
+        proof_workers = max(
+            1,
+            int(getattr(self.config, "capacity_audit_proof_verify_workers", 4) or 4),
+        )
+        if proof_workers != previous_proof_workers:
+            old_executor = self._capacity_audit_proof_executor
+            self._capacity_audit_proof_executor = ThreadPoolExecutor(max_workers=proof_workers)
+            old_executor.shutdown(wait=False, cancel_futures=True)
+
+        self.scorer.ema_alpha = self._scoring.ema_alpha
+        self.scorer.throughput_power = self._scoring.throughput_power
+        self._subnet_runtime_config_key = key
+        self._subnet_runtime_config_authoritative = authoritative
+        bt.logging.info(
+            f"Applied runtime subnet config version={runtime.version} "
+            f"effective_epoch={runtime.effective_epoch} source={runtime.source or 'server'} "
+            f"authoritative={authoritative}"
+        )
+        return True
 
     @property
     def _subtensor(self):
@@ -463,6 +594,7 @@ class ValidatorNeuron:
 
         bt.logging.info("Creating chain clients...")
         self._model_client, self._miner_client, self._payment_client = create_clients(self.config)
+        runtime_config_loaded = self._refresh_subnet_runtime_config(force=True)
 
         # SubnetConfig client for TEE measurement verification, blacklists, scoring params
         _sn_config_addr = getattr(self.config, "subnet_config_address", "")
@@ -476,17 +608,18 @@ class ValidatorNeuron:
                 )
                 self._subnet_config_client = SubnetConfigClient(_sn_chain_config)
                 bt.logging.info(f"SubnetConfig client initialized: {_sn_config_addr}")
-                # Boot-time read — without this, weight-setting fires with
-                # ScoringParams() defaults until the first _close_epoch.
-                try:
-                    self._scoring = self._subnet_config_client.get_scoring_params()
-                    self._last_good_scoring = self._scoring
-                    bt.logging.info(
-                        f"SubnetConfig boot read: burn={self._scoring.emission_burn:.0%} "
-                        f"ema={self._scoring.ema_alpha:.2f} tp={self._scoring.throughput_power:.1f}"
-                    )
-                except Exception as e:
-                    bt.logging.warning(f"SubnetConfig boot read failed, using defaults: {e}")
+                if not runtime_config_loaded:
+                    # Chain scoring is fallback only when the public runtime
+                    # subnet config and its local cache are unavailable.
+                    try:
+                        self._scoring = self._subnet_config_client.get_scoring_params()
+                        self._last_good_scoring = self._scoring
+                        bt.logging.info(
+                            f"SubnetConfig fallback boot read: burn={self._scoring.emission_burn:.0%} "
+                            f"ema={self._scoring.ema_alpha:.2f} tp={self._scoring.throughput_power:.1f}"
+                        )
+                    except Exception as e:
+                        bt.logging.warning(f"SubnetConfig fallback boot read failed, using defaults: {e}")
             except Exception as e:
                 bt.logging.warning(f"SubnetConfig client failed to initialize: {e}")
                 self._subnet_config_client = None
@@ -532,10 +665,10 @@ class ValidatorNeuron:
         self._load_scores_from_db()
 
         # Block from which to start processing.  Set in main_loop() to the
-        # current finalized block so we never replay historical blocks after
-        # a chain reset / fast-sync.  All blocks before this are silently
-        # skipped.
+        # current chain head so we never replay historical blocks after a chain
+        # reset / fast-sync.  All blocks before this are silently skipped.
         self._sync_block: int = 0
+        self._capacity_audit_last_finalized_confirmed: int = 0
 
     def _ensure_evm_registered(self):
         """Ensure registerEvm(uid) has been called on the current MinerRegistry."""
@@ -581,11 +714,11 @@ class ValidatorNeuron:
             )
 
     def _ensure_validator_registry_registered(self):
-        """Register on ValidatorRegistry with empty endpoint (participation signal).
+        """Register on ValidatorRegistry for validator participation.
 
-        Validators that don't run a proxy register with empty endpoint so they
-        appear in the participation count. Proxies overwrite the endpoint later
-        via their own register(real_url) call at startup.
+        The registry endpoint is the user/API proxy endpoint. Capacity-audit
+        proof ingest is published through native axon metadata by the validator
+        process itself and must not overwrite the proxy endpoint.
         """
         if self._evm_disabled:
             bt.logging.info("EVM disabled, skipping ValidatorRegistry registration")
@@ -624,9 +757,11 @@ class ValidatorNeuron:
                     private_key=self.evm_pk,
                 )
 
-            # Register with empty endpoint if not already registered
             if not vr.is_active_validator(self.evm_addr):
-                bt.logging.info("ValidatorRegistry: registering with empty endpoint (no proxy)")
+                bt.logging.info(
+                    "ValidatorRegistry: registering with empty endpoint "
+                    "(no public proxy endpoint)"
+                )
                 vr.register("", private_key=self.evm_pk)
             else:
                 bt.logging.debug("ValidatorRegistry: already registered")
@@ -638,6 +773,112 @@ class ValidatorNeuron:
                 f"Validator will continue without ValidatorRegistry — "
                 f"proxy endpoint discovery disabled until you have a validator permit."
             )
+
+    @staticmethod
+    def _is_public_audit_axon_ip(host: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return not (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+
+    @staticmethod
+    def _is_loopback_audit_bind_host(host: str) -> bool:
+        text = str(host or "").strip().lower()
+        if text in {"localhost", "ip6-localhost"}:
+            return True
+        try:
+            return ipaddress.ip_address(text).is_loopback
+        except ValueError:
+            return False
+
+    def _capacity_audit_axon_external_endpoint(self) -> tuple[Optional[str], int]:
+        port = int(getattr(self.config, "capacity_audit_ingest_port", 8091) or 8091)
+        raw_endpoint = str(getattr(self.config, "capacity_audit_public_url", "") or "").strip()
+        if not raw_endpoint:
+            return None, port
+
+        from neurons.capacity_audit_discovery import normalize_audit_endpoint
+
+        endpoint = normalize_audit_endpoint(raw_endpoint)
+        if not endpoint:
+            bt.logging.warning(
+                f"Capacity audit axon serve ignored invalid public URL {raw_endpoint!r}; "
+                "falling back to auto-detected external IP"
+            )
+            return None, port
+
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "http":
+            bt.logging.warning(
+                f"Capacity audit axon serve ignored non-HTTP public URL {raw_endpoint!r}; "
+                "Bittensor axon metadata carries host/port only"
+            )
+            return None, port
+        host = parsed.hostname or ""
+        public_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not host:
+            return None, public_port
+        if ValidatorNeuron._is_public_audit_axon_ip(host):
+            return host, public_port
+        bt.logging.warning(
+            f"Capacity audit axon serve ignored non-public IP/domain {host!r}; "
+            "falling back to auto-detected external IP"
+        )
+        return None, public_port
+
+    def _ensure_capacity_audit_axon_served(self) -> None:
+        if not self._capacity_audit_cfg.enabled:
+            return
+        if not bool(getattr(self.config, "capacity_audit_serve_axon", True)):
+            return
+        try:
+            bind_host = str(
+                getattr(self.config, "capacity_audit_ingest_host", "0.0.0.0") or "0.0.0.0"
+            )
+            public_url = str(getattr(self.config, "capacity_audit_public_url", "") or "").strip()
+            if ValidatorNeuron._is_loopback_audit_bind_host(bind_host) and not public_url:
+                bt.logging.warning(
+                    "Capacity audit axon metadata publish skipped: ingest is bound to "
+                    f"{bind_host!r} and no public URL/front door is configured"
+                )
+                return
+            external_ip, external_port = self._capacity_audit_axon_external_endpoint()
+            AxonCls = getattr(bt, "Axon", None) or getattr(bt, "axon")
+            axon = AxonCls(
+                wallet=self._wallet,
+                port=int(getattr(self.config, "capacity_audit_ingest_port", 8091) or 8091),
+                ip=bind_host,
+                external_ip=external_ip,
+                external_port=external_port,
+            )
+            response = self._subtensor.serve_axon(
+                netuid=self.config.netuid,
+                axon=axon,
+                raise_error=False,
+                wait_for_inclusion=True,
+                wait_for_finalization=True,
+            )
+            if getattr(response, "success", True):
+                served_ip = external_ip or getattr(response, "data", {}).get("external_ip", None)
+                bt.logging.info(
+                    "Capacity audit ingest published via Bittensor axon metadata: "
+                    f"{served_ip or 'auto'}:{external_port}"
+                )
+            else:
+                bt.logging.warning(
+                    "Capacity audit axon metadata publish failed: "
+                    f"{getattr(response, 'message', response)}"
+                )
+        except Exception as exc:
+            bt.logging.warning(f"Capacity audit axon metadata publish skipped: {exc}")
 
     def _resolve_burn_uid(self) -> int:
         """Resolve subnet owner hotkey to UID on this subnet (= burn target).
@@ -652,8 +893,2019 @@ class ValidatorNeuron:
         bt.logging.info(f"Burn UID resolved: {burn_uid} (subnet owner: {owner_hotkey})")
         return burn_uid
 
-    def on_finalized_block(self, block_number: int, block_hash: bytes):
-        """Called by WebSocket subscription on each finalized block.
+    @staticmethod
+    def _coerce_block_hash(raw: object) -> Optional[bytes]:
+        """Normalize a substrate block hash to 32 raw bytes."""
+        if isinstance(raw, bytes):
+            return raw if len(raw) == 32 else None
+        if raw is None:
+            return None
+        if hasattr(raw, "hex") and not isinstance(raw, str):
+            try:
+                raw = raw.hex()
+            except Exception:
+                return None
+        text = str(raw).strip()
+        if text.startswith("0x"):
+            text = text[2:]
+        if len(text) != 64:
+            return None
+        try:
+            return bytes.fromhex(text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _synthetic_block_hash(block_number: int) -> bytes:
+        """Compatibility hash for legacy block processing when RPC hash lookup fails."""
+        return hashlib.sha256(f"block_{int(block_number)}".encode()).digest()
+
+    def _get_chain_block_hash(
+        self,
+        block_number: int,
+        subtensor_obj: object | None = None,
+    ) -> Tuple[bytes, bool]:
+        """Return (block_hash, is_real_hash) for an explicit chain block number."""
+        targets: List[object] = []
+        if subtensor_obj is not None:
+            targets.append(subtensor_obj)
+        else:
+            targets.append(self._subtensor)
+
+        substrate = getattr(targets[0], "substrate", None) if targets else None
+        if substrate is not None:
+            try:
+                response = substrate.rpc_request("chain_getBlockHash", [int(block_number)])
+                raw_hash = response.get("result") if isinstance(response, dict) else response
+                normalized = ValidatorNeuron._coerce_block_hash(raw_hash)
+                if normalized is not None:
+                    return normalized, True
+            except Exception:
+                pass
+            targets.append(substrate)
+
+        for target in targets:
+            method = getattr(target, "get_block_hash", None)
+            if not callable(method):
+                continue
+            call_specs = (
+                ((), {"block": int(block_number)}),
+                ((), {"block_id": int(block_number)}),
+                ((int(block_number),), {}),
+            )
+            for args, kwargs in call_specs:
+                try:
+                    normalized = ValidatorNeuron._coerce_block_hash(method(*args, **kwargs))
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+                if normalized is not None:
+                    return normalized, True
+
+        now = time.time()
+        if now - self._last_block_hash_warning_at > 300:
+            self._last_block_hash_warning_at = now
+            msg = (
+                f"Could not resolve chain hash for block {block_number}; "
+                "using synthetic compatibility hash for legacy canary processing"
+            )
+            if getattr(self.config, "capacity_audit_enabled", False):
+                msg += " and skipping capacity-audit scheduling from this block"
+            bt.logging.warning(msg)
+        return ValidatorNeuron._synthetic_block_hash(block_number), False
+
+    @staticmethod
+    def _block_hash_hex(block_hash: bytes) -> str:
+        return bytes(block_hash).hex()
+
+    def _capacity_slot_group_key(self, miner: ActiveMiner) -> str:
+        return build_capacity_slot_group_key(
+            address=miner.address,
+            endpoint=getattr(miner, "endpoint", "") or "",
+            model_id=getattr(miner, "model_id", "") or "",
+            gpu_name=getattr(miner, "gpu_name", "") or "",
+            miner_uid=self._db.get_uid(miner.address),
+        )
+
+    def _capacity_audit_seed_hashes(self, selection_block: int, selection_block_hash: bytes) -> Optional[list[bytes]]:
+        count = max(1, int(self._capacity_audit_cfg.beacon_hash_count or 1))
+        hashes = [selection_block_hash]
+        if count <= 1:
+            return hashes
+        for offset in range(1, count):
+            block = int(selection_block) - offset
+            if block < 0:
+                bt.logging.info(
+                    f"Capacity audit: skipping B_select={selection_block} because "
+                    f"beacon hash offset={offset}/{count - 1} is before genesis"
+                )
+                return None
+            block_hash, real = self._get_chain_block_hash(block)
+            if not real:
+                bt.logging.info(
+                    f"Capacity audit: skipping B_select={selection_block} because "
+                    f"beacon hash block={block} offset={offset}/{count - 1} is unavailable"
+                )
+                return None
+            hashes.append(block_hash)
+        return hashes
+
+    def _discover_capacity_audit_miners(self) -> list[ActiveMiner]:
+        try:
+            miners = discover_active_miners(self._miner_client, self._model_client)
+        except Exception as exc:
+            bt.logging.warning(f"Capacity audit discovery failed, using cached epoch miners: {exc}")
+            return list(getattr(self, "_epoch_miners", []) or [])
+        if not miners:
+            return list(getattr(self, "_epoch_miners", []) or [])
+        max_workers = min(32, max(1, len(miners)))
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        futures = [pool.submit(self._fetch_miner_hardware, m) for m in miners]
+        try:
+            try:
+                for future in as_completed(futures, timeout=20):
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
+            except _FuturesTimeout:
+                stalled = sum(1 for future in futures if not future.done())
+                if stalled:
+                    bt.logging.warning(
+                        f"Capacity audit hardware refresh timed out with {stalled} pending endpoint(s)"
+                    )
+            except Exception:
+                pass
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+        return miners
+
+    def _store_capacity_audit_slot_snapshot(
+        self,
+        active: list[tuple[CapacitySlot, object]],
+        *,
+        block_number: int,
+        source: str,
+    ) -> None:
+        block = int(block_number or self._last_known_block or self._epoch_start_block or 0)
+        with self._capacity_audit_slot_snapshot_lock:
+            self._capacity_audit_slot_snapshot = list(active)
+            self._capacity_audit_slot_snapshot_block = block
+            self._capacity_audit_slot_snapshot_updated_at = time.time()
+            self._capacity_audit_slot_snapshot_last_error = ""
+        bt.logging.info(
+            f"Capacity audit slot snapshot refreshed: slots={len(active)} "
+            f"block={block} source={source}"
+        )
+
+    def _refresh_capacity_audit_slot_snapshot_from_miners(
+        self,
+        miners: list[ActiveMiner],
+        *,
+        block_number: int,
+        source: str,
+    ) -> None:
+        if not self._capacity_audit_cfg.enabled:
+            return
+        self._hydrate_capacity_audit_hardware_from_cache(miners)
+        self._store_capacity_audit_slot_snapshot(
+            [(slot, None) for slot in self._capacity_audit_selection_slots(miners)],
+            block_number=block_number,
+            source=source,
+        )
+
+    def _hydrate_capacity_audit_hardware_from_cache(
+        self,
+        miners: list[ActiveMiner],
+    ) -> None:
+        """Fill missing transient /health metadata from matching cached rows."""
+        missing = [
+            miner for miner in miners
+            if not (getattr(miner, "gpu_name", "") or "")
+            or int(getattr(miner, "gpu_count", 0) or 0) <= 0
+            or int(getattr(miner, "vram_gb", 0) or 0) <= 0
+        ]
+        if not missing:
+            return
+        try:
+            rows = self._db.get_active_entries()
+        except Exception:
+            return
+        by_key = {
+            (str(row.get("address", "")).lower(), int(row.get("model_index", 0) or 0)): row
+            for row in rows
+        }
+        for miner in missing:
+            key = (str(getattr(miner, "address", "") or "").lower(), int(getattr(miner, "model_index", 0) or 0))
+            row = by_key.get(key)
+            if not row:
+                continue
+            if str(row.get("endpoint") or "") != str(getattr(miner, "endpoint", "") or ""):
+                continue
+            if str(row.get("model_id") or "") != str(getattr(miner, "model_id", "") or ""):
+                continue
+            gpu_name = str(row.get("gpu_name") or "")
+            gpu_count = int(row.get("gpu_count") or 0)
+            vram_gb = int(row.get("vram_gb") or 0)
+            if not gpu_name or gpu_count <= 0 or vram_gb <= 0:
+                continue
+            miner.gpu_name = gpu_name
+            miner.gpu_count = gpu_count
+            miner.vram_gb = vram_gb
+            miner.compute_capability = str(row.get("compute_capability") or "")
+            try:
+                uuids = json.loads(row.get("gpu_uuids") or "[]")
+            except Exception:
+                uuids = []
+            miner.gpu_uuids = uuids if isinstance(uuids, list) else []
+
+    def _request_capacity_audit_slot_snapshot_refresh(
+        self,
+        *,
+        block_number: int,
+        force: bool = False,
+        reason: str = "periodic",
+    ) -> None:
+        if not self._capacity_audit_cfg.enabled:
+            return
+        block = int(block_number or self._last_known_block or 0)
+        refresh_blocks = int(getattr(self.config, "capacity_audit_slot_refresh_blocks", 60) or 0)
+        if refresh_blocks <= 0 and not force:
+            return
+        with self._capacity_audit_slot_snapshot_lock:
+            if self._capacity_audit_slot_snapshot_refreshing:
+                return
+            last = int(self._capacity_audit_slot_snapshot_block or 0)
+            if not force and refresh_blocks > 0 and last > 0 and block - last < refresh_blocks:
+                return
+            self._capacity_audit_slot_snapshot_refreshing = True
+
+        def _run() -> None:
+            try:
+                miners = self._discover_capacity_audit_miners()
+                active = self._capacity_audit_active_slots(miners)
+                self._store_capacity_audit_slot_snapshot(
+                    active,
+                    block_number=block,
+                    source=f"async:{reason}",
+                )
+            except Exception as exc:
+                with self._capacity_audit_slot_snapshot_lock:
+                    self._capacity_audit_slot_snapshot_last_error = str(exc)
+                bt.logging.warning(f"Capacity audit slot snapshot refresh failed: {exc}")
+            finally:
+                with self._capacity_audit_slot_snapshot_lock:
+                    self._capacity_audit_slot_snapshot_refreshing = False
+
+        self._capacity_audit_discovery_executor.submit(_run)
+
+    def _capacity_audit_slot_snapshot_for_selection(
+        self,
+        selection_block: int,
+    ) -> list[tuple[CapacitySlot, object]]:
+        block = int(selection_block)
+        stale_blocks = int(getattr(self.config, "capacity_audit_slot_snapshot_stale_blocks", 120) or 0)
+        with self._capacity_audit_slot_snapshot_lock:
+            active = list(self._capacity_audit_slot_snapshot)
+            snapshot_block = int(self._capacity_audit_slot_snapshot_block or 0)
+            refreshing = bool(self._capacity_audit_slot_snapshot_refreshing)
+            last_error = self._capacity_audit_slot_snapshot_last_error
+        if not active:
+            self._request_capacity_audit_slot_snapshot_refresh(
+                block_number=block,
+                force=False,
+                reason="empty",
+            )
+            suffix = f" error={last_error}" if last_error else ""
+            bt.logging.info(
+                f"Capacity audit: no cached eligible endpoint slots at block {block}; "
+                f"refreshing={refreshing}{suffix}"
+            )
+            return []
+        if stale_blocks > 0 and snapshot_block > 0 and block - snapshot_block > stale_blocks:
+            self._request_capacity_audit_slot_snapshot_refresh(
+                block_number=block,
+                force=False,
+                reason="stale",
+            )
+            bt.logging.info(
+                f"Capacity audit: cached eligible slot snapshot stale at block {block} "
+                f"(snapshot_block={snapshot_block}); skipping this window"
+            )
+            return []
+        return active
+
+    def _capacity_audit_active_slots(
+        self,
+        miners: Optional[list[ActiveMiner]] = None,
+    ) -> list[tuple[CapacitySlot, object]]:
+        slots: list[tuple[CapacitySlot, object]] = []
+        now = time.time()
+        for miner in list(miners if miners is not None else (getattr(self, "_epoch_miners", []) or [])):
+            registered_at = int(getattr(miner, "registered_at", 0) or 0)
+            min_age = float(self._capacity_audit_cfg.min_registration_age_s or 0.0)
+            if registered_at > 0 and min_age > 0 and now - registered_at < min_age:
+                continue
+            gpu_row = match_gpu_class(
+                getattr(miner, "gpu_name", "") or "",
+                int(getattr(miner, "vram_gb", 0) or 0),
+                self._capacity_audit_cfg,
+            )
+            if gpu_row is None or not gpu_row.calibrated or capacity_gpu_pass_count(gpu_row) <= 0:
+                continue
+            slots.append((
+                CapacitySlot(
+                    chain_id=int(getattr(self.config, "chain_id", 0) or 0),
+                    netuid=int(self.config.netuid),
+                    address=miner.address,
+                    model_index=int(miner.model_index),
+                    endpoint=miner.endpoint,
+                    model_id=miner.model_id,
+                    quant=miner.quant,
+                    max_context_len=int(miner.max_context_len or 0),
+                    miner_uid=self._db.get_uid(miner.address),
+                    gpu_name=getattr(miner, "gpu_name", "") or "",
+                    gpu_count=int(getattr(miner, "gpu_count", 0) or 0),
+                    vram_gb=int(getattr(miner, "vram_gb", 0) or 0),
+                    group_key=self._capacity_slot_group_key(miner),
+                ),
+                gpu_row,
+            ))
+        return slots
+
+    def _capacity_audit_selection_slots(
+        self,
+        miners: Optional[list[ActiveMiner]] = None,
+    ) -> list[CapacitySlot]:
+        slots: list[CapacitySlot] = []
+        now = time.time()
+        for miner in list(miners if miners is not None else (getattr(self, "_epoch_miners", []) or [])):
+            registered_at = int(getattr(miner, "registered_at", 0) or 0)
+            min_age = float(self._capacity_audit_cfg.min_registration_age_s or 0.0)
+            if registered_at > 0 and min_age > 0 and now - registered_at < min_age:
+                continue
+            slots.append(CapacitySlot(
+                chain_id=int(getattr(self.config, "chain_id", 0) or 0),
+                netuid=int(self.config.netuid),
+                address=miner.address,
+                model_index=int(miner.model_index),
+                endpoint=miner.endpoint,
+                model_id=miner.model_id,
+                quant=miner.quant,
+                max_context_len=int(miner.max_context_len or 0),
+                group_key=build_capacity_slot_group_key(
+                    address=miner.address,
+                    endpoint=getattr(miner, "endpoint", "") or "",
+                    model_id=getattr(miner, "model_id", "") or "",
+                ),
+            ))
+        return slots
+
+    def _capacity_audit_supported_slots_by_id(
+        self,
+        selected_slots: list[CapacitySlot],
+        active_snapshot: Optional[list[tuple[CapacitySlot, object]]] = None,
+    ) -> dict[str, tuple[CapacitySlot, object]]:
+        if not selected_slots:
+            return {}
+        selected_ids = {slot_id(slot) for slot in selected_slots}
+        supported: dict[str, tuple[CapacitySlot, object]] = {}
+        for slot, gpu_row in list(active_snapshot or []):
+            sid = slot_id(slot)
+            if sid not in selected_ids or gpu_row is None:
+                continue
+            if capacity_gpu_pass_count(gpu_row) <= 0:
+                continue
+            supported[sid] = (slot, gpu_row)
+        try:
+            rows = self._db.get_active_entries()
+        except Exception:
+            rows = []
+        by_key = {
+            (str(row.get("address", "")).lower(), int(row.get("model_index", 0) or 0)): row
+            for row in rows
+        }
+        for slot in selected_slots:
+            sid = slot_id(slot)
+            if sid in supported:
+                continue
+            row = by_key.get((slot.address_lower, int(slot.model_index)))
+            if not row:
+                continue
+            if str(row.get("endpoint") or "") != str(slot.endpoint or ""):
+                continue
+            if str(row.get("model_id") or "") != str(slot.model_id or ""):
+                continue
+            if str(row.get("quant") or "") != str(slot.quant or ""):
+                continue
+            if int(row.get("max_context_len") or 0) != int(slot.max_context_len or 0):
+                continue
+            gpu_name = str(row.get("gpu_name") or "")
+            gpu_count = int(row.get("gpu_count") or 0)
+            vram_gb = int(row.get("vram_gb") or 0)
+            gpu_row = match_gpu_class(gpu_name, vram_gb, self._capacity_audit_cfg)
+            if gpu_row is None or not gpu_row.calibrated or capacity_gpu_pass_count(gpu_row) <= 0:
+                resolved = self._capacity_audit_resolve_selected_slot_hardware(slot)
+                if resolved is not None:
+                    supported[sid] = resolved
+                continue
+            get_uid = getattr(self._db, "get_uid", None)
+            try:
+                miner_uid = get_uid(slot.address) if callable(get_uid) else slot.miner_uid
+            except Exception:
+                miner_uid = slot.miner_uid
+            supported_slot = CapacitySlot(
+                chain_id=slot.chain_id,
+                netuid=slot.netuid,
+                address=slot.address,
+                model_index=slot.model_index,
+                endpoint=slot.endpoint,
+                model_id=slot.model_id,
+                quant=slot.quant,
+                max_context_len=slot.max_context_len,
+                miner_uid=miner_uid,
+                gpu_name=gpu_name,
+                gpu_count=gpu_count,
+                vram_gb=vram_gb,
+                group_key=build_capacity_slot_group_key(
+                    address=slot.address,
+                    endpoint=slot.endpoint,
+                    model_id=slot.model_id,
+                    gpu_name=gpu_name,
+                    miner_uid=miner_uid,
+                ),
+            )
+            supported[sid] = (supported_slot, gpu_row)
+        return supported
+
+    def _capacity_audit_resolve_selected_slot_hardware(
+        self,
+        slot: CapacitySlot,
+    ) -> Optional[tuple[CapacitySlot, object]]:
+        """Resolve missing hardware for one already-selected slot.
+
+        Selection remains public and scalable. This fallback only touches slots
+        that already passed the deterministic B_select predicate and per-window
+        budget, so it does not reintroduce network-wide health fanout.
+        """
+        miner = ActiveMiner(
+            address=slot.address,
+            model_id=slot.model_id,
+            endpoint=slot.endpoint,
+            quant=slot.quant,
+            max_context_len=int(slot.max_context_len or 0),
+            model_index=int(slot.model_index),
+        )
+        try:
+            valid = self._fetch_miner_hardware(miner)
+        except Exception as exc:
+            bt.logging.debug(
+                f"Capacity audit selected-slot hardware fetch failed for "
+                f"{slot.address_lower[:10]} idx={slot.model_index}: {exc}"
+            )
+            return None
+        if valid is False:
+            bt.logging.info(
+                f"Capacity audit selected slot has invalid hardware metadata: "
+                f"{slot.address_lower[:10]} idx={slot.model_index}"
+            )
+            return None
+
+        gpu_name = str(getattr(miner, "gpu_name", "") or "")
+        gpu_count = int(getattr(miner, "gpu_count", 0) or 0)
+        vram_gb = int(getattr(miner, "vram_gb", 0) or 0)
+        gpu_row = match_gpu_class(gpu_name, vram_gb, self._capacity_audit_cfg)
+        if gpu_row is None or not gpu_row.calibrated or capacity_gpu_pass_count(gpu_row) <= 0:
+            return None
+
+        upsert = getattr(self._db, "upsert_entry", None)
+        if callable(upsert):
+            try:
+                upsert(
+                    address=slot.address,
+                    model_index=int(slot.model_index),
+                    model_id=slot.model_id,
+                    endpoint=slot.endpoint,
+                    quant=slot.quant,
+                    max_context_len=int(slot.max_context_len or 0),
+                    epoch=int(getattr(self, "_current_epoch", 0) or 0),
+                    gpu_name=gpu_name,
+                    gpu_count=gpu_count,
+                    vram_gb=vram_gb,
+                    compute_capability=str(getattr(miner, "compute_capability", "") or ""),
+                    gpu_uuids=list(getattr(miner, "gpu_uuids", []) or []),
+                )
+            except Exception as exc:
+                bt.logging.debug(
+                    f"Capacity audit selected-slot hardware cache update failed for "
+                    f"{slot.address_lower[:10]} idx={slot.model_index}: {exc}"
+                )
+
+        get_uid = getattr(self._db, "get_uid", None)
+        try:
+            miner_uid = get_uid(slot.address) if callable(get_uid) else slot.miner_uid
+        except Exception:
+            miner_uid = slot.miner_uid
+        supported_slot = CapacitySlot(
+            chain_id=slot.chain_id,
+            netuid=slot.netuid,
+            address=slot.address,
+            model_index=slot.model_index,
+            endpoint=slot.endpoint,
+            model_id=slot.model_id,
+            quant=slot.quant,
+            max_context_len=slot.max_context_len,
+            miner_uid=miner_uid,
+            gpu_name=gpu_name,
+            gpu_count=gpu_count,
+            vram_gb=vram_gb,
+            group_key=build_capacity_slot_group_key(
+                address=slot.address,
+                endpoint=slot.endpoint,
+                model_id=slot.model_id,
+                gpu_name=gpu_name,
+                miner_uid=miner_uid,
+            ),
+        )
+        bt.logging.info(
+            f"Capacity audit resolved selected-slot hardware: "
+            f"{slot.address_lower[:10]} idx={slot.model_index} gpu={gpu_name} vram_gb={vram_gb}"
+        )
+        return supported_slot, gpu_row
+
+    def _capacity_audit_start_recoverable(self, audit_block: int, current_block: int) -> bool:
+        """Return True while a late scheduler can still fairly judge timing."""
+        if int(current_block or 0) <= 0:
+            return True
+        cfg = self._capacity_audit_cfg
+        timing_window_s = float(cfg.deadline_s) + float(cfg.transport_grace_s)
+        recoverable_blocks = max(1, int((timing_window_s + 11.999) // 12.0))
+        return int(current_block) <= int(audit_block) + recoverable_blocks
+
+    def _capacity_audit_selection_recoverable(self, audit_block: int) -> bool:
+        last_seen_block = int(getattr(self, "_last_known_block", 0) or 0)
+        return ValidatorNeuron._capacity_audit_start_recoverable(self, audit_block, last_seen_block)
+
+    def _schedule_capacity_audit_window(
+        self,
+        *,
+        selection_block: int,
+        selection_block_hash: bytes,
+    ) -> None:
+        schedule_lock = getattr(self, "_capacity_audit_schedule_lock", None)
+        if schedule_lock is None:
+            return self._schedule_capacity_audit_window_locked(
+                selection_block=selection_block,
+                selection_block_hash=selection_block_hash,
+            )
+        with schedule_lock:
+            return self._schedule_capacity_audit_window_locked(
+                selection_block=selection_block,
+                selection_block_hash=selection_block_hash,
+            )
+
+    def _schedule_capacity_audit_window_locked(
+        self,
+        *,
+        selection_block: int,
+        selection_block_hash: bytes,
+    ) -> None:
+        cfg = self._capacity_audit_cfg
+        if not cfg.enabled:
+            return
+
+        epoch_number = int(selection_block // self.config.epoch_blocks)
+        audit_block = int(selection_block + cfg.lead_blocks)
+        proof_challenge_block = int(
+            audit_block + max(1, int(cfg.proof_challenge_delay_blocks or 1))
+        )
+        if not capacity_audit_window_fits_epoch(
+            selection_block,
+            int(self.config.epoch_blocks),
+            cfg,
+        ):
+            epoch_end = (epoch_number + 1) * int(self.config.epoch_blocks)
+            bt.logging.info(
+                f"Capacity audit: skipping late window B_select={selection_block} "
+                f"B_start={audit_block} B_proof={proof_challenge_block} "
+                f"epoch_end={epoch_end}"
+            )
+            return
+        now = time.time()
+        active = self._capacity_audit_slot_snapshot_for_selection(selection_block)
+        drained_slots = {
+            (drain.address.lower(), int(drain.model_index))
+            for drain in self._db.get_capacity_drains(now=now)
+        }
+        if drained_slots:
+            before = len(active)
+            active = [
+                (slot, row)
+                for slot, row in active
+                if (slot.address_lower, int(slot.model_index)) not in drained_slots
+            ]
+            if before != len(active):
+                bt.logging.info(
+                    f"Capacity audit: skipped {before - len(active)} already-drained "
+                    f"slot(s) at block {selection_block}"
+                )
+        try:
+            busy_slots = set(
+                self._db.get_capacity_audit_selection_busy_slots(
+                    selection_block=int(selection_block),
+                    cooldown_blocks=1,
+                )
+            )
+        except Exception as exc:
+            bt.logging.debug(f"Capacity audit busy-slot lookup failed: {exc}")
+            busy_slots = set()
+        if busy_slots:
+            before = len(active)
+            active = [
+                (slot, row)
+                for slot, row in active
+                if (slot.address_lower, int(slot.model_index)) not in busy_slots
+            ]
+            if before != len(active):
+                bt.logging.info(
+                    f"Capacity audit: skipped {before - len(active)} busy-overlap "
+                    f"slot(s) at block {selection_block}"
+                )
+        if not active:
+            bt.logging.info(
+                f"Capacity audit: no active endpoint slots at block {selection_block}"
+            )
+            return
+
+        seed_hashes = self._capacity_audit_seed_hashes(selection_block, selection_block_hash)
+        if seed_hashes is None:
+            return
+        if len(seed_hashes) <= 1:
+            cohort_seed = derive_audit_seed(selection_block_hash, epoch_number)
+        else:
+            cohort_seed = derive_audit_seed_from_hashes(seed_hashes, epoch_number)
+        selected = select_capacity_audit_slots(
+            [slot for slot, _row in active],
+            cohort_seed,
+            cfg,
+        )
+        if not selected:
+            return
+        budget = window_cohort_budget(len(active), cfg)
+        if budget > 0 and len(selected) > budget:
+            before = len(selected)
+            selected = selected[:budget]
+            bt.logging.info(
+                f"Capacity audit: truncated selected slots {before}->{len(selected)} "
+                f"by per-window drain budget at block {selection_block}"
+            )
+        supported_fn = getattr(self, "_capacity_audit_supported_slots_by_id", None)
+        if not callable(supported_fn):
+            supported_fn = ValidatorNeuron._capacity_audit_supported_slots_by_id.__get__(self)
+        supported_selected = supported_fn(selected, active)
+
+        if not self._capacity_audit_selection_recoverable(audit_block):
+            last_seen_block = int(getattr(self, "_last_known_block", 0) or 0)
+            bt.logging.info(
+                f"Capacity audit: skipping unrecoverably late window B_select={selection_block} "
+                f"B_start={audit_block} current_block={last_seen_block}"
+            )
+            return
+        audit_id = derive_audit_id(
+            chain_id=int(getattr(self.config, "chain_id", 0) or 0),
+            netuid=int(self.config.netuid),
+            epoch_number=epoch_number,
+            selection_block=int(selection_block),
+            audit_block=audit_block,
+            cohort_seed=cohort_seed,
+        )
+        drain_until_ts = (
+            now
+            + cfg.drain_seconds
+            + cfg.deadline_s
+            + cfg.transport_grace_s
+            + cfg.payload_deadline_s
+        )
+        rows: list[dict] = []
+        unsupported_selected = 0
+        for selected_slot in selected:
+            sid = slot_id(selected_slot)
+            supported = supported_selected.get(sid)
+            if supported is None:
+                unsupported_selected += 1
+                continue
+            slot, gpu_row = supported
+            rows.append({
+                "miner_address": slot.address_lower,
+                "model_index": slot.model_index,
+                "miner_uid": slot.miner_uid,
+                "endpoint": slot.endpoint,
+                "model_id": slot.model_id,
+                "quant": slot.quant,
+                "max_context_len": slot.max_context_len,
+                "gpu_name": slot.gpu_name,
+                "gpu_count": slot.gpu_count,
+                "vram_gb": slot.vram_gb,
+                "group_key": slot.group_key,
+                "slot_id": sid,
+                "lease_id": lease_id(slot, epoch_number),
+                "claimed_gpu_class": gpu_row.match_gpu_name,
+                "pass_count": capacity_gpu_pass_count(gpu_row),
+                "deadline_s": gpu_row.deadline_s or cfg.deadline_s,
+                "transport_grace_s": cfg.transport_grace_s,
+                "payload_deadline_s": cfg.payload_deadline_s,
+                "drain_until_ts": drain_until_ts,
+            })
+        if not rows:
+            bt.logging.info(
+                f"Capacity audit: public cohort selected no calibrated slots at block {selection_block} "
+                f"(selected={len(selected)} unsupported_or_unknown={unsupported_selected})"
+            )
+            return
+
+        self._db.create_capacity_audit_window(
+            audit_id=audit_id,
+            epoch_number=epoch_number,
+            selection_block=int(selection_block),
+            audit_block=audit_block,
+            proof_challenge_block=proof_challenge_block,
+            selection_block_hash=self._block_hash_hex(selection_block_hash),
+            cohort_seed=cohort_seed,
+            slots=rows,
+        )
+        self._write_shared_state()
+        bt.logging.info(
+            f"Capacity audit scheduled: audit_id={audit_id[:12]} "
+            f"epoch={epoch_number} B_select={selection_block} B_start={audit_block} "
+            f"B_proof={proof_challenge_block} "
+            f"selected={len(rows)}/{len(active)} "
+            f"unsupported_or_unknown={unsupported_selected} mode={cfg.mode}"
+        )
+
+    def _start_capacity_audit_windows(
+        self,
+        *,
+        audit_block: int,
+        audit_block_hash: bytes | None = None,
+        audit_block_hash_real: bool = True,
+    ) -> None:
+        if not self._capacity_audit_cfg.enabled:
+            return
+        windows = self._db.get_capacity_audit_windows_for_start(audit_block)
+        if not windows:
+            return
+        observed_at = time.time()
+        for window in windows:
+            window_audit_block = int(window["audit_block"])
+            current_head = max(
+                int(audit_block),
+                int(getattr(self, "_last_known_block", 0) or 0),
+            )
+            strict_timing_mode = str(getattr(self._capacity_audit_cfg, "mode", "observe") or "observe") in {
+                "score_gate",
+                "enforce",
+            }
+            if strict_timing_mode and current_head > window_audit_block:
+                reason = (
+                    "validator_start_missed"
+                    if not self._capacity_audit_start_recoverable(window_audit_block, current_head)
+                    else "validator_start_replayed"
+                )
+                stale = self._db.mark_capacity_audit_window_stale(
+                    window["audit_id"],
+                    reason=reason,
+                    released_at=observed_at,
+                )
+                if stale:
+                    self._write_shared_state()
+                bt.logging.warning(
+                    f"Capacity audit stale window skipped: audit_id={window['audit_id'][:12]} "
+                    f"B_start={window_audit_block} current_head={current_head} "
+                    f"released_slots={stale}"
+                )
+                continue
+            if not self._capacity_audit_start_recoverable(window_audit_block, current_head):
+                stale = self._db.mark_capacity_audit_window_stale(
+                    window["audit_id"],
+                    reason="validator_start_missed",
+                    released_at=observed_at,
+                )
+                if stale:
+                    self._write_shared_state()
+                bt.logging.warning(
+                    f"Capacity audit stale window skipped: audit_id={window['audit_id'][:12]} "
+                    f"B_start={window_audit_block} current_block={audit_block} "
+                    f"released_slots={stale}"
+                )
+                continue
+            if (
+                window_audit_block == int(audit_block)
+                and audit_block_hash is not None
+                and audit_block_hash_real
+            ):
+                start_block_hash = audit_block_hash
+            else:
+                start_block_hash, real = self._get_chain_block_hash(window_audit_block)
+                if not real:
+                    bt.logging.info(
+                        f"Capacity audit start catch-up waiting for real B_start hash: "
+                        f"audit_id={window['audit_id'][:12]} B_start={window_audit_block} "
+                        f"current_block={audit_block}"
+                    )
+                    continue
+            self._db.set_capacity_audit_block_hash(
+                window["audit_id"],
+                self._block_hash_hex(start_block_hash),
+                observed_at=observed_at,
+            )
+            resolved = self._db.resolve_capacity_audit_pending_start(
+                window["audit_id"],
+                observed_at=observed_at,
+            )
+            released = self._db.release_capacity_audit_completed_drains(
+                window["audit_id"],
+                require_proof_payload=self._capacity_audit_cfg.require_proof_payload,
+                released_at=observed_at,
+            )
+            if resolved or released:
+                self._write_shared_state()
+            bt.logging.info(
+                f"Capacity audit started: audit_id={window['audit_id'][:12]} "
+                f"B_start={window_audit_block} current_block={audit_block} "
+                f"pending_start_resolved={resolved} drains_released={released}"
+            )
+
+    def _record_capacity_audit_proof_challenges(
+        self,
+        *,
+        block_number: int,
+        block_hash: bytes | None = None,
+        block_hash_real: bool = True,
+    ) -> None:
+        if not self._capacity_audit_cfg.enabled:
+            return
+        windows = self._db.get_capacity_audit_windows_for_proof_challenge(block_number)
+        if not windows:
+            return
+        observed_at = time.time()
+        updated = 0
+        for window in windows:
+            challenge_block = int(window.get("proof_challenge_block") or 0)
+            if challenge_block <= 0:
+                continue
+            if (
+                challenge_block == int(block_number)
+                and block_hash is not None
+                and block_hash_real
+            ):
+                challenge_hash = block_hash
+            else:
+                challenge_hash, real = self._get_chain_block_hash(challenge_block)
+                if not real:
+                    bt.logging.info(
+                        f"Capacity audit proof challenge waiting for real block hash: "
+                        f"audit_id={window['audit_id'][:12]} B_proof={challenge_block} "
+                        f"current_block={block_number}"
+                    )
+                    continue
+            self._db.set_capacity_audit_proof_challenge_hash(
+                window["audit_id"],
+                self._block_hash_hex(challenge_hash),
+                observed_at=observed_at,
+            )
+            updated += 1
+        if updated:
+            bt.logging.info(f"Capacity audit: recorded {updated} proof challenge hashes")
+
+    def _confirm_capacity_audit_finalized_blocks(self, subtensor_obj: object | None = None) -> None:
+        """Confirm current-head audit hashes after they become finalized."""
+        if not self._capacity_audit_cfg.enabled:
+            return
+        finalized_block, _head_hash, real = self._get_current_finalized_block_and_hash(subtensor_obj)
+        if not real or finalized_block <= 0:
+            return
+        if finalized_block <= int(getattr(self, "_capacity_audit_last_finalized_confirmed", 0) or 0):
+            return
+        self._capacity_audit_last_finalized_confirmed = int(finalized_block)
+        try:
+            windows = self._db.get_capacity_audit_windows_for_finalization(finalized_block)
+        except Exception as exc:
+            bt.logging.debug(f"Capacity audit finalization lookup failed: {exc}")
+            return
+        if not windows:
+            return
+
+        confirmed = 0
+        reorged = 0
+        for window in windows:
+            audit_id = str(window.get("audit_id") or "")
+            if not audit_id:
+                continue
+            selection_ok: Optional[bool] = None
+            audit_ok: Optional[bool] = None
+            proof_ok: Optional[bool] = None
+
+            if window.get("selection_finalized_at") is None:
+                selection_block = int(window.get("selection_block") or 0)
+                expected = str(window.get("selection_block_hash") or "")
+                if selection_block > 0 and expected and selection_block <= finalized_block:
+                    block_hash, hash_real = self._get_chain_block_hash(selection_block, subtensor_obj)
+                    if hash_real:
+                        selection_ok = self._block_hash_hex(block_hash) == expected
+
+            if window.get("audit_finalized_at") is None:
+                audit_block = int(window.get("audit_block") or 0)
+                expected = str(window.get("audit_block_hash") or "")
+                if audit_block > 0 and expected and audit_block <= finalized_block:
+                    block_hash, hash_real = self._get_chain_block_hash(audit_block, subtensor_obj)
+                    if hash_real:
+                        audit_ok = self._block_hash_hex(block_hash) == expected
+
+            if window.get("proof_challenge_finalized_at") is None:
+                proof_block = int(window.get("proof_challenge_block") or 0)
+                expected = str(window.get("proof_challenge_block_hash") or "")
+                if proof_block > 0 and expected and proof_block <= finalized_block:
+                    block_hash, hash_real = self._get_chain_block_hash(proof_block, subtensor_obj)
+                    if hash_real:
+                        proof_ok = self._block_hash_hex(block_hash) == expected
+
+            if selection_ok is None and audit_ok is None and proof_ok is None:
+                continue
+            self._db.record_capacity_audit_finalization(
+                audit_id,
+                selection_confirmed=selection_ok,
+                audit_confirmed=audit_ok,
+                proof_confirmed=proof_ok,
+            )
+            if any(v is False for v in (selection_ok, audit_ok, proof_ok) if v is not None):
+                reorged += 1
+                bt.logging.warning(
+                    f"Capacity audit finalized hash mismatch: audit_id={audit_id[:12]} "
+                    f"B_finalized={finalized_block}"
+                )
+            else:
+                confirmed += 1
+        if confirmed or reorged:
+            self._write_shared_state()
+            bt.logging.info(
+                f"Capacity audit finalized confirmation: confirmed_updates={confirmed} "
+                f"reorged={reorged} finalized_block={finalized_block}"
+            )
+
+    def _recover_capacity_audit_hashes_for_artifact(self, row: dict, artifact: dict) -> dict:
+        """Best-effort B_start/B_proof hash recovery for late audit artifacts."""
+        if not self._capacity_audit_cfg.enabled:
+            return row
+        if self._capacity_audit_cfg.mode in ("score_gate", "enforce"):
+            return row
+
+        refreshed = False
+        if not str(row.get("audit_block_hash") or ""):
+            try:
+                audit_block = int(row.get("audit_block") or artifact.get("B_start") or 0)
+            except Exception:
+                audit_block = 0
+            if audit_block > 0:
+                try:
+                    audit_hash, real = self._get_chain_block_hash(audit_block)
+                except Exception:
+                    audit_hash, real = b"", False
+                if real:
+                    self._start_capacity_audit_windows(
+                        audit_block=audit_block,
+                        audit_block_hash=audit_hash,
+                    )
+                    refreshed = True
+
+        if not str(row.get("proof_challenge_block_hash") or ""):
+            try:
+                proof_challenge_block = int(
+                    row.get("proof_challenge_block") or artifact.get("B_proof") or 0
+                )
+            except Exception:
+                proof_challenge_block = 0
+            if proof_challenge_block > 0:
+                try:
+                    challenge_hash, real = self._get_chain_block_hash(proof_challenge_block)
+                except Exception:
+                    challenge_hash, real = b"", False
+                if real:
+                    self._record_capacity_audit_proof_challenges(
+                        block_number=proof_challenge_block,
+                        block_hash=challenge_hash,
+                    )
+                    refreshed = True
+
+        if not refreshed:
+            return row
+
+        address = str(row.get("miner_address") or artifact.get("address") or "").lower()
+        try:
+            model_index = int(row.get("model_index") or artifact.get("model_index"))
+        except Exception:
+            model_index = -1
+        audit_id = str(row.get("audit_id") or artifact.get("audit_id") or "")
+        if not audit_id or not address or model_index < 0:
+            return row
+        updated = self._db.get_capacity_audit_slot(audit_id, address, model_index)
+        return updated if updated is not None else row
+
+    def _handle_capacity_audit_block(
+        self,
+        block_number: int,
+        block_hash: bytes,
+        *,
+        block_hash_real: bool,
+    ) -> None:
+        if not self._capacity_audit_cfg.enabled:
+            return
+        expired = self._db.expire_capacity_audit_misses(
+            require_proof_payload=self._capacity_audit_cfg.require_proof_payload,
+            return_slots=True,
+        )
+        expired_slots = expired if isinstance(expired, list) else []
+        expired_count = len(expired_slots) if isinstance(expired, list) else int(expired or 0)
+        if expired_count:
+            bt.logging.info(f"Capacity audit: expired {expired_count} pending slots")
+            for slot in expired_slots:
+                verdict = str(slot.get("verdict") or "")
+                if verdict == "hard_proof_miss":
+                    self._on_capacity_audit_failure(
+                        str(slot.get("miner_address") or ""),
+                        int(slot.get("model_index") or 0),
+                        endpoint=str(slot.get("endpoint") or ""),
+                        verdict=verdict,
+                        failure_reason=str(slot.get("failure_reason") or ""),
+                    )
+                else:
+                    bt.logging.info(
+                        f"Capacity audit timing miss recorded pending receipt reconciliation: "
+                        f"{str(slot.get('miner_address') or '')[:10]} "
+                        f"model_index={int(slot.get('model_index') or 0)} "
+                        f"verdict={verdict or 'unknown'}"
+                    )
+            self._write_shared_state()
+        self._start_capacity_audit_windows(
+            audit_block=block_number,
+            audit_block_hash=block_hash,
+            audit_block_hash_real=block_hash_real,
+        )
+        self._record_capacity_audit_proof_challenges(
+            block_number=block_number,
+            block_hash=block_hash,
+            block_hash_real=block_hash_real,
+        )
+        if not block_hash_real:
+            if block_number % self.config.epoch_blocks == 0:
+                bt.logging.warning(
+                    f"Capacity audit: skipping B_select={block_number} because block hash is synthetic"
+                )
+            return
+        if capacity_audit_window_triggered(
+            block_number,
+            block_hash,
+            int(self.config.epoch_blocks),
+            self._capacity_audit_cfg,
+        ):
+            self._capacity_audit_executor.submit(
+                self._schedule_capacity_audit_window,
+                selection_block=block_number,
+                selection_block_hash=block_hash,
+            )
+
+    def _capacity_audit_artifact_dir(self, audit_id: str) -> str:
+        root = os.path.join(
+            os.environ.get("VERALLM_DATA_DIR", os.path.expanduser("~/.verathos")),
+            "capacity_audit",
+            str(audit_id),
+        )
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _recover_capacity_audit_window_from_artifact(self, artifact: dict) -> None:
+        """Recover a deterministic audit window missed by the scheduler.
+
+        A validator can transiently fail to read a chain block hash or fall
+        behind the polling loop while miners continue deriving the same
+        non-interactive window. On an otherwise unknown signed artifact, derive
+        the window synchronously and let normal slot/audit_id validation decide
+        whether the artifact belongs to the selected cohort.
+        """
+        if not self._capacity_audit_cfg.enabled:
+            return
+        if self._capacity_audit_cfg.mode in ("score_gate", "enforce"):
+            return
+        try:
+            selection_block = int(artifact.get("B_select"))
+            audit_block = int(artifact.get("B_start"))
+        except Exception:
+            return
+        cfg = self._capacity_audit_cfg
+        if audit_block != selection_block + int(cfg.lead_blocks):
+            return
+        if not capacity_audit_window_fits_epoch(
+            selection_block,
+            int(self.config.epoch_blocks),
+            cfg,
+        ):
+            return
+        last_seen_block = int(getattr(self, "_last_known_block", 0) or 0)
+        if last_seen_block > 0 and selection_block > last_seen_block:
+            return
+        if not self._capacity_audit_selection_recoverable(audit_block):
+            return
+        selection_hash, real = self._get_chain_block_hash(selection_block)
+        if not real:
+            bt.logging.info(
+                f"Capacity audit recovery skipped: real B_select hash unavailable "
+                f"B_select={selection_block}"
+            )
+            return
+        if not capacity_audit_window_triggered(
+            selection_block,
+            selection_hash,
+            int(self.config.epoch_blocks),
+            cfg,
+        ):
+            return
+        self._schedule_capacity_audit_window(
+            selection_block=selection_block,
+            selection_block_hash=selection_hash,
+        )
+        if last_seen_block >= audit_block:
+            audit_hash, audit_real = self._get_chain_block_hash(audit_block)
+            if audit_real:
+                self._start_capacity_audit_windows(
+                    audit_block=audit_block,
+                    audit_block_hash=audit_hash,
+                )
+        proof_challenge_block = int(
+            audit_block + max(1, int(cfg.proof_challenge_delay_blocks or 1))
+        )
+        if last_seen_block >= proof_challenge_block:
+            challenge_hash, challenge_real = self._get_chain_block_hash(proof_challenge_block)
+            if challenge_real:
+                self._record_capacity_audit_proof_challenges(
+                    block_number=proof_challenge_block,
+                    block_hash=challenge_hash,
+                )
+
+    def _validate_capacity_audit_artifact(self, artifact: dict) -> tuple[dict, Optional[str]]:
+        audit_id = str(artifact.get("audit_id") or "")
+        address = str(artifact.get("address") or artifact.get("miner_address") or "").lower()
+        try:
+            model_index = int(artifact.get("model_index"))
+        except Exception:
+            return {}, "invalid model_index"
+        if not audit_id:
+            return {}, "missing audit_id"
+        if not address:
+            return {}, "missing address"
+        if artifact.get("protocol_version") not in (None, PROTOCOL_VERSION):
+            return {}, "unsupported protocol_version"
+        if not verify_artifact_signature(artifact, address):
+            return {}, "invalid miner_signature"
+
+        row = self._db.get_capacity_audit_slot(audit_id, address, model_index)
+        if row is None:
+            self._recover_capacity_audit_window_from_artifact(artifact)
+            row = self._db.get_capacity_audit_slot(audit_id, address, model_index)
+        if row is None:
+            return {}, "unknown audit slot"
+        if str(artifact.get("slot_id") or "") != str(row["slot_id"]):
+            return {}, "slot_id mismatch"
+        if int(artifact.get("B_select", row["selection_block"])) != int(row["selection_block"]):
+            return {}, "B_select mismatch"
+        if int(artifact.get("B_start", row["audit_block"])) != int(row["audit_block"]):
+            return {}, "B_start mismatch"
+        if int(row.get("proof_challenge_block") or 0) > 0:
+            try:
+                artifact_b_proof = artifact.get("B_proof", row["proof_challenge_block"])
+                if int(artifact_b_proof) != int(row["proof_challenge_block"]):
+                    return {}, "B_proof mismatch"
+            except Exception:
+                return {}, "B_proof mismatch"
+        if int(artifact.get("pass_count", row["pass_count"]) or 0) != int(row["pass_count"]):
+            return {}, "pass_count mismatch"
+        claimed = str(artifact.get("claimed_gpu_class") or row["claimed_gpu_class"] or "")
+        if claimed and str(row["claimed_gpu_class"]) and claimed != str(row["claimed_gpu_class"]):
+            return {}, "claimed_gpu_class mismatch"
+        row = self._recover_capacity_audit_hashes_for_artifact(row, artifact)
+        return row, None
+
+    def ingest_capacity_audit_artifact(
+        self,
+        artifact: dict,
+        *,
+        received_at: Optional[float] = None,
+    ) -> tuple[int, dict]:
+        """Ingest a miner-published capacity audit artifact."""
+        if not self._capacity_audit_cfg.enabled:
+            return 404, {"ok": False, "error": "capacity audit disabled"}
+        if not isinstance(artifact, dict):
+            return 400, {"ok": False, "error": "artifact must be an object"}
+        artifact_type = str(artifact.get("artifact_type") or artifact.get("type") or "")
+        row, error = self._validate_capacity_audit_artifact(artifact)
+        if error:
+            return 400, {"ok": False, "error": error}
+        ts = time.time() if received_at is None else float(received_at)
+        audit_id = str(row["audit_id"])
+        address = str(row["miner_address"])
+        model_index = int(row["model_index"])
+
+        if artifact_type == "capacity_audit_pass0_receipt":
+            pass0_root = str(artifact.get("pass0_root") or "")
+            if not pass0_root:
+                return 400, {"ok": False, "error": "missing pass0_root"}
+            self._db.record_capacity_audit_pass0(
+                audit_id=audit_id,
+                address=address,
+                model_index=model_index,
+                pass0_root=pass0_root,
+                artifact=artifact,
+                received_at=ts,
+            )
+            return 200, {"ok": True, "verdict": "pass0_seen"}
+
+        if artifact_type == "capacity_audit_final_receipt":
+            final_root = str(artifact.get("final_root") or "")
+            transcript = str(
+                artifact.get("final_transcript_commit")
+                or artifact.get("transcript_root")
+                or ""
+            )
+            pass0_root = str(artifact.get("pass0_root") or "")
+            if not final_root:
+                return 400, {"ok": False, "error": "missing final_root"}
+            if not transcript:
+                return 400, {"ok": False, "error": "missing final_transcript_commit"}
+            if row.get("pass0_root") and pass0_root and pass0_root != row.get("pass0_root"):
+                self._db.record_capacity_audit_final(
+                    audit_id=audit_id,
+                    address=address,
+                    model_index=model_index,
+                    final_root=final_root,
+                    transcript_root=transcript,
+                    artifact=artifact,
+                    timing_status="invalid_transcript",
+                    verdict="hard_proof_miss",
+                    failure_reason="pass0_root_mismatch",
+                    received_at=ts,
+                )
+                self._on_capacity_audit_failure(
+                    address,
+                    model_index,
+                    endpoint=str(row.get("endpoint") or ""),
+                    verdict="hard_proof_miss",
+                    failure_reason="pass0_root_mismatch",
+                )
+                return 200, {"ok": True, "verdict": "hard_proof_miss"}
+
+            start_at = row.get("audit_start_observed_at")
+            if start_at is None:
+                timing_status = "pending_start"
+                verdict = "pass0_seen"
+                failure_reason = ""
+            else:
+                deadline = (
+                    float(start_at)
+                    + float(row.get("deadline_s") or self._capacity_audit_cfg.deadline_s)
+                    + float(row.get("transport_grace_s") or self._capacity_audit_cfg.transport_grace_s)
+                )
+                if ts <= deadline:
+                    timing_status = "pass"
+                    verdict = "timing_pass"
+                    failure_reason = ""
+                else:
+                    timing_status = "miss"
+                    verdict = "timing_miss"
+                    failure_reason = "deadline_exceeded"
+            self._db.record_capacity_audit_final(
+                audit_id=audit_id,
+                address=address,
+                model_index=model_index,
+                final_root=final_root,
+                transcript_root=transcript,
+                artifact=artifact,
+                timing_status=timing_status,
+                verdict=verdict,
+                failure_reason=failure_reason,
+                received_at=ts,
+            )
+            if verdict == "timing_miss":
+                bt.logging.info(
+                    f"Capacity audit timing miss recorded pending receipt reconciliation: "
+                    f"{address[:10]} model_index={model_index} audit_id={audit_id[:12]}"
+                )
+            if verdict == "timing_pass" and not self._capacity_audit_cfg.require_proof_payload:
+                self._db.release_capacity_audit_drain(
+                    audit_id=audit_id,
+                    address=address,
+                    model_index=model_index,
+                    released_at=ts,
+                )
+            self._write_shared_state()
+            return 200, {"ok": True, "verdict": verdict, "timing_status": timing_status}
+
+        if artifact_type == "capacity_audit_proof_payload":
+            if not row.get("transcript_root"):
+                return 409, {"ok": False, "error": "final receipt required before proof payload"}
+            self._db.record_capacity_audit_proof_received(
+                audit_id=audit_id,
+                address=address,
+                model_index=model_index,
+                received_at=ts,
+            )
+
+            def _record_hard_payload_miss(
+                reason: str,
+                proof_verify_ms: Optional[float] = None,
+            ) -> tuple[int, dict]:
+                self._db.record_capacity_audit_proof_verdict(
+                    audit_id=audit_id,
+                    address=address,
+                    model_index=model_index,
+                    proof_status="invalid_payload",
+                    verdict="hard_proof_miss",
+                    failure_reason=reason,
+                    proof_verify_ms=proof_verify_ms,
+                    received_at=ts,
+                )
+                self._on_capacity_audit_failure(
+                    address,
+                    model_index,
+                    endpoint=str(row.get("endpoint") or ""),
+                    verdict="hard_proof_miss",
+                    failure_reason=reason,
+                )
+                self._write_shared_state()
+                body = {"ok": True, "verdict": "hard_proof_miss", "proof_status": "invalid_payload"}
+                if proof_verify_ms is not None:
+                    body["proof_verify_ms"] = proof_verify_ms
+                return 200, body
+
+            proof = artifact.get("sampled_pass_proof")
+            if isinstance(proof, dict) and str(proof.get("format") or "") == COMBINED_PROOF_FORMAT:
+                proof_verify_ms: Optional[float] = None
+                try:
+                    gpu_index = int(artifact.get("gpu_index") or 0)
+                except Exception:
+                    gpu_index = 0
+                proof_challenge_block_hash = str(row.get("proof_challenge_block_hash") or "")
+                if not proof_challenge_block_hash:
+                    proof_challenge_block = int(row.get("proof_challenge_block") or 0)
+                    if proof_challenge_block <= 0:
+                        return 409, {"ok": False, "error": "proof challenge block required"}
+                    challenge_hash, real = self._get_chain_block_hash(proof_challenge_block)
+                    if not real:
+                        return 409, {"ok": False, "error": "proof challenge block hash required"}
+                    proof_challenge_block_hash = self._block_hash_hex(challenge_hash)
+                    self._db.set_capacity_audit_proof_challenge_hash(
+                        audit_id,
+                        proof_challenge_block_hash,
+                        observed_at=ts,
+                    )
+                proof_challenge_seed = derive_proof_challenge_seed(
+                    str(row["transcript_root"]),
+                    proof_challenge_block_hash,
+                    str(row["lease_id"]),
+                    str(row["slot_id"]),
+                    gpu_index,
+                )
+                if not str(row.get("audit_block_hash") or ""):
+                    return 409, {"ok": False, "error": "audit block hash required"}
+                proof_seed = derive_proof_seed(
+                    str(row.get("audit_block_hash") or ""),
+                    str(row.get("slot_id") or ""),
+                    gpu_index,
+                )
+                final_artifact = {}
+                try:
+                    final_artifact = json.loads(str(row.get("final_artifact") or "{}"))
+                except Exception:
+                    final_artifact = {}
+                verify_start = time.perf_counter()
+                try:
+                    ok, reason = verify_combined_proof_payload(
+                        proof=proof,
+                        final_artifact=final_artifact,
+                        expected_combined_transcript_root=str(row["transcript_root"]),
+                        lease_id=str(row["lease_id"]),
+                        gpu_index=gpu_index,
+                        proof_seed_hex=proof_seed,
+                        proof_challenge_seed_hex=proof_challenge_seed,
+                    )
+                except Exception as exc:
+                    proof_verify_ms = (time.perf_counter() - verify_start) * 1000.0
+                    current_verdict = str(row.get("verdict") or "pending")
+                    self._mark_capacity_audit_verifier_unhealthy(exc)
+                    self._db.record_capacity_audit_proof_verdict(
+                        audit_id=audit_id,
+                        address=address,
+                        model_index=model_index,
+                        proof_status="verify_error",
+                        verdict=current_verdict,
+                        failure_reason="validator_verify_error",
+                        proof_verify_ms=proof_verify_ms,
+                        received_at=ts,
+                    )
+                    if current_verdict == "timing_pass":
+                        self._db.release_capacity_audit_drain(
+                            audit_id=audit_id,
+                            address=address,
+                            model_index=model_index,
+                            released_at=ts,
+                        )
+                        self._write_shared_state()
+                    bt.logging.warning(
+                        f"Capacity audit proof verifier error: audit_id={audit_id[:12]} "
+                        f"miner={address[:10]} model_index={model_index}: {exc}"
+                    )
+                    return 200, {
+                        "ok": True,
+                        "verdict": current_verdict,
+                        "proof_status": "verify_error",
+                        "proof_verify_ms": proof_verify_ms,
+                    }
+                proof_verify_ms = (time.perf_counter() - verify_start) * 1000.0
+                if not ok:
+                    return _record_hard_payload_miss(reason, proof_verify_ms)
+                self._mark_capacity_audit_verifier_healthy()
+
+                proof_path = os.path.join(
+                    self._capacity_audit_artifact_dir(audit_id),
+                    f"{address}_{model_index}_proof_payload.json",
+                )
+                with open(proof_path, "w") as f:
+                    json.dump(artifact, f, sort_keys=True)
+                current_verdict = str(row.get("verdict") or "pending")
+                proof_status = "combined_proof_verified"
+                self._db.record_capacity_audit_proof_verdict(
+                    audit_id=audit_id,
+                    address=address,
+                    model_index=model_index,
+                    proof_status=proof_status,
+                    verdict=current_verdict,
+                    proof_artifact_path=proof_path,
+                    proof_verify_ms=proof_verify_ms,
+                    received_at=ts,
+                )
+                if current_verdict == "timing_pass":
+                    self._db.release_capacity_audit_drain(
+                        audit_id=audit_id,
+                        address=address,
+                        model_index=model_index,
+                        released_at=ts,
+                    )
+                    self._write_shared_state()
+                return 200, {
+                    "ok": True,
+                    "verdict": current_verdict,
+                    "proof_status": proof_status,
+                    "proof_verify_ms": proof_verify_ms,
+                }
+
+            return _record_hard_payload_miss("unsupported_proof_payload_format")
+
+        return 400, {"ok": False, "error": "unknown artifact_type"}
+
+    def _prepare_capacity_audit_proof_enqueue(
+        self,
+        artifact: dict,
+        *,
+        received_at: float,
+    ) -> tuple[int, dict, Optional[dict]]:
+        if not self._capacity_audit_cfg.enabled:
+            return 404, {"ok": False, "error": "capacity audit disabled"}, None
+        if not isinstance(artifact, dict):
+            return 400, {"ok": False, "error": "artifact must be an object"}, None
+        artifact_type = str(artifact.get("artifact_type") or artifact.get("type") or "")
+        if artifact_type != "capacity_audit_proof_payload":
+            return 400, {"ok": False, "error": "unknown artifact_type"}, None
+
+        row, error = self._validate_capacity_audit_artifact(artifact)
+        if error:
+            return 400, {"ok": False, "error": error}, None
+        if not row or not row.get("transcript_root"):
+            return 409, {"ok": False, "error": "final receipt required before proof payload"}, None
+
+        audit_id = str(row["audit_id"])
+        address = str(row["miner_address"])
+        model_index = int(row["model_index"])
+        if not str(row.get("proof_challenge_block_hash") or ""):
+            proof_challenge_block = int(row.get("proof_challenge_block") or 0)
+            if proof_challenge_block <= 0:
+                return 409, {"ok": False, "error": "proof challenge block required"}, None
+            challenge_hash, real = self._get_chain_block_hash(proof_challenge_block)
+            if not real:
+                return 409, {"ok": False, "error": "proof challenge block hash required"}, None
+            self._db.set_capacity_audit_proof_challenge_hash(
+                audit_id,
+                self._block_hash_hex(challenge_hash),
+                observed_at=received_at,
+            )
+        if not str(row.get("audit_block_hash") or ""):
+            return 409, {"ok": False, "error": "audit block hash required"}, None
+
+        self._db.record_capacity_audit_proof_received(
+            audit_id=audit_id,
+            address=address,
+            model_index=model_index,
+            received_at=received_at,
+        )
+        return 202, {"ok": True, "proof_status": "verify_pending"}, row
+
+    def _run_capacity_audit_proof_verification(self, artifact: dict, received_at: float) -> None:
+        try:
+            self.ingest_capacity_audit_artifact(artifact, received_at=received_at)
+        except Exception as exc:
+            bt.logging.warning(f"Capacity audit proof verification worker failed: {exc}")
+            try:
+                row, error = self._validate_capacity_audit_artifact(artifact)
+                if error or not row:
+                    return
+                current_verdict = str(row.get("verdict") or "pending")
+                audit_id = str(row["audit_id"])
+                address = str(row["miner_address"])
+                model_index = int(row["model_index"])
+                self._mark_capacity_audit_verifier_unhealthy(exc)
+                self._db.record_capacity_audit_proof_verdict(
+                    audit_id=audit_id,
+                    address=address,
+                    model_index=model_index,
+                    proof_status="verify_error",
+                    verdict=current_verdict,
+                    failure_reason="validator_verify_error",
+                    received_at=received_at,
+                )
+                if current_verdict == "timing_pass":
+                    self._db.release_capacity_audit_drain(
+                        audit_id=audit_id,
+                        address=address,
+                        model_index=model_index,
+                        released_at=received_at,
+                    )
+                    self._write_shared_state()
+            except Exception:
+                pass
+
+    def _mark_capacity_audit_verifier_unhealthy(self, exc: BaseException) -> None:
+        self._capacity_audit_verifier_unhealthy = True
+        self._capacity_audit_verifier_last_error = str(exc)
+
+    def _mark_capacity_audit_verifier_healthy(self) -> None:
+        if getattr(self, "_capacity_audit_verifier_unhealthy", False):
+            bt.logging.info("Capacity audit proof verifier recovered after a successful verification")
+        self._capacity_audit_verifier_unhealthy = False
+        self._capacity_audit_verifier_last_error = ""
+
+    def submit_capacity_audit_proof_artifact(
+        self,
+        artifact: dict,
+        *,
+        received_at: Optional[float] = None,
+    ) -> tuple[int, dict]:
+        ts = time.time() if received_at is None else float(received_at)
+        status, body, _row = self._prepare_capacity_audit_proof_enqueue(
+            artifact,
+            received_at=ts,
+        )
+        if status >= 300:
+            return status, body
+        self._capacity_audit_proof_executor.submit(
+            self._run_capacity_audit_proof_verification,
+            artifact,
+            ts,
+        )
+        return status, body
+
+    def _build_capacity_audit_ingest_app(self):
+        from fastapi import FastAPI, Request
+        from fastapi.responses import JSONResponse
+        app = FastAPI(title="Verathos Capacity Audit Ingest")
+
+        async def _read_payload(request: Request) -> tuple[int, dict]:
+            max_bytes = int(
+                getattr(
+                    self._capacity_audit_cfg,
+                    "max_proof_payload_bytes",
+                    32 * 1024 * 1024,
+                )
+                or 32 * 1024 * 1024
+            )
+            body = await request.body()
+            if len(body) > max_bytes:
+                return 413, {
+                    "error": "payload_too_large",
+                    "max_bytes": max_bytes,
+                }
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                return 400, {"error": "invalid_json"}
+            if not isinstance(payload, dict):
+                return 400, {"error": "payload_must_be_object"}
+            return 200, payload
+
+        @app.get("/capacity/audit/v1/health")
+        async def _health():
+            return {
+                "status": "ok",
+                "service": "verathos-capacity-audit-ingest",
+                "capacity_audit": True,
+                "protocol_version": PROTOCOL_VERSION,
+            }
+
+        async def _receipt(request):
+            read_status, payload = await _read_payload(request)
+            if read_status != 200:
+                return JSONResponse(status_code=read_status, content=payload)
+            status, body = self.ingest_capacity_audit_artifact(payload)
+            return JSONResponse(status_code=status, content=body)
+
+        async def _proof(request):
+            read_status, payload = await _read_payload(request)
+            if read_status != 200:
+                return JSONResponse(status_code=read_status, content=payload)
+            status, body = self.submit_capacity_audit_proof_artifact(payload)
+            return JSONResponse(status_code=status, content=body)
+
+        _receipt.__annotations__["request"] = Request
+        _proof.__annotations__["request"] = Request
+        app.post("/capacity/audit/v1/receipt")(_receipt)
+        app.post("/capacity/audit/v1/proof")(_proof)
+
+        return app
+
+    def _start_capacity_audit_ingest_server(self) -> None:
+        if not self._capacity_audit_cfg.enabled:
+            return
+        try:
+            import uvicorn
+            app = self._build_capacity_audit_ingest_app()
+        except Exception as e:
+            bt.logging.warning(f"Capacity audit ingest disabled: FastAPI/uvicorn unavailable: {e}")
+            return
+
+        host = str(getattr(self.config, "capacity_audit_ingest_host", "127.0.0.1") or "127.0.0.1")
+        port = int(getattr(self.config, "capacity_audit_ingest_port", 8091) or 8091)
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        self._capacity_audit_server = server
+        self._capacity_audit_server_thread = threading.Thread(
+            target=server.run,
+            name="capacity-audit-ingest",
+            daemon=True,
+        )
+        self._capacity_audit_server_thread.start()
+        bt.logging.info(f"Capacity audit ingest listening on {host}:{port}")
+
+    def _capacity_audit_enforcement_enabled(
+        self,
+        epoch_number: Optional[int] = None,
+    ) -> bool:
+        cfg = self._capacity_audit_cfg
+        if not cfg.enabled or cfg.mode not in ("score_gate", "enforce"):
+            return False
+        if bool(getattr(self, "_subnet_runtime_config_authoritative", False)):
+            return True
+        if epoch_number is not None:
+            logged_epoch = getattr(
+                self,
+                "_capacity_audit_non_authoritative_log_epoch",
+                None,
+            )
+            if logged_epoch != int(epoch_number):
+                self._capacity_audit_non_authoritative_log_epoch = int(epoch_number)
+                bt.logging.warning(
+                    "Capacity audit enforcement disabled for this epoch: "
+                    "hosted subnet config is unavailable or invalid"
+                )
+        return False
+
+    def _capacity_audit_on_chain_model_ids(self, epoch_number: int) -> Optional[List[str]]:
+        cache_epoch = getattr(self, "_capacity_audit_model_gate_cache_epoch", None)
+        if cache_epoch == int(epoch_number):
+            return getattr(self, "_capacity_audit_model_gate_model_ids", None)
+        client = getattr(self, "_model_client", None)
+        if client is None:
+            return None
+        try:
+            model_ids = client.get_model_list()
+            self._capacity_audit_model_gate_cache_epoch = int(epoch_number)
+            self._capacity_audit_model_gate_model_ids = model_ids
+            return model_ids
+        except Exception as exc:
+            bt.logging.warning(f"Capacity audit model gate: model list unavailable: {exc}")
+            return None
+
+    def _capacity_audit_model_gate_reason(
+        self,
+        miner: ActiveMiner,
+        epoch_number: int,
+    ) -> str:
+        if not self._capacity_audit_enforcement_enabled(epoch_number):
+            return ""
+        gpu_name = str(getattr(miner, "gpu_name", "") or "")
+        vram_gb = int(getattr(miner, "vram_gb", 0) or 0)
+        if not gpu_name or vram_gb <= 0:
+            return "capacity-audit model gate: missing hardware metadata"
+        gpu_row = match_gpu_class(gpu_name, vram_gb, self._capacity_audit_cfg)
+        if gpu_row is None:
+            return f"capacity-audit model gate: unsupported GPU class {gpu_name} {vram_gb}GB"
+        if not gpu_row.calibrated:
+            return f"capacity-audit model gate: uncalibrated GPU class {gpu_row.match_gpu_name}"
+        on_chain_models = self._capacity_audit_on_chain_model_ids(epoch_number)
+        if on_chain_models is None:
+            return ""
+        ok, reason, expected = validate_capacity_recommended_model(
+            model_id=str(getattr(miner, "model_id", "") or ""),
+            quant=str(getattr(miner, "quant", "") or ""),
+            max_context_len=int(getattr(miner, "max_context_len", 0) or 0),
+            vram_gb=vram_gb,
+            on_chain_models=on_chain_models,
+        )
+        if ok:
+            return ""
+        if expected is None:
+            return f"capacity-audit model gate: {reason}"
+        return (
+            "capacity-audit model gate: "
+            f"{reason}; expected model={expected.model_id} "
+            f"quant={expected.quant} ctx>={expected.max_context_len}"
+        )
+
+    def _capacity_audit_score_gate_reason(
+        self,
+        address: str,
+        model_index: int,
+        epoch_number: int,
+        uid: Optional[int] = None,
+    ) -> str:
+        cfg = self._capacity_audit_cfg
+        if not cfg.enabled or cfg.mode != "score_gate":
+            return ""
+        if not self._capacity_audit_enforcement_enabled(epoch_number):
+            return ""
+        if getattr(self, "_capacity_audit_verifier_unhealthy", False):
+            reason = str(getattr(self, "_capacity_audit_verifier_last_error", "") or "")
+            suffix = f": {reason[:160]}" if reason else ""
+            bt.logging.warning(
+                f"Capacity audit score gate disabled while proof verifier is unhealthy{suffix}"
+            )
+            return ""
+        since_epoch = max(0, int(epoch_number) - int(cfg.repeat_window_epochs) + 1)
+        uid_int: Optional[int]
+        try:
+            uid_int = int(uid) if uid is not None else None
+        except (TypeError, ValueError):
+            uid_int = None
+        if uid_int is None:
+            try:
+                resolved = self._db.get_uid(address)
+                uid_int = int(resolved) if resolved is not None else None
+            except Exception:
+                uid_int = None
+        if uid_int is not None:
+            hard_failures = self._db.recent_capacity_failures_for_uid(
+                uid_int,
+                since_epoch=since_epoch,
+                verdicts=("hard_proof_miss", "no_show"),
+                require_chain_confirmed=True,
+            )
+        else:
+            hard_failures = self._db.recent_capacity_failures(
+                address,
+                model_index,
+                since_epoch=since_epoch,
+                verdicts=("hard_proof_miss", "no_show"),
+                require_chain_confirmed=True,
+            )
+        if hard_failures >= int(cfg.hard_proof_misses_for_zero_score):
+            return f"{hard_failures} hard capacity-audit failures"
+        if cfg.allow_timing_only_score_gate:
+            if uid_int is not None:
+                timing_failures = self._db.recent_capacity_failures_for_uid(
+                    uid_int,
+                    since_epoch=since_epoch,
+                    verdicts=("timing_miss",),
+                    require_chain_confirmed=True,
+                )
+            else:
+                timing_failures = self._db.recent_capacity_failures(
+                    address,
+                    model_index,
+                    since_epoch=since_epoch,
+                    verdicts=("timing_miss",),
+                    require_chain_confirmed=True,
+                )
+            if timing_failures >= int(cfg.timing_misses_for_zero_score):
+                return f"{timing_failures} timing capacity-audit misses"
+        return ""
+
+    def _apply_capacity_audit_score_gate(
+        self,
+        address: str,
+        model_index: int,
+        uid: int,
+        reason: str,
+    ) -> bool:
+        if not reason:
+            return False
+        if not self._capacity_audit_enforcement_enabled():
+            return False
+        if uid is None:
+            return False
+        state = self.scorer.states.get(uid)
+        if state is None or not state.entries:
+            bt.logging.info(
+                f"Capacity audit score gate: {address[:10]} model_index={model_index} "
+                f"matched ({reason}) but UID {uid} has no score state to zero"
+            )
+            return False
+        for entry_model_index, entry in state.entries.items():
+            if entry.ema_score != 0.0:
+                entry.ema_score = 0.0
+            self._db.save_score(
+                state.address,
+                entry_model_index,
+                entry.ema_score,
+                entry.total_epochs,
+                entry.scored_epochs,
+            )
+        bt.logging.info(
+            f"Capacity audit score gate: zeroed UID {uid} "
+            f"entries={len(state.entries)} trigger={address[:10]} model_index={model_index} "
+            f"({reason})"
+        )
+        return True
+
+    @staticmethod
+    def _capacity_audit_receipt_overlap_s(
+        receipt: ServiceReceipt,
+        *,
+        window_start: float,
+        window_end: float,
+        slack_s: float = 2.0,
+    ) -> float:
+        if int(getattr(receipt, "tokens_generated", 0) or 0) <= 0:
+            return 0.0
+        if not receipt_has_validator_observed_timing(receipt):
+            return 0.0
+        proofed = (
+            bool(getattr(receipt, "proof_requested", False) and getattr(receipt, "proof_verified", False))
+            or getattr(receipt, "tee_attestation_verified", None) is True
+        )
+        if not proofed:
+            return 0.0
+        interval = receipt_observed_interval(receipt)
+        if interval is None:
+            return 0.0
+        start, end = interval
+        start -= slack_s
+        end += slack_s
+        return max(0.0, min(end, window_end) - max(start, window_start))
+
+    def _reconcile_capacity_audit_timing_excuses(
+        self,
+        miner: ActiveMiner,
+        all_receipts: List[ServiceReceipt],
+        epoch_number: int,
+    ) -> int:
+        """Neutralize timing/no-show misses explained by signed work overlap.
+
+        This is intentionally not a generic busy excuse. ``all_receipts`` is
+        expected to come from the verified receipt pull path. Only v2 receipts
+        whose validator-observed timing is separately signed and whose work is
+        proof/TEE verified can excuse a hot-capacity timing miss. The receipt
+        may be a canary or organic request; miner-reported timing is ignored.
+        """
+        cfg = self._capacity_audit_cfg
+        if not cfg.enabled or cfg.mode not in ("score_gate", "enforce"):
+            return 0
+        if not self._capacity_audit_enforcement_enabled(epoch_number):
+            return 0
+        try:
+            failed_slots = self._db.get_capacity_audit_slots_for_epoch(
+                int(epoch_number),
+                address=miner.address,
+                model_index=int(miner.model_index),
+                verdicts=("timing_miss", "no_show"),
+            )
+        except Exception as exc:
+            bt.logging.debug(f"Capacity audit overlap reconciliation lookup failed: {exc}")
+            return 0
+        if not failed_slots or not all_receipts:
+            return 0
+
+        relevant_receipts = [
+            r for r in all_receipts
+            if r.miner_address.lower() == miner.address.lower()
+            and int(r.model_index) == int(miner.model_index)
+            and r.model_id == miner.model_id
+        ]
+        if not relevant_receipts:
+            return 0
+
+        updated = 0
+        for row in failed_slots:
+            audit_start = row.get("audit_start_observed_at")
+            if audit_start is None:
+                continue
+            audit_start = float(audit_start)
+            deadline_s = float(row.get("deadline_s") or cfg.deadline_s)
+            transport_grace_s = float(row.get("transport_grace_s") or cfg.transport_grace_s)
+            window_end = audit_start + deadline_s + transport_grace_s
+            if row.get("final_received_at") is not None:
+                late_s = max(0.0, float(row["final_received_at"]) - window_end)
+                required_overlap_s = max(1.0, min(5.0, late_s if late_s > 0 else 1.0))
+            else:
+                required_overlap_s = 5.0
+
+            overlaps: list[tuple[ServiceReceipt, float]] = []
+            total_overlap_s = 0.0
+            for receipt in relevant_receipts:
+                overlap_s = self._capacity_audit_receipt_overlap_s(
+                    receipt,
+                    window_start=audit_start,
+                    window_end=window_end,
+                )
+                if overlap_s <= 0:
+                    continue
+                overlaps.append((receipt, overlap_s))
+                total_overlap_s += overlap_s
+
+            if total_overlap_s < required_overlap_s:
+                continue
+            validators = {
+                getattr(r, "validator_hotkey", b"").hex()
+                for r, _overlap in overlaps
+                if getattr(r, "validator_hotkey", b"")
+            }
+            canary_count = sum(1 for r, _overlap in overlaps if getattr(r, "is_canary", False))
+            organic_count = max(0, len(overlaps) - canary_count)
+            reason = (
+                "verified_work_overlap_receipt:"
+                f"overlap_s={total_overlap_s:.1f},"
+                f"required_s={required_overlap_s:.1f},"
+                f"receipts={len(overlaps)},"
+                f"canary={canary_count},"
+                f"organic={organic_count},"
+                f"validators={len(validators)},"
+                f"prior_verdict={row.get('verdict') or ''}"
+            )
+            changed = self._db.mark_capacity_audit_timing_excused(
+                audit_id=str(row["audit_id"]),
+                address=miner.address,
+                model_index=int(miner.model_index),
+                reason=reason,
+            )
+            if changed:
+                updated += changed
+                bt.logging.info(
+                    f"Capacity audit timing excused for {miner.address[:10]} "
+                    f"model_index={miner.model_index} audit_id={str(row['audit_id'])[:12]} "
+                    f"({reason})"
+                )
+        if updated:
+            self._write_shared_state()
+        return updated
+
+    def _on_capacity_audit_failure(
+        self,
+        miner_address: str,
+        model_index: int,
+        *,
+        endpoint: str = "",
+        verdict: str = "",
+        failure_reason: str = "",
+    ) -> None:
+        cfg = self._capacity_audit_cfg
+        if not cfg.enabled or cfg.mode not in ("score_gate", "enforce"):
+            return
+        if not self._capacity_audit_enforcement_enabled():
+            return
+        if not miner_address:
+            return
+        bt.logging.info(
+            f"Capacity audit failure -> probation: {miner_address[:10]} "
+            f"model_index={model_index} verdict={verdict or 'unknown'} "
+            f"reason={failure_reason or 'unknown'}"
+        )
+        self._on_proof_failure(miner_address, int(model_index), endpoint=endpoint)
+
+    def on_finalized_block(
+        self,
+        block_number: int,
+        block_hash: bytes,
+        *,
+        block_hash_real: bool = True,
+    ):
+        """Called by WebSocket subscription on each processed chain-head block.
 
         Drives the epoch lifecycle: start epoch, dispatch canary tests,
         close epoch (pull receipts + score), set weights.
@@ -682,8 +2934,24 @@ class ValidatorNeuron:
             if self._epoch_miners:
                 self._enrich_miners_from_metagraph(self._epoch_miners)
                 self._write_shared_state()
+        refresh_blocks = int(getattr(self.config, "capacity_audit_slot_refresh_blocks", 60) or 0)
+        if (
+            self._capacity_audit_cfg.enabled
+            and refresh_blocks > 0
+            and block_number % refresh_blocks == 0
+        ):
+            self._request_capacity_audit_slot_snapshot_refresh(
+                block_number=block_number,
+                reason="periodic",
+            )
         if block_number % 5 == 0 and hasattr(self, '_cached_metagraph_parts'):
             bt.logging.info(f"Metagraph | block={block_number} | {' | '.join(self._cached_metagraph_parts)}")
+
+        self._handle_capacity_audit_block(
+            block_number,
+            block_hash,
+            block_hash_real=block_hash_real,
+        )
 
         # 1. Epoch boundary → start new epoch
         if block_number % epoch_blocks == 0:
@@ -709,7 +2977,9 @@ class ValidatorNeuron:
 
         # 2. Dispatch pending canary tests
         if self._canary_scheduler is not None:
-            pending = self._canary_scheduler.get_pending_tests(block_number)
+            with self._canary_scheduler_lock:
+                pending = self._canary_scheduler.get_pending_tests(block_number)
+            pending = self._defer_capacity_audit_drained_canaries(pending, block_number)
             if pending:
                 for t in pending:
                     _uid = self._db.get_uid(t.miner_address)
@@ -820,6 +3090,8 @@ class ValidatorNeuron:
     def _start_new_epoch(self, epoch_start_block: int):
         """Start a new epoch — non-blocking; heavy setup runs on executor."""
         epoch_number = epoch_start_block // self.config.epoch_blocks
+        self._refresh_subnet_runtime_config(current_epoch=epoch_number, force=True)
+        epoch_number = epoch_start_block // self.config.epoch_blocks
         if epoch_number != self._current_epoch:
             self._reset_canary_executor()
         self._current_epoch = epoch_number
@@ -863,14 +3135,21 @@ class ValidatorNeuron:
         """Return True while a canary still belongs to the active epoch."""
         return self._running and epoch_number == self._current_epoch
 
+    @staticmethod
+    def _miner_model_key(address: str, model_index: int) -> Tuple[str, int]:
+        """Canonical in-memory key for per-epoch miner/model accounting."""
+        return (str(address).lower(), int(model_index))
+
     def _mark_canary_started(self, epoch_number: int, key: Tuple[str, int]) -> None:
         """Count a canary only once it actually starts running."""
+        key = self._miner_model_key(key[0], key[1])
         self._expected_receipts[key] = self._expected_receipts.get(key, 0) + 1
         epoch_inflight = self._inflight_canaries.setdefault(epoch_number, {})
         epoch_inflight[key] = epoch_inflight.get(key, 0) + 1
 
     def _mark_canary_finished(self, epoch_number: int, key: Tuple[str, int]) -> None:
         """Clear in-flight accounting when a canary finishes or is abandoned."""
+        key = self._miner_model_key(key[0], key[1])
         epoch_inflight = self._inflight_canaries.get(epoch_number)
         if not epoch_inflight:
             return
@@ -886,11 +3165,13 @@ class ValidatorNeuron:
         """Drop expected receipt count for active-epoch validator-side misses."""
         if epoch_number != self._current_epoch:
             return
+        key = self._miner_model_key(key[0], key[1])
         if self._expected_receipts.get(key, 0) > 0:
             self._expected_receipts[key] -= 1
 
     def _effective_expected_receipts(self, epoch_number: int, key: Tuple[str, int]) -> int:
         """Expected receipts minus canaries still in flight at close time."""
+        key = self._miner_model_key(key[0], key[1])
         expected = self._expected_receipts.get(key, 0)
         inflight_epoch = self._closing_inflight_canaries.get(
             epoch_number,
@@ -899,30 +3180,181 @@ class ValidatorNeuron:
         inflight = inflight_epoch.get(key, 0)
         return max(0, expected - inflight)
 
+    def _capacity_audit_drained_keys(self) -> Set[Tuple[str, int]]:
+        """Return endpoint slots currently drained for a capacity audit window."""
+        cfg = getattr(self, "_capacity_audit_cfg", None)
+        if not cfg or not getattr(cfg, "enabled", False):
+            return set()
+        try:
+            drains = self._db.get_capacity_drains()
+        except Exception as exc:
+            bt.logging.debug(f"Capacity audit drain lookup failed: {exc}")
+            return set()
+        out: Set[Tuple[str, int]] = set()
+        for drain in drains:
+            try:
+                out.add((str(drain.address).lower(), int(drain.model_index)))
+            except Exception:
+                continue
+        return out
+
+    def _capacity_audit_key_drained(self, key: Tuple[str, int]) -> bool:
+        address, model_index = key
+        return self._miner_model_key(address, model_index) in self._capacity_audit_drained_keys()
+
+    def _requeue_capacity_audit_canary(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+        *,
+        block_number: Optional[int] = None,
+        phase: str = "dispatch",
+    ) -> bool:
+        """Requeue one canary when its target endpoint is in an audit drain."""
+        if not self._canary_epoch_active(epoch_number):
+            return False
+        key = self._miner_model_key(test.miner_address, test.model_index)
+        if not self._capacity_audit_key_drained(key):
+            return False
+
+        if block_number is None:
+            block_number = int(self._last_known_block or self._epoch_start_block or 0)
+        test.target_block = int(block_number) + 1
+        with self._canary_scheduler_lock:
+            if self._canary_scheduler is None or self._canary_scheduler.epoch_number != epoch_number:
+                return False
+            self._canary_scheduler.tests.append(test)
+            self._canary_scheduler.tests.sort(key=lambda t: (t.target_block, t.miner_address))
+        bt.logging.info(
+            f"Capacity audit drain: requeued canary for {test.miner_address[:10]} "
+            f"model_index={test.model_index} phase={phase} block={block_number}"
+        )
+        return True
+
+    @staticmethod
+    def _is_capacity_audit_http_503(exc: BaseException) -> bool:
+        if not ValidatorNeuron._is_http_503(exc):
+            return False
+        response = getattr(exc, "response", None)
+        try:
+            body = str(response.text or "").lower()
+        except Exception:
+            body = ""
+        return "capacity audit" in body or "audit in progress" in body
+
+    @staticmethod
+    def _is_http_503(exc: BaseException) -> bool:
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return False
+        response = getattr(exc, "response", None)
+        return response is not None and int(getattr(response, "status_code", 0) or 0) == 503
+
+    def _requeue_capacity_audit_gate_canary(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+        *,
+        block_number: Optional[int] = None,
+        phase: str = "audit_gate_503",
+    ) -> bool:
+        """Requeue one canary after the miner's local audit gate rejected it."""
+        if not self._canary_epoch_active(epoch_number):
+            return False
+        if block_number is None:
+            block_number = int(self._last_known_block or self._epoch_start_block or 0)
+        test.target_block = int(block_number) + 1
+        with self._canary_scheduler_lock:
+            if self._canary_scheduler is None or self._canary_scheduler.epoch_number != epoch_number:
+                return False
+            self._canary_scheduler.tests.append(test)
+            self._canary_scheduler.tests.sort(key=lambda t: (t.target_block, t.miner_address))
+        bt.logging.info(
+            f"Capacity audit gate: requeued canary for {test.miner_address[:10]} "
+            f"model_index={test.model_index} phase={phase} block={block_number}"
+        )
+        return True
+
+    def _defer_capacity_audit_drained_canaries(
+        self,
+        tests: List[CanaryTest],
+        block_number: int,
+    ) -> List[CanaryTest]:
+        """Requeue canaries whose endpoint is temporarily drained for audit.
+
+        Audit drains are not miner failures; they reserve a short deterministic
+        window where organic traffic and validator canaries must stay off the
+        selected slot so the hot-capacity timing signal is clean.  Requeueing to
+        the next block preserves coverage when the drain clears and avoids
+        counting a skipped audit-window canary as an expected receipt.
+        """
+        if not tests:
+            return tests
+        drained = self._capacity_audit_drained_keys()
+        if not drained:
+            return tests
+
+        runnable: List[CanaryTest] = []
+        deferred: List[CanaryTest] = []
+        for test in tests:
+            key = self._miner_model_key(test.miner_address, test.model_index)
+            if key in drained:
+                test.target_block = int(block_number) + 1
+                deferred.append(test)
+            else:
+                runnable.append(test)
+
+        if deferred and self._canary_scheduler is not None:
+            with self._canary_scheduler_lock:
+                if self._canary_scheduler is not None:
+                    self._canary_scheduler.tests.extend(deferred)
+                    self._canary_scheduler.tests.sort(key=lambda t: (t.target_block, t.miner_address))
+            bt.logging.info(
+                f"Capacity audit drain: deferred {len(deferred)} canary test(s) "
+                f"at block {block_number}"
+            )
+        return runnable
+
     def _do_epoch_setup(self, epoch_start_block: int, epoch_number: int):
         """Heavy epoch setup — runs on a background executor thread."""
         t0 = time.monotonic()
 
         # Discover ALL active miners
         previous_miners = list(self._epoch_miners)  # cache for fallback
+        discovery_failed = False
         try:
             self._epoch_miners = discover_active_miners(
                 self._miner_client, self._model_client,
             )
+            self._epoch_miners_discovery_valid = True
         except Exception as e:
             bt.logging.warning(f"Discovery RPC failed: {e} — will fall back to previous miners")
+            discovery_failed = True
             self._epoch_miners = []  # triggers fallback below
+            self._epoch_miners_discovery_valid = False
         bt.logging.info(f"Epoch {epoch_number} (block {epoch_start_block}): discovered {len(self._epoch_miners)} miner entries")
 
         # Enrich miners with SS58 keys from metagraph (for analytics + shared state)
         self._enrich_miners_from_metagraph(self._epoch_miners)
 
         if not self._epoch_miners:
+            if not discovery_failed:
+                deactivated = self._db.mark_unseen_inactive(epoch_number)
+                if deactivated > 0:
+                    bt.logging.info(f"Deactivated {deactivated} stale miner entries")
+                self._refresh_capacity_audit_slot_snapshot_from_miners(
+                    [],
+                    block_number=epoch_start_block,
+                    source="epoch_setup_empty",
+                )
+                self._canary_scheduler = None
+                self._write_shared_state()
+                return
             # RPC failure (e.g. 429 rate limit) — fall back to previous
             # epoch's miners so canary testing continues uninterrupted.
             # Miners don't change between epochs in practice.
             if previous_miners:
                 self._epoch_miners = previous_miners
+                self._epoch_miners_discovery_valid = False
                 bt.logging.warning(f"Discovery returned 0 miners — falling back to {len(previous_miners)} miners from previous epoch")
             else:
                 # Fresh start with no previous miners — try shared state
@@ -938,6 +3370,7 @@ class ValidatorNeuron:
                             )
                             for m in shared.miner_endpoints
                         ]
+                        self._epoch_miners_discovery_valid = False
                         bt.logging.warning(f"Discovery returned 0 miners, no previous epoch — falling back to {len(self._epoch_miners)} miners from shared state")
                 except Exception:
                     pass
@@ -1025,10 +3458,17 @@ class ValidatorNeuron:
                     hotkey_ss58=getattr(m, "hotkey_ss58", ""),
                     coldkey_ss58=getattr(m, "coldkey_ss58", ""),
                 )
+                self._db.mark_entry_inactive(m.address, m.model_index)
         self._epoch_miners = alive_miners
         if not self._epoch_miners:
             bt.logging.warning(f"Epoch {epoch_number}: no reachable miners after TCP pre-filter")
+            self._refresh_capacity_audit_slot_snapshot_from_miners(
+                [],
+                block_number=epoch_start_block,
+                source="epoch_setup_no_reachable",
+            )
             self._canary_scheduler = None
+            self._write_shared_state()
             return
 
         # ── Identity verification: filter out hijacked endpoints ────
@@ -1049,14 +3489,20 @@ class ValidatorNeuron:
             future = self._control_executor.submit(self._verify_miner_identity, representative)
             id_futures[future] = (representative, miners)
 
-        # Overall deadline: scales with miner count / pool workers, but capped
-        # at 120s.  Beyond that we're better off including unverified miners
-        # (canary proofs will catch any bad actors) than delaying epoch start.
+        # Overall deadline: scales with unique endpoint groups / pool workers,
+        # but stays capped. Allow enough per-miner budget for one cold HTTP
+        # timeout plus a retry; beyond that, proceed with miners that verified.
         _id_batches = len(identity_groups) // self.config.max_concurrent_verifications + 1
-        _id_batch_budget = max(3.0, min(self.config.identity_challenge_timeout + 5.0, 15.0))
+        _id_per_miner_budget = min(
+            45,
+            max(
+                self.config.identity_challenge_timeout + 10,
+                self.config.identity_challenge_timeout * 2 + 5,
+            ),
+        )
         overall_deadline = min(120, max(
-            self.config.identity_challenge_timeout + 10,
-            _id_batches * _id_batch_budget + 10,
+            _id_per_miner_budget,
+            _id_batches * 3 + 10,  # ~3s per batch (most pass fast) + 10s grace
         ))
         completed_futures = set()
         try:
@@ -1163,6 +3609,12 @@ class ValidatorNeuron:
         if not self._epoch_miners:
             self._canary_scheduler = None
             return
+
+        self._refresh_capacity_audit_slot_snapshot_from_miners(
+            self._epoch_miners,
+            block_number=epoch_start_block,
+            source="epoch_setup",
+        )
 
         # Persist discovered miners to DB
         for miner in self._epoch_miners:
@@ -1349,7 +3801,14 @@ class ValidatorNeuron:
             )
             return
 
-        key = (test.miner_address, test.model_index)
+        key = self._miner_model_key(test.miner_address, test.model_index)
+        if self._requeue_capacity_audit_canary(
+            test,
+            epoch_number,
+            phase="pre_start",
+        ):
+            return
+
         self._mark_canary_started(epoch_number, key)
 
         try:
@@ -1362,6 +3821,13 @@ class ValidatorNeuron:
                         f"model_index={test.model_index}: test_epoch={epoch_number}, "
                         f"current_epoch={self._current_epoch}"
                     )
+                    return
+                if self._requeue_capacity_audit_canary(
+                    test,
+                    epoch_number,
+                    phase=f"retry_{attempt}",
+                ):
+                    self._decrement_expected_receipt(epoch_number, key)
                     return
                 try:
                     return self._execute_canary_test_once(
@@ -1398,6 +3864,14 @@ class ValidatorNeuron:
             if last_exc is not None:
                 if not self._canary_epoch_active(epoch_number):
                     return
+                if self._is_capacity_audit_http_503(last_exc):
+                    if self._requeue_capacity_audit_gate_canary(
+                        test,
+                        epoch_number,
+                        phase="retry_exhausted",
+                    ):
+                        self._decrement_expected_receipt(epoch_number, key)
+                        return
                 bt.logging.info(f"Canary failed after {max_retries} retries (miner busy) for {test.miner_address[:10]} model={test.model_id}")
                 reject_ts = int(time.time())
                 self._decrement_expected_receipt(epoch_number, key)
@@ -1442,6 +3916,14 @@ class ValidatorNeuron:
                     f"model_index={test.model_index}: test_epoch={epoch_number}, "
                     f"current_epoch={self._current_epoch}"
                 )
+                return
+            key = (test.miner_address.lower(), int(test.model_index))
+            if self._requeue_capacity_audit_canary(
+                test,
+                epoch_number,
+                phase="pre_http",
+            ):
+                self._decrement_expected_receipt(epoch_number, key)
                 return
 
             with ValidatorClient(
@@ -1710,7 +4192,7 @@ class ValidatorNeuron:
                 ttft_ms = timing.get("ttft_ms", 0.0)
                 output_tokens = timing.get("output_tokens", 0)
                 input_tokens = timing.get("input_tokens", 0)
-                inference_ms = timing.get("inference_ms", 0.0)
+                observed_start_ts, observed_end_ts, inference_ms = validator_observed_timing(timing)
                 tokens_per_sec = (
                     output_tokens / (inference_ms / 1000)
                     if inference_ms > 0 and output_tokens > 0
@@ -1734,6 +4216,9 @@ class ValidatorNeuron:
                     proof_requested=test.verify_proof,
                     tee_attestation_verified=tee_attestation_verified,
                     is_canary=True,
+                    timestamp=int(observed_end_ts),
+                    observed_start_ts=observed_start_ts,
+                    observed_end_ts=observed_end_ts,
                 )
                 if not pushed_ok:
                     _key_pf = (test.miner_address, test.model_index)
@@ -1799,6 +4284,8 @@ class ValidatorNeuron:
             # hasn't retried yet, re-raise so it can retry once.
             if _transport_retry_allowed and isinstance(e, _transport_exc):
                 raise
+            if _transport_retry_allowed and self._is_http_503(e):
+                raise
             # Validator-side sqlite3 errors must NEVER be attributed to the
             # miner.  A cross-thread Connection race ("bad parameter or
             # other API misuse") inside any of our DB helpers would
@@ -1851,7 +4338,7 @@ class ValidatorNeuron:
             # Repeated failures (>3 per epoch) are evaluated at epoch close,
             # with the error timestamps used to find overlapping organic
             # receipts (same forgiveness mechanism as the 503 busy-skip path).
-            key = (test.miner_address, test.model_index)
+            key = self._miner_model_key(test.miner_address, test.model_index)
             self._canary_errors[key] = self._canary_errors.get(key, 0) + 1
             self._canary_error_times.setdefault(key, []).append(int(time.time()))
             self._decrement_expected_receipt(epoch_number, key)
@@ -1985,6 +4472,11 @@ class ValidatorNeuron:
         except Exception as e:
             bt.logging.debug(f"miner_version poll failed: {e}")
 
+        runtime_config_loaded = self._refresh_subnet_runtime_config(
+            current_epoch=epoch_number,
+            force=True,
+        )
+
         # ── Build the validator authority snapshot for receipt verification.
         # Done ONCE per epoch close so the per-receipt loop is pure dict +
         # array access (no RPC, no metagraph rebuild).
@@ -2051,6 +4543,7 @@ class ValidatorNeuron:
                 )
 
         # ── Pass 1: collect all receipts ──────────────────────────
+        self._receipt_pull_failed_keys: Set[Tuple[str, int]] = set()
         miner_receipts, all_epoch_receipts = self._collect_epoch_receipts(
             epoch_number, receipt_authority,
         )
@@ -2086,15 +4579,24 @@ class ValidatorNeuron:
                  for k, v in sorted(peer_medians_by_model.items())[:5]}
             bt.logging.info(f"Epoch {epoch_number} peer medians: {_pm_summary}")
 
-        # ── Read all scoring params from SubnetConfig (single RPC) ──
-        # Fall back to last successfully read params (not hardcoded defaults)
-        # so a transient RPC failure doesn't cause a one-epoch scoring glitch.
-        if self._subnet_config_client is not None:
+        # ── Read scoring params ───────────────────────────────────
+        # Hosted subnet config is authoritative. Chain scoring is fallback
+        # only when no hosted config/cache is usable.
+        if runtime_config_loaded:
+            bt.logging.debug(
+                f"Runtime subnet config scoring: tee={self._scoring.tee_bonus:.2f} "
+                f"ema={self._scoring.ema_alpha:.2f} tp={self._scoring.throughput_power:.1f} "
+                f"proof_rate={self._scoring.proof_sample_rate:.2f} "
+                f"prob_passes={self._scoring.probation_required_passes} "
+                f"demand_max={self._scoring.demand_bonus_max:.2f} "
+                f"burn={self._scoring.emission_burn:.0%}"
+            )
+        elif self._subnet_config_client is not None:
             try:
                 self._scoring = self._subnet_config_client.get_scoring_params()
                 self._last_good_scoring = self._scoring  # cache for fallback
                 bt.logging.debug(
-                    f"SubnetConfig scoring: tee={self._scoring.tee_bonus:.2f} "
+                    f"SubnetConfig fallback scoring: tee={self._scoring.tee_bonus:.2f} "
                     f"ema={self._scoring.ema_alpha:.2f} tp={self._scoring.throughput_power:.1f} "
                     f"proof_rate={self._scoring.proof_sample_rate:.2f} "
                     f"prob_passes={self._scoring.probation_required_passes} "
@@ -2211,7 +4713,7 @@ class ValidatorNeuron:
                 if r.validator_hotkey == self._validator_hotkey_bytes
             ]
 
-            key = (miner.address, miner.model_index)
+            key = self._miner_model_key(miner.address, miner.model_index)
             # Reconcile stale probation keys: if the miner re-registered
             # (new leaseModel call), the contract array index changes but
             # probation still references the old index.
@@ -2223,6 +4725,34 @@ class ValidatorNeuron:
             # DB migrate_probation needs explicit old index; use tracker's side-effect
             # to keep them in sync.
             expected = self._effective_expected_receipts(epoch_number, key)
+            self._reconcile_capacity_audit_timing_excuses(
+                miner,
+                all_receipts,
+                epoch_number,
+            )
+            audit_zero_reason = self._capacity_audit_model_gate_reason(
+                miner,
+                epoch_number,
+            ) or self._capacity_audit_score_gate_reason(
+                miner.address,
+                miner.model_index,
+                epoch_number,
+                uid=uid,
+            )
+
+            if key in getattr(self, "_receipt_pull_failed_keys", set()):
+                if not self._apply_capacity_audit_score_gate(
+                    miner.address,
+                    miner.model_index,
+                    uid,
+                    audit_zero_reason,
+                ):
+                    bt.logging.warning(
+                        f"Skipping receipt-based score for {miner.address[:10]} "
+                        f"model_index={miner.model_index} at epoch {epoch_number} — "
+                        f"receipt pull failed after retries"
+                    )
+                continue
 
             # Skip scoring if no canaries were dispatched AND no busy-skips.
             # The expected count is decremented on each 503, so expected==0
@@ -2230,7 +4760,13 @@ class ValidatorNeuron:
             # In the latter case we must still run the busy-skip evaluation.
             busy_skips_this_epoch = self._busy_skips.get(key, 0)
             if expected == 0 and busy_skips_this_epoch == 0:
-                bt.logging.info(f"Skipping score for {miner.address[:10]} model_index={miner.model_index} — 0 canaries dispatched")
+                if not self._apply_capacity_audit_score_gate(
+                    miner.address,
+                    miner.model_index,
+                    uid,
+                    audit_zero_reason,
+                ):
+                    bt.logging.info(f"Skipping score for {miner.address[:10]} model_index={miner.model_index} — 0 canaries dispatched")
                 continue
 
             # Count proof verification outcomes from own receipts
@@ -2284,6 +4820,13 @@ class ValidatorNeuron:
                 peer_medians=peer_medians_by_model.get(miner.model_id),
                 tee_bonus=self._scoring.tee_bonus,
             )
+            if self._apply_capacity_audit_score_gate(
+                miner.address,
+                miner.model_index,
+                uid,
+                audit_zero_reason,
+            ):
+                epoch_score = 0.0
 
             # Persist score to DB (write-through)
             if epoch_score is not None:
@@ -2345,7 +4888,7 @@ class ValidatorNeuron:
                 bt.logging.debug(f"Failed to log epoch score: {_db_err}")
 
             # ── Probation lifecycle (DB-backed + in-memory tracker) ──
-            key = (miner.address, miner.model_index)
+            key = self._miner_model_key(miner.address, miner.model_index)
             had_proof_failure = (
                 outcome.proof_tests > 0 and outcome.proof_failures > 0
             )
@@ -2607,6 +5150,20 @@ class ValidatorNeuron:
         )
         self._db.set_meta("current_epoch", str(epoch_number))
 
+        try:
+            cleanup = self._db.compact_capacity_audit_storage(
+                current_epoch=int(epoch_number),
+                retain_failure_epochs=int(self._capacity_audit_cfg.repeat_window_epochs) + 2,
+                retain_artifacts=os.environ.get(
+                    "VERATHOS_CAPACITY_AUDIT_RETAIN_ARTIFACTS",
+                    "",
+                ).lower() in {"1", "true", "yes", "on"},
+            )
+            if any(cleanup.values()):
+                bt.logging.info(f"Capacity audit storage cleanup: {cleanup}")
+        except Exception as exc:
+            bt.logging.warning(f"Capacity audit storage cleanup failed: {exc}")
+
         # Periodic analytics backup+cleanup (every ~7 days ≈ 140 epochs)
         if epoch_number % 140 == 0:
             for table, fn in [
@@ -2643,7 +5200,9 @@ class ValidatorNeuron:
         """Pull epoch receipts without sharing workers with canary execution."""
         miner_receipts: Dict[str, List[ServiceReceipt]] = {}
         all_epoch_receipts: List[ServiceReceipt] = []
+        pull_failed_keys: Set[Tuple[str, int]] = set()
         if not self._epoch_miners:
+            self._receipt_pull_failed_keys = pull_failed_keys
             return miner_receipts, all_epoch_receipts
 
         # Receipt close is a scoring-critical phase. Do not submit these jobs
@@ -2686,6 +5245,11 @@ class ValidatorNeuron:
                     miner = receipt_futures[fut]
                     try:
                         receipts = fut.result()
+                        if receipts is None:
+                            pull_failed_keys.add(
+                                self._miner_model_key(miner.address, miner.model_index)
+                            )
+                            continue
                         addr_key = miner.address.lower()
                         seen = seen_sigs_by_addr.setdefault(addr_key, set())
                         new_receipts = []
@@ -2698,7 +5262,10 @@ class ValidatorNeuron:
                         miner_receipts.setdefault(miner.address, []).extend(new_receipts)
                         all_epoch_receipts.extend(new_receipts)
                     except Exception as e:
-                        bt.logging.debug(f"Receipt pull exception for {miner.address[:10]}: {e}")
+                        pull_failed_keys.add(
+                            self._miner_model_key(miner.address, miner.model_index)
+                        )
+                        bt.logging.warning(f"Receipt pull exception for {miner.address[:10]}: {e}")
             except _FuturesTimeout:
                 stalled = [
                     receipt_futures[f].address[:10]
@@ -2710,6 +5277,10 @@ class ValidatorNeuron:
                 )
                 for f in receipt_futures:
                     if not f.done():
+                        miner = receipt_futures[f]
+                        pull_failed_keys.add(
+                            self._miner_model_key(miner.address, miner.model_index)
+                        )
                         f.cancel()
 
             if cross_pull_dups > 0:
@@ -2719,6 +5290,7 @@ class ValidatorNeuron:
         finally:
             receipt_executor.shutdown(wait=False, cancel_futures=True)
 
+        self._receipt_pull_failed_keys = pull_failed_keys
         return miner_receipts, all_epoch_receipts
 
     def _pull_epoch_receipts(
@@ -2726,7 +5298,7 @@ class ValidatorNeuron:
         miner: ActiveMiner,
         epoch_number: int,
         authority: ValidatorAuthority | None = None,
-    ) -> List[ServiceReceipt]:
+    ) -> Optional[List[ServiceReceipt]]:
         """Pull all receipts from a miner for the given epoch.
 
         GET /epoch/{epoch_number}/receipts — returns all accumulated receipts.
@@ -2743,20 +5315,65 @@ class ValidatorNeuron:
         url = f"{miner.endpoint.rstrip('/')}/epoch/{epoch_number}/receipts"
         path = f"/epoch/{epoch_number}/receipts"
 
-        try:
-            from neurons.request_signing import sign_request
-            auth_headers = sign_request(
-                method="GET", path=path, body=b"",
-                hotkey_ss58=self._validator_hotkey_ss58,
-                hotkey_seed=self._validator_private_key,
-            )
-            resp = httpx.get(url, timeout=self.config.epoch_receipt_pull_timeout,
-                             headers=auth_headers, verify=False)
-            if resp.status_code != 200:
-                bt.logging.debug(f"Receipt pull from {miner.address[:10]} returned {resp.status_code}")
-                return []
+        from neurons.request_signing import sign_request
+        auth_headers = sign_request(
+            method="GET", path=path, body=b"",
+            hotkey_ss58=self._validator_hotkey_ss58,
+            hotkey_seed=self._validator_private_key,
+        )
+        transient_status = {408, 425, 429, 500, 502, 503, 504}
+        transient_exc = (
+            httpx.TimeoutException, httpx.ReadError, httpx.ConnectError,
+            httpx.RemoteProtocolError, httpx.WriteError,
+        )
+        attempts = 3
+        last_err = None
+        resp = None
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = httpx.get(
+                    url,
+                    timeout=self.config.epoch_receipt_pull_timeout,
+                    headers=auth_headers,
+                    verify=False,
+                )
+                if resp.status_code == 200:
+                    break
+                last_err = f"HTTP {resp.status_code}"
+                if resp.status_code in transient_status and attempt < attempts:
+                    bt.logging.info(
+                        f"Receipt pull retry {attempt}/{attempts} for {miner.address[:10]} "
+                        f"model_index={miner.model_index}: {last_err}"
+                    )
+                    time.sleep(min(2.0 * attempt, 5.0))
+                    continue
+                bt.logging.warning(
+                    f"Receipt pull from {miner.address[:10]} model_index={miner.model_index} "
+                    f"failed: {last_err}"
+                )
+                return None
+            except transient_exc as e:
+                last_err = f"{type(e).__name__}: {e}"
+                if attempt < attempts:
+                    bt.logging.info(
+                        f"Receipt pull retry {attempt}/{attempts} for {miner.address[:10]} "
+                        f"model_index={miner.model_index}: {last_err}"
+                    )
+                    time.sleep(min(2.0 * attempt, 5.0))
+                    continue
+                bt.logging.warning(
+                    f"Receipt pull failed for {miner.address[:10]} model_index={miner.model_index} "
+                    f"after {attempts} attempts: {last_err}"
+                )
+                return None
+            except Exception as e:
+                bt.logging.warning(
+                    f"Receipt pull failed for {miner.address[:10]} model_index={miner.model_index}: {e}"
+                )
+                return None
 
-            data = resp.json()
+        try:
+            data = resp.json() if resp is not None else {}
             receipt_dicts = data.get("receipts", [])
 
             verified = []
@@ -2784,12 +5401,18 @@ class ValidatorNeuron:
                     f"signature(s) out of {len(receipt_dicts)} pulled"
                 )
 
-            bt.logging.debug(f"Pulled {len(verified)}/{len(receipt_dicts)} valid (unique) receipts from {miner.address[:10]}")
+            bt.logging.info(
+                f"Pulled {len(verified)}/{len(receipt_dicts)} valid receipt(s) "
+                f"from {miner.address[:10]} model_index={miner.model_index}"
+            )
             return verified
 
         except Exception as e:
-            bt.logging.debug(f"Receipt pull failed for {miner.address[:10]}: {e}")
-            return []
+            bt.logging.warning(
+                f"Receipt pull decode/verify failed for {miner.address[:10]} "
+                f"model_index={miner.model_index}: {e}"
+            )
+            return None
 
     def _push_receipt_to_miner(
         self,
@@ -2808,6 +5431,9 @@ class ValidatorNeuron:
         proof_requested: bool = False,
         tee_attestation_verified: object = None,  # None=not tested, True=passed, False=failed
         is_canary: bool = False,
+        timestamp: Optional[int] = None,
+        observed_start_ts: Optional[float] = None,
+        observed_end_ts: Optional[float] = None,
     ) -> bool:
         """Push signed receipt. Returns True on 200; retries transient transport/5xx."""
         receipt = create_receipt(
@@ -2827,6 +5453,9 @@ class ValidatorNeuron:
             proof_requested=proof_requested,
             tee_attestation_verified=tee_attestation_verified,
             is_canary=is_canary,
+            timestamp=timestamp,
+            observed_start_ts=observed_start_ts,
+            observed_end_ts=observed_end_ts,
         )
 
         url = f"{miner_endpoint.rstrip('/')}/epoch/receipt"
@@ -2938,7 +5567,7 @@ class ValidatorNeuron:
         Halves EMA score on every failure — geometric decay punishes repeat
         offenders while keeping single failures recoverable.
         """
-        key = (miner_address, model_index)
+        key = self._miner_model_key(miner_address, model_index)
         # Look up UID + SS58 for human-readable logging.  These are only
         # used for log messages — the DB row itself is keyed on
         # (address, model_index).
@@ -2993,8 +5622,11 @@ class ValidatorNeuron:
         url = f"{miner.endpoint.rstrip('/')}/identity/challenge"
         bt.logging.debug(f"Identity challenge for {miner.address[:10]} at {url}")
         resp = None
-        max_attempts = 6
-        deadline = time.monotonic() + self.config.identity_challenge_timeout + 5
+        last_error = None
+        last_status = None
+        max_attempts = 4
+        timeout_s = max(1.0, float(self.config.identity_challenge_timeout or 10.0))
+        deadline = time.monotonic() + min(45.0, max(timeout_s + 10.0, timeout_s * 2.0 + 5.0))
         for attempt in range(1, max_attempts + 1):
             if time.monotonic() >= deadline:
                 break
@@ -3004,24 +5636,37 @@ class ValidatorNeuron:
                 resp = httpx.post(
                     url,
                     json={"nonce": nonce.hex()},
-                    timeout=min(self.config.identity_challenge_timeout, remaining),
+                    timeout=min(timeout_s, remaining),
                     verify=False,
                 )
+                last_status = int(resp.status_code)
                 if resp.status_code == 200:
                     break
                 if resp.status_code in (404, 405, 501):
                     return None  # endpoint doesn't support challenges
             except Exception as _ide:
+                last_error = _ide
                 bt.logging.debug(f"Identity challenge exception for {miner.address[:10]}: {_ide}")
             if attempt < max_attempts and time.monotonic() < deadline:
-                wait = min(2.0, 0.25 * attempt, deadline - time.monotonic())
+                wait = min(2.0, 0.25 * (2 ** (attempt - 1)), deadline - time.monotonic())
                 if wait <= 0:
                     break
-                bt.logging.debug(f"Identity challenge retry {attempt}/{max_attempts} for {miner.address[:10]}, next in {wait:.2f}s")
+                bt.logging.debug(
+                    f"Identity challenge retry {attempt}/{max_attempts} for "
+                    f"{miner.address[:10]}, next in {wait:.2f}s"
+                )
                 time.sleep(wait)
 
         if resp is None or resp.status_code != 200:
-            bt.logging.debug(f"Identity challenge failed for {miner.address[:10]} after {attempt} attempts")
+            detail = (
+                f"status={last_status}"
+                if last_status is not None
+                else f"error={last_error}"
+            )
+            bt.logging.debug(
+                f"Identity challenge failed for {miner.address[:10]} after "
+                f"{attempt} attempts ({detail})"
+            )
             return None
 
         try:
@@ -3394,7 +6039,7 @@ class ValidatorNeuron:
         # for UID/SS58 of miners the validator can't TCP-reach.
         uid_map = uid_map_all
         miners = getattr(self, "_epoch_miners", [])
-        if not miners:
+        if not miners and not getattr(self, "_epoch_miners_discovery_valid", False):
             # No live miners (startup before first epoch) — reconstruct from DB
             db_entries = self._db.get_active_entries()
             from neurons.discovery import ActiveMiner
@@ -3501,8 +6146,11 @@ class ValidatorNeuron:
             dtype=torch.long,
         )
 
+        subtensor_obj = None
         try:
-            self._subtensor.set_weights(
+            SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
+            subtensor_obj = SubtensorCls(network=self.config.subtensor_network)
+            subtensor_obj.set_weights(
                 wallet=self._wallet,
                 netuid=self.config.netuid,
                 uids=uid_tensor,
@@ -3514,14 +6162,21 @@ class ValidatorNeuron:
             )
         except Exception as e:
             bt.logging.error(f"Failed to set weights: {e}")
+            raise
+        finally:
+            if subtensor_obj is not None:
+                self._close_subtensor(subtensor_obj)
 
     def _get_current_block(self) -> int:
-        """Get the current finalized block number."""
+        """Get the current best/head block number."""
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TE
         try:
             with ThreadPoolExecutor(1) as pool:
-                future = pool.submit(self._subtensor.get_current_block)
-                return future.result(timeout=15)
+                future = pool.submit(self._get_current_head_block_and_hash)
+                block, _hash, real = future.result(timeout=15)
+                if real and block > 0:
+                    return block
+                return self._last_known_block
         except _TE:
             bt.logging.warning("get_current_block timed out (15s) — reconnecting")
             self.__subtensor = None  # force reconnect on next call
@@ -3564,22 +6219,21 @@ class ValidatorNeuron:
             bt.logging.debug(f"Metagraph refresh failed: {e}")
 
     def _get_current_block_with_retry(self, max_attempts: int = 30) -> int:
-        """Get current block with retry — used at startup only."""
+        """Get current best/head block with retry — used at startup only."""
         import random
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TE
         for attempt in range(1, max_attempts + 1):
             try:
-                bt.logging.debug(f"get_current_block attempt {attempt}/{max_attempts}...")
-                # Use a thread + timeout to detect silent WS hangs.
+                bt.logging.debug(f"get_current_head_block attempt {attempt}/{max_attempts}...")
                 with ThreadPoolExecutor(1) as pool:
-                    future = pool.submit(self._subtensor.get_current_block)
-                    block = future.result(timeout=30)
-                if block > 0:
-                    bt.logging.debug(f"get_current_block: block={block}")
+                    future = pool.submit(self._get_current_head_block_and_hash)
+                    block, _hash, real = future.result(timeout=30)
+                if real and block > 0:
+                    bt.logging.debug(f"get_current_head_block: block={block}")
                     return block
             except _TE:
                 bt.logging.warning(
-                    f"get_current_block timed out after 30s (attempt {attempt}/{max_attempts}) — "
+                    f"get_current_head_block timed out after 30s (attempt {attempt}/{max_attempts}) — "
                     f"Subtensor WS may be hanging",
                 )
                 # Force reconnect on next attempt by clearing cached subtensor
@@ -3600,7 +6254,7 @@ class ValidatorNeuron:
     # ------------------------------------------------------------------
 
     def main_loop(self):
-        """Run the validator via WebSocket subscription to finalized block headers.
+        """Run the validator via WebSocket subscription to current-head block headers.
 
         Uses substrate WebSocket subscription for real-time block tracking.
         Falls back to polling if subscription is unavailable.
@@ -3619,7 +6273,15 @@ class ValidatorNeuron:
         epoch_blocks = self.config.epoch_blocks
         blocks_into_epoch = current % epoch_blocks
         current_epoch_start = current - blocks_into_epoch
-        if blocks_into_epoch <= epoch_blocks // 4:
+        start_at_current = str(os.getenv("VERATHOS_VALIDATOR_START_AT_CURRENT_BLOCK", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if start_at_current:
+            self._sync_block = current
+        elif blocks_into_epoch <= epoch_blocks // 4:
             # Early in epoch — start from current epoch boundary so we can
             # still schedule and run tests in this epoch.
             self._sync_block = current_epoch_start
@@ -3628,41 +6290,310 @@ class ValidatorNeuron:
             self._sync_block = current_epoch_start + epoch_blocks
         bt.logging.info(f"Sync: current block={current}, epoch_offset={blocks_into_epoch}/{epoch_blocks}, will start processing at block {self._sync_block}")
 
-        # WebSocket subscriptions are unreliable on testnet (silently hang
-        # without delivering block headers).  Use polling — one RPC call per
-        # 12s is well within rate limits.
-        # TODO(mainnet): re-enable subscription with proper watchdog.
-        self._run_with_polling()
+        self._run_with_streaming()
 
-    def _run_with_subscription(self):
-        """Subscribe to finalized block headers via WebSocket.
+    @staticmethod
+    def _block_number_from_header(block_header: object) -> Optional[int]:
+        value = getattr(block_header, "value", block_header)
+        if isinstance(value, dict):
+            header = value.get("header") if isinstance(value.get("header"), dict) else value
+            number = header.get("number")
+            if number is not None:
+                try:
+                    return int(number)
+                except (TypeError, ValueError):
+                    return None
+        return None
 
-        Creates a FRESH Subtensor/substrate connection for the subscription
-        because the existing ``self._subtensor`` connection can have stale
-        WS state that causes ``subscribe_block_headers`` to hang silently.
-        """
+    @staticmethod
+    def _close_subtensor(subtensor_obj) -> None:
+        for obj in (subtensor_obj, getattr(subtensor_obj, "substrate", None)):
+            close = getattr(obj, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _head_hash_arg(raw_hash: object, hash_bytes: bytes) -> str:
+        if isinstance(raw_hash, str) and raw_hash.startswith("0x"):
+            return raw_hash
+        return "0x" + bytes(hash_bytes).hex()
+
+    def _get_current_finalized_block_and_hash(
+        self,
+        subtensor_obj: object | None = None,
+    ) -> tuple[int, bytes | None, bool]:
+        target = subtensor_obj if subtensor_obj is not None else self._subtensor
+        substrate = getattr(target, "substrate", None)
+        if substrate is None:
+            return 0, None, False
+        try:
+            response = substrate.rpc_request("chain_getFinalizedHead", [])
+            raw_hash = response.get("result") if isinstance(response, dict) else response
+            block_hash = self._coerce_block_hash(raw_hash)
+            if block_hash is None:
+                return 0, None, False
+            header = substrate.get_block_header(
+                block_hash=self._head_hash_arg(raw_hash, block_hash)
+            )
+            block_number = self._block_number_from_header(header)
+            if block_number is None:
+                return 0, None, False
+            return int(block_number), block_hash, True
+        except Exception as exc:
+            bt.logging.debug(f"Finalized head lookup failed: {exc}")
+            return 0, None, False
+
+    def _get_current_head_block_and_hash(
+        self,
+        subtensor_obj: object | None = None,
+    ) -> tuple[int, bytes | None, bool]:
+        target = subtensor_obj if subtensor_obj is not None else self._subtensor
+        try:
+            method = getattr(target, "get_current_block", None)
+            if callable(method):
+                block_number = int(method())
+            else:
+                substrate = getattr(target, "substrate", None)
+                if substrate is None:
+                    return 0, None, False
+                header = substrate.get_chain_head()
+                block_number = self._block_number_from_header(header) or 0
+            if block_number <= 0:
+                return 0, None, False
+            block_hash, real = self._get_chain_block_hash(block_number, target)
+            return block_number, block_hash if real else None, real
+        except Exception as exc:
+            bt.logging.debug(f"Current head lookup failed: {exc}")
+            return 0, None, False
+
+    def _block_stream_watchdog_s(self) -> float:
+        raw = os.getenv("VERATHOS_BLOCK_STREAM_WATCHDOG_S", "30")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 30.0
+        return max(5.0, value)
+
+    def _block_stream_fallback_poll_s(self) -> float:
+        raw = getattr(
+            self.config,
+            "capacity_audit_worker_poll_s",
+            os.getenv("VERATHOS_CAPACITY_AUDIT_WORKER_POLL_S", "2"),
+        )
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 2.0
+        return max(0.1, value)
+
+    def _process_current_head_block_range(
+        self,
+        last_block: int,
+        current_block: int,
+        subtensor_obj: object | None = None,
+        *,
+        current_hash: bytes | None = None,
+        current_hash_real: bool = True,
+    ) -> int:
+        if current_block <= last_block:
+            return last_block
+        self._last_known_block = current_block
+        for block_num in range(last_block + 1, current_block + 1):
+            if not self._running:
+                break
+            if block_num == current_block and current_hash is not None:
+                block_hash, block_hash_real = current_hash, current_hash_real
+            else:
+                block_hash, block_hash_real = self._get_chain_block_hash(
+                    block_num,
+                    subtensor_obj,
+                )
+            try:
+                self.on_finalized_block(
+                    block_num,
+                    block_hash,
+                    block_hash_real=block_hash_real,
+                )
+            except Exception as e:
+                bt.logging.debug(f"Block {block_num} processing: {e}")
+            last_block = block_num
+        confirmer = getattr(self, "_confirm_capacity_audit_finalized_blocks", None)
+        if callable(confirmer):
+            confirmer(subtensor_obj)
+        return last_block
+
+    def _poll_current_head_catch_up(self, last_block: int) -> int:
+        current, current_hash, current_hash_real = self._get_current_head_block_and_hash()
+        if current <= 0:
+            bt.logging.debug("Current-head catch-up skipped: no valid head block")
+            return last_block
+
+        # Show progress while waiting for sync block
+        if current < self._sync_block:
+            blocks_left = self._sync_block - current
+            if current % 10 == 0:
+                bt.logging.info(
+                    f"Block {current} | waiting for epoch boundary "
+                    f"(block {self._sync_block}, ~{blocks_left * 12 // 60}min)",
+                )
+            if current % 60 == 0:
+                self._refresh_metagraph_stats()
+            if current % 5 == 0 and hasattr(self, '_cached_metagraph_parts'):
+                bt.logging.info(f"Metagraph | block={current} | {' | '.join(self._cached_metagraph_parts)}")
+
+        return self._process_current_head_block_range(
+            last_block,
+            current,
+            current_hash=current_hash,
+            current_hash_real=current_hash_real,
+        )
+
+    def _run_with_streaming(self):
+        """Use current-head streaming as primary path with polling catch-up."""
         import bittensor as bt
 
-        bt.logging.info("Creating fresh Subtensor connection for block subscription...")
-        SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
-        fresh_sub = SubtensorCls(network=self.config.subtensor_network)
+        last_block = self._sync_block - 1
+        watchdog_s = self._block_stream_watchdog_s()
+        fallback_poll_s = self._block_stream_fallback_poll_s()
+        while self._running:
+            fresh_sub = None
+            try:
+                bt.logging.info("Creating fresh Subtensor connection for current-head block stream...")
+                SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
+                fresh_sub = SubtensorCls(network=self.config.subtensor_network)
+                substrate = getattr(fresh_sub, "substrate", None)
+                subscribe = getattr(substrate, "subscribe_block_headers", None)
+                if subscribe is None:
+                    bt.logging.warning("Current-head block stream unavailable; using polling catch-up")
+                    last_block = self._poll_current_head_catch_up(last_block)
+                    time.sleep(fallback_poll_s)
+                    continue
 
-        def callback(block_header):
-            """Callback for subscribe_block_headers."""
-            if not self._running:
-                raise StopIteration("Validator shutting down")
+                state = SimpleNamespace(
+                    error=None,
+                    last_block=last_block,
+                    last_header_at=0.0,
+                    active=False,
+                    started_at=time.monotonic(),
+                )
+                lock = threading.Lock()
+                process_lock = threading.Lock()
+                stop_event = threading.Event()
+                last_catch_up_at = 0.0
 
-            block_number = block_header["header"]["number"]
-            block_hash = hashlib.sha256(
-                str(block_number).encode() + str(block_header).encode()
-            ).digest()
+                def callback(block_header):
+                    if not self._running or stop_event.is_set():
+                        raise StopIteration("Validator shutting down")
+                    block_number = self._block_number_from_header(block_header)
+                    if block_number is None:
+                        return None
+                    with process_lock:
+                        with lock:
+                            state.last_header_at = time.monotonic()
+                            state.active = True
+                            base_block = int(state.last_block)
+                        try:
+                            block_hash, block_hash_real = self._get_chain_block_hash(
+                                block_number,
+                                fresh_sub,
+                            )
+                            new_last = self._process_current_head_block_range(
+                                base_block,
+                                block_number,
+                                fresh_sub,
+                                current_hash=block_hash,
+                                current_hash_real=block_hash_real,
+                            )
+                        finally:
+                            with lock:
+                                state.active = False
+                        with lock:
+                            state.last_block = new_last
+                    return None
 
-            self.on_finalized_block(block_number, block_hash)
+                def catch_up_if_due(now: float, last_block_snapshot: int, active: bool) -> int:
+                    nonlocal last_catch_up_at
+                    if active or now - last_catch_up_at < fallback_poll_s:
+                        return last_block_snapshot
+                    last_catch_up_at = now
+                    try:
+                        if not process_lock.acquire(blocking=False):
+                            return last_block_snapshot
+                        try:
+                            with lock:
+                                base_block = int(state.last_block)
+                            new_last = self._poll_current_head_catch_up(base_block)
+                        finally:
+                            process_lock.release()
+                        with lock:
+                            if int(new_last) > int(state.last_block):
+                                state.last_block = int(new_last)
+                        if int(new_last) > int(last_block_snapshot):
+                            bt.logging.debug(
+                                f"Current-head stream catch-up advanced "
+                                f"last_block={last_block_snapshot}->{new_last}"
+                            )
+                        return max(int(last_block_snapshot), int(new_last))
+                    except Exception as exc:
+                        bt.logging.debug(f"Current-head stream catch-up skipped: {exc}")
+                        return last_block_snapshot
 
-        bt.logging.info("Subscribing to finalized block headers (fresh connection)...")
-        fresh_sub.substrate.subscribe_block_headers(
-            callback, finalized_only=True,
-        )
+                def run_subscription():
+                    try:
+                        subscribe(callback, finalized_only=False)
+                    except Exception as exc:
+                        with lock:
+                            state.error = exc
+
+                thread = threading.Thread(
+                    target=run_subscription,
+                    name="validator-current-block-stream",
+                    daemon=True,
+                )
+                thread.start()
+                bt.logging.info(
+                    f"Subscribing to current-head block headers "
+                    f"(watchdog_s={watchdog_s:g}, fallback_poll_s={fallback_poll_s:g})"
+                )
+
+                while self._running and thread.is_alive():
+                    time.sleep(min(1.0, max(0.1, fallback_poll_s)))
+                    now = time.monotonic()
+                    with lock:
+                        error = state.error
+                        active = bool(state.active)
+                        last_header_at = float(state.last_header_at or 0.0)
+                        last_block = int(state.last_block)
+                        started_at = float(state.started_at)
+                    last_block = catch_up_if_due(now, last_block, active)
+                    if error is not None:
+                        bt.logging.warning(f"Current-head block stream ended: {error}")
+                        break
+                    reference_at = last_header_at or started_at
+                    if not active and now - reference_at > watchdog_s:
+                        bt.logging.warning(
+                            f"Current-head block stream stale for {now - reference_at:.1f}s; "
+                            "reconnecting after polling catch-up"
+                        )
+                        break
+
+                stop_event.set()
+                last_block = int(getattr(state, "last_block", last_block) or last_block)
+                self._close_subtensor(fresh_sub)
+                fresh_sub = None
+                if self._running:
+                    last_block = self._poll_current_head_catch_up(last_block)
+            except Exception as exc:
+                bt.logging.error(f"Current-head block stream error: {exc}")
+                last_block = self._poll_current_head_catch_up(last_block)
+                time.sleep(fallback_poll_s)
+            finally:
+                if fresh_sub is not None:
+                    self._close_subtensor(fresh_sub)
 
     def _run_with_polling(self):
         """Fallback: poll for new blocks periodically."""
@@ -3675,39 +6606,7 @@ class ValidatorNeuron:
 
         while self._running:
             try:
-                current = self._get_current_block()
-
-                # Show progress while waiting for sync block
-                if current < self._sync_block:
-                    blocks_left = self._sync_block - current
-                    if current % 10 == 0:
-                        bt.logging.info(
-                            f"Block {current} | waiting for epoch boundary "
-                            f"(block {self._sync_block}, ~{blocks_left * 12 // 60}min)",
-                        )
-                    if current % 60 == 0:
-                        self._refresh_metagraph_stats()
-                    if current % 5 == 0 and hasattr(self, '_cached_metagraph_parts'):
-                        bt.logging.info(f"Metagraph | block={current} | {' | '.join(self._cached_metagraph_parts)}")
-
-                if current > last_block:
-                    self._last_known_block = current
-                    # Process each block we missed
-                    for block_num in range(last_block + 1, current + 1):
-                        if not self._running:
-                            break
-                        # Derive block hash (polling can't get real hash easily)
-                        block_hash = hashlib.sha256(
-                            f"block_{block_num}".encode()
-                        ).digest()
-                        try:
-                            self.on_finalized_block(block_num, block_hash)
-                        except Exception as e:
-                            bt.logging.debug(f"Block {block_num} processing: {e}")
-                        # Always advance — never re-process the same block.
-                        # If on_finalized_block threw, we skip that block
-                        # rather than re-processing it in a loop.
-                        last_block = block_num
+                last_block = self._poll_current_head_catch_up(last_block)
                 poll_backoff = 12  # Reset on success
             except Exception as e:
                 is_rate_limit = "429" in str(e) or "Too Many Requests" in str(e)
@@ -3726,8 +6625,13 @@ class ValidatorNeuron:
 
     def shutdown(self):
         self._running = False
+        if self._capacity_audit_server is not None:
+            self._capacity_audit_server.should_exit = True
         self._executor.shutdown(wait=False)
         self._control_executor.shutdown(wait=False)
+        self._capacity_audit_executor.shutdown(wait=False)
+        self._capacity_audit_discovery_executor.shutdown(wait=False)
+        self._capacity_audit_proof_executor.shutdown(wait=False)
 
 
 def parse_args():
@@ -3768,6 +6672,73 @@ def parse_args():
                              "want to fund an EVM mirror with TAO. Network still works "
                              "fine: dead miners get cleaned up via 24h lease expiry and "
                              "other validators' reportOffline votes.")
+    parser.add_argument("--capacity-audit", action="store_true",
+                        help="Enable hot-capacity audit windows (default mode: observe).")
+    parser.add_argument("--capacity-audit-mode", default=None,
+                        choices=("observe", "score_gate", "soft_gate", "enforce"),
+                        help="Capacity audit verdict policy.")
+    parser.add_argument("--capacity-audit-ingest-host", default=None,
+                        help="Host for validator-side capacity artifact ingest.")
+    parser.add_argument("--capacity-audit-ingest-port", type=int, default=None,
+                        help="Port for validator-side capacity artifact ingest.")
+    parser.add_argument("--capacity-audit-public-url", default=None,
+                        help="Public validator audit-ingest IP:port URL to publish through axon metadata.")
+    axon_group = parser.add_mutually_exclusive_group()
+    axon_group.add_argument("--capacity-audit-serve-axon",
+                            dest="capacity_audit_serve_axon",
+                            action="store_true", default=None,
+                            help="Publish validator audit ingest IP:port via Bittensor axon metadata.")
+    axon_group.add_argument("--no-capacity-audit-serve-axon",
+                            dest="capacity_audit_serve_axon",
+                            action="store_false",
+                            help="Do not publish capacity audit ingest via Bittensor axon metadata.")
+    parser.add_argument("--capacity-audit-windows-per-epoch", type=int, default=None,
+                        help="Number of deterministic capacity-audit windows per subnet epoch.")
+    parser.add_argument("--capacity-audit-max-drain-fraction", type=float, default=None,
+                        help="Maximum active endpoint fraction drained in one audit window.")
+    parser.add_argument("--capacity-audit-group-stress-fraction", type=float, default=None,
+                        help="Share of each audit-window budget reserved for related-slot group stress.")
+    parser.add_argument("--capacity-audit-beacon-hash-count", type=int, default=None,
+                        help="Number of prior chain-head hashes mixed into the audit selection beacon.")
+    parser.add_argument("--capacity-audit-min-registration-age-s", type=float, default=None,
+                        help="Minimum endpoint lease age before it can enter capacity-audit cohorts.")
+    parser.add_argument("--capacity-audit-slot-refresh-blocks", type=int, default=None,
+                        help="Background refresh cadence for cached capacity-audit eligible slots; 0 disables extra refreshes.")
+    parser.add_argument("--capacity-audit-slot-snapshot-stale-blocks", type=int, default=None,
+                        help="Maximum age of cached capacity-audit eligible slots before skipping a window; 0 disables staleness.")
+    parser.add_argument("--capacity-audit-proof-verify-workers", type=int, default=None,
+                        help="Bounded worker count for validator-side capacity proof verification.")
+    parser.add_argument("--capacity-audit-lead-blocks", type=int, default=None,
+                        help="Blocks between audit selection and audit start.")
+    parser.add_argument("--capacity-audit-proof-challenge-delay-blocks", type=int, default=None,
+                        help="Blocks between audit start and deferred proof challenge.")
+    parser.add_argument("--capacity-audit-drain-seconds", type=float, default=None,
+                        help="Nominal endpoint drain period before the timing deadline.")
+    parser.add_argument("--capacity-audit-deadline-s", type=float, default=None,
+                        help="Timing deadline, in seconds, measured from observed B_start.")
+    parser.add_argument("--capacity-audit-transport-grace-s", type=float, default=None,
+                        help="Additional final-receipt transport grace after the timing deadline.")
+    parser.add_argument("--capacity-audit-payload-deadline-s", type=float, default=None,
+                        help="Deferred proof payload timeout after the final timing receipt.")
+    parser.add_argument("--capacity-audit-max-proof-payload-bytes", type=int, default=None,
+                        help="Maximum capacity audit receipt/proof JSON request size.")
+    parser.add_argument("--capacity-audit-require-proof-payload", action="store_true",
+                        help="Treat missing deferred capacity proof payloads as hard proof misses.")
+    parser.add_argument("--capacity-audit-repeat-window-epochs", type=int, default=None,
+                        help="Epoch lookback window for repeated capacity-audit failures before score zeroing.")
+    parser.add_argument("--capacity-audit-timing-misses-for-zero-score", type=int, default=None,
+                        help="Timing misses within the repeat window required to zero score in score_gate mode.")
+    parser.add_argument("--capacity-audit-hard-proof-misses-for-zero-score", type=int, default=None,
+                        help="Hard proof/no-show misses within the repeat window required to zero score in score_gate mode.")
+    timing_gate = parser.add_mutually_exclusive_group()
+    timing_gate.add_argument("--capacity-audit-allow-timing-only-score-gate",
+                             dest="capacity_audit_allow_timing_only_score_gate",
+                             action="store_true", default=None,
+                             help="Allow repeated timing-only misses to zero score in score_gate mode.")
+    timing_gate.add_argument("--no-capacity-audit-allow-timing-only-score-gate",
+                             dest="capacity_audit_allow_timing_only_score_gate",
+                             action="store_false",
+                             help="Do not zero score from timing-only misses; hard proof/no-show misses still count.")
     # Bittensor logging flags (--logging.debug, --logging.trace, --logging.info)
     bt.logging.add_args(parser)
     return parser.parse_args()
@@ -3782,6 +6753,58 @@ def main():
     extra_kwargs = {}
     if args.ema_alpha is not None:
         extra_kwargs["ema_alpha"] = args.ema_alpha
+    if args.capacity_audit:
+        extra_kwargs["capacity_audit_enabled"] = True
+    if args.capacity_audit_mode is not None:
+        extra_kwargs["capacity_audit_mode"] = args.capacity_audit_mode
+    if args.capacity_audit_ingest_host is not None:
+        extra_kwargs["capacity_audit_ingest_host"] = args.capacity_audit_ingest_host
+    if args.capacity_audit_ingest_port is not None:
+        extra_kwargs["capacity_audit_ingest_port"] = args.capacity_audit_ingest_port
+    if args.capacity_audit_public_url is not None:
+        extra_kwargs["capacity_audit_public_url"] = args.capacity_audit_public_url
+    if args.capacity_audit_serve_axon is not None:
+        extra_kwargs["capacity_audit_serve_axon"] = args.capacity_audit_serve_axon
+    if args.capacity_audit_windows_per_epoch is not None:
+        extra_kwargs["capacity_audit_windows_per_epoch"] = args.capacity_audit_windows_per_epoch
+    if args.capacity_audit_max_drain_fraction is not None:
+        extra_kwargs["capacity_audit_max_drain_fraction"] = args.capacity_audit_max_drain_fraction
+    if args.capacity_audit_group_stress_fraction is not None:
+        extra_kwargs["capacity_audit_group_stress_fraction"] = args.capacity_audit_group_stress_fraction
+    if args.capacity_audit_beacon_hash_count is not None:
+        extra_kwargs["capacity_audit_beacon_hash_count"] = args.capacity_audit_beacon_hash_count
+    if args.capacity_audit_min_registration_age_s is not None:
+        extra_kwargs["capacity_audit_min_registration_age_s"] = args.capacity_audit_min_registration_age_s
+    if args.capacity_audit_slot_refresh_blocks is not None:
+        extra_kwargs["capacity_audit_slot_refresh_blocks"] = args.capacity_audit_slot_refresh_blocks
+    if args.capacity_audit_slot_snapshot_stale_blocks is not None:
+        extra_kwargs["capacity_audit_slot_snapshot_stale_blocks"] = args.capacity_audit_slot_snapshot_stale_blocks
+    if args.capacity_audit_proof_verify_workers is not None:
+        extra_kwargs["capacity_audit_proof_verify_workers"] = args.capacity_audit_proof_verify_workers
+    if args.capacity_audit_lead_blocks is not None:
+        extra_kwargs["capacity_audit_lead_blocks"] = args.capacity_audit_lead_blocks
+    if args.capacity_audit_proof_challenge_delay_blocks is not None:
+        extra_kwargs["capacity_audit_proof_challenge_delay_blocks"] = args.capacity_audit_proof_challenge_delay_blocks
+    if args.capacity_audit_drain_seconds is not None:
+        extra_kwargs["capacity_audit_drain_seconds"] = args.capacity_audit_drain_seconds
+    if args.capacity_audit_deadline_s is not None:
+        extra_kwargs["capacity_audit_deadline_s"] = args.capacity_audit_deadline_s
+    if args.capacity_audit_transport_grace_s is not None:
+        extra_kwargs["capacity_audit_transport_grace_s"] = args.capacity_audit_transport_grace_s
+    if args.capacity_audit_payload_deadline_s is not None:
+        extra_kwargs["capacity_audit_payload_deadline_s"] = args.capacity_audit_payload_deadline_s
+    if args.capacity_audit_max_proof_payload_bytes is not None:
+        extra_kwargs["capacity_audit_max_proof_payload_bytes"] = args.capacity_audit_max_proof_payload_bytes
+    if args.capacity_audit_require_proof_payload:
+        extra_kwargs["capacity_audit_require_proof_payload"] = True
+    if args.capacity_audit_repeat_window_epochs is not None:
+        extra_kwargs["capacity_audit_repeat_window_epochs"] = args.capacity_audit_repeat_window_epochs
+    if args.capacity_audit_timing_misses_for_zero_score is not None:
+        extra_kwargs["capacity_audit_timing_misses_for_zero_score"] = args.capacity_audit_timing_misses_for_zero_score
+    if args.capacity_audit_hard_proof_misses_for_zero_score is not None:
+        extra_kwargs["capacity_audit_hard_proof_misses_for_zero_score"] = args.capacity_audit_hard_proof_misses_for_zero_score
+    if args.capacity_audit_allow_timing_only_score_gate is not None:
+        extra_kwargs["capacity_audit_allow_timing_only_score_gate"] = args.capacity_audit_allow_timing_only_score_gate
     config = NeuronConfig.from_env(
         wallet_name=args.wallet,
         hotkey_name=args.hotkey,
@@ -3836,6 +6859,8 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     neuron.setup()
+    neuron._start_capacity_audit_ingest_server()
+    neuron._ensure_capacity_audit_axon_served()
 
     # ── Startup banner ──
     network = args.subtensor_network or "test"
@@ -3873,6 +6898,7 @@ def main():
         neuron._epoch_miners = discover_active_miners(
             neuron._miner_client, neuron._model_client,
         )
+        neuron._epoch_miners_discovery_valid = True
         neuron._enrich_miners_from_metagraph(neuron._epoch_miners)
         # Fetch hardware metadata from miners at startup (best-effort)
         from concurrent.futures import as_completed as _as_completed
@@ -3896,6 +6922,11 @@ def main():
                 compute_capability=miner.compute_capability,
                 gpu_uuids=miner.gpu_uuids,
             )
+        neuron._refresh_capacity_audit_slot_snapshot_from_miners(
+            neuron._epoch_miners,
+            block_number=getattr(neuron, "_last_known_block", 0) or 0,
+            source="startup",
+        )
         # Re-apply UIDs after upsert_entry created the rows.
         # _enrich_miners_from_metagraph calls set_uid (UPDATE) before
         # upsert_entry (INSERT), so the UPDATE is a no-op for new miners.
@@ -3913,6 +6944,7 @@ def main():
         # restart fires before _close_epoch with an empty _blacklisted_uids set.
         neuron._refresh_blacklist({m.address for m in neuron._epoch_miners})
     except Exception as e:
+        neuron._epoch_miners_discovery_valid = False
         bt.logging.debug(f"Startup discovery failed: {e} — shared state from DB only")
 
     # Write shared state immediately so the proxy has data before first epoch

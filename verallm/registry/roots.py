@@ -164,6 +164,47 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
         commitment_data.append(param_hash)
     model_commitment = hashlib.sha256(b"".join(commitment_data)).digest()
 
+    def _is_fused_awq_projection(layer) -> bool:
+        if layer is None or not hasattr(layer, "qweight"):
+            return False
+        try:
+            if not is_awq_layer(layer):
+                return False
+        except Exception:
+            return False
+        parts = getattr(layer, "output_partition_sizes", None)
+        if parts is not None:
+            try:
+                return len(parts) > 1
+            except TypeError:
+                return False
+        return "mergedcolumnparallellinear" in type(layer).__name__.lower()
+
+    def _extract_forward_int8(gate_proj):
+        try:
+            out_dim = getattr(gate_proj, 'output_size', 0)
+            if out_dim <= 0:
+                out_dim = getattr(gate_proj, 'out_features', 0)
+            if out_dim <= 0 and hasattr(gate_proj, 'output_partition_sizes'):
+                out_dim = sum(gate_proj.output_partition_sizes)
+            if out_dim <= 0:
+                return None
+            device = next(gate_proj.parameters()).device
+            dtype = getattr(gate_proj, 'params_dtype', torch.float16)
+            eye = torch.eye(hidden_size, dtype=dtype, device=device)
+            with torch.no_grad():
+                result = gate_proj(eye)
+            W_fp16 = result[0] if isinstance(result, (tuple, list)) else result
+            W_float = W_fp16.float()
+            absmax = W_float.abs().max().clamp(min=1e-8)
+            W_int8 = (W_float / absmax * 127).round().clamp(-128, 127).to(torch.int8)
+            if W_int8.is_cuda:
+                W_int8 = W_int8.cpu()
+            return W_int8
+        except Exception as e:
+            logger.warning("Identity-matrix weight extraction failed: %s", e)
+            return None
+
     def _compute_root_for_weight(gate_proj, W_raw_tensor=None):
         """Compute Merkle root for a weight tensor — auto-detects quant format."""
         mode = detect_layer_quant_mode(gate_proj) if gate_proj is not None else "fp16"
@@ -175,7 +216,10 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
                 elif mode == "int4":
                     if hasattr(gate_proj, 'qweight'):
                         if is_awq_layer(gate_proj):
-                            W_int8 = get_awq_weights_as_int8_gpu(gate_proj)
+                            if _is_fused_awq_projection(gate_proj):
+                                W_int8 = _extract_forward_int8(gate_proj)
+                            else:
+                                W_int8 = get_awq_weights_as_int8_gpu(gate_proj)
                         else:
                             W_int8 = get_int4_weights_as_int8_gpu(gate_proj)
                     else:
@@ -233,23 +277,8 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
         # Identity-matrix fallback: forward() dequantizes any format (Marlin, etc.)
         if gate_proj is not None and hasattr(gate_proj, 'forward'):
             try:
-                out_dim = getattr(gate_proj, 'output_size', 0)
-                if out_dim <= 0:
-                    out_dim = getattr(gate_proj, 'out_features', 0)
-                if out_dim <= 0 and hasattr(gate_proj, 'output_partition_sizes'):
-                    out_dim = sum(gate_proj.output_partition_sizes)
-                if out_dim > 0:
-                    device = next(gate_proj.parameters()).device
-                    dtype = getattr(gate_proj, 'params_dtype', torch.float16)
-                    eye = torch.eye(hidden_size, dtype=dtype, device=device)
-                    with torch.no_grad():
-                        result = gate_proj(eye)
-                    W_fp16 = result[0] if isinstance(result, (tuple, list)) else result
-                    W_float = W_fp16.float()
-                    absmax = W_float.abs().max().clamp(min=1e-8)
-                    W_int8 = (W_float / absmax * 127).round().clamp(-128, 127).to(torch.int8)
-                    if W_int8.is_cuda:
-                        W_int8 = W_int8.cpu()
+                W_int8 = _extract_forward_int8(gate_proj)
+                if W_int8 is not None:
                     return compute_flat_weight_root(W_int8, chunk_size)
             except Exception as e:
                 logger.warning("Identity-matrix weight extraction failed: %s", e)
