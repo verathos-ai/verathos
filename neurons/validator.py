@@ -60,6 +60,7 @@ from neurons.capacity_audit import (
     derive_audit_id,
     derive_audit_seed,
     derive_audit_seed_from_hashes,
+    deterministic_sample_slots,
     derive_proof_challenge_seed,
     derive_proof_seed,
     lease_id,
@@ -1558,7 +1559,7 @@ class ValidatorNeuron:
         budget = window_cohort_budget(len(active), cfg)
         if budget > 0 and len(selected) > budget:
             before = len(selected)
-            selected = selected[:budget]
+            selected = deterministic_sample_slots(selected, cohort_seed, budget)
             bt.logging.info(
                 f"Capacity audit: truncated selected slots {before}->{len(selected)} "
                 f"by per-window drain budget at block {selection_block}"
