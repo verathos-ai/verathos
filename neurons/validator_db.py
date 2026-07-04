@@ -32,6 +32,7 @@ DEFAULT_DB_PATH = os.path.join(
     "verathos_validator.db",
 )
 
+CAPACITY_AUDIT_HISTORY_RETENTION_SECONDS = 48 * 60 * 60
 _SCHEMA_VERSION = "1"
 
 
@@ -308,6 +309,50 @@ class ValidatorStateDB:
 
             CREATE INDEX IF NOT EXISTS idx_capacity_audit_drains
                 ON capacity_audit_slots(drain_until_ts, verdict);
+
+            CREATE TABLE IF NOT EXISTS capacity_audit_history (
+                audit_id             TEXT NOT NULL,
+                miner_address        TEXT NOT NULL,
+                model_index          INTEGER NOT NULL,
+                miner_uid            INTEGER,
+                endpoint             TEXT NOT NULL DEFAULT '',
+                model_id             TEXT NOT NULL DEFAULT '',
+                quant                TEXT NOT NULL DEFAULT '',
+                max_context_len      INTEGER NOT NULL DEFAULT 0,
+                gpu_name             TEXT NOT NULL DEFAULT '',
+                gpu_count            INTEGER NOT NULL DEFAULT 0,
+                vram_gb              INTEGER NOT NULL DEFAULT 0,
+                group_key            TEXT NOT NULL DEFAULT '',
+                slot_id              TEXT NOT NULL DEFAULT '',
+                lease_id             TEXT NOT NULL DEFAULT '',
+                claimed_gpu_class    TEXT NOT NULL DEFAULT '',
+                pass_count           INTEGER NOT NULL DEFAULT 0,
+                epoch_number         INTEGER NOT NULL DEFAULT 0,
+                selection_block      INTEGER NOT NULL DEFAULT 0,
+                audit_block          INTEGER NOT NULL DEFAULT 0,
+                proof_challenge_block INTEGER NOT NULL DEFAULT 0,
+                verdict              TEXT NOT NULL DEFAULT '',
+                timing_status        TEXT NOT NULL DEFAULT '',
+                proof_status         TEXT NOT NULL DEFAULT '',
+                failure_reason       TEXT,
+                proof_verify_ms      REAL,
+                pass0_received_at    REAL,
+                final_received_at    REAL,
+                proof_received_at    REAL,
+                slot_created_at      REAL NOT NULL,
+                slot_updated_at      REAL NOT NULL,
+                archived_at          REAL NOT NULL,
+                PRIMARY KEY (audit_id, miner_address, model_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_capacity_audit_history_archived
+                ON capacity_audit_history(archived_at);
+
+            CREATE INDEX IF NOT EXISTS idx_capacity_audit_history_uid
+                ON capacity_audit_history(miner_uid, archived_at);
+
+            CREATE INDEX IF NOT EXISTS idx_capacity_audit_history_outcome
+                ON capacity_audit_history(verdict, proof_status, archived_at);
         """)
         self._conn.commit()
 
@@ -1842,12 +1887,17 @@ class ValidatorStateDB:
         *,
         current_epoch: int,
         retain_failure_epochs: int,
+        retain_history_seconds: float = CAPACITY_AUDIT_HISTORY_RETENTION_SECONDS,
         retain_artifacts: bool = False,
+        now: Optional[float] = None,
     ) -> dict[str, int]:
+        now_ts = time.time() if now is None else float(now)
         if retain_artifacts:
             return {
                 "artifact_files_deleted": 0,
                 "artifact_rows_cleared": 0,
+                "history_rows_archived": 0,
+                "old_history_rows_deleted": 0,
                 "success_rows_deleted": 0,
                 "old_failure_rows_deleted": 0,
                 "empty_windows_deleted": 0,
@@ -1860,10 +1910,20 @@ class ValidatorStateDB:
             "missing_payload",
         )
         failure_verdicts = ("timing_miss", "hard_proof_miss", "no_show")
+        history_verdicts = (
+            "timing_pass",
+            "timing_excused",
+            "timing_miss",
+            "hard_proof_miss",
+            "no_show",
+            "stale_window",
+            "chain_reorged",
+        )
         keep_from_epoch = max(
             0,
             int(current_epoch) - max(1, int(retain_failure_epochs)) + 1,
         )
+        history_cutoff = now_ts - max(0.0, float(retain_history_seconds))
         with self._lock:
             path_rows = self._conn.execute(
                 f"""SELECT DISTINCT s.proof_artifact_path AS path
@@ -1898,6 +1958,37 @@ class ValidatorStateDB:
                 bt.logging.debug(f"Capacity audit artifact cleanup skipped {path}: {exc}")
 
         with self._lock:
+            history_cur = self._conn.execute(
+                f"""INSERT OR REPLACE INTO capacity_audit_history (
+                        audit_id, miner_address, model_index, miner_uid, endpoint,
+                        model_id, quant, max_context_len, gpu_name, gpu_count,
+                        vram_gb, group_key, slot_id, lease_id, claimed_gpu_class,
+                        pass_count, epoch_number, selection_block, audit_block,
+                        proof_challenge_block, verdict, timing_status, proof_status,
+                        failure_reason, proof_verify_ms, pass0_received_at,
+                        final_received_at, proof_received_at, slot_created_at,
+                        slot_updated_at, archived_at
+                    )
+                    SELECT
+                        s.audit_id, LOWER(s.miner_address), s.model_index, s.miner_uid,
+                        s.endpoint, s.model_id, s.quant, s.max_context_len, s.gpu_name,
+                        s.gpu_count, s.vram_gb, s.group_key, s.slot_id, s.lease_id,
+                        s.claimed_gpu_class, s.pass_count, w.epoch_number,
+                        w.selection_block, w.audit_block, w.proof_challenge_block,
+                        s.verdict, s.timing_status, s.proof_status, s.failure_reason,
+                        s.proof_verify_ms, s.pass0_received_at, s.final_received_at,
+                        s.proof_received_at, s.created_at, s.updated_at, ?
+                    FROM capacity_audit_slots s
+                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                    WHERE w.epoch_number <= ?
+                      AND s.verdict IN ({','.join('?' for _ in history_verdicts)})""",
+                (now_ts, int(current_epoch), *history_verdicts),
+            )
+            history_delete_cur = self._conn.execute(
+                """DELETE FROM capacity_audit_history
+                   WHERE archived_at < ?""",
+                (history_cutoff,),
+            )
             artifact_cur = self._conn.execute(
                 f"""UPDATE capacity_audit_slots
                     SET pass0_artifact = NULL,
@@ -1920,7 +2011,7 @@ class ValidatorStateDB:
                         OR verdict IN ({','.join('?' for _ in failure_verdicts)})
                         OR verdict IN ('timing_excused', 'stale_window', 'chain_reorged')
                       )""",
-                (time.time(), int(current_epoch), *final_proof_statuses, *failure_verdicts),
+                (now_ts, int(current_epoch), *final_proof_statuses, *failure_verdicts),
             )
             success_cur = self._conn.execute(
                 """DELETE FROM capacity_audit_slots
@@ -1954,6 +2045,8 @@ class ValidatorStateDB:
         return {
             "artifact_files_deleted": files_deleted,
             "artifact_rows_cleared": artifact_cur.rowcount or 0,
+            "history_rows_archived": history_cur.rowcount or 0,
+            "old_history_rows_deleted": history_delete_cur.rowcount or 0,
             "success_rows_deleted": success_cur.rowcount or 0,
             "old_failure_rows_deleted": failure_cur.rowcount or 0,
             "empty_windows_deleted": window_cur.rowcount or 0,
