@@ -2745,6 +2745,48 @@ class ValidatorNeuron:
         )
         return True
 
+    def _apply_capacity_audit_model_gate(
+        self,
+        address: str,
+        model_index: int,
+        uid: int,
+        reason: str,
+    ) -> bool:
+        if not reason:
+            return False
+        if not self._capacity_audit_enforcement_enabled():
+            return False
+        if uid is None:
+            return False
+        state = self.scorer.states.get(uid)
+        if state is None or not state.entries:
+            bt.logging.info(
+                f"Capacity audit model gate: {address[:10]} model_index={model_index} "
+                f"matched ({reason}) but UID {uid} has no score state to zero"
+            )
+            return False
+        entry = state.entries.get(model_index)
+        if entry is None:
+            bt.logging.info(
+                f"Capacity audit model gate: {address[:10]} model_index={model_index} "
+                f"matched ({reason}) but UID {uid} has no matching score entry"
+            )
+            return False
+        if entry.ema_score != 0.0:
+            entry.ema_score = 0.0
+        self._db.save_score(
+            address,
+            model_index,
+            entry.ema_score,
+            entry.total_epochs,
+            entry.scored_epochs,
+        )
+        bt.logging.info(
+            f"Capacity audit model gate: zeroed UID {uid} "
+            f"model_index={model_index} address={address[:10]} ({reason})"
+        )
+        return True
+
     @staticmethod
     def _capacity_audit_receipt_overlap_s(
         receipt: ServiceReceipt,
@@ -4731,10 +4773,11 @@ class ValidatorNeuron:
                 all_receipts,
                 epoch_number,
             )
-            audit_zero_reason = self._capacity_audit_model_gate_reason(
+            model_gate_reason = self._capacity_audit_model_gate_reason(
                 miner,
                 epoch_number,
-            ) or self._capacity_audit_score_gate_reason(
+            )
+            audit_score_gate_reason = self._capacity_audit_score_gate_reason(
                 miner.address,
                 miner.model_index,
                 epoch_number,
@@ -4742,12 +4785,19 @@ class ValidatorNeuron:
             )
 
             if key in getattr(self, "_receipt_pull_failed_keys", set()):
-                if not self._apply_capacity_audit_score_gate(
+                gated = self._apply_capacity_audit_model_gate(
                     miner.address,
                     miner.model_index,
                     uid,
-                    audit_zero_reason,
-                ):
+                    model_gate_reason,
+                )
+                gated = self._apply_capacity_audit_score_gate(
+                    miner.address,
+                    miner.model_index,
+                    uid,
+                    audit_score_gate_reason,
+                ) or gated
+                if not gated:
                     bt.logging.warning(
                         f"Skipping receipt-based score for {miner.address[:10]} "
                         f"model_index={miner.model_index} at epoch {epoch_number} — "
@@ -4761,12 +4811,19 @@ class ValidatorNeuron:
             # In the latter case we must still run the busy-skip evaluation.
             busy_skips_this_epoch = self._busy_skips.get(key, 0)
             if expected == 0 and busy_skips_this_epoch == 0:
-                if not self._apply_capacity_audit_score_gate(
+                gated = self._apply_capacity_audit_model_gate(
                     miner.address,
                     miner.model_index,
                     uid,
-                    audit_zero_reason,
-                ):
+                    model_gate_reason,
+                )
+                gated = self._apply_capacity_audit_score_gate(
+                    miner.address,
+                    miner.model_index,
+                    uid,
+                    audit_score_gate_reason,
+                ) or gated
+                if not gated:
                     bt.logging.info(f"Skipping score for {miner.address[:10]} model_index={miner.model_index} — 0 canaries dispatched")
                 continue
 
@@ -4821,12 +4878,19 @@ class ValidatorNeuron:
                 peer_medians=peer_medians_by_model.get(miner.model_id),
                 tee_bonus=self._scoring.tee_bonus,
             )
-            if self._apply_capacity_audit_score_gate(
+            gated = self._apply_capacity_audit_model_gate(
                 miner.address,
                 miner.model_index,
                 uid,
-                audit_zero_reason,
-            ):
+                model_gate_reason,
+            )
+            gated = self._apply_capacity_audit_score_gate(
+                miner.address,
+                miner.model_index,
+                uid,
+                audit_score_gate_reason,
+            ) or gated
+            if gated:
                 epoch_score = 0.0
 
             # Persist score to DB (write-through)

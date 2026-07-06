@@ -1649,8 +1649,18 @@ class CapacityAuditMinerWorker:
                     f"audit_id={audit_slot.audit_id[:12]}"
                 )
             else:
-                self._publish_proof(proof_payload)
-                bt.logging.info(f"Capacity audit artifacts published: audit_id={audit_slot.audit_id[:12]}")
+                accepted = self._publish_proof(proof_payload)
+                if accepted > 0:
+                    bt.logging.info(
+                        f"Capacity audit artifacts published: "
+                        f"audit_id={audit_slot.audit_id[:12]} validators={accepted}"
+                    )
+                else:
+                    bt.logging.info(
+                        f"Capacity audit artifacts not accepted by validators: "
+                        f"audit_id={audit_slot.audit_id[:12]} "
+                        "slot was not scheduled or endpoints were unavailable"
+                    )
         self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
         self._clear_audit_drain(audit_slot.audit_id)
 
@@ -1756,17 +1766,17 @@ class CapacityAuditMinerWorker:
             return artifact
         return None
 
-    def _publish_receipt(self, artifact: dict) -> None:
-        self._publish_artifact(
+    def _publish_receipt(self, artifact: dict) -> int:
+        return self._publish_artifact(
             "/capacity/audit/v1/receipt",
             artifact,
             attempts=3,
             retry_delay_s=0.25,
         )
 
-    def _publish_proof(self, artifact: dict) -> None:
+    def _publish_proof(self, artifact: dict) -> int:
         attempts = max(1, int(float(self.runtime_cfg.payload_deadline_s or 0.0) // 5.0))
-        self._publish_artifact(
+        return self._publish_artifact(
             "/capacity/audit/v1/proof",
             artifact,
             attempts=min(12, attempts),
@@ -1780,23 +1790,31 @@ class CapacityAuditMinerWorker:
         *,
         attempts: int = 1,
         retry_delay_s: float = 0.0,
-    ) -> None:
+    ) -> int:
         audit_id = str(artifact.get("audit_id") or "")
         artifact_type = str(artifact.get("artifact_type") or "")
+        accepted = 0
         for attempt in range(max(1, int(attempts))):
             pending: list[str] = []
-            validator_urls = self._validator_endpoint_urls(force_refresh=attempt > 0)
+            all_validator_urls = self._validator_endpoint_urls(force_refresh=attempt > 0)
+            validator_urls = all_validator_urls
             if audit_id:
                 validator_urls = tuple(
                     base for base in validator_urls if not self._validator_rejected_audit(base, audit_id)
                 )
             if not validator_urls:
-                bt.logging.warning(
+                message = (
                     f"Capacity audit publish has no validator endpoints: "
                     f"audit_id={audit_id[:12]} "
                     f"type={artifact_type}"
                 )
-                return
+                if audit_id and all_validator_urls:
+                    bt.logging.info(
+                        f"{message}; slot was not scheduled by known validators"
+                    )
+                else:
+                    bt.logging.warning(message)
+                return accepted
 
             def _post(base: str):
                 try:
@@ -1827,17 +1845,25 @@ class CapacityAuditMinerWorker:
                         continue
                     if resp.status_code < 300:
                         self._record_validator_publish_result(base, True)
+                        accepted += 1
                         continue
                     retryable = resp.status_code in (409, 425, 429, 500, 502, 503, 504)
+                    if self._is_unknown_audit_slot_response(resp.status_code, resp.text):
+                        bt.logging.info(
+                            f"Capacity audit validator did not schedule slot: "
+                            f"audit_id={audit_id[:12]} type={artifact_type} "
+                            f"B_select={artifact.get('B_select')} "
+                            f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
+                            f"url={base}{path}"
+                        )
+                        self._record_validator_audit_rejection(base, audit_id)
+                        continue
                     bt.logging.warning(
                         f"Capacity audit publish failed: audit_id={audit_id[:12]} "
                         f"type={artifact_type} B_select={artifact.get('B_select')} "
                         f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
                         f"url={base}{path} status={resp.status_code} body={resp.text[:200]}"
                     )
-                    if self._is_unknown_audit_slot_response(resp.status_code, resp.text):
-                        self._record_validator_audit_rejection(base, audit_id)
-                        continue
                     failure_kind = self._validator_endpoint_failure_kind(resp.status_code)
                     if failure_kind:
                         self._record_validator_publish_result(
@@ -1848,8 +1874,9 @@ class CapacityAuditMinerWorker:
                     if retryable:
                         pending.append(base)
             if not pending or attempt + 1 >= max(1, int(attempts)):
-                return
+                return accepted
             time.sleep(max(0.1, float(retry_delay_s)))
+        return accepted
 
     def _validator_rejected_audit(self, endpoint: str, audit_id: str) -> bool:
         rejected = getattr(self, "_audit_endpoint_rejections", None)
