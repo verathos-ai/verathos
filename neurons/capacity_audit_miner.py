@@ -1649,7 +1649,7 @@ class CapacityAuditMinerWorker:
                     f"audit_id={audit_slot.audit_id[:12]}"
                 )
             else:
-                accepted = self._publish_proof(proof_payload)
+                accepted = self._publish_proof(proof_payload) or 0
                 if accepted > 0:
                     bt.logging.info(
                         f"Capacity audit artifacts published: "
