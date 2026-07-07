@@ -38,6 +38,7 @@ class SubnetRuntimeConfigError(ValueError):
 @dataclass(frozen=True)
 class MaintenanceGraceConfig:
     enabled: bool = False
+    open_ended: bool = False
     until_epoch: Optional[int] = None
     until_unix_ts: Optional[int] = None
     reason: str = ""
@@ -290,6 +291,7 @@ def _parse_maintenance_grace(payload: Mapping[str, Any]) -> MaintenanceGraceConf
 
     cfg = MaintenanceGraceConfig(
         enabled=_optional_bool(raw, "enabled", False),
+        open_ended=_optional_bool(raw, "open_ended", False),
         until_epoch=_optional_nullable_int(raw, "until_epoch", None, minimum=0),
         until_unix_ts=_optional_nullable_int(raw, "until_unix_ts", None, minimum=0),
         reason=_optional_str(raw, "reason", "", maximum_length=160),
@@ -299,9 +301,14 @@ def _parse_maintenance_grace(payload: Mapping[str, Any]) -> MaintenanceGraceConf
         suppress_report_offline=_optional_bool(raw, "suppress_report_offline", True),
         suppress_proxy_proof_strikes=_optional_bool(raw, "suppress_proxy_proof_strikes", True),
     )
-    if cfg.enabled and cfg.until_epoch is None and cfg.until_unix_ts is None:
+    if (
+        cfg.enabled
+        and not cfg.open_ended
+        and cfg.until_epoch is None
+        and cfg.until_unix_ts is None
+    ):
         raise SubnetRuntimeConfigError(
-            "maintenance_grace requires until_epoch or until_unix_ts when enabled"
+            "maintenance_grace requires open_ended, until_epoch, or until_unix_ts when enabled"
         )
     return cfg
 
@@ -314,6 +321,8 @@ def maintenance_grace_active(
 ) -> bool:
     if grace is None or not grace.enabled:
         return False
+    if grace.open_ended:
+        return True
     epoch_active = False
     if grace.until_epoch is not None and current_epoch is not None:
         epoch_active = int(current_epoch) <= int(grace.until_epoch)
@@ -722,6 +731,7 @@ def apply_runtime_config_to_neuron_config(
     )
     grace = runtime.maintenance_grace
     config.maintenance_grace_enabled = grace.enabled
+    config.maintenance_grace_open_ended = grace.open_ended
     config.maintenance_grace_until_epoch = grace.until_epoch
     config.maintenance_grace_until_unix_ts = grace.until_unix_ts
     config.maintenance_grace_reason = grace.reason
@@ -740,6 +750,7 @@ def apply_runtime_config_to_neuron_config(
 def maintenance_grace_config_from_neuron_config(config: Any) -> MaintenanceGraceConfig:
     return MaintenanceGraceConfig(
         enabled=bool(getattr(config, "maintenance_grace_enabled", False)),
+        open_ended=bool(getattr(config, "maintenance_grace_open_ended", False)),
         until_epoch=getattr(config, "maintenance_grace_until_epoch", None),
         until_unix_ts=getattr(config, "maintenance_grace_until_unix_ts", None),
         reason=str(getattr(config, "maintenance_grace_reason", "") or ""),

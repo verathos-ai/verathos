@@ -85,6 +85,7 @@ class NeuronConfig(ChainConfig):
     # Operator-controlled maintenance grace. Intended for coordinated releases
     # where validators should keep measuring but temporarily avoid penalties.
     maintenance_grace_enabled: bool = False
+    maintenance_grace_open_ended: bool = False
     maintenance_grace_until_epoch: int | None = None
     maintenance_grace_until_unix_ts: int | None = None
     maintenance_grace_reason: str = ""
@@ -169,6 +170,7 @@ class NeuronConfig(ChainConfig):
             "subnet_config_cache_path": "VERATHOS_SUBNET_CONFIG_CACHE_PATH",
             "subnet_config_disable": "VERATHOS_SUBNET_CONFIG_DISABLE",
             "maintenance_grace_enabled": "VERATHOS_MAINTENANCE_GRACE_ENABLED",
+            "maintenance_grace_open_ended": "VERATHOS_MAINTENANCE_GRACE_OPEN_ENDED",
             "maintenance_grace_until_epoch": "VERATHOS_MAINTENANCE_GRACE_UNTIL_EPOCH",
             "maintenance_grace_until_unix_ts": "VERATHOS_MAINTENANCE_GRACE_UNTIL_UNIX_TS",
             "maintenance_grace_reason": "VERATHOS_MAINTENANCE_GRACE_REASON",
@@ -253,6 +255,7 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_serve_axon",
             "subnet_config_disable",
             "maintenance_grace_enabled",
+            "maintenance_grace_open_ended",
             "maintenance_grace_suppress_score_zeroing",
             "maintenance_grace_suppress_probation",
             "maintenance_grace_suppress_capacity_score_gate",
