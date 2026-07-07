@@ -12,6 +12,7 @@ import ipaddress
 import json
 import math
 import random
+import re
 import struct
 import time
 from dataclasses import dataclass, field
@@ -891,10 +892,17 @@ def select_capacity_audit_slots(
     return sorted(selected, key=lambda s: (s.address_lower, s.model_index, s.endpoint))
 
 
+def _canonical_gpu_name(gpu_name: str) -> str:
+    normalized = " ".join(str(gpu_name or "").strip().lower().split())
+    normalized = normalized.replace("pci-e", "pcie").replace("pci e", "pcie")
+    normalized = re.sub(r"\b(\d{2,3})\s*g(?:b)?\b", r"\1gb", normalized)
+    return normalized
+
+
 def match_gpu_class(gpu_name: str, vram_gb: int, cfg: CapacityAuditRuntimeConfig) -> CapacityGpuClass | None:
-    normalized = (gpu_name or "").strip().lower()
+    normalized = _canonical_gpu_name(gpu_name)
     for row in cfg.gpu_classes:
-        if row.match_gpu_name.strip().lower() != normalized:
+        if _canonical_gpu_name(row.match_gpu_name) != normalized:
             continue
         if row.vram_gb and vram_gb and abs(int(vram_gb) - int(row.vram_gb)) > 2:
             continue

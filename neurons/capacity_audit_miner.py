@@ -968,9 +968,18 @@ class CapacityAuditMinerWorker:
         )
         supported = self._supported_local_slot(selection_slot, miner)
         if supported is None:
+            observed_gpu_name = getattr(miner, "gpu_name", "") or ""
+            observed_vram_gb = int(getattr(miner, "vram_gb", 0) or 0)
+            reason = (
+                "missing_health_metadata"
+                if not observed_gpu_name or observed_vram_gb <= 0
+                else "unsupported_or_uncalibrated_gpu_class"
+            )
             bt.logging.warning(
                 "Capacity audit selected this endpoint but local GPU is not calibrated "
-                f"or health metadata is unavailable: audit_id={audit_id[:12]}"
+                f"or health metadata is unavailable: audit_id={audit_id[:12]} "
+                f"reason={reason} gpu_name={observed_gpu_name or '<empty>'} "
+                f"vram_gb={observed_vram_gb} health_url_count={len(self._health_urls_for_miner(miner))}"
             )
             return []
         supported_slot, row = supported
