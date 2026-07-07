@@ -36,6 +36,19 @@ class SubnetRuntimeConfigError(ValueError):
 
 
 @dataclass(frozen=True)
+class MaintenanceGraceConfig:
+    enabled: bool = False
+    until_epoch: Optional[int] = None
+    until_unix_ts: Optional[int] = None
+    reason: str = ""
+    suppress_score_zeroing: bool = True
+    suppress_probation: bool = True
+    suppress_capacity_score_gate: bool = True
+    suppress_report_offline: bool = True
+    suppress_proxy_proof_strikes: bool = True
+
+
+@dataclass(frozen=True)
 class RuntimeSubnetConfig:
     schema_version: int
     version: int
@@ -59,6 +72,7 @@ class RuntimeSubnetConfig:
     capacity_audit_slot_refresh_blocks: int
     capacity_audit_slot_snapshot_stale_blocks: int
     capacity_audit_proof_verify_workers: int
+    maintenance_grace: MaintenanceGraceConfig
     payload: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
     source: str = ""
 
@@ -181,6 +195,57 @@ def _require_str(
     return out
 
 
+def _optional_bool(
+    data: Mapping[str, Any],
+    key: str,
+    default: bool,
+) -> bool:
+    if key not in data:
+        return bool(default)
+    value = data[key]
+    if not isinstance(value, bool):
+        raise SubnetRuntimeConfigError(f"{key} must be boolean")
+    return bool(value)
+
+
+def _optional_nullable_int(
+    data: Mapping[str, Any],
+    key: str,
+    default: int | None,
+    *,
+    minimum: int | None = None,
+) -> int | None:
+    if key not in data:
+        return default
+    value = data[key]
+    if value is None:
+        return None
+    _reject_bool(value, key)
+    if not isinstance(value, int):
+        raise SubnetRuntimeConfigError(f"{key} must be an integer or null")
+    if minimum is not None and value < minimum:
+        raise SubnetRuntimeConfigError(f"{key} must be >= {minimum}")
+    return int(value)
+
+
+def _optional_str(
+    data: Mapping[str, Any],
+    key: str,
+    default: str,
+    *,
+    maximum_length: int | None = None,
+) -> str:
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, str):
+        raise SubnetRuntimeConfigError(f"{key} must be a string")
+    out = value.strip()
+    if maximum_length is not None and len(out) > maximum_length:
+        raise SubnetRuntimeConfigError(f"{key} must be <= {maximum_length} characters")
+    return out
+
+
 def _gpu_class_to_dict(row: CapacityGpuClass) -> dict[str, Any]:
     return dict(asdict(row))
 
@@ -210,6 +275,54 @@ def _parse_gpu_classes(data: Mapping[str, Any]) -> tuple[CapacityGpuClass, ...]:
     if not isinstance(raw, list) or not raw:
         raise SubnetRuntimeConfigError("capacity_audit.gpu_classes must be a non-empty list")
     return tuple(_parse_gpu_class(row, idx) for idx, row in enumerate(raw))
+
+
+def _maintenance_grace_to_dict(row: MaintenanceGraceConfig) -> dict[str, Any]:
+    return dict(asdict(row))
+
+
+def _parse_maintenance_grace(payload: Mapping[str, Any]) -> MaintenanceGraceConfig:
+    raw = payload.get("maintenance_grace", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise SubnetRuntimeConfigError("maintenance_grace must be an object")
+
+    cfg = MaintenanceGraceConfig(
+        enabled=_optional_bool(raw, "enabled", False),
+        until_epoch=_optional_nullable_int(raw, "until_epoch", None, minimum=0),
+        until_unix_ts=_optional_nullable_int(raw, "until_unix_ts", None, minimum=0),
+        reason=_optional_str(raw, "reason", "", maximum_length=160),
+        suppress_score_zeroing=_optional_bool(raw, "suppress_score_zeroing", True),
+        suppress_probation=_optional_bool(raw, "suppress_probation", True),
+        suppress_capacity_score_gate=_optional_bool(raw, "suppress_capacity_score_gate", True),
+        suppress_report_offline=_optional_bool(raw, "suppress_report_offline", True),
+        suppress_proxy_proof_strikes=_optional_bool(raw, "suppress_proxy_proof_strikes", True),
+    )
+    if cfg.enabled and cfg.until_epoch is None and cfg.until_unix_ts is None:
+        raise SubnetRuntimeConfigError(
+            "maintenance_grace requires until_epoch or until_unix_ts when enabled"
+        )
+    return cfg
+
+
+def maintenance_grace_active(
+    grace: MaintenanceGraceConfig | None,
+    *,
+    current_epoch: int | None = None,
+    now: float | None = None,
+) -> bool:
+    if grace is None or not grace.enabled:
+        return False
+    epoch_active = False
+    if grace.until_epoch is not None and current_epoch is not None:
+        epoch_active = int(current_epoch) <= int(grace.until_epoch)
+    time_active = False
+    if grace.until_unix_ts is not None:
+        time_active = float(now if now is not None else time.time()) <= float(
+            grace.until_unix_ts
+        )
+    return epoch_active or time_active
 
 
 def build_default_subnet_config_payload(
@@ -308,6 +421,9 @@ def build_default_subnet_config_payload(
             "proof_verify_workers": int(neuron_config.capacity_audit_proof_verify_workers),
             "gpu_classes": [_gpu_class_to_dict(row) for row in DEFAULT_GPU_CLASSES],
         },
+        "maintenance_grace": _maintenance_grace_to_dict(
+            maintenance_grace_config_from_neuron_config(neuron_config)
+        ),
     }
 
 
@@ -444,6 +560,7 @@ def validate_subnet_config_payload(
         audit_data, "slot_snapshot_stale_blocks", minimum=0
     )
     proof_verify_workers = _require_int(audit_data, "proof_verify_workers", minimum=1)
+    maintenance_grace = _parse_maintenance_grace(payload)
 
     normalized = build_default_subnet_config_payload(
         scoring=scoring,
@@ -500,6 +617,7 @@ def validate_subnet_config_payload(
         "proof_verify_workers": proof_verify_workers,
         "gpu_classes": [_gpu_class_to_dict(row) for row in gpu_classes],
     }
+    normalized["maintenance_grace"] = _maintenance_grace_to_dict(maintenance_grace)
 
     return RuntimeSubnetConfig(
         schema_version=schema_version,
@@ -524,6 +642,7 @@ def validate_subnet_config_payload(
         capacity_audit_slot_refresh_blocks=slot_refresh_blocks,
         capacity_audit_slot_snapshot_stale_blocks=slot_snapshot_stale_blocks,
         capacity_audit_proof_verify_workers=proof_verify_workers,
+        maintenance_grace=maintenance_grace,
         payload=normalized,
         source=source,
     )
@@ -601,7 +720,45 @@ def apply_runtime_config_to_neuron_config(
     config.capacity_audit_proof_verify_workers = (
         runtime.capacity_audit_proof_verify_workers
     )
+    grace = runtime.maintenance_grace
+    config.maintenance_grace_enabled = grace.enabled
+    config.maintenance_grace_until_epoch = grace.until_epoch
+    config.maintenance_grace_until_unix_ts = grace.until_unix_ts
+    config.maintenance_grace_reason = grace.reason
+    config.maintenance_grace_suppress_score_zeroing = grace.suppress_score_zeroing
+    config.maintenance_grace_suppress_probation = grace.suppress_probation
+    config.maintenance_grace_suppress_capacity_score_gate = (
+        grace.suppress_capacity_score_gate
+    )
+    config.maintenance_grace_suppress_report_offline = grace.suppress_report_offline
+    config.maintenance_grace_suppress_proxy_proof_strikes = (
+        grace.suppress_proxy_proof_strikes
+    )
     return config
+
+
+def maintenance_grace_config_from_neuron_config(config: Any) -> MaintenanceGraceConfig:
+    return MaintenanceGraceConfig(
+        enabled=bool(getattr(config, "maintenance_grace_enabled", False)),
+        until_epoch=getattr(config, "maintenance_grace_until_epoch", None),
+        until_unix_ts=getattr(config, "maintenance_grace_until_unix_ts", None),
+        reason=str(getattr(config, "maintenance_grace_reason", "") or ""),
+        suppress_score_zeroing=bool(
+            getattr(config, "maintenance_grace_suppress_score_zeroing", True)
+        ),
+        suppress_probation=bool(
+            getattr(config, "maintenance_grace_suppress_probation", True)
+        ),
+        suppress_capacity_score_gate=bool(
+            getattr(config, "maintenance_grace_suppress_capacity_score_gate", True)
+        ),
+        suppress_report_offline=bool(
+            getattr(config, "maintenance_grace_suppress_report_offline", True)
+        ),
+        suppress_proxy_proof_strikes=bool(
+            getattr(config, "maintenance_grace_suppress_proxy_proof_strikes", True)
+        ),
+    )
 
 
 def capacity_audit_config_from_neuron_config(config: Any) -> CapacityAuditRuntimeConfig:

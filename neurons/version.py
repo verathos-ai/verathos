@@ -92,7 +92,7 @@ miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 
 VALIDATOR_MAJOR = 0
 VALIDATOR_MINOR = 1
-VALIDATOR_PATCH = 21
+VALIDATOR_PATCH = 22
 
 validator_version: int = _encode(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)
 validator_version_str: str = _version_str(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)

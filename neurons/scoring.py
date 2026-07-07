@@ -237,6 +237,7 @@ def compute_epoch_entry_score(
     peer_medians: Optional[PeerMedians] = None,
     tee_bonus: float = 1.0,
     demand_bonus: float = 1.0,
+    suppress_hard_failures: bool = False,
 ) -> Optional[float]:
     """Compute a single entry's score for one epoch from receipt data.
 
@@ -267,22 +268,25 @@ def compute_epoch_entry_score(
             return None
         threshold = max(1, outcome.expected_own_receipt_count - 1)
         if len(outcome.own_receipts) < threshold:
-            bt.logging.info(f"Receipt integrity failure for {_who} model_index={outcome.model_index}: expected {outcome.expected_own_receipt_count} own receipts, found {len(outcome.own_receipts)} -> score=0")
-            return 0.0
+            action = "score update suppressed" if suppress_hard_failures else "score=0"
+            bt.logging.info(f"Receipt integrity failure for {_who} model_index={outcome.model_index}: expected {outcome.expected_own_receipt_count} own receipts, found {len(outcome.own_receipts)} -> {action}")
+            return None if suppress_hard_failures else 0.0
 
     # Proof verification failure: any failed proof -> hard penalty.
     # Use INFO not WARNING — the validator did its job correctly, the
     # miner is the one with the problem.  Operators don't need to be
     # paged for cheating / faulty miners.
     if outcome.proof_tests > 0 and outcome.proof_failures > 0:
-        bt.logging.info(f"Proof verification failure for {_who} model_index={outcome.model_index}: {outcome.proof_failures}/{outcome.proof_tests} proofs failed -> score=0")
-        return 0.0
+        action = "score update suppressed" if suppress_hard_failures else "score=0"
+        bt.logging.info(f"Proof verification failure for {_who} model_index={outcome.model_index}: {outcome.proof_failures}/{outcome.proof_tests} proofs failed -> {action}")
+        return None if suppress_hard_failures else 0.0
 
     # TEE attestation failure: any failed attestation -> hard penalty.
     # Same rationale: miner-side failure, not a validator issue.
     if outcome.tee_tests > 0 and outcome.tee_failures > 0:
-        bt.logging.info(f"TEE attestation failure for {_who} model_index={outcome.model_index}: {outcome.tee_failures}/{outcome.tee_tests} attestations failed -> score=0")
-        return 0.0
+        action = "score update suppressed" if suppress_hard_failures else "score=0"
+        bt.logging.info(f"TEE attestation failure for {_who} model_index={outcome.model_index}: {outcome.tee_failures}/{outcome.tee_tests} attestations failed -> {action}")
+        return None if suppress_hard_failures else 0.0
 
     # No receipts at all -> not tested / unreachable (EMA unchanged)
     if not outcome.all_receipts:
@@ -349,7 +353,7 @@ def compute_epoch_entry_score(
 
     total_tokens = min(canary_tokens, canary_tokens_budget) + organic_tokens
     if total_tokens <= 0:
-        return 0.0
+        return None if suppress_hard_failures else 0.0
 
     # Extract latency: split canary vs organic, take WORSE (max) of the two
     # medians when both are statistically meaningful.  This neutralizes any
@@ -658,6 +662,7 @@ class CompositeScorer:
         demand_bonus: float = 1.0,
         peer_medians: Optional[PeerMedians] = None,
         tee_bonus: float = 1.0,
+        suppress_hard_failures: bool = False,
     ) -> Optional[float]:
         """Update score for a single entry based on an epoch outcome.
 
@@ -698,6 +703,7 @@ class CompositeScorer:
             peer_medians=peer_medians,
             tee_bonus=tee_bonus,
             demand_bonus=demand_bonus,
+            suppress_hard_failures=suppress_hard_failures,
         )
 
         self._update_entry_ema(entry, epoch_score)

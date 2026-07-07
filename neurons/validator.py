@@ -77,9 +77,12 @@ from neurons.capacity_audit_combined import (
 from neurons.config import NeuronConfig
 from neurons.discovery import ActiveMiner, discover_active_miners
 from neurons.subnet_runtime_config import (
+    MaintenanceGraceConfig,
     RuntimeSubnetConfigClient,
     apply_runtime_config_to_neuron_config,
     capacity_audit_config_from_neuron_config,
+    maintenance_grace_active,
+    maintenance_grace_config_from_neuron_config,
 )
 from neurons.model_resolve import validate_capacity_recommended_model
 from neurons.version import spec_version, version_str, validator_version, validator_version_str
@@ -464,6 +467,7 @@ class ValidatorNeuron:
         self._capacity_audit_verifier_unhealthy = False
         self._capacity_audit_verifier_last_error = ""
         self._capacity_audit_cfg = capacity_audit_config_from_neuron_config(config)
+        self._maintenance_grace_cfg = maintenance_grace_config_from_neuron_config(config)
         self._subnet_runtime_config_client = RuntimeSubnetConfigClient.from_config(
             config,
             log=bt.logging,
@@ -519,6 +523,7 @@ class ValidatorNeuron:
         self._scoring = runtime.scoring
         self._last_good_scoring = runtime.scoring
         self._capacity_audit_cfg = runtime.capacity_audit
+        self._maintenance_grace_cfg = runtime.maintenance_grace
         self._probation_tracker.required_passes = runtime.scoring.probation_required_passes
         self._probation_tracker.escalation_epochs = runtime.probation_escalation_epochs
         for state in getattr(self._probation_tracker, "_probation", {}).values():
@@ -544,6 +549,34 @@ class ValidatorNeuron:
             f"authoritative={authoritative}"
         )
         return True
+
+    def _maintenance_grace_active(
+        self,
+        *,
+        current_epoch: int | None = None,
+        action: str | None = None,
+    ) -> bool:
+        cfg: MaintenanceGraceConfig = getattr(
+            self,
+            "_maintenance_grace_cfg",
+            maintenance_grace_config_from_neuron_config(self.config),
+        )
+        epoch = current_epoch
+        if epoch is None:
+            epoch = getattr(self, "_current_epoch", None)
+        if not maintenance_grace_active(cfg, current_epoch=epoch):
+            return False
+        if action is None:
+            return True
+        return bool(getattr(cfg, action, False))
+
+    def _maintenance_grace_reason(self) -> str:
+        cfg: MaintenanceGraceConfig = getattr(
+            self,
+            "_maintenance_grace_cfg",
+            maintenance_grace_config_from_neuron_config(self.config),
+        )
+        return cfg.reason or "maintenance grace"
 
     @property
     def _subtensor(self):
@@ -2571,6 +2604,23 @@ class ValidatorNeuron:
     ) -> bool:
         cfg = self._capacity_audit_cfg
         if not cfg.enabled or cfg.mode not in ("score_gate", "enforce"):
+            return False
+        if self._maintenance_grace_active(
+            current_epoch=epoch_number,
+            action="suppress_capacity_score_gate",
+        ):
+            if epoch_number is not None:
+                logged_epoch = getattr(
+                    self,
+                    "_capacity_audit_grace_log_epoch",
+                    None,
+                )
+                if logged_epoch != int(epoch_number):
+                    self._capacity_audit_grace_log_epoch = int(epoch_number)
+                    bt.logging.info(
+                        "Capacity audit enforcement disabled for this epoch: "
+                        f"{self._maintenance_grace_reason()}"
+                    )
             return False
         if bool(getattr(self, "_subnet_runtime_config_authoritative", False)):
             return True
@@ -4866,6 +4916,10 @@ class ValidatorNeuron:
                     model_bps, self._scoring.demand_bonus_max,
                 )
 
+            suppress_score_zeroing = self._maintenance_grace_active(
+                current_epoch=epoch_number,
+                action="suppress_score_zeroing",
+            )
             epoch_score = self.scorer.update(
                 uid=uid,
                 address=miner.address,
@@ -4877,6 +4931,7 @@ class ValidatorNeuron:
                 demand_bonus=demand_bonus,
                 peer_medians=peer_medians_by_model.get(miner.model_id),
                 tee_bonus=self._scoring.tee_bonus,
+                suppress_hard_failures=suppress_score_zeroing,
             )
             gated = self._apply_capacity_audit_model_gate(
                 miner.address,
@@ -4960,13 +5015,22 @@ class ValidatorNeuron:
 
             if had_proof_failure:
                 # Enter or reset probation (mid-epoch may have already entered)
-                self._probation_tracker.enter_probation(
-                    key, epoch_number, endpoint=getattr(miner, 'endpoint', ''))
-                self._db.enter_probation(
-                    miner.address, miner.model_index, epoch_number,
-                    uid=uid if uid is not None else -1,
-                    hotkey_ss58=getattr(miner, "hotkey_ss58", "") or "",
-                )
+                if self._maintenance_grace_active(
+                    current_epoch=epoch_number,
+                    action="suppress_probation",
+                ):
+                    bt.logging.info(
+                        f"Maintenance grace suppressed probation for {miner.address[:10]} "
+                        f"model_index={miner.model_index}: {self._maintenance_grace_reason()}"
+                    )
+                else:
+                    self._probation_tracker.enter_probation(
+                        key, epoch_number, endpoint=getattr(miner, 'endpoint', ''))
+                    self._db.enter_probation(
+                        miner.address, miner.model_index, epoch_number,
+                        uid=uid if uid is not None else -1,
+                        hotkey_ss58=getattr(miner, "hotkey_ss58", "") or "",
+                    )
             elif self._probation_tracker.is_on_probation(key):
                 if outcome.proof_tests > 0 and outcome.proof_failures == 0:
                     # All proofs passed this epoch — record clean pass
@@ -5077,13 +5141,22 @@ class ValidatorNeuron:
                 and not (r.proof_requested and not r.proof_verified)
             )
             had_strike_last_epoch = key in self._zero_fc_last_epoch
+            suppress_probation = self._maintenance_grace_active(
+                current_epoch=epoch_number,
+                action="suppress_probation",
+            )
             if (
                 fc_succeeded == 0
                 and not had_proof_failure
                 and not self._probation_tracker.is_on_probation(key)
             ):
                 organic_count = sum(1 for r in all_receipts if not r.is_canary)
-                if organic_count >= 3:
+                if suppress_probation:
+                    bt.logging.info(
+                        f"Maintenance grace suppressed capability failure for {miner.address[:10]} "
+                        f"model_index={miner.model_index}: {self._maintenance_grace_reason()}"
+                    )
+                elif organic_count >= 3:
                     bt.logging.info(
                         f"Full-context capability DEFERRED for {miner.address[:10]} "
                         f"model_index={miner.model_index} ({organic_count} organic "
@@ -5111,7 +5184,7 @@ class ValidatorNeuron:
                         miner.address, miner.model_index,
                         endpoint=getattr(miner, 'endpoint', ''))
             # Update the two-strike tracker for next epoch's decision.
-            if fc_succeeded == 0:
+            if fc_succeeded == 0 and not suppress_probation:
                 self._zero_fc_last_epoch.add(key)
             else:
                 self._zero_fc_last_epoch.discard(key)
@@ -5633,6 +5706,13 @@ class ValidatorNeuron:
         offenders while keeping single failures recoverable.
         """
         key = self._miner_model_key(miner_address, model_index)
+        if self._maintenance_grace_active(action="suppress_probation"):
+            bt.logging.info(
+                f"Maintenance grace suppressed proof-failure probation for "
+                f"{miner_address[:10]} model_index={model_index}: "
+                f"{self._maintenance_grace_reason()}"
+            )
+            return
         # Look up UID + SS58 for human-readable logging.  These are only
         # used for log messages — the DB row itself is keyed on
         # (address, model_index).
@@ -6059,6 +6139,12 @@ class ValidatorNeuron:
             bt.logging.debug(
                 f"EVM disabled — skipping reportOffline for {miner.address[:10]} "
                 f"model_index={miner.model_index} (other validators + 24h lease handle it)"
+            )
+            return
+        if self._maintenance_grace_active(action="suppress_report_offline"):
+            bt.logging.info(
+                f"Maintenance grace suppressed reportOffline for {miner.address[:10]} "
+                f"model_index={miner.model_index}: {self._maintenance_grace_reason()}"
             )
             return
         try:
