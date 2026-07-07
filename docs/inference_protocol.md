@@ -2,6 +2,8 @@
 
 How Verathos cryptographically verifies that miners run the correct model and compute results honestly, without the validator needing a GPU.
 
+For the full technical proof line, see the [Proof Protocol Whitepaper](proof_protocol.md).
+
 ## Overview
 
 The Verathos inference protocol is a probabilistic verification system for LLM inference. It proves that a miner ran a specific model with committed weights, without the validator needing to run the model.
@@ -287,5 +289,6 @@ See the [User Guide: TEE Inference](user_guide.md#tee-inference-trusted-executio
 
 ## See Also
 
+- [Proof Protocol Whitepaper](proof_protocol.md) - full proof line, transcript, challenge derivation, and verification details
 - [Bittensor Integration](bittensor_integration.md) - how the subnet uses proofs for scoring, epochs, and weight setting
 - [API Reference](api.md) - HTTP protocol for inference requests
