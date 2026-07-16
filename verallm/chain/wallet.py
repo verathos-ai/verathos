@@ -33,7 +33,7 @@ def sign_evm_registration(
     Returns:
         ``(sig_r, sig_s)`` — each 32 bytes, ready for the contract call.
     """
-    from substrateinterface import Keypair
+    from bittensor_wallet import Keypair
     from web3 import Web3
 
     # Replicate Solidity: keccak256(abi.encodePacked(msg.sender, uid, netuid, address(this)))
@@ -139,6 +139,11 @@ def _ss58_encode(public_key: bytes, ss58_format: int = 42) -> str:
     return _base58_encode(payload + checksum)
 
 
+def ss58_encode(public_key: bytes, ss58_format: int = 42) -> str:
+    """Encode a 32-byte AccountId as an SS58 address."""
+    return _ss58_encode(public_key, ss58_format)
+
+
 _BASE58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
@@ -190,8 +195,8 @@ def _base58_decode(s: str) -> bytes:
         if idx < 0:
             raise ValueError(f"Invalid base58 character: {char!r}")
         n += idx
-    # Count leading '1's → leading zero bytes
-    leading = sum(1 for c in s if c == "1")
+    # Only the leading run of '1' characters represents zero bytes.
+    leading = len(s) - len(s.lstrip("1"))
     result = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
     return b"\x00" * leading + result
 

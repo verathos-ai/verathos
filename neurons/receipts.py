@@ -250,7 +250,7 @@ def sign_receipt(receipt: ServiceReceipt, hotkey_seed: bytes) -> ServiceReceipt:
     Returns:
         A new ServiceReceipt with ``validator_signature`` populated.
     """
-    from substrateinterface import Keypair
+    from bittensor_wallet import Keypair
 
     message = encode_receipt_message(receipt)
     keypair = Keypair.create_from_seed(hotkey_seed[:32].hex())
@@ -331,8 +331,8 @@ def verify_service_receipt(
         return False
 
     try:
-        from scalecodec.utils.ss58 import ss58_encode
-        from substrateinterface import Keypair
+        from bittensor_wallet import Keypair
+        from verallm.chain.wallet import ss58_encode
 
         ss58 = ss58_encode(receipt.validator_hotkey)
         if authority.lookup(ss58) is None:
@@ -374,8 +374,8 @@ def verify_receipt_timing_signature(receipt: ServiceReceipt) -> bool:
     if len(getattr(receipt, "timing_signature", b"") or b"") != 64:
         return False
     try:
-        from scalecodec.utils.ss58 import ss58_encode
-        from substrateinterface import Keypair
+        from bittensor_wallet import Keypair
+        from verallm.chain.wallet import ss58_encode
 
         ss58 = ss58_encode(receipt.validator_hotkey)
         kp = Keypair(ss58_address=ss58)

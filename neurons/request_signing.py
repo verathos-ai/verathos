@@ -75,7 +75,7 @@ def sign_request(
     Returns:
         Dict of headers to add to the request.
     """
-    from substrateinterface import Keypair
+    from bittensor_wallet import Keypair
 
     timestamp = str(int(time.time()))
     message = build_signing_message(method, path, body, timestamp)
@@ -111,7 +111,7 @@ def verify_request(
     Returns:
         (ok, reason) — True if valid, False with reason string.
     """
-    from substrateinterface import Keypair
+    from bittensor_wallet import Keypair
 
     # Check timestamp freshness
     try:

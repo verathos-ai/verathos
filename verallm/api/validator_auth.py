@@ -8,7 +8,7 @@ Exempt endpoints: /health, /model_spec (always public, rate-limited per IP).
 
 Package boundary: this module does NOT import bittensor. The metagraph
 lookup is done in neurons/miner.py which writes the allowlist file.
-Signature verification uses substrateinterface (Sr25519).
+Signature verification uses bittensor-wallet (Sr25519).
 """
 
 from __future__ import annotations

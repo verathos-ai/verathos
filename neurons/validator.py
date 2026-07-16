@@ -681,7 +681,7 @@ class ValidatorNeuron:
         # permitted validator.  The 32-byte ``_validator_hotkey_bytes`` is
         # the raw Sr25519 public key — equivalently, the bytes underlying
         # ``_validator_hotkey_ss58``.
-        from substrateinterface import Keypair as _Keypair
+        from bittensor_wallet import Keypair as _Keypair
         _kp = _Keypair.create_from_seed(hotkey_seed[:32].hex())
         self._validator_hotkey_bytes = _kp.public_key
         self._validator_private_key = hotkey_seed

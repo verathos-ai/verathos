@@ -854,10 +854,7 @@ if [ "$SKIP_INSTALL" = false ]; then
     $PYTHON -m pip install --no-cache-dir -e ".[neurons]" 2>&1 | tail -20
     fix_ld_library_path
 
-    # Pin async-substrate-interface <2: ASI 2.0 breaks bittensor 10.x
-    # (removes ScaleObj) and introduces scalecodec/cyscale namespace conflict.
-    # Force downgrade if 2.x was pulled transitively.
-    $PYTHON -m pip install --no-cache-dir 'async-substrate-interface>=1.6,<2' 2>&1 | tail -3
+    $PYTHON -c 'import neurons; import bittensor as bt; assert bt.__version__ == "10.3.2"'
 
     # Defensive pin: kernels 0.13.0 (released 2026-04-11) ships a
     # `str | None` annotation in PythonPackage.import_name that breaks

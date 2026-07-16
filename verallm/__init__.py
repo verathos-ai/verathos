@@ -18,6 +18,10 @@ Subpackages:
     runtime/     - Runtime utilities
 """
 
+from verallm.runtime_dependency_migration import ensure_bittensor_codec_compatibility
+
+ensure_bittensor_codec_compatibility()
+
 __version__ = "0.1.0"
 
 from verallm.config import Config, ToleranceSpec
