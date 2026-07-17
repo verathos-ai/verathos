@@ -1744,14 +1744,15 @@ def _build_commitment(miner, activations, input_token_ids, output_token_ids,
                 _materialized.append(_item)
         logits_steps = _materialized
     _logits_aligned = True
+    # When the model finishes via stop token (finish_reason=stop), the final
+    # decode step can produce a token that is not counted in output_token_ids,
+    # while the compute_logits hook still captures its logits. Strip the last
+    # uncounted stop-token row before either canonical or greedy alignment
+    # checks so a benign +1 does not suppress decode commitments.
+    if is_greedy and isinstance(logits_steps, list) and len(logits_steps) == len(output_token_ids) + 1:
+        logits_steps = logits_steps[:-1]
+
     if _canonical_active:
-        # When the model finishes via stop token (finish_reason=stop),
-        # the last decode step produces a token that is NOT counted in
-        # output_token_ids, but the compute_logits hook still captures
-        # its logits.  Strip the LAST entry (the uncounted stop-token
-        # logits) to keep per_step aligned 1:1 with output_token_ids.
-        if isinstance(logits_steps, list) and len(logits_steps) == len(output_token_ids) + 1:
-            logits_steps = logits_steps[:-1]  # drop the stop-token entry
         if isinstance(logits_steps, list) and len(logits_steps) != len(output_token_ids):
             _logits_aligned = False
             bt.logging.warning(
