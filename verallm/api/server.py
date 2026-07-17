@@ -1760,6 +1760,14 @@ def _build_commitment(miner, activations, input_token_ids, output_token_ids,
                 f"Skipping decode commitment."
             )
     elif is_greedy and isinstance(logits_steps, list) and logits_steps:
+        # Stop-token off-by-one correction (mirrors the canonical branch above):
+        # a generation that finishes on a stop token produces one extra decode
+        # step whose logits the compute_logits hook captures but which is NOT
+        # counted in output_token_ids.  Strip that trailing entry so the arrays
+        # stay aligned 1:1, instead of failing the length check below and
+        # skipping the decode commitment (which yields an unverifiable proof).
+        if len(logits_steps) == len(output_token_ids) + 1:
+            logits_steps = logits_steps[:-1]
         # Captured leaves are top-K bytes: K × fp32 vals + K × int64 indices,
         # sorted by (value DESC, index ASC).  The global argmax is at
         # sorted position 0, so we just check `top_idx[0] == output_token`.
