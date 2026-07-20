@@ -1029,6 +1029,16 @@ class ProbationTracker:
             result.setdefault(addr, []).append(model_index)
         return result
 
+    def clear_address(self, address: str) -> int:
+        """Drop probation state for an identity that no longer owns its UID."""
+        address_lower = str(address).lower()
+        stale_keys = [key for key in self._probation if key[0].lower() == address_lower]
+        for key in stale_keys:
+            del self._probation[key]
+        if stale_keys:
+            self._save()
+        return len(stale_keys)
+
     def _save(self) -> None:
         """Persist probation state to disk (atomic write)."""
         data = []

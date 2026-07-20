@@ -73,6 +73,9 @@ class NeuronConfig(ChainConfig):
 
     # Shared state between validator and proxy processes
     shared_state_path: str = "/tmp/verathos_validator_state.json"
+    miner_debug_enabled: bool = False
+    miner_debug_state_path: str = "/tmp/verathos_miner_debug.json"
+    miner_debug_refresh_seconds: float = 60.0
 
     # Public subnet runtime config. This becomes the ground truth for runtime
     # tuning params once deployed; chain scoring remains fallback only.
@@ -168,6 +171,9 @@ class NeuronConfig(ChainConfig):
             "x402_gateway_address": "VERATHOS_X402_GATEWAY",
             "x402_base_rpc_url": "VERATHOS_X402_BASE_RPC",
             "shared_state_path": "VERATHOS_SHARED_STATE_PATH",
+            "miner_debug_enabled": "VERATHOS_MINER_DEBUG_ENABLED",
+            "miner_debug_state_path": "VERATHOS_MINER_DEBUG_STATE_PATH",
+            "miner_debug_refresh_seconds": "VERATHOS_MINER_DEBUG_REFRESH_SECONDS",
             "subnet_config_url": "VERATHOS_SUBNET_CONFIG_URL",
             "subnet_config_refresh_seconds": "VERATHOS_SUBNET_CONFIG_REFRESH_SECONDS",
             "subnet_config_timeout_seconds": "VERATHOS_SUBNET_CONFIG_TIMEOUT_SECONDS",
@@ -234,6 +240,7 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_uid_escalation_fraction",
             "capacity_audit_min_registration_age_s",
             "capacity_audit_worker_poll_s",
+            "miner_debug_refresh_seconds",
             "subnet_config_refresh_seconds", "subnet_config_timeout_seconds",
         }
         _int_fields = {
@@ -266,6 +273,7 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_allow_timing_only_score_gate",
             "capacity_audit_serve_axon",
             "subnet_config_disable",
+            "miner_debug_enabled",
             "maintenance_grace_enabled",
             "maintenance_grace_open_ended",
             "maintenance_grace_suppress_score_zeroing",

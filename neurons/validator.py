@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import math
 import os
 import signal
 import json
@@ -414,6 +415,12 @@ class ValidatorNeuron:
 
         # SS58 cache: EVM address (lowercase) → {hotkey_ss58, coldkey_ss58}
         self._ss58_cache: Dict[str, Dict[str, str]] = {}
+        # EVM addresses excluded because UID ownership checks show another
+        # address/hotkey now owns that numeric UID.
+        self._stale_uid_addresses: Set[str] = set()
+        self._miner_debug_cache_lock = threading.Lock()
+        self._miner_debug_refresh_in_flight = False
+        self._miner_debug_last_scheduled_at = 0.0
 
         # Epoch state
         self._current_epoch: int = 0
@@ -492,6 +499,7 @@ class ValidatorNeuron:
         # other's freshly written drains before selecting endpoint slots.
         self._capacity_audit_executor = ThreadPoolExecutor(max_workers=1)
         self._capacity_audit_discovery_executor = ThreadPoolExecutor(max_workers=1)
+        self._miner_debug_executor = ThreadPoolExecutor(max_workers=1)
         proof_workers = max(
             1,
             int(getattr(config, "capacity_audit_proof_verify_workers", 4) or 4),
@@ -1740,6 +1748,7 @@ class ValidatorNeuron:
         )
         rows: list[dict] = []
         unsupported_selected = 0
+        hotkey_lookup = getattr(self, "_get_miner_ss58", None)
         for selected_slot in selected:
             sid = slot_id(selected_slot)
             supported = supported_selected.get(sid)
@@ -1747,10 +1756,21 @@ class ValidatorNeuron:
                 unsupported_selected += 1
                 continue
             slot, gpu_row = supported
+            miner_hotkey = (
+                hotkey_lookup(slot.address_lower, "hotkey")
+                if callable(hotkey_lookup) else ""
+            )
+            if not miner_hotkey and slot.miner_uid is not None:
+                owner_lookup = getattr(self._db, "get_uid_owner", None)
+                if callable(owner_lookup):
+                    owner = owner_lookup(int(slot.miner_uid)) or {}
+                    if str(owner.get("evm_address") or "").lower() == slot.address_lower:
+                        miner_hotkey = str(owner.get("hotkey_ss58") or "")
             rows.append({
                 "miner_address": slot.address_lower,
                 "model_index": slot.model_index,
                 "miner_uid": slot.miner_uid,
+                "miner_hotkey_ss58": miner_hotkey,
                 "endpoint": slot.endpoint,
                 "model_id": slot.model_id,
                 "quant": slot.quant,
@@ -3373,6 +3393,10 @@ class ValidatorNeuron:
                                 bt.logging.warning(f"set_weights attempt {_sw_attempt}/3 failed: {_sw_err} — retrying in {_sw_delay}s")
                                 time.sleep(_sw_delay)
                 self._control_executor.submit(_set_weights_with_retry)
+
+        self._schedule_miner_debug_refresh(
+            current_epoch=block_number // max(1, int(epoch_blocks)),
+        )
 
         _wd_elapsed = time.monotonic() - _wd_t0
         if _wd_elapsed > 12.0:
@@ -6304,10 +6328,194 @@ class ValidatorNeuron:
 
     def _get_miner_ss58(self, miner_address: str, key_type: str = "hotkey") -> str:
         """O(1) lookup of miner SS58 from cache."""
-        entry = self._ss58_cache.get(miner_address.lower())
+        entry = getattr(self, "_ss58_cache", {}).get(miner_address.lower())
         if entry:
             return entry.get(f"{key_type}_ss58", "")
         return ""
+
+    def _stale_uid_identity(
+        self,
+        miner_address: str,
+        uid_val: Optional[int],
+        mg,
+    ) -> bool:
+        """True when a cached EVM→UID mapping points at a recycled UID."""
+        if uid_val is None:
+            return False
+        addr = miner_address.lower()
+        try:
+            n = int(mg.n.item())
+        except Exception:
+            n = int(getattr(mg, "n", 0) or 0)
+        if uid_val < 0 or uid_val >= n:
+            return False
+        current_hotkey = str(mg.hotkeys[uid_val] or "")
+        try:
+            cached_identity = self._db.get_cached_identity(miner_address)
+        except Exception:
+            cached_identity = {}
+        cached_hotkey = str((cached_identity or {}).get("hotkey_ss58") or "")
+
+        def _exclude(owner_addr: str = "") -> bool:
+            try:
+                ValidatorNeuron._reconcile_uid_owner_identity(
+                    self,
+                    int(uid_val),
+                    current_hotkey,
+                    str(owner_addr or "").lower(),
+                )
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Failed to retire stale UID owner: uid={uid_val} "
+                    f"address={addr[:10]}: {exc}"
+                )
+            self._stale_uid_addresses.add(addr)
+            try:
+                self._db.mark_address_inactive(addr)
+                self._db.clear_probation_for_address(addr)
+                self._db.mark_capacity_audit_address_identity_stale(addr)
+            except Exception:
+                pass
+            tracker = getattr(self, "_probation_tracker", None)
+            clear_address = getattr(tracker, "clear_address", None)
+            if callable(clear_address):
+                clear_address(addr)
+            self._ss58_cache.pop(addr, None)
+            suffix = f" current_uid_evm={owner_addr[:10]}" if owner_addr else ""
+            bt.logging.warning(
+                f"Stale miner UID association excluded: address={addr[:10]} "
+                f"uid={uid_val} cached_hotkey={cached_hotkey[:8]} "
+                f"current_hotkey={current_hotkey[:8]}{suffix}"
+            )
+            return True
+
+        try:
+            contract_owner = None
+            owner_lookup = getattr(self._miner_client, "get_registered_evm_for_uid", None)
+            if callable(owner_lookup):
+                contract_owner = owner_lookup(int(uid_val))
+            if contract_owner:
+                owner_addr = str(contract_owner).lower()
+                if owner_addr != addr:
+                    try:
+                        try:
+                            refreshed_owner = owner_lookup(int(uid_val), refresh=True)
+                        except TypeError:
+                            refreshed_owner = owner_lookup(int(uid_val))
+                    except Exception:
+                        refreshed_owner = contract_owner
+                    refreshed_addr = str(refreshed_owner or "").lower()
+                    if refreshed_addr != addr:
+                        return _exclude(refreshed_addr or owner_addr)
+                    owner_addr = refreshed_addr
+
+                if cached_hotkey and current_hotkey and cached_hotkey != current_hotkey:
+                    try:
+                        try:
+                            refreshed_owner = owner_lookup(int(uid_val), refresh=True)
+                        except TypeError:
+                            refreshed_owner = owner_lookup(int(uid_val))
+                    except Exception:
+                        refreshed_owner = None
+                    if not refreshed_owner or str(refreshed_owner).lower() != addr:
+                        return _exclude(str(refreshed_owner or "").lower())
+                return False
+        except Exception as exc:
+            bt.logging.debug(
+                f"Contract UID owner lookup failed for address={addr[:10]} "
+                f"uid={uid_val}: {exc}"
+            )
+        if not cached_hotkey or not current_hotkey or cached_hotkey == current_hotkey:
+            return False
+        return _exclude()
+
+    def _reconcile_uid_owner_identity(
+        self,
+        uid: int,
+        hotkey_ss58: str,
+        evm_address: str,
+    ) -> None:
+        """Reconcile mutable validator state with the current reusable UID owner."""
+        uid_i = int(uid)
+        address = str(evm_address).lower()
+        current_epoch = int(getattr(self, "_current_epoch", 0) or 0)
+        if current_epoch <= 0:
+            current_block = int(getattr(self, "_last_known_block", 0) or 0)
+            epoch_blocks = max(1, int(getattr(self.config, "epoch_blocks", 360) or 360))
+            current_epoch = current_block // epoch_blocks
+
+        result = self._db.reconcile_uid_owner(
+            uid_i,
+            str(hotkey_ss58 or ""),
+            address,
+            current_epoch,
+        )
+        previous = result.get("previous") or {}
+        previous_address = str(
+            previous.get("evm_address")
+            or result.get("inferred_previous_evm")
+            or ""
+        ).lower()
+        previous_hotkey = str(
+            previous.get("hotkey_ss58")
+            or result.get("inferred_previous_hotkey")
+            or ""
+        )
+        moved_from_uids = {
+            int(moved_uid)
+            for moved_uid in (result.get("moved_from_uids") or [])
+            if int(moved_uid) != uid_i
+        }
+
+        current_owners = self._db.get_uid_owners()
+        addresses = set(self._db.get_addresses_for_uid(uid_i))
+        if previous_address:
+            addresses.add(previous_address)
+        for old_address in addresses:
+            if not old_address or old_address == address:
+                continue
+            owns_another_uid = any(
+                int(other_uid) != uid_i
+                and str(owner.get("evm_address") or "").lower() == old_address
+                for other_uid, owner in current_owners.items()
+            )
+            if owns_another_uid:
+                continue
+            self._stale_uid_addresses.add(old_address)
+            self._db.mark_address_inactive(old_address)
+            self._db.clear_probation_for_address(old_address)
+            self._db.mark_capacity_audit_address_identity_stale(old_address)
+            self._ss58_cache.pop(old_address, None)
+            self._probation_tracker.clear_address(old_address)
+
+        if not result.get("changed") and not result.get("address_moved"):
+            return
+
+        if moved_from_uids or (
+            previous_address == address
+            and previous_hotkey != str(hotkey_ss58 or "")
+        ):
+            self._db.reset_address_identity_state(address)
+            self._probation_tracker.clear_address(address)
+            self._db.mark_capacity_audit_address_identity_stale(address)
+
+        for moved_uid in moved_from_uids:
+            self.scorer.states.pop(moved_uid, None)
+            self._blacklisted_uids.discard(moved_uid)
+            if isinstance(getattr(self, "_last_weights", None), dict):
+                self._last_weights[moved_uid] = 0.0
+        self.scorer.states[uid_i] = MinerScoreState(uid=uid_i, address=address)
+        if address in getattr(self, "_blacklisted_addresses", set()):
+            self._blacklisted_uids.add(uid_i)
+        else:
+            self._blacklisted_uids.discard(uid_i)
+        if isinstance(getattr(self, "_last_weights", None), dict):
+            self._last_weights[uid_i] = 0.0
+        bt.logging.info(
+            f"UID {uid_i} owner changed; reset mutable score state for "
+            f"hotkey={str(hotkey_ss58 or '')[:8]} address={address[:10]} "
+            f"generation={result.get('generation')}"
+        )
 
     def _enrich_miners_from_metagraph(self, miners: List[ActiveMiner]) -> None:
         """Enrich miners with SS58 keys from metagraph. Updates _ss58_cache.
@@ -6319,21 +6527,63 @@ class ValidatorNeuron:
             mg = self._subtensor.metagraph(self.config.netuid)
             self._metagraph = mg
             n = mg.n.item()
+            valid_miners: List[ActiveMiner] = []
             for miner in miners:
                 uid_val = None
                 try:
                     uid_val = self._miner_client.get_associated_uid(miner.address)
                 except Exception:
                     uid_val = self._db.get_uid(miner.address)
-                if uid_val is not None and uid_val < n:
+                if uid_val is not None and 0 <= int(uid_val) < n:
+                    cached_identity = self._db.get_cached_identity(miner.address)
+                    cached_hotkey = str(
+                        (cached_identity or {}).get("hotkey_ss58")
+                        or self._get_miner_ss58(miner.address, "hotkey")
+                        or ""
+                    )
+                    current_hotkey = str(mg.hotkeys[int(uid_val)] or "")
+                    if cached_hotkey and current_hotkey and cached_hotkey != current_hotkey:
+                        try:
+                            try:
+                                refreshed_uid = self._miner_client.get_associated_uid(
+                                    miner.address,
+                                    refresh=True,
+                                )
+                            except TypeError:
+                                refreshed_uid = self._miner_client.get_associated_uid(
+                                    miner.address
+                                )
+                            if refreshed_uid is not None:
+                                uid_val = refreshed_uid
+                        except Exception:
+                            pass
+                if uid_val is not None and 0 <= int(uid_val) < int(n):
+                    uid_val = int(uid_val)
+                    if self._stale_uid_identity(miner.address, uid_val, mg):
+                        continue
+                    self._stale_uid_addresses.discard(miner.address.lower())
                     miner.hotkey_ss58 = mg.hotkeys[uid_val]
                     miner.coldkey_ss58 = mg.coldkeys[uid_val] if hasattr(mg, 'coldkeys') else ""
+                    try:
+                        self._reconcile_uid_owner_identity(
+                            int(uid_val),
+                            miner.hotkey_ss58,
+                            miner.address,
+                        )
+                    except Exception as exc:
+                        bt.logging.warning(
+                            f"UID owner reconciliation failed: address={miner.address[:10]} "
+                            f"uid={uid_val}: {exc}; excluding this miner refresh"
+                        )
+                        continue
                     self._db.set_uid(miner.address, uid_val)
                     # Update cache
                     self._ss58_cache[miner.address.lower()] = {
                         "hotkey_ss58": miner.hotkey_ss58,
                         "coldkey_ss58": miner.coldkey_ss58,
                     }
+                valid_miners.append(miner)
+            miners[:] = valid_miners
         except Exception as e:
             bt.logging.debug(f"Metagraph enrichment failed: {e}")
 
@@ -6363,6 +6613,163 @@ class ValidatorNeuron:
             else:
                 bt.logging.warning(f"Failed to report offline: {e}")
 
+    def _miner_debug_network_snapshot(self) -> Dict[int, dict]:
+        """Copy already-cached weight and metagraph values for diagnostics."""
+        try:
+            last_weights = dict(getattr(self, "_last_weights", {}) or {})
+        except RuntimeError:
+            last_weights = {}
+
+        mg = getattr(self, "_metagraph", None)
+        try:
+            n_value = getattr(mg, "n", 0) if mg is not None else 0
+            metagraph_size = int(n_value.item() if hasattr(n_value, "item") else n_value)
+        except (TypeError, ValueError, AttributeError):
+            metagraph_size = 0
+
+        def _metric(uid: int, *names: str) -> Optional[float]:
+            if mg is None:
+                return None
+            for name in names:
+                try:
+                    values = getattr(mg, name)
+                    value = float(values[uid])
+                except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    return value
+            return None
+
+        def _hotkey(uid: int) -> str:
+            if mg is None:
+                return ""
+            try:
+                return str(mg.hotkeys[uid] or "")
+            except (AttributeError, IndexError, TypeError):
+                return ""
+
+        metagraph_block = None
+        if mg is not None:
+            try:
+                block_value = getattr(mg, "block")
+                metagraph_block = int(
+                    block_value.item() if hasattr(block_value, "item") else block_value
+                )
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+        uids = set(range(max(0, metagraph_size)))
+        for uid in last_weights:
+            try:
+                uids.add(int(uid))
+            except (TypeError, ValueError):
+                continue
+
+        result: Dict[int, dict] = {}
+        for uid in sorted(uids):
+            raw_weight = last_weights.get(uid, last_weights.get(str(uid)))
+            try:
+                weight = float(raw_weight) if raw_weight is not None else None
+            except (TypeError, ValueError):
+                weight = None
+            if weight is not None and not math.isfinite(weight):
+                weight = None
+            result[uid] = {
+                "last_validator_weight": weight,
+                "metagraph_hotkey_ss58": _hotkey(uid),
+                "metagraph_incentive": _metric(uid, "I", "incentive"),
+                "metagraph_emission": _metric(uid, "E", "emission"),
+                "metagraph_trust": _metric(uid, "trust", "T"),
+                "metagraph_consensus": _metric(uid, "C", "consensus"),
+                "metagraph_block": metagraph_block,
+            }
+        return result
+
+    def _schedule_miner_debug_refresh(
+        self,
+        *,
+        current_epoch: Optional[int] = None,
+        force: bool = False,
+    ) -> bool:
+        """Refresh the optional diagnostics file without blocking validator work."""
+        if not bool(getattr(self.config, "miner_debug_enabled", False)):
+            return False
+        epoch = int(current_epoch if current_epoch is not None else self._current_epoch)
+        if epoch <= 0:
+            return False
+        refresh_s = max(
+            1.0,
+            float(getattr(self.config, "miner_debug_refresh_seconds", 60.0) or 60.0),
+        )
+        now = time.monotonic()
+        with self._miner_debug_cache_lock:
+            if self._miner_debug_refresh_in_flight:
+                return False
+            if not force and now - self._miner_debug_last_scheduled_at < refresh_s:
+                return False
+            self._miner_debug_refresh_in_flight = True
+            self._miner_debug_last_scheduled_at = now
+
+        stale_addresses = set(getattr(self, "_stale_uid_addresses", set()) or set())
+        blacklist = set(getattr(self, "_blacklisted_addresses", set()) or set())
+
+        def _refresh() -> None:
+            try:
+                enforcement_enabled = self._capacity_audit_enforcement_enabled(epoch)
+                suppression_reason = ""
+                if not enforcement_enabled:
+                    if self._maintenance_grace_active(
+                        current_epoch=epoch,
+                        action="suppress_capacity_score_gate",
+                    ):
+                        suppression_reason = self._maintenance_grace_reason()
+                    elif not bool(getattr(self, "_subnet_runtime_config_authoritative", False)):
+                        suppression_reason = "hosted subnet config is unavailable or invalid"
+                if getattr(self, "_capacity_audit_verifier_unhealthy", False):
+                    enforcement_enabled = False
+                    suppression_reason = "capacity proof verifier is unhealthy"
+
+                model_gate_reasons: Dict[Tuple[str, int], str] = {}
+                for miner in list(getattr(self, "_epoch_miners", []) or []):
+                    reason = self._capacity_audit_model_gate_reason(miner, epoch)
+                    if reason:
+                        model_gate_reasons[
+                            (str(miner.address).lower(), int(miner.model_index))
+                        ] = reason
+                network_state = ValidatorNeuron._miner_debug_network_snapshot(self)
+                snapshot = self._db.build_miner_debug_snapshots(
+                    current_epoch=epoch,
+                    capacity_audit_cfg=self._capacity_audit_cfg,
+                    stale_addresses=stale_addresses,
+                    blacklisted_addresses=blacklist,
+                    model_gate_reasons=model_gate_reasons,
+                    capacity_audit_gate_enforced=enforcement_enabled,
+                    capacity_audit_gate_suppression_reason=suppression_reason,
+                    uid_network_state=network_state,
+                    epoch_seconds=max(
+                        1,
+                        int(getattr(self.config, "epoch_blocks", 360) or 360) * 12,
+                    ),
+                )
+                from neurons.shared_state import write_miner_debug_state
+                write_miner_debug_state(
+                    snapshot,
+                    str(getattr(self.config, "miner_debug_state_path", "") or ""),
+                )
+            except Exception as exc:
+                bt.logging.warning(f"Failed to refresh miner debug state: {exc}")
+            finally:
+                with self._miner_debug_cache_lock:
+                    self._miner_debug_refresh_in_flight = False
+
+        try:
+            self._miner_debug_executor.submit(_refresh)
+        except Exception:
+            with self._miner_debug_cache_lock:
+                self._miner_debug_refresh_in_flight = False
+            return False
+        return True
+
     def _write_shared_state(self):
         """Write shared state file for the proxy process.
 
@@ -6376,11 +6783,19 @@ class ValidatorNeuron:
         shared.last_weights = getattr(self, "_last_weights", {})
         shared.demand_scores = getattr(self, "_last_demand_scores", {})
         shared.blacklisted_addresses = sorted(self._blacklisted_addresses)
+        stale_addresses = {
+            str(a).lower()
+            for a in getattr(self, "_stale_uid_addresses", set())
+            if str(a or "").strip()
+        }
+        shared.stale_miner_addresses = sorted(stale_addresses)
         # Build ss58_map with UIDs so the proxy can resolve UIDs for
         # miners not in miner_endpoints (e.g. inactive/unreachable).
         uid_map_all = self._db.get_all_uids()
         ss58_with_uid: Dict[str, Dict[str, str]] = {}
         for addr, info in self._ss58_cache.items():
+            if addr in stale_addresses:
+                continue
             entry = dict(info)  # copy {hotkey_ss58, coldkey_ss58}
             uid_val = uid_map_all.get(addr)
             if uid_val is not None:
@@ -6439,6 +6854,7 @@ class ValidatorNeuron:
                 gpu_uuids=getattr(m, "gpu_uuids", []),
             )
             for m in miners
+            if m.address.lower() not in stale_addresses
         ]
 
         write_shared_state(shared, self.config.shared_state_path)
@@ -6457,16 +6873,25 @@ class ValidatorNeuron:
             return
 
         uid_map = self._db.get_all_uids()
+        uid_owners = self._db.get_uid_owners()
         loaded = 0
         for (address, model_index), data in saved.items():
             uid = uid_map.get(address)
             if uid is None:
+                continue
+            owner = uid_owners.get(int(uid))
+            if (
+                owner is not None
+                and str(owner.get("evm_address") or "").lower() != address.lower()
+            ):
                 continue
 
             if uid not in self.scorer.states:
                 self.scorer.states[uid] = MinerScoreState(uid=uid, address=address)
 
             state = self.scorer.states[uid]
+            if state.address.lower() != address.lower():
+                continue
             if model_index not in state.entries:
                 state.entries[model_index] = ModelEntryScore(
                     model_id=data["model_id"],
@@ -6986,6 +7411,7 @@ class ValidatorNeuron:
         self._control_executor.shutdown(wait=False)
         self._capacity_audit_executor.shutdown(wait=False)
         self._capacity_audit_discovery_executor.shutdown(wait=False)
+        self._miner_debug_executor.shutdown(wait=False)
         self._capacity_audit_proof_executor.shutdown(wait=False)
 
 

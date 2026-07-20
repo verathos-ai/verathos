@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import bittensor as bt
 import os
 import sqlite3
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from neurons.shared_state import AuditDrain, MinerEntry, ValidatorSharedState
 
@@ -42,6 +43,80 @@ def _coerce_nonnegative_int(value: object) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _debug_error_kind(message: object) -> str:
+    """Return a stable public issue code for an upstream canary/chat error."""
+    msg = str(message or "").lower()
+    if not msg:
+        return ""
+    if "401" in msg or "unauthorized" in msg:
+        return "chat_unauthorized"
+    if "403" in msg or "forbidden" in msg:
+        return "chat_forbidden"
+    if "404" in msg or "not found" in msg:
+        return "chat_not_found"
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    if "connection" in msg or "connect" in msg or "network is unreachable" in msg:
+        return "connection_failed"
+    if "ssl" in msg or "certificate" in msg or "tls" in msg:
+        return "tls_error"
+    return "chat_error"
+
+
+_DEBUG_ERROR_SUMMARIES = {
+    "chat_unauthorized": "Inference request was unauthorized.",
+    "chat_forbidden": "Inference request was forbidden.",
+    "chat_not_found": "Inference route was not found.",
+    "timeout": "Inference request timed out.",
+    "connection_failed": "Validator could not connect to the inference endpoint.",
+    "tls_error": "Inference endpoint failed TLS validation.",
+    "chat_error": "Inference request failed.",
+    "proof_failure": "Proof verification failed.",
+    "tee_failure": "TEE attestation verification failed.",
+}
+
+
+def _debug_public_error_summary(kind: str) -> str:
+    return _DEBUG_ERROR_SUMMARIES.get(str(kind or ""), "Request failed.")
+
+
+def _debug_public_reason(value: object, fallback: str) -> str:
+    """Expose only stable machine reason codes, never arbitrary exception text."""
+    reason = str(value or "").strip()
+    if (
+        reason
+        and len(reason) <= 96
+        and all(ch.isalnum() or ch in {"_", "-", "."} for ch in reason)
+    ):
+        return reason
+    return fallback
+
+
+_CAPACITY_AUDIT_UNSUPPORTED_PAYLOAD_FAILURES = {
+    "unsupported_proof_payload_format",
+    "unsupported_combined_format",
+    "unsupported_combined_workload",
+}
+
+
+def _debug_capacity_audit_invalid_failure(
+    verdict: object,
+    proof_status: object,
+    failure_reason: object,
+) -> bool:
+    reason = str(failure_reason or "")
+    return (
+        str(verdict or "") == "hard_proof_miss"
+        and (
+            reason == "pass0_root_mismatch"
+            or (
+                str(proof_status or "") == "invalid_payload"
+                and reason not in _CAPACITY_AUDIT_UNSUPPORTED_PAYLOAD_FAILURES
+            )
+        )
+    )
 
 
 class ValidatorStateDB:
@@ -115,6 +190,18 @@ class ValidatorStateDB:
 
             CREATE INDEX IF NOT EXISTS idx_miner_entries_active
                 ON miner_entries(is_active) WHERE is_active = 1;
+
+            CREATE TABLE IF NOT EXISTS uid_ownership (
+                uid                 INTEGER PRIMARY KEY,
+                hotkey_ss58         TEXT NOT NULL,
+                evm_address         TEXT NOT NULL,
+                generation          INTEGER NOT NULL DEFAULT 1,
+                identity_start_epoch INTEGER NOT NULL DEFAULT 0,
+                updated_at          REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_uid_ownership_evm
+                ON uid_ownership(evm_address);
 
             CREATE TABLE IF NOT EXISTS epoch_log (
                 epoch_number    INTEGER PRIMARY KEY,
@@ -266,6 +353,7 @@ class ValidatorStateDB:
                 miner_address        TEXT NOT NULL,
                 model_index          INTEGER NOT NULL,
                 miner_uid            INTEGER,
+                miner_hotkey_ss58    TEXT NOT NULL DEFAULT '',
                 endpoint             TEXT NOT NULL,
                 model_id             TEXT NOT NULL,
                 quant                TEXT NOT NULL DEFAULT '',
@@ -315,6 +403,7 @@ class ValidatorStateDB:
                 miner_address        TEXT NOT NULL,
                 model_index          INTEGER NOT NULL,
                 miner_uid            INTEGER,
+                miner_hotkey_ss58    TEXT NOT NULL DEFAULT '',
                 endpoint             TEXT NOT NULL DEFAULT '',
                 model_id             TEXT NOT NULL DEFAULT '',
                 quant                TEXT NOT NULL DEFAULT '',
@@ -400,6 +489,16 @@ class ValidatorStateDB:
             "capacity_audit_slots",
             "proof_verify_ms",
             "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_slots",
+            "miner_hotkey_ss58",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._ensure_column(
+            "capacity_audit_history",
+            "miner_hotkey_ss58",
+            "TEXT NOT NULL DEFAULT ''",
         )
 
         # One-time migration: prune historical duplicate rows then install
@@ -614,6 +713,52 @@ class ValidatorStateDB:
             )
             self._conn.commit()
             return cursor.rowcount > 0
+
+    def mark_address_inactive(self, address: str) -> int:
+        """Mark all miner-model entries for an address inactive locally."""
+        address = address.lower()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE miner_entries SET is_active = 0, updated_at = ?
+                   WHERE address = ? AND is_active = 1""",
+                (time.time(), address),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def reset_address_identity_state(self, address: str) -> int:
+        """Reset mutable score/probation state after the address changes hotkey owner."""
+        address = address.lower()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE miner_entries SET
+                       ema_score = 0.0,
+                       total_epochs = 0,
+                       scored_epochs = 0,
+                       probation_entered_epoch = NULL,
+                       probation_consecutive_passes = 0,
+                       updated_at = ?
+                   WHERE address = ?""",
+                (time.time(), address),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def clear_probation_for_address(self, address: str) -> int:
+        """Clear mutable probation state for an identity that no longer owns a UID."""
+        address = address.lower()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE miner_entries SET
+                       probation_entered_epoch = NULL,
+                       probation_consecutive_passes = 0,
+                       updated_at = ?
+                   WHERE address = ?
+                     AND probation_entered_epoch IS NOT NULL""",
+                (time.time(), address),
+            )
+            self._conn.commit()
+            return cursor.rowcount
 
     def get_active_entries(self) -> List[dict]:
         """Return all active miner-model entries as dicts."""
@@ -942,6 +1087,24 @@ class ValidatorStateDB:
             ).fetchone()
         return row["bittensor_uid"] if row is not None else None
 
+    def get_cached_identity(self, address: str) -> dict:
+        """Return the most useful cached UID/SS58 identity for an EVM address."""
+        address = address.lower()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT bittensor_uid, hotkey_ss58, coldkey_ss58
+                   FROM miner_entries
+                   WHERE address = ?
+                   ORDER BY
+                     CASE WHEN hotkey_ss58 IS NOT NULL AND hotkey_ss58 != '' THEN 0 ELSE 1 END,
+                     is_active DESC,
+                     last_seen_epoch DESC,
+                     updated_at DESC
+                   LIMIT 1""",
+                (address,),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
     def set_uid(self, address: str, uid: int) -> None:
         """Set UID for all miner_entries rows with this address (denormalized)."""
         address = address.lower()
@@ -959,6 +1122,270 @@ class ValidatorStateDB:
                 "SELECT DISTINCT address, bittensor_uid FROM miner_entries WHERE bittensor_uid IS NOT NULL"
             )
             return {row["address"]: row["bittensor_uid"] for row in cursor.fetchall()}
+
+    def reconcile_uid_owner(
+        self,
+        uid: int,
+        hotkey_ss58: str,
+        evm_address: str,
+        epoch: int,
+    ) -> dict:
+        """Persist the current owner of a reusable Bittensor UID slot."""
+        uid_i = int(uid)
+        hotkey = str(hotkey_ss58 or "")
+        evm = str(evm_address or "").lower()
+        epoch_i = max(0, int(epoch or 0))
+        now = time.time()
+        with self._lock:
+            moved_rows = []
+            if evm:
+                moved_rows = self._conn.execute(
+                    """SELECT uid FROM uid_ownership
+                       WHERE LOWER(evm_address) = ? AND uid != ?""",
+                    (evm, uid_i),
+                ).fetchall()
+            moved_from_uids = sorted(int(moved["uid"]) for moved in moved_rows)
+            if moved_from_uids:
+                self._conn.execute(
+                    """UPDATE uid_ownership SET
+                           hotkey_ss58 = '', evm_address = '',
+                           generation = generation + 1,
+                           identity_start_epoch = ?, updated_at = ?
+                       WHERE LOWER(evm_address) = ? AND uid != ?""",
+                    (epoch_i, now, evm, uid_i),
+                )
+            row = self._conn.execute(
+                "SELECT * FROM uid_ownership WHERE uid = ?",
+                (uid_i,),
+            ).fetchone()
+            previous = dict(row) if row is not None else None
+            inferred_previous_hotkey = ""
+            inferred_previous_evm = ""
+            if row is None:
+                cached_rows = self._conn.execute(
+                    """SELECT address, hotkey_ss58
+                       FROM miner_entries
+                       WHERE bittensor_uid = ?
+                       ORDER BY is_active DESC, last_seen_epoch DESC, updated_at DESC""",
+                    (uid_i,),
+                ).fetchall()
+                previous_row = next(
+                    (
+                        cached for cached in cached_rows
+                        if str(cached["address"] or "").lower() != evm
+                        or (
+                            str(cached["hotkey_ss58"] or "")
+                            and hotkey
+                            and str(cached["hotkey_ss58"] or "") != hotkey
+                        )
+                    ),
+                    None,
+                )
+                if previous_row is not None:
+                    inferred_previous_hotkey = str(previous_row["hotkey_ss58"] or "")
+                    inferred_previous_evm = str(previous_row["address"] or "").lower()
+                changed = previous_row is not None or bool(moved_from_uids)
+                start_epoch = epoch_i if changed else 0
+                self._conn.execute(
+                    """INSERT INTO uid_ownership (
+                           uid, hotkey_ss58, evm_address, generation,
+                           identity_start_epoch, updated_at
+                       ) VALUES (?, ?, ?, 1, ?, ?)""",
+                    (uid_i, hotkey, evm, start_epoch, now),
+                )
+                generation = 1
+            else:
+                changed = (
+                    str(row["hotkey_ss58"] or "") != hotkey
+                    or str(row["evm_address"] or "").lower() != evm
+                    or bool(moved_from_uids)
+                )
+                generation = int(row["generation"] or 1) + (1 if changed else 0)
+                start_epoch = epoch_i if changed else int(row["identity_start_epoch"] or 0)
+                self._conn.execute(
+                    """UPDATE uid_ownership SET
+                           hotkey_ss58 = ?, evm_address = ?, generation = ?,
+                           identity_start_epoch = ?, updated_at = ?
+                       WHERE uid = ?""",
+                    (hotkey, evm, generation, start_epoch, now, uid_i),
+                )
+            self._conn.commit()
+        return {
+            "changed": changed,
+            "uid": uid_i,
+            "hotkey_ss58": hotkey,
+            "evm_address": evm,
+            "generation": generation,
+            "identity_start_epoch": start_epoch,
+            "previous": previous,
+            "inferred_previous_hotkey": inferred_previous_hotkey,
+            "inferred_previous_evm": inferred_previous_evm,
+            "moved_from_uids": moved_from_uids,
+            "address_moved": bool(moved_from_uids),
+        }
+
+    def get_uid_owner(self, uid: int) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM uid_ownership WHERE uid = ?",
+                (int(uid),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_uid_owners(self) -> Dict[int, dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM uid_ownership").fetchall()
+        return {int(row["uid"]): dict(row) for row in rows}
+
+    def get_addresses_for_uid(self, uid: int) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT address FROM miner_entries WHERE bittensor_uid = ?",
+                (int(uid),),
+            ).fetchall()
+        return [str(row["address"]).lower() for row in rows]
+
+    def _capacity_uid_identity_filter_locked(self, uid: int) -> Tuple[str, tuple]:
+        """Return a SQL predicate selecting only the current UID identity."""
+        owner = self._conn.execute(
+            "SELECT * FROM uid_ownership WHERE uid = ?",
+            (int(uid),),
+        ).fetchone()
+        if owner is not None:
+            address = str(owner["evm_address"] or "").lower()
+            hotkey = str(owner["hotkey_ss58"] or "")
+            start_epoch = max(0, int(owner["identity_start_epoch"] or 0))
+            if hotkey:
+                return (
+                    """LOWER(s.miner_address) = ?
+                       AND (
+                         s.miner_uid = ?
+                         OR (
+                           s.miner_uid IS NULL
+                           AND (? = 0 OR w.epoch_number > ?)
+                         )
+                       )
+                       AND (
+                         s.miner_hotkey_ss58 = ?
+                         OR (
+                           COALESCE(s.miner_hotkey_ss58, '') = ''
+                           AND (? = 0 OR w.epoch_number > ?)
+                         )
+                       )""",
+                    (
+                        address,
+                        int(uid),
+                        start_epoch,
+                        start_epoch,
+                        hotkey,
+                        start_epoch,
+                        start_epoch,
+                    ),
+                )
+            return (
+                """LOWER(s.miner_address) = ?
+                   AND (
+                     s.miner_uid = ?
+                     OR (
+                       s.miner_uid IS NULL
+                       AND (? = 0 OR w.epoch_number > ?)
+                     )
+                   )""",
+                (address, int(uid), start_epoch, start_epoch),
+            )
+
+        rows = self._conn.execute(
+            """SELECT DISTINCT LOWER(address) AS address
+               FROM miner_entries
+               WHERE bittensor_uid = ? AND is_active = 1""",
+            (int(uid),),
+        ).fetchall()
+        addresses = [str(row["address"] or "").lower() for row in rows]
+        if not addresses:
+            return "0 = 1", ()
+        placeholders = ",".join("?" for _ in addresses)
+        return (
+            f"(s.miner_uid = ? OR s.miner_uid IS NULL) "
+            f"AND LOWER(s.miner_address) IN ({placeholders})",
+            (int(uid), *addresses),
+        )
+
+    def _capacity_address_identity_filter_locked(
+        self,
+        address: str,
+    ) -> Tuple[str, tuple]:
+        """Return the hotkey-generation predicate for a current EVM owner."""
+        owner = self._conn.execute(
+            """SELECT uid, hotkey_ss58, identity_start_epoch
+               FROM uid_ownership
+               WHERE LOWER(evm_address) = ?
+               ORDER BY updated_at DESC
+               LIMIT 1""",
+            (str(address).lower(),),
+        ).fetchone()
+        if owner is None:
+            return "1 = 1", ()
+        uid = int(owner["uid"])
+        hotkey = str(owner["hotkey_ss58"] or "")
+        start_epoch = max(0, int(owner["identity_start_epoch"] or 0))
+        uid_clause = """(
+             s.miner_uid = ?
+             OR (
+               s.miner_uid IS NULL
+               AND (? = 0 OR w.epoch_number > ?)
+             )
+           )"""
+        if not hotkey:
+            return uid_clause, (uid, start_epoch, start_epoch)
+        return (
+            """(
+                 (
+                   s.miner_uid = ?
+                   OR (
+                     s.miner_uid IS NULL
+                     AND (? = 0 OR w.epoch_number > ?)
+                   )
+                 )
+                 AND (
+                   s.miner_hotkey_ss58 = ?
+                   OR (
+                     COALESCE(s.miner_hotkey_ss58, '') = ''
+                     AND (? = 0 OR w.epoch_number > ?)
+                   )
+                 )
+               )""",
+            (
+                uid,
+                start_epoch,
+                start_epoch,
+                hotkey,
+                start_epoch,
+                start_epoch,
+            ),
+        )
+
+    def mark_capacity_audit_address_identity_stale(self, address: str) -> int:
+        """Release unfinished audit obligations belonging to a retired identity."""
+        address = address.lower()
+        now = time.time()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET verdict = 'stale_window',
+                       timing_status = 'timing_excused',
+                       failure_reason = 'stale_uid_identity',
+                       drain_until_ts = 0,
+                       updated_at = ?
+                   WHERE miner_address = ?
+                     AND verdict IN ('pending', 'pass0_seen', 'timing_pass')
+                     AND proof_status NOT IN (
+                       'combined_proof_verified', 'proof_verified',
+                       'invalid_payload', 'verify_error', 'missing_payload'
+                     )""",
+                (now, address),
+            )
+            self._conn.commit()
+            return cursor.rowcount
 
     # ── Epoch log ────────────────────────────────────────────────────
 
@@ -1057,17 +1484,19 @@ class ValidatorStateDB:
             for slot in slots:
                 self._conn.execute(
                     """INSERT OR IGNORE INTO capacity_audit_slots (
-                        audit_id, miner_address, model_index, miner_uid, endpoint,
+                        audit_id, miner_address, model_index, miner_uid,
+                        miner_hotkey_ss58, endpoint,
                         model_id, quant, max_context_len, gpu_name, gpu_count,
                         vram_gb, group_key, slot_id, lease_id, claimed_gpu_class,
                         pass_count, deadline_s, transport_grace_s,
                         payload_deadline_s, drain_until_ts, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         audit_id,
                         str(slot["miner_address"]).lower(),
                         int(slot["model_index"]),
                         slot.get("miner_uid"),
+                        str(slot.get("miner_hotkey_ss58", "")),
                         str(slot.get("endpoint", "")),
                         str(slot.get("model_id", "")),
                         str(slot.get("quant", "")),
@@ -1720,6 +2149,9 @@ class ValidatorStateDB:
                 " AND w.chain_status != 'reorged'"
             )
         with self._lock:
+            identity_clause, identity_params = self._capacity_address_identity_filter_locked(
+                address
+            )
             row = self._conn.execute(
                 f"""SELECT COUNT(*) AS n
                     FROM capacity_audit_slots s
@@ -1728,8 +2160,12 @@ class ValidatorStateDB:
                       AND s.model_index = ?
                       AND w.epoch_number >= ?
                       AND s.verdict IN ({placeholders})
+                      AND {identity_clause}
                       {confirmation_clause}""",
-                (address.lower(), int(model_index), int(since_epoch), *verdicts),
+                (
+                    address.lower(), int(model_index), int(since_epoch),
+                    *verdicts, *identity_params,
+                ),
             ).fetchone()
         return int(row["n"] if row is not None else 0)
 
@@ -1756,6 +2192,9 @@ class ValidatorStateDB:
                 " AND w.chain_status != 'reorged'"
             )
         with self._lock:
+            identity_clause, identity_params = self._capacity_address_identity_filter_locked(
+                address
+            )
             row = self._conn.execute(
                 f"""SELECT COUNT(*) AS n
                     FROM capacity_audit_slots s
@@ -1775,8 +2214,12 @@ class ValidatorStateDB:
                           )
                         )
                       )
+                      AND {identity_clause}
                       {confirmation_clause}""",
-                (address.lower(), int(model_index), int(since_epoch)),
+                (
+                    address.lower(), int(model_index), int(since_epoch),
+                    *identity_params,
+                ),
             ).fetchone()
         return int(row["n"] if row is not None else 0)
 
@@ -1804,20 +2247,16 @@ class ValidatorStateDB:
                 " AND w.chain_status != 'reorged'"
             )
         with self._lock:
+            identity_clause, identity_params = self._capacity_uid_identity_filter_locked(uid)
             row = self._conn.execute(
                 f"""SELECT COUNT(*) AS n
                     FROM capacity_audit_slots s
                     JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
                     WHERE w.epoch_number >= ?
                       AND s.verdict IN ({placeholders})
-                      AND (
-                        s.miner_uid = ?
-                        OR s.miner_address IN (
-                          SELECT address FROM miner_entries WHERE bittensor_uid = ?
-                        )
-                      )
+                      AND ({identity_clause})
                       {confirmation_clause}""",
-                (int(since_epoch), *verdicts, int(uid), int(uid)),
+                (int(since_epoch), *verdicts, *identity_params),
             ).fetchone()
         return int(row["n"] if row is not None else 0)
 
@@ -1844,6 +2283,7 @@ class ValidatorStateDB:
                 " AND w.chain_status != 'reorged'"
             )
         with self._lock:
+            identity_clause, identity_params = self._capacity_uid_identity_filter_locked(uid)
             rows = self._conn.execute(
                 f"""SELECT
                         s.miner_address,
@@ -1874,16 +2314,11 @@ class ValidatorStateDB:
                     FROM capacity_audit_slots s
                     JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
                     WHERE w.epoch_number >= ?
-                      AND (
-                        s.miner_uid = ?
-                        OR s.miner_address IN (
-                          SELECT address FROM miner_entries WHERE bittensor_uid = ?
-                        )
-                      )
+                      AND ({identity_clause})
                       AND s.verdict IN ('hard_proof_miss', 'no_show', 'timing_miss')
                       {confirmation_clause}
                     GROUP BY s.miner_address, s.model_index""",
-                (int(since_epoch), int(uid), int(uid)),
+                (int(since_epoch), *identity_params),
             ).fetchall()
         return {
             (str(row["miner_address"]).lower(), int(row["model_index"])): {
@@ -1896,11 +2331,22 @@ class ValidatorStateDB:
 
     def active_entry_count_for_uid(self, uid: int) -> int:
         with self._lock:
-            row = self._conn.execute(
-                """SELECT COUNT(*) AS n FROM miner_entries
-                   WHERE is_active = 1 AND bittensor_uid = ?""",
+            owner = self._conn.execute(
+                "SELECT evm_address FROM uid_ownership WHERE uid = ?",
                 (int(uid),),
             ).fetchone()
+            if owner is not None:
+                row = self._conn.execute(
+                    """SELECT COUNT(*) AS n FROM miner_entries
+                       WHERE is_active = 1 AND LOWER(address) = ?""",
+                    (str(owner["evm_address"] or "").lower(),),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    """SELECT COUNT(*) AS n FROM miner_entries
+                       WHERE is_active = 1 AND bittensor_uid = ?""",
+                    (int(uid),),
+                ).fetchone()
         return int(row["n"] if row is not None else 0)
 
     def get_capacity_audit_slots_for_epoch(
@@ -2109,7 +2555,8 @@ class ValidatorStateDB:
         with self._lock:
             history_cur = self._conn.execute(
                 f"""INSERT OR REPLACE INTO capacity_audit_history (
-                        audit_id, miner_address, model_index, miner_uid, endpoint,
+                        audit_id, miner_address, model_index, miner_uid,
+                        miner_hotkey_ss58, endpoint,
                         model_id, quant, max_context_len, gpu_name, gpu_count,
                         vram_gb, group_key, slot_id, lease_id, claimed_gpu_class,
                         pass_count, epoch_number, selection_block, audit_block,
@@ -2120,7 +2567,8 @@ class ValidatorStateDB:
                     )
                     SELECT
                         s.audit_id, LOWER(s.miner_address), s.model_index, s.miner_uid,
-                        s.endpoint, s.model_id, s.quant, s.max_context_len, s.gpu_name,
+                        s.miner_hotkey_ss58, s.endpoint, s.model_id, s.quant,
+                        s.max_context_len, s.gpu_name,
                         s.gpu_count, s.vram_gb, s.group_key, s.slot_id, s.lease_id,
                         s.claimed_gpu_class, s.pass_count, w.epoch_number,
                         w.selection_block, w.audit_block, w.proof_challenge_block,
@@ -2199,6 +2647,1150 @@ class ValidatorStateDB:
             "success_rows_deleted": success_cur.rowcount or 0,
             "old_failure_rows_deleted": failure_cur.rowcount or 0,
             "empty_windows_deleted": window_cur.rowcount or 0,
+        }
+
+    # ── Miner debug snapshots ───────────────────────────────────────
+
+    def build_miner_debug_snapshots(
+        self,
+        *,
+        current_epoch: int,
+        capacity_audit_cfg: object,
+        stale_addresses: Optional[set[str]] = None,
+        blacklisted_addresses: Optional[set[str]] = None,
+        model_gate_reasons: Optional[Dict[Tuple[str, int], str]] = None,
+        capacity_audit_gate_enforced: Optional[bool] = None,
+        capacity_audit_gate_suppression_reason: str = "",
+        uid_network_state: Optional[Dict[int, dict]] = None,
+        window_hours: Tuple[int, ...] = (24, 48),
+        epoch_seconds: int = 72 * 60,
+    ) -> Dict[str, Any]:
+        """Build cached public miner diagnostics for the proxy.
+
+        This intentionally returns bounded aggregates and redacted last-error
+        summaries only. Public callers must not trigger live DB queries.
+        """
+        from neurons.capacity_audit import capacity_audit_uid_escalation_threshold
+
+        now = time.time()
+        cur_epoch = max(0, int(current_epoch or 0))
+        windows = tuple(sorted({max(1, min(48, int(h))) for h in window_hours}))
+        epoch_s = max(1, int(epoch_seconds or 1))
+        window_epochs = {
+            h: max(1, int(math.ceil((h * 3600.0) / epoch_s)))
+            for h in windows
+        }
+        min_epoch = max(0, cur_epoch - max(window_epochs.values()) + 1)
+        stale = {str(a).lower() for a in (stale_addresses or set()) if str(a or "").strip()}
+        blacklisted = {
+            str(a).lower()
+            for a in (blacklisted_addresses or set())
+            if str(a or "").strip()
+        }
+        model_gates = {
+            (str(key[0]).lower(), int(key[1])): str(reason or "")
+            for key, reason in (model_gate_reasons or {}).items()
+            if reason
+        }
+        network_by_uid = {
+            int(uid): dict(values or {})
+            for uid, values in (uid_network_state or {}).items()
+        }
+
+        with self._lock:
+            owner_rows = [
+                dict(r) for r in self._conn.execute("SELECT * FROM uid_ownership").fetchall()
+            ]
+            entry_rows = [
+                dict(r)
+                for r in self._conn.execute(
+                    """SELECT *
+                       FROM miner_entries
+                       WHERE bittensor_uid IS NOT NULL
+                         AND (
+                           is_active = 1
+                           OR last_seen_epoch >= ?
+                           OR (
+                             probation_entered_epoch IS NOT NULL
+                             AND last_seen_epoch >= ?
+                           )
+                         )
+                       ORDER BY bittensor_uid, address, model_index""",
+                    (min_epoch, min_epoch),
+                ).fetchall()
+            ]
+            canary_rows = [
+                dict(r)
+                for r in self._conn.execute(
+                    """SELECT epoch_number, miner_uid, LOWER(miner_address) AS miner_address,
+                              COALESCE(miner_hotkey_ss58, '') AS miner_hotkey_ss58,
+                              model_index, endpoint, status, error_message,
+                              proof_requested, proof_verified, proof_failure_reason,
+                              tee_requested, tee_verified,
+                              tokens_generated, tokens_per_sec, created_at
+                       FROM canary_results
+                       WHERE epoch_number >= ?
+                         AND miner_uid IS NOT NULL
+                       ORDER BY epoch_number ASC, created_at ASC""",
+                    (min_epoch,),
+                ).fetchall()
+            ]
+            receipt_rows = [
+                dict(r)
+                for r in self._conn.execute(
+                    """SELECT MAX(e.bittensor_uid) AS miner_uid,
+                              LOWER(r.miner_address) AS miner_address,
+                              COALESCE(r.miner_hotkey_ss58, '') AS miner_hotkey_ss58,
+                              r.model_index,
+                              r.epoch_number,
+                              COUNT(*) AS receipts,
+                              SUM(CASE WHEN r.is_canary THEN 1 ELSE 0 END) AS canary_receipts,
+                              SUM(CASE WHEN r.is_own THEN 1 ELSE 0 END) AS own_receipts,
+                              SUM(CASE WHEN r.proof_requested THEN 1 ELSE 0 END) AS proof_requested,
+                              SUM(CASE WHEN r.proof_verified THEN 1 ELSE 0 END) AS proof_verified,
+                              SUM(r.tokens_per_sec) AS tok_s_sum,
+                              MAX(r.created_at) AS last_created_at
+                       FROM network_receipts r
+                       LEFT JOIN miner_entries e
+                         ON e.address = LOWER(r.miner_address)
+                        AND e.model_index = r.model_index
+                       WHERE r.epoch_number >= ?
+                       GROUP BY LOWER(r.miner_address), r.model_index,
+                                COALESCE(r.miner_hotkey_ss58, ''), r.epoch_number""",
+                    (min_epoch,),
+                ).fetchall()
+            ]
+            score_rows = [
+                dict(r)
+                for r in self._conn.execute(
+                    """SELECT epoch_number, miner_uid, LOWER(miner_address) AS miner_address,
+                              COALESCE(miner_hotkey_ss58, '') AS miner_hotkey_ss58,
+                              model_index, epoch_score, ema_score, own_receipts,
+                              all_receipts, expected_receipts, proof_tests,
+                              proof_failures, tee_tests, tee_failures,
+                              tee_verified, created_at
+                       FROM epoch_scores
+                       WHERE epoch_number >= ?
+                         AND miner_uid IS NOT NULL
+                       ORDER BY epoch_number ASC, created_at ASC""",
+                    (min_epoch,),
+                ).fetchall()
+            ]
+            audit_rows = [
+                dict(r)
+                for r in self._conn.execute(
+                    """SELECT audit_id, miner_uid, LOWER(miner_address) AS miner_address,
+                              miner_hotkey_ss58,
+                              model_index, endpoint, model_id, gpu_name, pass_count,
+                              epoch_number, verdict, timing_status, proof_status,
+                              failure_reason, updated_at, source_priority
+                       FROM (
+                         SELECT h.audit_id,
+                                COALESCE(h.miner_uid, e.bittensor_uid) AS miner_uid,
+                                h.miner_hotkey_ss58,
+                                h.miner_address, h.model_index,
+                                h.endpoint, h.model_id, h.gpu_name, h.pass_count,
+                                h.epoch_number, h.verdict, h.timing_status,
+                                h.proof_status, h.failure_reason,
+                                h.slot_updated_at AS updated_at, 0 AS source_priority
+                         FROM capacity_audit_history h
+                         LEFT JOIN miner_entries e
+                           ON e.address = LOWER(h.miner_address)
+                          AND e.model_index = h.model_index
+                         WHERE h.epoch_number >= ?
+                           AND COALESCE(h.miner_uid, e.bittensor_uid) IS NOT NULL
+                         UNION ALL
+                         SELECT s.audit_id,
+                                COALESCE(s.miner_uid, e.bittensor_uid) AS miner_uid,
+                                s.miner_hotkey_ss58,
+                                s.miner_address, s.model_index,
+                                s.endpoint, s.model_id, s.gpu_name, s.pass_count,
+                                w.epoch_number, s.verdict, s.timing_status,
+                                s.proof_status, s.failure_reason,
+                                s.updated_at, 1 AS source_priority
+                         FROM capacity_audit_slots s
+                         JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                         LEFT JOIN miner_entries e
+                           ON e.address = LOWER(s.miner_address)
+                          AND e.model_index = s.model_index
+                         WHERE w.epoch_number >= ?
+                           AND COALESCE(s.miner_uid, e.bittensor_uid) IS NOT NULL
+                           AND w.chain_status != 'reorged'
+                       )
+                       ORDER BY epoch_number ASC, source_priority DESC, updated_at DESC""",
+                    (min_epoch, min_epoch),
+                ).fetchall()
+            ]
+
+        owners_by_uid: Dict[int, dict] = {
+            int(row["uid"]): row for row in owner_rows
+        }
+        for row in entry_rows:
+            uid_value = row.get("bittensor_uid")
+            if uid_value is None or int(uid_value) in owners_by_uid:
+                continue
+            if not int(row.get("is_active") or 0):
+                continue
+            owners_by_uid[int(uid_value)] = {
+                "uid": int(uid_value),
+                "hotkey_ss58": str(row.get("hotkey_ss58") or ""),
+                "evm_address": str(row.get("address") or "").lower(),
+                "generation": 0,
+                "identity_start_epoch": 0,
+            }
+
+        def event_key(row: dict) -> tuple[int, str, int] | None:
+            uid = row.get("miner_uid")
+            if uid is None:
+                return None
+            uid_i = int(uid)
+            address = str(row.get("miner_address") or "").lower()
+            owner = owners_by_uid.get(uid_i)
+            if owner is not None:
+                if address != str(owner.get("evm_address") or "").lower():
+                    return None
+                owner_hotkey = str(owner.get("hotkey_ss58") or "")
+                event_hotkey = str(row.get("miner_hotkey_ss58") or "")
+                if event_hotkey and owner_hotkey and event_hotkey != owner_hotkey:
+                    return None
+                if (
+                    not event_hotkey
+                    and int(row.get("epoch_number") or 0)
+                    <= int(owner.get("identity_start_epoch") or 0)
+                    and int(owner.get("identity_start_epoch") or 0) > 0
+                ):
+                    return None
+            return (
+                uid_i,
+                address,
+                int(row.get("model_index") or 0),
+            )
+
+        filtered_entries: list[dict] = []
+        for row in entry_rows:
+            uid = row.get("bittensor_uid")
+            if uid is None:
+                continue
+            owner = owners_by_uid.get(int(uid))
+            if owner is not None and str(row.get("address") or "").lower() != str(
+                owner.get("evm_address") or ""
+            ).lower():
+                continue
+            filtered_entries.append(row)
+        entry_rows = filtered_entries
+
+        repeat_window = max(
+            1,
+            int(getattr(capacity_audit_cfg, "repeat_window_epochs", 20) or 20),
+        )
+        gate_since_epoch = max(0, cur_epoch - repeat_window + 1)
+        gate_configured = bool(
+            getattr(capacity_audit_cfg, "enabled", False)
+            and str(getattr(capacity_audit_cfg, "mode", "") or "") == "score_gate"
+        )
+        gate_enabled = gate_configured and (
+            True
+            if capacity_audit_gate_enforced is None
+            else bool(capacity_audit_gate_enforced)
+        )
+        gate_counts: Dict[tuple[int, str, int], dict[str, int]] = {}
+        gate_failure_epochs_all: Dict[
+            tuple[int, str, int], Dict[str, list[int]]
+        ] = {}
+        if gate_configured:
+            confirmation_clause = (
+                " AND w.selection_finalized_at IS NOT NULL"
+                " AND w.audit_finalized_at IS NOT NULL"
+                " AND ("
+                "   w.proof_challenge_block <= 0"
+                "   OR ("
+                "     w.proof_challenge_block_hash != ''"
+                "     AND w.proof_challenge_finalized_at IS NOT NULL"
+                "   )"
+                " )"
+                " AND w.chain_status != 'reorged'"
+            )
+            with self._lock:
+                gate_rows = [
+                    dict(row) for row in self._conn.execute(
+                    f"""SELECT
+                            COALESCE(s.miner_uid, e.bittensor_uid) AS miner_uid,
+                            LOWER(s.miner_address) AS miner_address,
+                            s.miner_hotkey_ss58,
+                            s.model_index,
+                            w.epoch_number,
+                            s.verdict,
+                            s.proof_status,
+                            s.failure_reason
+                        FROM capacity_audit_slots s
+                        JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                        LEFT JOIN miner_entries e
+                          ON e.address = LOWER(s.miner_address)
+                         AND e.model_index = s.model_index
+                        WHERE w.epoch_number >= ?
+                          AND COALESCE(s.miner_uid, e.bittensor_uid) IS NOT NULL
+                          AND s.verdict IN ('hard_proof_miss', 'no_show', 'timing_miss')
+                          {confirmation_clause}
+                        ORDER BY w.epoch_number ASC""",
+                    (gate_since_epoch,),
+                ).fetchall()]
+            for row in gate_rows:
+                key = event_key(row)
+                if key is None:
+                    continue
+                counts = gate_counts.setdefault(key, {
+                    "invalid_proof_failures": 0,
+                    "hard_failures": 0,
+                    "timing_failures": 0,
+                })
+                epochs = gate_failure_epochs_all.setdefault(
+                    key,
+                    {"invalid_proof": [], "hard": [], "timing": []},
+                )
+                verdict = str(row.get("verdict") or "")
+                epoch_i = int(row.get("epoch_number") or 0)
+                if _debug_capacity_audit_invalid_failure(
+                    verdict,
+                    row.get("proof_status"),
+                    row.get("failure_reason"),
+                ):
+                    counts["invalid_proof_failures"] += 1
+                    epochs["invalid_proof"].append(epoch_i)
+                if verdict in {"hard_proof_miss", "no_show"}:
+                    counts["hard_failures"] += 1
+                    epochs["hard"].append(epoch_i)
+                if verdict == "timing_miss":
+                    counts["timing_failures"] += 1
+                    epochs["timing"].append(epoch_i)
+
+        entries_by_uid: Dict[int, list[dict]] = {}
+        active_count_by_uid: Dict[int, int] = {}
+        for row in entry_rows:
+            uid = row.get("bittensor_uid")
+            if uid is None:
+                continue
+            uid_i = int(uid)
+            entries_by_uid.setdefault(uid_i, []).append(row)
+            if int(row.get("is_active") or 0):
+                active_count_by_uid[uid_i] = active_count_by_uid.get(uid_i, 0) + 1
+
+        def empty_canary() -> dict[str, Any]:
+            return {
+                "total": 0,
+                "ok": 0,
+                "errors": 0,
+                "proof_requested": 0,
+                "proof_verified": 0,
+                "proof_failures": 0,
+                "tee_requested": 0,
+                "tee_verified": 0,
+                "tee_failures": 0,
+                "last_status": "",
+                "last_error_kind": "",
+                "last_error": "",
+                "last_proof_failure": "",
+                "last_tee_failure": "",
+                "last_epoch": None,
+                "error_kinds": {},
+                "recent_errors": [],
+                "recent_proof_failures": [],
+                "recent_tee_failures": [],
+            }
+
+        def empty_audit() -> dict[str, Any]:
+            return {
+                "total": 0,
+                "timing_pass": 0,
+                "timing_excused": 0,
+                "timing_miss": 0,
+                "hard_proof_miss": 0,
+                "no_show": 0,
+                "pending": 0,
+                "failure_reasons": {},
+                "recent_failures": [],
+            }
+
+        def add_hint(hints: list[dict[str, str]], code: str, message: str) -> None:
+            if not any(h.get("code") == code for h in hints):
+                hints.append({"code": code, "message": message})
+
+        def add_step(steps: list[str], message: str) -> None:
+            if message and message not in steps:
+                steps.append(message)
+
+        def remaining_from_clear_epoch(clear_epoch: Optional[int]) -> tuple[Optional[int], Optional[float]]:
+            if clear_epoch is None:
+                return None, None
+            epochs_remaining = max(0, int(clear_epoch) - cur_epoch)
+            hours_remaining = round((epochs_remaining * epoch_s) / 3600.0, 2)
+            return epochs_remaining, hours_remaining
+
+        def category_gate_status(
+            *,
+            name: str,
+            failure_count: int,
+            threshold: int,
+            failure_epochs: list[int],
+        ) -> Optional[dict[str, Any]]:
+            if threshold <= 0 or failure_count < threshold:
+                return None
+            epochs = sorted(int(e) for e in failure_epochs)
+            next_clear_epoch = None
+            if len(epochs) >= threshold:
+                idx = min(len(epochs) - 1, max(0, int(failure_count) - int(threshold)))
+                next_clear_epoch = epochs[idx] + repeat_window
+            epochs_remaining, hours_remaining = remaining_from_clear_epoch(next_clear_epoch)
+            return {
+                "reason": name,
+                "failures": int(failure_count),
+                "threshold": int(threshold),
+                "failure_epochs": epochs[-20:],
+                "next_possible_clear_epoch": next_clear_epoch,
+                "epochs_remaining_if_clean": epochs_remaining,
+                "estimated_hours_remaining_if_clean": hours_remaining,
+            }
+
+        def build_entry_gate_status(
+            key: tuple[int, str, int],
+            gate_data: dict[str, int],
+            gate_failure_epochs: dict[tuple[int, str, int], dict[str, list[int]]],
+        ) -> dict[str, Any]:
+            categories: list[dict[str, Any]] = []
+            failure_epochs = gate_failure_epochs.get(key, {})
+            invalid_status = category_gate_status(
+                name="invalid_proof",
+                failure_count=int(gate_data.get("invalid_proof_failures", 0) or 0),
+                threshold=int(getattr(capacity_audit_cfg, "invalid_proof_misses_for_zero_score", 1) or 1),
+                failure_epochs=failure_epochs.get("invalid_proof", []),
+            )
+            if invalid_status:
+                categories.append(invalid_status)
+            hard_status = category_gate_status(
+                name="hard_proof_or_no_show",
+                failure_count=int(gate_data.get("hard_failures", 0) or 0),
+                threshold=int(getattr(capacity_audit_cfg, "hard_proof_misses_for_zero_score", 2) or 2),
+                failure_epochs=failure_epochs.get("hard", []),
+            )
+            if hard_status:
+                categories.append(hard_status)
+            if bool(getattr(capacity_audit_cfg, "allow_timing_only_score_gate", True)):
+                timing_status = category_gate_status(
+                    name="timing",
+                    failure_count=int(gate_data.get("timing_failures", 0) or 0),
+                    threshold=int(getattr(capacity_audit_cfg, "timing_misses_for_zero_score", 2) or 2),
+                    failure_epochs=failure_epochs.get("timing", []),
+                )
+                if timing_status:
+                    categories.append(timing_status)
+
+            clear_epochs = [
+                int(c["next_possible_clear_epoch"])
+                for c in categories
+                if c.get("next_possible_clear_epoch") is not None
+            ]
+            next_clear_epoch = (
+                max(clear_epochs)
+                if categories and len(clear_epochs) == len(categories)
+                else None
+            )
+            epochs_remaining, hours_remaining = remaining_from_clear_epoch(next_clear_epoch)
+            return {
+                "configured": gate_configured,
+                "enabled": gate_enabled,
+                "suppression_reason": (
+                    str(capacity_audit_gate_suppression_reason or "")
+                    if gate_configured and not gate_enabled else ""
+                ),
+                "active": bool(gate_enabled and categories),
+                "lookback_epochs": repeat_window,
+                "since_epoch": gate_since_epoch,
+                "active_reasons": [str(c["reason"]) for c in categories],
+                "next_possible_clear_epoch": next_clear_epoch,
+                "epochs_remaining_if_clean": epochs_remaining if categories else 0,
+                "estimated_hours_remaining_if_clean": hours_remaining if categories else 0.0,
+                "categories": categories,
+            }
+
+        def build_window(window_h: int) -> dict[str, Any]:
+            since_epoch = max(0, cur_epoch - window_epochs[window_h] + 1)
+            canaries: Dict[tuple[int, str, int], dict[str, Any]] = {}
+            receipts: Dict[tuple[int, str, int], dict[str, Any]] = {}
+            scores: Dict[tuple[int, str, int], dict[str, Any]] = {}
+            audits: Dict[tuple[int, str, int], dict[str, Any]] = {}
+            gate_failure_epochs = gate_failure_epochs_all
+            audit_seen: set[tuple[str, str, int]] = set()
+            uids: set[int] = set(entries_by_uid) | set(network_by_uid)
+
+            for row in canary_rows:
+                if int(row.get("epoch_number") or 0) < since_epoch:
+                    continue
+                key = event_key(row)
+                if key is None:
+                    continue
+                uids.add(key[0])
+                item = canaries.setdefault(key, empty_canary())
+                item["total"] += 1
+                status = str(row.get("status") or "")
+                err = row.get("error_message") or ""
+                error_kind = _debug_error_kind(err)
+                if status == "ok":
+                    item["ok"] += 1
+                else:
+                    item["errors"] += 1
+                    if not error_kind:
+                        error_kind = "chat_error"
+                    error_text = _debug_public_error_summary(error_kind)
+                    error_kinds = item["error_kinds"]
+                    error_kinds[error_kind] = int(error_kinds.get(error_kind, 0)) + 1
+                    item["recent_errors"].append({
+                        "epoch": int(row.get("epoch_number") or 0),
+                        "status": status,
+                        "error_kind": error_kind,
+                        "error": error_text,
+                    })
+                    if len(item["recent_errors"]) > 10:
+                        item["recent_errors"] = item["recent_errors"][-10:]
+                    item["last_error_kind"] = error_kind
+                    item["last_error"] = error_text
+                if int(row.get("proof_requested") or 0):
+                    item["proof_requested"] += 1
+                    if int(row.get("proof_verified") or 0):
+                        item["proof_verified"] += 1
+                    elif status == "ok":
+                        item["proof_failures"] += 1
+                        proof_reason = _debug_public_reason(
+                            row.get("proof_failure_reason"),
+                            "proof_verification_failed",
+                        )
+                        item["last_proof_failure"] = proof_reason
+                        item["recent_proof_failures"].append({
+                            "epoch": int(row.get("epoch_number") or 0),
+                            "reason": proof_reason,
+                        })
+                        item["recent_proof_failures"] = item["recent_proof_failures"][-10:]
+                if int(row.get("tee_requested") or 0):
+                    item["tee_requested"] += 1
+                    if int(row.get("tee_verified") or 0):
+                        item["tee_verified"] += 1
+                    elif status == "ok":
+                        item["tee_failures"] += 1
+                        item["last_tee_failure"] = "tee_attestation_not_verified"
+                        item["recent_tee_failures"].append({
+                            "epoch": int(row.get("epoch_number") or 0),
+                            "reason": "tee_attestation_not_verified",
+                        })
+                        item["recent_tee_failures"] = item["recent_tee_failures"][-10:]
+                item["last_status"] = status
+                item["last_epoch"] = int(row.get("epoch_number") or 0)
+
+            for row in receipt_rows:
+                epoch_i = int(row.get("epoch_number") or 0)
+                if row.get("miner_uid") is None or epoch_i < since_epoch:
+                    continue
+                key = event_key(row)
+                if key is None:
+                    continue
+                uids.add(key[0])
+                item = receipts.setdefault(key, {
+                    "receipts": 0,
+                    "canary_receipts": 0,
+                    "own_receipts": 0,
+                    "proof_requested": 0,
+                    "proof_verified": 0,
+                    "avg_tok_s": 0.0,
+                    "first_epoch": None,
+                    "last_epoch": None,
+                    "_tok_s_sum": 0.0,
+                })
+                receipt_count = int(row.get("receipts") or 0)
+                item["receipts"] += receipt_count
+                item["canary_receipts"] += int(row.get("canary_receipts") or 0)
+                item["own_receipts"] += int(row.get("own_receipts") or 0)
+                item["proof_requested"] += int(row.get("proof_requested") or 0)
+                item["proof_verified"] += int(row.get("proof_verified") or 0)
+                item["_tok_s_sum"] += float(row.get("tok_s_sum") or 0.0)
+                item["avg_tok_s"] = round(
+                    item["_tok_s_sum"] / max(1, item["receipts"]),
+                    2,
+                )
+                item["first_epoch"] = (
+                    epoch_i if item["first_epoch"] is None
+                    else min(int(item["first_epoch"]), epoch_i)
+                )
+                item["last_epoch"] = (
+                    epoch_i if item["last_epoch"] is None
+                    else max(int(item["last_epoch"]), epoch_i)
+                )
+
+            for row in score_rows:
+                if int(row.get("epoch_number") or 0) < since_epoch:
+                    continue
+                key = event_key(row)
+                if key is None:
+                    continue
+                uids.add(key[0])
+                scores[key] = {
+                    "last_scored_epoch": int(row.get("epoch_number") or 0),
+                    "epoch_score": (
+                        None
+                        if row.get("epoch_score") is None
+                        else float(row.get("epoch_score"))
+                    ),
+                    "ema_score": float(row.get("ema_score") or 0.0),
+                    "own_receipts": int(row.get("own_receipts") or 0),
+                    "all_receipts": int(row.get("all_receipts") or 0),
+                    "expected_receipts": int(row.get("expected_receipts") or 0),
+                    "proof_tests": int(row.get("proof_tests") or 0),
+                    "proof_failures": int(row.get("proof_failures") or 0),
+                    "tee_tests": int(row.get("tee_tests") or 0),
+                    "tee_failures": int(row.get("tee_failures") or 0),
+                    "tee_verified": bool(row.get("tee_verified") or 0),
+                }
+
+            for row in audit_rows:
+                if int(row.get("epoch_number") or 0) < since_epoch:
+                    continue
+                key = event_key(row)
+                if key is None:
+                    continue
+                dedupe = (
+                    str(row.get("audit_id") or ""),
+                    key[1],
+                    key[2],
+                )
+                if dedupe in audit_seen:
+                    continue
+                audit_seen.add(dedupe)
+                uids.add(key[0])
+                item = audits.setdefault(key, empty_audit())
+                verdict = str(row.get("verdict") or "pending")
+                item["total"] += 1
+                if verdict in item:
+                    item[verdict] += 1
+                else:
+                    item["pending"] += 1
+                raw_reason = row.get("failure_reason") or ""
+                reason = (
+                    _debug_public_reason(raw_reason, "capacity_audit_failed")
+                    if raw_reason else ""
+                )
+                if reason:
+                    reasons = item["failure_reasons"]
+                    reasons[reason] = int(reasons.get(reason, 0)) + 1
+                if verdict in {"timing_miss", "hard_proof_miss", "no_show"}:
+                    epoch_i = int(row.get("epoch_number") or 0)
+                    item["recent_failures"].append({
+                        "epoch": epoch_i,
+                        "model_index": key[2],
+                        "verdict": verdict,
+                        "timing_status": str(row.get("timing_status") or ""),
+                        "proof_status": str(row.get("proof_status") or ""),
+                        "failure_reason": reason,
+                        "gpu_name": str(row.get("gpu_name") or ""),
+                        "pass_count": int(row.get("pass_count") or 0),
+                    })
+                    if len(item["recent_failures"]) > 20:
+                        item["recent_failures"] = item["recent_failures"][-20:]
+
+            result_uids: Dict[str, Any] = {}
+            for uid in sorted(uids):
+                uid_entries = [
+                    e for e in entries_by_uid.get(uid, [])
+                    if int(e.get("is_active") or 0)
+                    or int(e.get("last_seen_epoch") or 0) >= since_epoch
+                    or e.get("probation_entered_epoch") is not None
+                ]
+                entry_keys = {
+                    (uid, str(e.get("address") or "").lower(), int(e.get("model_index") or 0))
+                    for e in uid_entries
+                }
+                for key in set(canaries) | set(receipts) | set(scores) | set(audits) | set(gate_counts):
+                    if key[0] == uid:
+                        entry_keys.add(key)
+
+                entries = []
+                hints: list[dict[str, str]] = []
+                active_entries = 0
+                inactive_recent_entries = 0
+                on_probation = 0
+                latest_scored_epoch = None
+                best_score = 0.0
+                entry_gate_status_by_key: Dict[tuple[int, str, int], dict[str, Any]] = {}
+                for key in sorted(entry_keys, key=lambda k: (k[1], k[2])):
+                    _, addr, idx = key
+                    db_entry = next(
+                        (
+                            e for e in uid_entries
+                            if str(e.get("address") or "").lower() == addr
+                            and int(e.get("model_index") or 0) == idx
+                        ),
+                        None,
+                    )
+                    score_data = scores.get(key, {})
+                    canary_data = canaries.get(key, empty_canary())
+                    audit_data = audits.get(key, empty_audit())
+                    receipt_data = dict(receipts.get(key, {
+                        "receipts": 0,
+                        "canary_receipts": 0,
+                        "own_receipts": 0,
+                        "proof_requested": 0,
+                        "proof_verified": 0,
+                        "avg_tok_s": 0.0,
+                        "first_epoch": None,
+                        "last_epoch": None,
+                    }))
+                    receipt_data.pop("_tok_s_sum", None)
+                    gate_data = gate_counts.get(key, {
+                        "invalid_proof_failures": 0,
+                        "hard_failures": 0,
+                        "timing_failures": 0,
+                    })
+                    gate_status = build_entry_gate_status(
+                        key,
+                        gate_data,
+                        gate_failure_epochs,
+                    )
+                    entry_gate_status_by_key[key] = gate_status
+                    is_active = bool(db_entry and int(db_entry.get("is_active") or 0))
+                    if is_active:
+                        active_entries += 1
+                    elif db_entry is not None:
+                        inactive_recent_entries += 1
+                    probation_epoch = (
+                        db_entry.get("probation_entered_epoch")
+                        if db_entry is not None else None
+                    )
+                    is_probation = probation_epoch is not None
+                    if is_probation:
+                        on_probation += 1
+                    probation_consecutive = (
+                        int(db_entry.get("probation_consecutive_passes") or 0)
+                        if db_entry else 0
+                    )
+                    probation_required = (
+                        int(db_entry.get("probation_required_passes") or 0)
+                        if db_entry else 0
+                    )
+                    probation_remaining = (
+                        max(0, probation_required - probation_consecutive)
+                        if is_probation else 0
+                    )
+                    raw_ema = float(db_entry.get("ema_score") or 0.0) if db_entry else 0.0
+                    display_score = 0.0 if not is_active else (raw_ema if raw_ema > 0 else 0.01)
+                    is_blacklisted = addr in blacklisted
+                    model_gate_reason = model_gates.get((addr, idx), "")
+                    best_score = max(best_score, display_score)
+                    if score_data.get("last_scored_epoch") is not None:
+                        latest_scored_epoch = max(
+                            latest_scored_epoch or 0,
+                            int(score_data["last_scored_epoch"]),
+                        )
+
+                    entry_hint_codes: list[str] = []
+                    if is_blacklisted:
+                        entry_hint_codes.append("blacklisted")
+                        add_hint(
+                            hints,
+                            "blacklisted",
+                            "This miner address is currently blacklisted by subnet configuration.",
+                        )
+                    if model_gate_reason:
+                        entry_hint_codes.append("model_gate_active")
+                        add_hint(
+                            hints,
+                            "model_gate_active",
+                            "This executor does not satisfy the current capacity model/GPU gate.",
+                        )
+                    if addr in stale:
+                        entry_hint_codes.append("stale_uid_identity")
+                        add_hint(
+                            hints,
+                            "stale_uid_identity",
+                            "This address is stale for the current UID owner and should not be routed.",
+                        )
+                    if is_probation:
+                        entry_hint_codes.append("on_probation")
+                        add_hint(
+                            hints,
+                            "on_probation",
+                            "One or more entries are on probation and need clean passes to recover.",
+                        )
+                    if is_active and int(db_entry.get("scored_epochs") or 0) == 0:
+                        entry_hint_codes.append("new_entry_not_scored")
+                        add_hint(
+                            hints,
+                            "new_entry_not_scored",
+                            "A current active entry has not closed a scored epoch yet.",
+                        )
+                    if canary_data.get("last_error_kind"):
+                        entry_hint_codes.append(str(canary_data["last_error_kind"]))
+                        if canary_data["last_error_kind"] == "chat_unauthorized":
+                            add_hint(
+                                hints,
+                                "chat_unauthorized",
+                                "The endpoint is reachable but /chat rejects validator requests with 401.",
+                            )
+                        else:
+                            add_hint(
+                                hints,
+                                str(canary_data["last_error_kind"]),
+                                "Recent canary requests failed on the inference route.",
+                            )
+                    if int(canary_data.get("proof_failures") or 0):
+                        entry_hint_codes.append("proof_failure")
+                        add_hint(
+                            hints,
+                            "proof_failure",
+                            "Recent synthetic proof verification failed for this executor.",
+                        )
+                    if int(canary_data.get("tee_failures") or 0):
+                        entry_hint_codes.append("tee_failure")
+                        add_hint(
+                            hints,
+                            "tee_failure",
+                            "Recent TEE attestation verification failed for this executor.",
+                        )
+                    if gate_data["hard_failures"] or gate_data["timing_failures"] or gate_data["invalid_proof_failures"]:
+                        entry_hint_codes.append("capacity_audit_failures")
+                        add_hint(
+                            hints,
+                            "capacity_audit_failures",
+                            "Recent capacity-audit failures are still inside the scoring lookback.",
+                        )
+
+                    entry_next_steps: list[str] = []
+                    if is_blacklisted:
+                        add_step(
+                            entry_next_steps,
+                            "Resolve the subnet blacklist reason before expecting a score.",
+                        )
+                    if model_gate_reason:
+                        add_step(entry_next_steps, model_gate_reason)
+                    if not is_active:
+                        add_step(
+                            entry_next_steps,
+                            "This executor is not active in the cached validator state; start or re-register the intended endpoint.",
+                        )
+                    if addr in stale:
+                        add_step(
+                            entry_next_steps,
+                            "Stop using this stale address for the current UID owner.",
+                        )
+                    if is_active and int(db_entry.get("scored_epochs") or 0) == 0:
+                        add_step(
+                            entry_next_steps,
+                            "Keep the endpoint online until at least one scored epoch closes.",
+                        )
+                    if canary_data.get("last_error_kind"):
+                        add_step(
+                            entry_next_steps,
+                            "Fix the inference route shown by canary.last_error before expecting score recovery.",
+                        )
+                    if int(canary_data.get("proof_failures") or 0):
+                        add_step(
+                            entry_next_steps,
+                            "Check proof generation and keep the endpoint online for clean synthetic proofs.",
+                        )
+                    if int(canary_data.get("tee_failures") or 0):
+                        add_step(
+                            entry_next_steps,
+                            "Check the TEE attestation path and registered enclave identity.",
+                        )
+                    if is_probation:
+                        add_step(
+                            entry_next_steps,
+                            f"Keep this executor clean for {probation_remaining} more probation pass(es).",
+                        )
+                    if gate_status.get("active"):
+                        clear_epoch = gate_status.get("next_possible_clear_epoch")
+                        suffix = (
+                            f" Earliest clear if clean: epoch {clear_epoch}."
+                            if clear_epoch is not None else ""
+                        )
+                        add_step(
+                            entry_next_steps,
+                            "Fix capacity-audit execution/publishing for this executor and keep it clean."
+                            + suffix,
+                        )
+                    elif (
+                        gate_data["hard_failures"]
+                        or gate_data["timing_failures"]
+                        or gate_data["invalid_proof_failures"]
+                    ):
+                        add_step(
+                            entry_next_steps,
+                            "Recent audit failures are present but below the active gate threshold; keep this executor clean.",
+                        )
+
+                    entries.append({
+                        "address": addr,
+                        "model_index": idx,
+                        "endpoint": db_entry.get("endpoint") if db_entry else "",
+                        "model_id": db_entry.get("model_id") if db_entry else "",
+                        "quant": db_entry.get("quant") if db_entry else "",
+                        "gpu_name": db_entry.get("gpu_name") if db_entry else "",
+                        "gpu_count": int(db_entry.get("gpu_count") or 0) if db_entry else 0,
+                        "vram_gb": int(db_entry.get("vram_gb") or 0) if db_entry else 0,
+                        "active": is_active,
+                        "stale": addr in stale,
+                        "blacklisted": is_blacklisted,
+                        "model_gate": {
+                            "active": bool(model_gate_reason),
+                            "reason": model_gate_reason,
+                        },
+                        "first_seen_epoch": db_entry.get("first_seen_epoch") if db_entry else None,
+                        "last_seen_epoch": db_entry.get("last_seen_epoch") if db_entry else None,
+                        "score": display_score,
+                        "ema_score": raw_ema,
+                        "total_epochs": int(db_entry.get("total_epochs") or 0) if db_entry else 0,
+                        "scored_epochs": int(db_entry.get("scored_epochs") or 0) if db_entry else 0,
+                        "probation": {
+                            "active": is_probation,
+                            "entered_epoch": probation_epoch,
+                            "consecutive_passes": probation_consecutive,
+                            "required_passes": probation_required,
+                            "passes_remaining_if_clean": probation_remaining,
+                        },
+                        "canary": canary_data,
+                        "receipts": receipt_data,
+                        "last_score": score_data,
+                        "capacity_audit": {
+                            **audit_data,
+                            "gate_counts": gate_data,
+                            "gate_status": gate_status,
+                        },
+                        "issue_codes": entry_hint_codes,
+                        "next_steps": entry_next_steps,
+                    })
+
+                if inactive_recent_entries:
+                    add_hint(
+                        hints,
+                        "recent_endpoint_churn",
+                        "Recent inactive entries still exist for this UID; replacing endpoints does not erase the lookback immediately.",
+                    )
+                if active_entries == 0:
+                    add_hint(hints, "no_active_endpoint", "No active endpoint is present for this UID.")
+
+                convicted = []
+                convicted_details = []
+                for key, row in gate_counts.items():
+                    if key[0] != uid:
+                        continue
+                    gate_status = entry_gate_status_by_key.get(key) or build_entry_gate_status(
+                        key,
+                        row,
+                        gate_failure_epochs,
+                    )
+                    if gate_status.get("active"):
+                        convicted.append(key)
+                        convicted_details.append({
+                            "address": key[1],
+                            "model_index": key[2],
+                            "active_reasons": gate_status.get("active_reasons", []),
+                            "next_possible_clear_epoch": gate_status.get("next_possible_clear_epoch"),
+                            "epochs_remaining_if_clean": gate_status.get("epochs_remaining_if_clean"),
+                            "estimated_hours_remaining_if_clean": gate_status.get("estimated_hours_remaining_if_clean"),
+                        })
+
+                evidence_entry_count = len([k for k in gate_counts if k[0] == uid])
+                entry_count = max(active_count_by_uid.get(uid, 0), evidence_entry_count)
+                quorum = (
+                    capacity_audit_uid_escalation_threshold(entry_count, capacity_audit_cfg)
+                    if gate_enabled and entry_count > 0
+                    else 0
+                )
+                uid_gate_active = bool(gate_enabled and entry_count > 1 and len(convicted) >= quorum)
+                uid_next_clear_epoch = None
+                if uid_gate_active and quorum > 0:
+                    clear_epochs = sorted(
+                        int(d["next_possible_clear_epoch"])
+                        for d in convicted_details
+                        if d.get("next_possible_clear_epoch") is not None
+                    )
+                    clears_needed = len(convicted) - quorum + 1
+                    if clears_needed > 0 and len(clear_epochs) >= clears_needed:
+                        uid_next_clear_epoch = clear_epochs[clears_needed - 1]
+                uid_epochs_remaining, uid_hours_remaining = remaining_from_clear_epoch(
+                    uid_next_clear_epoch
+                )
+                if uid_gate_active:
+                    add_hint(
+                        hints,
+                        "uid_audit_gate_active",
+                        "UID-level capacity-audit floor is active; adding new healthy endpoints does not clear old failures inside the lookback.",
+                    )
+
+                network_source = network_by_uid.get(uid, {})
+
+                def network_float(name: str) -> Optional[float]:
+                    value = network_source.get(name)
+                    try:
+                        number = float(value) if value is not None else None
+                    except (TypeError, ValueError):
+                        return None
+                    return number if number is not None and math.isfinite(number) else None
+
+                try:
+                    metagraph_block = (
+                        int(network_source["metagraph_block"])
+                        if network_source.get("metagraph_block") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    metagraph_block = None
+                network = {
+                    "last_validator_weight": network_float("last_validator_weight"),
+                    "metagraph_hotkey_ss58": str(
+                        network_source.get("metagraph_hotkey_ss58") or ""
+                    ),
+                    "metagraph_incentive": network_float("metagraph_incentive"),
+                    "metagraph_emission": network_float("metagraph_emission"),
+                    "metagraph_trust": network_float("metagraph_trust"),
+                    "metagraph_consensus": network_float("metagraph_consensus"),
+                    "metagraph_block": metagraph_block,
+                }
+                if (
+                    network["last_validator_weight"] is not None
+                    and network["last_validator_weight"] > 0.0
+                    and network["metagraph_incentive"] is not None
+                    and network["metagraph_incentive"] <= 0.0
+                ):
+                    add_hint(
+                        hints,
+                        "local_weight_not_reflected",
+                        "This validator assigned a positive last weight, but the cached metagraph incentive is still zero; network consensus may not have reflected it yet.",
+                    )
+
+                uid_next_steps: list[str] = []
+                if active_entries == 0:
+                    add_step(
+                        uid_next_steps,
+                        "Bring at least one endpoint online for this UID.",
+                    )
+                if uid_gate_active:
+                    clear_epoch = uid_next_clear_epoch
+                    suffix = (
+                        f" Earliest UID-wide clear if clean: epoch {clear_epoch}."
+                        if clear_epoch is not None else ""
+                    )
+                    add_step(
+                        uid_next_steps,
+                        "Do not add replacement endpoints to mask failing ones; fix the convicted executors and keep the UID clean."
+                        + suffix,
+                    )
+                if inactive_recent_entries:
+                    add_step(
+                        uid_next_steps,
+                        "Old inactive entries still exist in the lookback; explicitly deactivate broken endpoints and wait for the window to roll.",
+                    )
+                if on_probation:
+                    add_step(
+                        uid_next_steps,
+                        "One or more executors are on probation; check each entry's probation.passes_remaining_if_clean.",
+                    )
+
+                primary_issue = "healthy"
+                for code in (
+                    "blacklisted",
+                    "uid_audit_gate_active",
+                    "model_gate_active",
+                    "stale_uid_identity",
+                    "proof_failure",
+                    "tee_failure",
+                    "chat_unauthorized",
+                    "chat_forbidden",
+                    "chat_not_found",
+                    "timeout",
+                    "connection_failed",
+                    "tls_error",
+                    "chat_error",
+                    "no_active_endpoint",
+                    "on_probation",
+                    "new_entry_not_scored",
+                    "local_weight_not_reflected",
+                    "capacity_audit_failures",
+                    "recent_endpoint_churn",
+                ):
+                    if any(h.get("code") == code for h in hints):
+                        primary_issue = code
+                        break
+
+                result_uids[str(uid)] = {
+                    "uid": uid,
+                    "identity": {
+                        "hotkey_ss58": str(
+                            (owners_by_uid.get(uid) or {}).get("hotkey_ss58") or ""
+                        ),
+                        "evm_address": str(
+                            (owners_by_uid.get(uid) or {}).get("evm_address") or ""
+                        ).lower(),
+                        "generation": int(
+                            (owners_by_uid.get(uid) or {}).get("generation") or 0
+                        ),
+                        "identity_start_epoch": int(
+                            (owners_by_uid.get(uid) or {}).get("identity_start_epoch") or 0
+                        ),
+                    },
+                    "primary_issue": primary_issue,
+                    "summary": {
+                        "active_entries": active_entries,
+                        "recent_entries": len(entries),
+                        "inactive_recent_entries": inactive_recent_entries,
+                        "entries_on_probation": on_probation,
+                        "best_score": best_score,
+                        "latest_scored_epoch": latest_scored_epoch,
+                    },
+                    "network": network,
+                    "uid_gate": {
+                        "configured": gate_configured,
+                        "enabled": gate_enabled,
+                        "suppression_reason": (
+                            str(capacity_audit_gate_suppression_reason or "")
+                            if gate_configured and not gate_enabled else ""
+                        ),
+                        "active": uid_gate_active,
+                        "lookback_epochs": repeat_window,
+                        "since_epoch": gate_since_epoch,
+                        "convicted_entries": len(convicted),
+                        "entry_count": entry_count,
+                        "quorum": quorum,
+                        "convicted": convicted_details,
+                        "next_possible_clear_epoch": uid_next_clear_epoch,
+                        "epochs_remaining_if_clean": (
+                            uid_epochs_remaining if uid_gate_active else 0
+                        ),
+                        "estimated_hours_remaining_if_clean": (
+                            uid_hours_remaining if uid_gate_active else 0.0
+                        ),
+                        "thresholds": {
+                            "invalid_proof_misses": int(getattr(capacity_audit_cfg, "invalid_proof_misses_for_zero_score", 1) or 1),
+                            "hard_proof_misses": int(getattr(capacity_audit_cfg, "hard_proof_misses_for_zero_score", 2) or 2),
+                            "timing_misses": int(getattr(capacity_audit_cfg, "timing_misses_for_zero_score", 2) or 2),
+                            "timing_only_allowed": bool(getattr(capacity_audit_cfg, "allow_timing_only_score_gate", True)),
+                            "uid_min_entries": int(getattr(capacity_audit_cfg, "uid_escalation_min_entries", 2) or 2),
+                            "uid_fraction": float(getattr(capacity_audit_cfg, "uid_escalation_fraction", 0.10) or 0.10),
+                            "uid_max_entries": int(getattr(capacity_audit_cfg, "uid_escalation_max_entries", 10) or 10),
+                        },
+                    },
+                    "hints": hints,
+                    "next_steps": uid_next_steps,
+                    "entries": entries,
+                }
+
+            return {
+                "window_h": window_h,
+                "window_epochs": window_epochs[window_h],
+                "since_epoch": since_epoch,
+                "uids": result_uids,
+            }
+
+        return {
+            "enabled": True,
+            "version": 1,
+            "generated_at": now,
+            "epoch_number": cur_epoch,
+            "windows": {str(h): build_window(h) for h in windows},
         }
 
     # ── Shared state derivation ──────────────────────────────────────

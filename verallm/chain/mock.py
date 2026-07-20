@@ -82,6 +82,7 @@ class MockMinerRegistryClient:
     ):
         self._miners: Dict[str, List[OnChainMinerModel]] = miners or {}
         self._associated_uids: Dict[str, int] = {}  # evm_address -> uid
+        self._registered_evm_by_uid: Dict[int, str] = {}
         self._demand_scores: Dict[str, int] = demand_scores or {}
         self._tee: Dict[str, OnChainTEECapability] = {}
 
@@ -105,12 +106,29 @@ class MockMinerRegistryClient:
         m = models[index]
         return m.active and m.expires_at > int(time.time())
 
-    def get_associated_uid(self, evm_address: str) -> Optional[int]:
+    def get_associated_uid(
+        self,
+        evm_address: str,
+        *,
+        refresh: bool = False,
+    ) -> Optional[int]:
         return self._associated_uids.get(evm_address.lower())
 
     def set_associated_uid(self, evm_address: str, uid: int) -> None:
         """Test helper: simulate an associate_evm_key association."""
         self._associated_uids[evm_address.lower()] = uid
+
+    def get_registered_evm_for_uid(
+        self,
+        uid: int,
+        *,
+        refresh: bool = False,
+    ) -> Optional[str]:
+        return self._registered_evm_by_uid.get(int(uid))
+
+    def set_registered_evm_for_uid(self, uid: int, evm_address: str) -> None:
+        """Test helper: simulate MinerRegistry.uidToEvm(uid)."""
+        self._registered_evm_by_uid[int(uid)] = evm_address
 
     def register_model(
         self, model_id, endpoint, model_spec_ref, quant, max_context_len, private_key=None

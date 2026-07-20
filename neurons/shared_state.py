@@ -16,7 +16,7 @@ import bittensor as bt
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,9 @@ class ValidatorSharedState:
     # SubnetConfig blacklist — addresses whose weights the validator zeros.
     # Proxy reads this to also zero the score in /v1/network/stats.
     blacklisted_addresses: List[str] = field(default_factory=list)
+    # Stale EVM addresses excluded by validator UID ownership checks. Proxy
+    # must not route or display these addresses.
+    stale_miner_addresses: List[str] = field(default_factory=list)
     updated_at: float = 0.0
 
 
@@ -127,6 +130,7 @@ def write_shared_state(
         "demand_scores": state.demand_scores,
         "ss58_map": state.ss58_map,
         "blacklisted_addresses": list(state.blacklisted_addresses),
+        "stale_miner_addresses": list(state.stale_miner_addresses),
         "updated_at": time.time(),
     }
     tmp_path = path + ".tmp"
@@ -188,7 +192,34 @@ def read_shared_state(
             demand_scores=data.get("demand_scores", {}),
             ss58_map=data.get("ss58_map", {}),
             blacklisted_addresses=data.get("blacklisted_addresses", []),
+            stale_miner_addresses=data.get("stale_miner_addresses", []),
             updated_at=data.get("updated_at", 0.0),
         )
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def write_miner_debug_state(data: Dict[str, Any], path: str) -> None:
+    """Atomically write the optional public miner diagnostics cache."""
+    tmp_path = path + ".tmp"
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        bt.logging.warning(f"Failed to write miner debug state to {path}: {exc}")
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def read_miner_debug_state(path: str) -> Optional[Dict[str, Any]]:
+    """Read the last complete miner diagnostics cache."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
         return None

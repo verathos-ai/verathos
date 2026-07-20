@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _FuturesTimeout
 from dataclasses import asdict, dataclass
@@ -287,18 +288,24 @@ class CapacityAuditEndpointResolver:
         self._endpoint_failures: dict[str, int] = {}
         self._endpoint_transient_failures: dict[str, int] = {}
         self._endpoint_quarantine_until: dict[str, float] = {}
+        self._background_refresh_lock = threading.Lock()
+        self._background_refreshing = False
         self._load_cache()
 
     def current_urls(self, *, force_refresh: bool = False) -> tuple[str, ...]:
         now = time.time()
-        if not force_refresh:
-            cached = tuple(
-                item.endpoint
-                for item in self._endpoints
-                if item.endpoint and not self._is_quarantined(item.endpoint, now)
-            )
-            if cached:
-                return cached
+        cached = tuple(
+            item.endpoint
+            for item in self._endpoints
+            if item.endpoint and not self._is_quarantined(item.endpoint, now)
+        )
+        if not force_refresh and cached:
+            if (
+                now - self._cache_updated_at >= self.cache_ttl_s
+                and now >= self._next_refresh_after
+            ):
+                self._request_background_refresh()
+            return cached
 
         self.refresh(force=force_refresh)
         now = time.time()
@@ -307,6 +314,30 @@ class CapacityAuditEndpointResolver:
             for item in self._endpoints
             if item.endpoint and not self._is_quarantined(item.endpoint, now)
         )
+
+    def _request_background_refresh(self) -> None:
+        """Refresh stale chain discovery without blocking artifact publication."""
+        with self._background_refresh_lock:
+            if self._background_refreshing:
+                return
+            self._background_refreshing = True
+
+        def _run() -> None:
+            try:
+                self.refresh(force=False)
+            except Exception as exc:
+                bt.logging.debug(
+                    f"Capacity audit validator background refresh failed: {exc}"
+                )
+            finally:
+                with self._background_refresh_lock:
+                    self._background_refreshing = False
+
+        threading.Thread(
+            target=_run,
+            name="capacity-audit-validator-refresh",
+            daemon=True,
+        ).start()
 
     def refresh(self, *, force: bool = False) -> list[ValidatorAuditEndpoint]:
         now = time.time()
@@ -440,9 +471,21 @@ class CapacityAuditEndpointResolver:
             return []
         usable: list[ValidatorAuditEndpoint] = []
         dropped = 0
+        inconclusive = 0
         max_workers = min(DISCOVERY_PROBE_MAX_WORKERS, max(1, len(endpoint_list)))
         pool = ThreadPoolExecutor(max_workers=max_workers)
         futures = {pool.submit(self._probe_endpoint, item.endpoint): item for item in endpoint_list}
+        handled = set()
+
+        def record_result(item: ValidatorAuditEndpoint, status: str) -> None:
+            nonlocal dropped, inconclusive
+            if status == "bad":
+                dropped += 1
+                return
+            usable.append(item)
+            if status != "ok":
+                inconclusive += 1
+
         try:
             try:
                 for future in as_completed(
@@ -454,27 +497,39 @@ class CapacityAuditEndpointResolver:
                         status = future.result()
                     except Exception:
                         status = "unknown"
-                    if status == "ok":
-                        usable.append(item)
-                    else:
-                        dropped += 1
+                    handled.add(future)
+                    record_result(item, status)
             except _FuturesTimeout:
                 pending = 0
                 for future, item in futures.items():
+                    if future in handled:
+                        continue
                     if future.done():
+                        try:
+                            status = future.result()
+                        except Exception:
+                            status = "unknown"
+                        record_result(item, status)
                         continue
                     pending += 1
                     future.cancel()
-                dropped += pending
+                    usable.append(item)
+                inconclusive += pending
                 if pending:
                     bt.logging.warning(
-                        f"Capacity audit discovery probe timed out for {pending} endpoint(s)"
+                        f"Capacity audit discovery probe timed out for {pending} endpoint(s); "
+                        "retaining chain-discovered targets"
                     )
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
         if dropped:
             bt.logging.warning(
                 f"Capacity audit discovery dropped {dropped} endpoint(s) without usable audit ingest"
+            )
+        if inconclusive:
+            bt.logging.info(
+                f"Capacity audit discovery retained {inconclusive} chain-discovered "
+                "endpoint(s) after inconclusive health probes"
             )
         return usable
 
