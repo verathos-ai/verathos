@@ -4274,6 +4274,7 @@ class ValidatorNeuron:
                     presence_penalty=test.presence_penalty,
                     top_k=test.top_k,
                     top_p=test.top_p,
+                    allow_unbound_output_count=test.verify_tee,
                 )
 
                 if not self._canary_epoch_active(epoch_number):

@@ -27,10 +27,9 @@ Weight composition:
                   score per UID = (1/N)², total = N × (1/N)² = 1/N of honest.
                   Per-receipt output cap: canary receipts are capped at
                   CANARY_OUTPUT_CAP (matches canary spec max), organic at
-                  ORGANIC_OUTPUT_CAP (matches proxy default).  Defends against
-                  miners that ignore max_tokens to inflate scoring (the proof
-                  system verifies computation correctness but does not bind
-                  output_token_count to the validator's max_tokens request).
+                  ORGANIC_OUTPUT_CAP (matches proxy default). This is defense
+                  in depth for legacy/imported receipts; live clients reject
+                  counts that exceed the request or disagree with proof data.
 
     TTFT_FACTOR = min(1.3, sqrt(model_median_ttft / miner_median_ttft))
                   Peer-relative: compares this miner's median TTFT to the median
@@ -297,14 +296,11 @@ def compute_epoch_entry_score(
     # per token) while prefill is parallel. Reflects actual GPU cost ratio.
     # Receipts where proof was requested and failed contribute 0 tokens.
     #
-    # Per-receipt output cap: defends against miners that ignore the
-    # validator's max_tokens to inflate scoring.  The proof system verifies
-    # computation correctness but does NOT bind output_token_count to the
-    # validator's max_tokens request — a patched server can generate beyond
-    # the limit, commit to the longer count honestly, and proofs still pass.
-    # Cap canary receipts at the canary spec max (small canary 100-300,
-    # full-context 200), and organic receipts at the proxy default
-    # max_new_tokens.  Honest miners are unaffected; cheaters are bounded.
+    # Per-receipt output cap is defense in depth for legacy/imported receipts.
+    # Live validator clients reject counts that exceed max_new_tokens or do not
+    # match the commitment and proof bundle. Cap canary receipts at the canary
+    # spec max (small canary 100-300, full-context 200), and organic receipts at
+    # the proxy default max_new_tokens.
     OUTPUT_WEIGHT = 3
     CANARY_OUTPUT_CAP = 300       # matches max_new_tokens in canary.generate_*
     ORGANIC_OUTPUT_CAP = 4096     # matches PlaintextChatRequest.max_new_tokens default

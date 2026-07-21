@@ -123,6 +123,63 @@ def _finalize_validator_timing(
     return timing
 
 
+def _validated_output_token_count(
+    data: dict,
+    *,
+    max_new_tokens: int,
+    commitment: Optional[InferenceCommitment],
+    commitment_present: bool,
+    proof_data: object,
+    allow_unbound: bool = False,
+) -> int:
+    """Return the proof-bound output count or reject inconsistent metadata."""
+    reported = data.get("output_tokens")
+    if isinstance(reported, bool) or not isinstance(reported, int):
+        raise RuntimeError(
+            f"Miner returned invalid output token count: {reported!r}"
+        )
+    if reported < 0:
+        raise RuntimeError(
+            f"Miner returned negative output token count: {reported}"
+        )
+    if reported > int(max_new_tokens):
+        raise RuntimeError(
+            "Miner output token count exceeds request limit: "
+            f"reported={reported}, max_new_tokens={max_new_tokens}"
+        )
+
+    # TEE responses do not expose plaintext commitments or token IDs. For
+    # proof-backed responses, require every independently supplied count to
+    # agree before the value reaches receipts, billing, or scoring.
+    if not commitment_present and allow_unbound:
+        return reported
+    if not commitment_present:
+        raise RuntimeError("Miner response is missing an inference commitment")
+    if commitment is None:
+        raise RuntimeError("Miner returned an invalid inference commitment")
+
+    committed = int(commitment.output_token_count)
+    if reported != committed:
+        raise RuntimeError(
+            "Miner output token count mismatch: "
+            f"reported={reported}, committed={committed}"
+        )
+
+    output_token_ids = (
+        proof_data.get("output_token_ids")
+        if isinstance(proof_data, dict)
+        else None
+    )
+    if not isinstance(output_token_ids, list):
+        raise RuntimeError("Miner proof bundle is missing output_token_ids")
+    if reported != len(output_token_ids):
+        raise RuntimeError(
+            "Miner output token count mismatch: "
+            f"reported={reported}, proof_bundle={len(output_token_ids)}"
+        )
+    return reported
+
+
 # ============================================================================
 # SSE parser
 # ============================================================================
@@ -432,6 +489,7 @@ class ValidatorClient:
         temperature: float = 1.0,
         sampling_verification_bps: int = 0,
         stream_callback=None,
+        allow_unbound_output_count: bool = False,
     ) -> Tuple[str, InferenceCommitment, InferenceProofBundle, bytes, dict]:
         """Send inference request, stream tokens, get commitment + proofs.
 
@@ -505,7 +563,14 @@ class ValidatorClient:
                     timing["beacon_ms"] = data.get("beacon_ms", 0)
                     timing["challenge_ms"] = data.get("challenge_ms", 0)
                     timing["input_tokens"] = data.get("input_tokens", 0)
-                    timing["output_tokens"] = data.get("output_tokens", 0)
+                    timing["output_tokens"] = _validated_output_token_count(
+                        data,
+                        max_new_tokens=max_new_tokens,
+                        commitment=commitment,
+                        commitment_present=bool(commit_data),
+                        proof_data=proof_data,
+                        allow_unbound=allow_unbound_output_count,
+                    )
                 elif event_type == "error":
                     raise RuntimeError(f"Miner error: {data.get('error', data)}")
 
@@ -544,6 +609,7 @@ class ValidatorClient:
         tool_choice=None,
         parallel_tool_calls: Optional[bool] = None,
         deserialize_proof_bundle: bool = True,
+        allow_unbound_output_count: bool = False,
     ) -> Tuple[str, Optional[InferenceCommitment], Optional[InferenceProofBundle], bytes, dict]:
         """Send chat-style inference request (OpenAI messages format).
 
@@ -657,7 +723,14 @@ class ValidatorClient:
                     timing["beacon_ms"] = data.get("beacon_ms", 0)
                     timing["challenge_ms"] = data.get("challenge_ms", 0)
                     timing["input_tokens"] = data.get("input_tokens", 0)
-                    timing["output_tokens"] = data.get("output_tokens", 0)
+                    timing["output_tokens"] = _validated_output_token_count(
+                        data,
+                        max_new_tokens=max_new_tokens,
+                        commitment=commitment,
+                        commitment_present=bool(commit_data),
+                        proof_data=proof_data,
+                        allow_unbound=allow_unbound_output_count,
+                    )
                 elif event_type == "error":
                     raise RuntimeError(f"Miner error: {data.get('error', data)}")
 
@@ -2258,6 +2331,7 @@ class AsyncValidatorClient(ValidatorClient):
         tool_choice=None,
         parallel_tool_calls: Optional[bool] = None,
         deserialize_proof_bundle: bool = True,
+        allow_unbound_output_count: bool = False,
     ) -> Tuple[str, Optional[InferenceCommitment], Optional[InferenceProofBundle], bytes, dict]:
         nonce = os.urandom(32)
 
@@ -2346,7 +2420,14 @@ class AsyncValidatorClient(ValidatorClient):
                     timing["beacon_ms"] = data.get("beacon_ms", 0)
                     timing["challenge_ms"] = data.get("challenge_ms", 0)
                     timing["input_tokens"] = data.get("input_tokens", 0)
-                    timing["output_tokens"] = data.get("output_tokens", 0)
+                    timing["output_tokens"] = _validated_output_token_count(
+                        data,
+                        max_new_tokens=max_new_tokens,
+                        commitment=commitment,
+                        commitment_present=bool(commit_data),
+                        proof_data=proof_data,
+                        allow_unbound=allow_unbound_output_count,
+                    )
                 elif event_type == "error":
                     raise RuntimeError(f"Miner error: {data.get('error', data)}")
 
