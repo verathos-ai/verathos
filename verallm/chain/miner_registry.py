@@ -173,6 +173,35 @@ class MinerRegistryClient:
         self._cache.set(cache_key, evm_str, ttl=60)
         return evm_str
 
+    def get_registered_uid_for_evm(
+        self,
+        evm_address: str,
+        *,
+        refresh: bool = False,
+    ) -> Optional[int]:
+        """Return the contract-level UID registered for an EVM address."""
+        from web3 import Web3
+        addr = Web3.to_checksum_address(evm_address)
+
+        cache_key = f"registered_uid:{addr}"
+        if refresh:
+            self._cache.invalidate(cache_key)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached if cached != _NONE_SENTINEL else None
+
+        registered = self._provider.call_with_retry(
+            lambda: self._contract.functions.evmRegistered(addr).call()
+        )
+        if not registered:
+            self._cache.set(cache_key, _NONE_SENTINEL, ttl=60)
+            return None
+        uid = int(self._provider.call_with_retry(
+            lambda: self._contract.functions.evmToUid(addr).call()
+        ))
+        self._cache.set(cache_key, uid, ttl=60)
+        return uid
+
     # ── Paid writes ──────────────────────────────────────────────
 
     def register_evm(
@@ -208,6 +237,9 @@ class MinerRegistryClient:
             self._contract.functions.registerEvm(uid, sig_r, sig_s),
             private_key=private_key,
         )
+        self._cache.invalidate(f"associated_uid:{evm_address}")
+        self._cache.invalidate(f"registered_uid:{evm_address}")
+        self._cache.invalidate(f"uid_to_evm:{int(uid)}")
         logger.info("Registered EVM → UID %d (SR25519 verified): %s", uid, tx_hash)
         return tx_hash
 

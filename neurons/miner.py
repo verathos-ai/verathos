@@ -339,11 +339,12 @@ class MinerNeuron:
                 time.sleep(delay)
 
     def _ensure_evm_registered(self):
-        """Ensure registerEvm(uid) has been called on the current MinerRegistry contract.
+        """Ensure the miner's EVM address is bound to its current UID.
 
         Uses self.uid (resolved at startup from Substrate metagraph).
-        The contract's _resolveUid() falls back to the evmToUid mapping set
-        by registerEvm(), so this must succeed before registerModel() will work.
+        UID slots can be recycled and a hotkey can later register under a new
+        UID, so an existing EVM registration alone is not sufficient. Both
+        contract mapping directions must match the current pair.
 
         Retries with backoff — never silently gives up.
         """
@@ -355,37 +356,90 @@ class MinerNeuron:
 
         for attempt in range(1, 11):
             try:
-                if self._miner_client.is_evm_registered(self.evm_addr):
-                    bt.logging.info(f"EVM already registered on MinerRegistry (UID={self.uid})")
+                associated_uid = self._miner_client.get_associated_uid(
+                    self.evm_addr,
+                    refresh=True,
+                )
+                registered_uid = self._miner_client.get_registered_uid_for_evm(
+                    self.evm_addr,
+                    refresh=True,
+                )
+                registered_evm = self._miner_client.get_registered_evm_for_uid(
+                    self.uid,
+                    refresh=True,
+                )
+                evm_matches = (
+                    registered_evm is not None
+                    and registered_evm.lower() == self.evm_addr.lower()
+                )
+                if (
+                    associated_uid == self.uid
+                    and registered_uid == self.uid
+                    and evm_matches
+                ):
+                    bt.logging.info(
+                        f"EVM already registered on MinerRegistry (UID={self.uid})"
+                    )
                     return
-            except Exception as e:
-                if attempt == 10:
-                    raise RuntimeError(
-                        f"Cannot check EVM registration after 10 attempts: {e}"
-                    ) from e
-                delay = min(2 ** attempt * 3, 60) + random.uniform(0, 5)
-                bt.logging.warning(f"is_evm_registered check failed (attempt {attempt}/10): {e} — retrying in {delay:.0f}s")
-                time.sleep(delay)
-                continue
 
-            # Not registered — call registerEvm(uid)
-            try:
-                bt.logging.info(f"Registering EVM → UID {self.uid} on MinerRegistry")
+                if registered_uid is not None or registered_evm is not None:
+                    bt.logging.warning(
+                        "Stale MinerRegistry EVM binding detected: "
+                        f"resolved UID={associated_uid}, registered UID={registered_uid}, "
+                        f"UID {self.uid} maps to {registered_evm or 'no EVM'}; "
+                        "repairing current binding"
+                    )
+                else:
+                    bt.logging.info(
+                        f"Registering EVM -> UID {self.uid} on MinerRegistry"
+                    )
+
                 self._miner_client.register_evm(
                     self.uid,
                     hotkey_seed=self.hotkey_seed,
                     netuid=self.config.netuid,
                     private_key=self.evm_pk,
                 )
+
+                verified_uid = self._miner_client.get_registered_uid_for_evm(
+                    self.evm_addr,
+                    refresh=True,
+                )
+                verified_associated_uid = self._miner_client.get_associated_uid(
+                    self.evm_addr,
+                    refresh=True,
+                )
+                verified_evm = self._miner_client.get_registered_evm_for_uid(
+                    self.uid,
+                    refresh=True,
+                )
+                if (
+                    verified_associated_uid != self.uid
+                    or verified_uid != self.uid
+                    or not (
+                        verified_evm
+                        and verified_evm.lower() == self.evm_addr.lower()
+                    )
+                ):
+                    raise RuntimeError(
+                        "registerEvm receipt succeeded but the current binding "
+                        f"was not visible: resolved UID={verified_associated_uid}, "
+                        f"registered UID={verified_uid}, UID {self.uid} maps to "
+                        f"{verified_evm or 'no EVM'}"
+                    )
                 bt.logging.info(f"registerEvm({self.uid}) succeeded")
                 return
             except Exception as e:
                 if attempt == 10:
                     raise RuntimeError(
-                        f"registerEvm({self.uid}) failed after 10 attempts: {e}"
+                        "Cannot reconcile EVM registration for "
+                        f"UID {self.uid} after 10 attempts: {e}"
                     ) from e
                 delay = min(2 ** attempt * 3, 60) + random.uniform(0, 5)
-                bt.logging.warning(f"registerEvm({self.uid}) failed (attempt {attempt}/10): {e} — retrying in {delay:.0f}s")
+                bt.logging.warning(
+                    "EVM registration reconciliation failed "
+                    f"(attempt {attempt}/10): {e} — retrying in {delay:.0f}s"
+                )
                 time.sleep(delay)
 
     # File the server writes when it auto-tunes max_num_seqs for Mamba/GDN
@@ -867,15 +921,17 @@ class MinerNeuron:
 
         for attempt in range(1, max_retries + 1):
             try:
-                # Step 1: Check for existing registration (must succeed)
+                # Step 1: Reconcile EVM -> UID before accepting an existing
+                # model entry. A hotkey may have moved to a new UID while its
+                # model lease remained active under the same EVM address.
+                self._ensure_evm_registered()
+
+                # Step 2: Check for existing model registration (must succeed)
                 existing_index = self.check_existing_registration(
                     model_id, endpoint, quant, max_context_len,
                 )
                 if existing_index is not None:
                     return existing_index
-
-                # Step 2: Ensure EVM→UID mapping
-                self._ensure_evm_registered()
 
                 # Step 3: Register
                 spec_ref = Web3.solidity_keccak(["string"], [model_id])
