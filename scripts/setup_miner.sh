@@ -261,11 +261,6 @@ fi
 
 cd "$REPO_DIR"
 
-GPU_VRAM_GB=$(( (GPU_VRAM + 512) / 1024 ))
-if ! "$PYTHON" scripts/check_capacity_audit_gpu.py --gpu-name "$GPU_NAME" --vram-gb "$GPU_VRAM_GB"; then
-    exit 1
-fi
-
 # ── LD_LIBRARY_PATH: find pip-installed NVIDIA libs ──────────────────────────
 # torch 2.9+ (from vLLM pip) needs libcusparseLt.so.0 which lives in
 # site-packages/nvidia/*/lib/ — not on the default search path.
@@ -1286,6 +1281,13 @@ from hot_capacity_workspace.bench_combined import main
     echo "Installation complete."
 else
     echo "  Skipping install (--skip-install)"
+fi
+
+# This check imports the installed Verathos runtime, so it must run after the
+# dependency installation on a fresh clone. Let the runtime detect VRAM rather
+# than independently rounding nvidia-smi MiB (which disagrees for H200 cards).
+if ! "$PYTHON" scripts/check_capacity_audit_gpu.py --gpu-name "$GPU_NAME"; then
+    exit 1
 fi
 
 # ── Persist environment for future SSH sessions ──────────────────────────────

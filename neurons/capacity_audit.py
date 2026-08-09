@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
+from verallm.vram import normalize_vram_gb
 
 PROTOCOL_VERSION = "verathos-capacity-audit-v1"
 DEFAULT_MAX_PROOF_PAYLOAD_BYTES = 32 * 1024 * 1024
@@ -317,7 +318,7 @@ DEFAULT_GPU_CLASSES: tuple[CapacityGpuClass, ...] = (
     ),
     CapacityGpuClass(
         "NVIDIA H200",
-        144,
+        141,
         passes=1661,
         capacity_passes=20,
         capacity_tail_passes=12,
@@ -344,7 +345,7 @@ DEFAULT_GPU_CLASSES: tuple[CapacityGpuClass, ...] = (
     ),
     CapacityGpuClass(
         "NVIDIA B200",
-        183,
+        192,
         passes=1154,
         capacity_passes=43,
         capacity_tail_passes=1,
@@ -932,7 +933,11 @@ def match_gpu_class(gpu_name: str, vram_gb: int, cfg: CapacityAuditRuntimeConfig
     for row in cfg.gpu_classes:
         if _canonical_gpu_name(row.match_gpu_name) != normalized:
             continue
-        if row.vram_gb and vram_gb and abs(int(vram_gb) - int(row.vram_gb)) > 2:
+        if (
+            row.vram_gb
+            and vram_gb
+            and abs(normalize_vram_gb(int(vram_gb)) - normalize_vram_gb(int(row.vram_gb))) > 2
+        ):
             continue
         return row
     return None
