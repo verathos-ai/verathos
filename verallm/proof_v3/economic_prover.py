@@ -160,6 +160,10 @@ def build_economic_execution_anchor_reveals_from_replay_v3(
     from verallm.proof_v3.execution_anchor import (
         ExecutionAnchorReplayStageV3,
     )
+    from verallm.proof_v3.execution_anchor_segment import (
+        SparseExecutionAnchorReplayStageV3,
+        reconstruct_execution_anchor_sparse_paths_v3,
+    )
     from zkllm.crypto.merkle import MerkleTree
 
     commitments = tuple(commitments)
@@ -169,7 +173,13 @@ def build_economic_execution_anchor_reveals_from_replay_v3(
     replay_by_stage = {}
     for stage in replay_stages:
         if (
-            not isinstance(stage, ExecutionAnchorReplayStageV3)
+            not isinstance(
+                stage,
+                (
+                    ExecutionAnchorReplayStageV3,
+                    SparseExecutionAnchorReplayStageV3,
+                ),
+            )
             or stage.stage_id in replay_by_stage
         ):
             raise ProofV3Error(
@@ -201,12 +211,25 @@ def build_economic_execution_anchor_reveals_from_replay_v3(
                 f"execution anchor replay geometry changed for "
                 f"{commitment.stage_id}"
             )
-        leaf_hashes = [
-            stage.leaf_hashes[offset:offset + 32]
-            for offset in range(0, len(stage.leaf_hashes), 32)
-        ]
-        tree = MerkleTree.from_leaf_hashes(leaf_hashes)
-        if tree.root != commitment.root:
+        if isinstance(stage, SparseExecutionAnchorReplayStageV3):
+            root, paths = reconstruct_execution_anchor_sparse_paths_v3(
+                num_leaves=stage.row_count,
+                leaf_hashes=stage.visible_leaf_hashes(),
+                retained_nodes=stage.retained_nodes,
+                opening_indices=tuple(positions),
+            )
+            paths_by_position = dict(zip(positions, paths, strict=True))
+        else:
+            leaf_hashes = [
+                stage.leaf_hashes[offset:offset + 32]
+                for offset in range(0, len(stage.leaf_hashes), 32)
+            ]
+            tree = MerkleTree.from_leaf_hashes(leaf_hashes)
+            root = tree.root
+            paths_by_position = {
+                position: tree.get_path(position) for position in positions
+            }
+        if root != commitment.root:
             raise ProofV3Error(
                 f"execution anchor replay root changed for "
                 f"{commitment.stage_id}"
@@ -220,9 +243,9 @@ def build_economic_execution_anchor_reveals_from_replay_v3(
                         row_bytes=selected_rows[position],
                         sibling_hashes=tuple(
                             digest
-                            for digest, _is_left in tree.get_path(
-                                position
-                            ).siblings
+                            for digest, _is_left in (
+                                paths_by_position[position].siblings
+                            )
                         ),
                     )
                     for position in positions
@@ -261,7 +284,26 @@ def build_economic_execution_anchor_lane_reveals_from_replay_v3(
         build_execution_anchor_lane_opening_v3,
         execution_anchor_lane_bytes_v3,
     )
+    from verallm.proof_v3.execution_anchor_segment import (
+        SparseExecutionAnchorReplayStageV3,
+        reconstruct_execution_anchor_sparse_paths_v3,
+    )
     from zkllm.crypto.merkle import MerkleTree, hash_leaf
+
+    def _retained_lane_source(stage, row_index, lane_index):
+        if isinstance(stage, SparseExecutionAnchorReplayStageV3):
+            for retained_range in stage.retained_lane_ranges:
+                local_index = int(row_index) - int(retained_range.start)
+                source = retained_range.replay_stage
+                if (
+                    0 <= local_index < source.row_count
+                    and int(lane_index) in source.retained_lane_indices
+                ):
+                    return source, local_index
+            return None
+        if int(lane_index) in stage.retained_lane_indices:
+            return stage, int(row_index)
+        return None
 
     commitments = tuple(commitments)
     keys = tuple(lane_keys)
@@ -292,7 +334,13 @@ def build_economic_execution_anchor_lane_reveals_from_replay_v3(
     replay_by_stage = {}
     for stage in tuple(replay_stages):
         if (
-            not isinstance(stage, ExecutionAnchorReplayStageV3)
+            not isinstance(
+                stage,
+                (
+                    ExecutionAnchorReplayStageV3,
+                    SparseExecutionAnchorReplayStageV3,
+                ),
+            )
             or stage.stage_id in replay_by_stage
         ):
             raise ProofV3Error(
@@ -311,7 +359,7 @@ def build_economic_execution_anchor_lane_reveals_from_replay_v3(
             item for item in commitments if item.stage_id == stage_id
         )
         selected_rows = dict(stage.selected_rows)
-        retained_lane_indices = set(stage.retained_lane_indices)
+        sparse = isinstance(stage, SparseExecutionAnchorReplayStageV3)
         requested = tuple(
             (row_index, lane_index)
             for commitment_index, row_index, lane_index in keys
@@ -323,7 +371,12 @@ def build_economic_execution_anchor_lane_reveals_from_replay_v3(
             or stage.row_width != commitment.row_width
             or any(
                 row_index not in selected_rows
-                and lane_index not in retained_lane_indices
+                and _retained_lane_source(
+                    stage,
+                    row_index,
+                    lane_index,
+                )
+                is None
                 for row_index, lane_index in requested
             )
         ):
@@ -331,30 +384,94 @@ def build_economic_execution_anchor_lane_reveals_from_replay_v3(
                 f"execution anchor lane replay geometry changed for "
                 f"{stage_id}"
             )
-        tree = MerkleTree.from_leaf_hashes(
-            [
-                stage.leaf_hashes[offset:offset + 32]
-                for offset in range(0, len(stage.leaf_hashes), 32)
-            ]
-        )
-        if tree.root != commitment.root:
+        if sparse:
+            root, paths = reconstruct_execution_anchor_sparse_paths_v3(
+                num_leaves=stage.row_count,
+                leaf_hashes=stage.visible_leaf_hashes(),
+                retained_nodes=stage.retained_nodes,
+                opening_indices=tuple(sorted(positions)),
+            )
+            paths_by_position = dict(
+                zip(sorted(positions), paths, strict=True)
+            )
+            tree = None
+        else:
+            tree = MerkleTree.from_leaf_hashes(
+                [
+                    stage.leaf_hashes[offset:offset + 32]
+                    for offset in range(0, len(stage.leaf_hashes), 32)
+                ]
+            )
+            root = tree.root
+            paths_by_position = {
+                position: tree.get_path(position) for position in positions
+            }
+        if root != commitment.root:
             raise ProofV3Error(
                 f"execution anchor lane replay root changed for {stage_id}"
             )
-        sources[stage_id] = (tree, selected_rows, stage)
+        sources[stage_id] = (
+            tree,
+            paths_by_position,
+            selected_rows,
+            stage,
+        )
 
     reveals = []
     for commitment_index, row_index, lane_index in keys:
         commitment = commitments[commitment_index]
-        tree, rows, stage = sources[commitment.stage_id]
+        tree, paths_by_position, rows, stage = sources[
+            commitment.stage_id
+        ]
         if row_index in rows:
-            opening = build_execution_anchor_lane_opening_v3(
-                commitment=commitment,
-                row_index=row_index,
-                row_bytes=rows[row_index],
-                row_tree=tree,
-                lane_index=lane_index,
-            )
+            if tree is not None:
+                opening = build_execution_anchor_lane_opening_v3(
+                    commitment=commitment,
+                    row_index=row_index,
+                    row_bytes=rows[row_index],
+                    row_tree=tree,
+                    lane_index=lane_index,
+                )
+            else:
+                lane_bytes = execution_anchor_lane_bytes_v3(
+                    commitment.stage_id
+                )
+                padded = rows[row_index] + bytes(
+                    (-len(rows[row_index])) % lane_bytes
+                )
+                lane_values = tuple(
+                    padded[offset : offset + lane_bytes]
+                    for offset in range(0, len(padded), lane_bytes)
+                )
+                lane_tree = MerkleTree.from_leaf_hashes(
+                    [hash_leaf(value) for value in lane_values]
+                )
+                visible = stage.visible_leaf_hashes()
+                if (
+                    lane_index >= len(lane_values)
+                    or lane_tree.root != visible.get(row_index)
+                ):
+                    raise ProofV3Error(
+                        "sparse execution anchor selected lane changed "
+                        "after replay"
+                    )
+                opening = ExecutionAnchorLaneOpeningV3(
+                    row_index=row_index,
+                    lane_index=lane_index,
+                    lane_bytes=lane_values[lane_index],
+                    lane_sibling_hashes=tuple(
+                        sibling
+                        for sibling, _is_left in lane_tree.get_path(
+                            lane_index
+                        ).siblings
+                    ),
+                    row_sibling_hashes=tuple(
+                        sibling
+                        for sibling, _is_left in paths_by_position[
+                            row_index
+                        ].siblings
+                    ),
+                )
         else:
             lane_bytes = execution_anchor_lane_bytes_v3(
                 commitment.stage_id
@@ -362,17 +479,27 @@ def build_economic_execution_anchor_lane_reveals_from_replay_v3(
             lane_count = (
                 commitment.row_width + lane_bytes - 1
             ) // lane_bytes
+            source_record = _retained_lane_source(
+                stage,
+                row_index,
+                lane_index,
+            )
+            if source_record is None:
+                raise ProofV3Error(
+                    "execution anchor retained lane is unavailable"
+                )
+            retained_stage, retained_row_index = source_record
             try:
-                retained_slot = stage.retained_lane_indices.index(
+                retained_slot = retained_stage.retained_lane_indices.index(
                     lane_index
                 )
             except ValueError as exc:
                 raise ProofV3Error(
                     "execution anchor retained lane is unavailable"
                 ) from exc
-            hash_base = row_index * lane_count * 32
+            hash_base = retained_row_index * lane_count * 32
             lane_hashes = [
-                stage.retained_lane_hashes[
+                retained_stage.retained_lane_hashes[
                     hash_base + index * 32:
                     hash_base + (index + 1) * 32
                 ]
@@ -380,12 +507,13 @@ def build_economic_execution_anchor_lane_reveals_from_replay_v3(
             ]
             value_base = (
                 (
-                    row_index * len(stage.retained_lane_indices)
+                    retained_row_index
+                    * len(retained_stage.retained_lane_indices)
                     + retained_slot
                 )
                 * lane_bytes
             )
-            lane_value = stage.retained_lane_values[
+            lane_value = retained_stage.retained_lane_values[
                 value_base:value_base + lane_bytes
             ]
             if (
@@ -396,15 +524,23 @@ def build_economic_execution_anchor_lane_reveals_from_replay_v3(
                     "execution anchor retained lane changed after capture"
                 )
             lane_tree = MerkleTree.from_leaf_hashes(lane_hashes)
-            expected_row_leaf = stage.leaf_hashes[
-                row_index * 32:(row_index + 1) * 32
-            ]
+            expected_row_leaf = (
+                stage.visible_leaf_hashes().get(row_index)
+                if sparse
+                else stage.leaf_hashes[
+                    row_index * 32:(row_index + 1) * 32
+                ]
+            )
             if lane_tree.root != expected_row_leaf:
                 raise ProofV3Error(
                     "execution anchor retained lane tree changed after capture"
                 )
             lane_path = lane_tree.get_path(lane_index)
-            row_path = tree.get_path(row_index)
+            row_path = (
+                paths_by_position[row_index]
+                if sparse
+                else tree.get_path(row_index)
+            )
             opening = ExecutionAnchorLaneOpeningV3(
                 row_index=row_index,
                 lane_index=lane_index,

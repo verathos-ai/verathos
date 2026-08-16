@@ -119,6 +119,39 @@ def _compute_lm_head_root_cpu(lm_head_mod, hidden_size: int, chunk_size: int) ->
     raise RuntimeError("No extraction method available for lm_head on CPU")
 
 
+def compute_model_identity_commitment(model) -> bytes:
+    """Commit to the canonical parameter namespace and disk shapes.
+
+    vLLM may repack FP8 parameters differently across GPU architectures.  The
+    load-time patcher retains their checkpoint shapes, which must be used here
+    so the model identity is independent of the serving backend.
+    """
+
+    substitutions = (
+        (".weight", "_orig_fp8_weight"),
+        (".weight_scale_inv", "_orig_fp8_weight_scale"),
+        (".weight_scale", "_orig_fp8_weight_scale"),
+    )
+    commitment_data = []
+    for name, param in model.named_parameters():
+        shape = param.shape
+        for suffix, stash_attr in substitutions:
+            if name.endswith(suffix):
+                parent = name[:-len(suffix)]
+                try:
+                    parent_module = model.get_submodule(parent)
+                    orig = getattr(parent_module, stash_attr, None)
+                    if orig is not None:
+                        shape = orig.shape
+                except (AttributeError, KeyError):
+                    pass
+                break
+        commitment_data.append(
+            hashlib.sha256(name.encode() + str(shape).encode()).digest()
+        )
+    return hashlib.sha256(b"".join(commitment_data)).digest()
+
+
 def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelSpec:
     """
     Compute weight Merkle roots for a model and return a ModelSpec.
@@ -149,41 +182,7 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
                 num_layers, hidden_size, intermediate_size)
     logger.info("Registry: Detected quantization: %s (%s)", quant_mode, mode_desc)
 
-    # Model identity commitment (hash of parameter names + shapes).
-    # For FP8 layers where vLLM has repacked the in-memory weight (Marlin
-    # int32 tiles on Ampere), use the canonical disk shape from the
-    # patcher-stashed `_orig_fp8_weight` so the commitment stays
-    # backend-independent on Ampere/Hopper/Blackwell.  On backends without
-    # the patcher (Hopper/Blackwell for block-wise FP8 — vLLM doesn't
-    # repack), and for fp16/bf16/AWQ/GPTQ paths, param.shape is already
-    # the canonical disk shape so nothing changes.
-    commitment_data = []
-    # Map suffix → (stash attr) for FP8 params whose in-memory shape diverges
-    # from disk on backends that repack (Marlin on Ampere repacks BOTH weight
-    # and weight_scale_inv).  On Hopper/Blackwell with block-wise FP8 the
-    # patcher doesn't fire (detector returns False) so the substitution is
-    # a no-op and param.shape is already the canonical disk shape.
-    _FP8_SHAPE_SUBSTITUTIONS = (
-        (".weight",            "_orig_fp8_weight"),
-        (".weight_scale_inv",  "_orig_fp8_weight_scale"),
-        (".weight_scale",      "_orig_fp8_weight_scale"),
-    )
-    for name, param in model.named_parameters():
-        shape = param.shape
-        for suffix, stash_attr in _FP8_SHAPE_SUBSTITUTIONS:
-            if name.endswith(suffix):
-                parent = name[:-len(suffix)]
-                try:
-                    parent_module = model.get_submodule(parent)
-                    orig = getattr(parent_module, stash_attr, None)
-                    if orig is not None:
-                        shape = orig.shape
-                except (AttributeError, KeyError):
-                    pass
-                break
-        param_hash = hashlib.sha256(name.encode() + str(shape).encode()).digest()
-        commitment_data.append(param_hash)
-    model_commitment = hashlib.sha256(b"".join(commitment_data)).digest()
+    model_commitment = compute_model_identity_commitment(model)
 
     def _is_fused_awq_projection(layer) -> bool:
         if layer is None or not hasattr(layer, "qweight"):

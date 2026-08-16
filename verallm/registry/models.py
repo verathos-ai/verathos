@@ -2012,6 +2012,34 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
     ),
 
     # ================================================================
+    # Qwen3.8 — official FP8 dense hybrid model
+    # ================================================================
+
+    ModelEntry(
+        id="qwen3.8-27b",
+        name="Qwen3.8-27B",
+        base_model="Qwen/Qwen3.8-27B",
+        architecture="dense",
+        categories=(ModelCategory.GENERAL, ModelCategory.CODING, ModelCategory.MULTIMODAL),
+        tier_configs=(
+            TierConfig(
+                VRAMTier.GB_80,
+                "Qwen/Qwen3.8-27B-FP8",
+                (QuantOption("fp8", 262144),),
+                notes="Official pre-quantized FP8 — full native 256K context",
+            ),
+        ),
+        total_params_b=27.0, active_params_b=27.0,
+        native_context_len=262144,
+        generation_quality=1.10,
+        verified_inference=True,
+        family="qwen3.8", provider="Qwen",
+        notes="Multimodal dense hybrid model with 48 GDN and 16 gated "
+              "full-attention layers; verified serving is limited to the official "
+              "FP8 checkpoint",
+    ),
+
+    # ================================================================
     # Multi-GPU models — NOT YET SUPPORTED by the protocol
     # ================================================================
 

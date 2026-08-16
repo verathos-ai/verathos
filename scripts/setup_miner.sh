@@ -335,6 +335,82 @@ print(':'.join(d for d in dirs if os.path.isdir(d)))
 
 fix_ld_library_path
 
+install_proof_pcs_runtime() {
+    local runtime_dir="${VENV_DIR}/lib/verathos"
+    local runtime_library="${runtime_dir}/libverathos_pcs_v2.so"
+    local python_tag
+    local wheel
+
+    python_tag=$(
+        "$PYTHON" -c \
+            "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+    )
+    wheel=$(
+        find "${REPO_DIR}/dist" -maxdepth 1 -type f \
+            -name "zkllm-*-${python_tag}-${python_tag}-*.whl" \
+            -print 2>/dev/null | sort | tail -1
+    )
+    if [ -z "$wheel" ]; then
+        # The PCS library is Python-ABI independent. A release wheel for a
+        # different supported Python version is therefore a valid source; the
+        # ctypes loader still enforces the exact PCS ABI below.
+        wheel=$(
+            find "${REPO_DIR}/dist" -maxdepth 1 -type f \
+                -name "zkllm-*.whl" -print 2>/dev/null | sort | tail -1
+        )
+    fi
+    if [ -z "$wheel" ]; then
+        echo "ERROR: bundled zkllm release wheel is missing; cannot install proof PCS."
+        return 1
+    fi
+
+    mkdir -p "$runtime_dir"
+    "$PYTHON" - "$wheel" "$runtime_library" <<'PY'
+import os
+import pathlib
+import sys
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+member = "zkllm/crypto/libverathos_pcs_v2.so"
+with zipfile.ZipFile(wheel) as archive:
+    try:
+        payload = archive.read(member)
+    except KeyError as exc:
+        raise SystemExit(f"{wheel} does not contain {member}") from exc
+temporary = destination.with_suffix(".so.tmp")
+temporary.write_bytes(payload)
+temporary.chmod(0o755)
+os.replace(temporary, destination)
+PY
+
+    # This runs before the Torch/vLLM dependency step.  Validate the extracted
+    # library directly so a clean Ubuntu image does not import the checkout's
+    # torch-dependent zkllm package before Torch has been installed.
+    if ! "$PYTHON" - "$runtime_library" <<'PY'
+import ctypes
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1]).resolve()
+library = ctypes.CDLL(str(path))
+library.verathos_pcs_v2_abi_version.argtypes = []
+library.verathos_pcs_v2_abi_version.restype = ctypes.c_uint32
+abi_version = int(library.verathos_pcs_v2_abi_version())
+if abi_version != 10:
+    raise SystemExit(f"proof PCS ABI mismatch: expected 10, got {abi_version}")
+print(f"  proof PCS ABI {abi_version}: {path}")
+PY
+    then
+        echo "ERROR: bundled proof PCS library failed its ABI/load check."
+        return 1
+    fi
+
+    PROOF_PCS_RUNTIME_LIBRARY="$runtime_library"
+    export VERATHOS_PCS_V2_LIB="$runtime_library"
+}
+
 # vLLM's Qwen3.6 GDN path compiles a small FlashInfer kernel during the first
 # production warmup.  CUDA runtime wheels are sufficient for torch/vLLM, but
 # they do not provide nvcc.  On the qualified CUDA 13 Hopper/Blackwell lane,
@@ -985,6 +1061,9 @@ if [ "$SKIP_INSTALL" = false ]; then
         echo "  The dist/ directory should contain pre-built zkllm wheels."
         exit 1
     fi
+    if ! install_proof_pcs_runtime; then
+        exit 1
+    fi
 
     echo ""
     echo "Step 2/6: Installing Python dependencies..."
@@ -1364,6 +1443,7 @@ assert hasattr(zkllm_native, 'cuda_blake3_activation_update_peaks'), 'Missing pr
 assert hasattr(zkllm_native, 'cuda_blake3_activation_update_peaks_heterogeneous'), 'Missing proof-v3 heterogeneous frontier reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_runtime_row_roots_into'), 'Missing proof-v3 graph row reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_prehashed_update_peaks'), 'Missing proof-v3 prehashed frontier reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_prehashed_update_peaks_ranges'), 'Missing proof-v3 sparse range reducer'
 for name in (
     'combine_registered_catalog_u31_batch',
     'prove_linear',
@@ -1487,6 +1567,7 @@ export LIBRARY_PATH="${LIBRARY_PATH:-}"
 export CUDA_HOME="${CUDA_HOME:-}"
 export HF_HOME="${HF_HOME}"
 export PATH="${REPO_DIR}/.venv-vllm/bin${CUDA_HOME:+:${CUDA_HOME}/bin}:\${PATH}"
+export VERATHOS_PCS_V2_LIB="${PROOF_PCS_RUNTIME_LIBRARY:-${VERATHOS_PCS_V2_LIB:-}}"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export TORCHINDUCTOR_COMPILE_THREADS="\${TORCHINDUCTOR_COMPILE_THREADS:-\${VERATHOS_TORCHINDUCTOR_COMPILE_THREADS:-4}}"
 # Runtime cache paths are persisted from setup-time detection.  On normal

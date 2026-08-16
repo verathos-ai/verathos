@@ -35,6 +35,9 @@ __all__ = [
     "SchedulerGeometryStepV3",
     "SchedulerGeometryTraceBuilderV3",
     "SchedulerGeometryTraceV3",
+    "decode_checkpoint_window_geometry_v3",
+    "decode_checkpoint_suffix_geometry_v3",
+    "prompt_boundary_geometry_v3",
     "prefix_cache_full_recompute_geometry_v3",
     "scheduler_geometry_replay_equivalent_v3",
 ]
@@ -420,6 +423,167 @@ class SchedulerGeometryTraceBuilderV3:
             steps=tuple(self._steps),
             initial_computed_tokens=int(initial),
         )
+
+
+def decode_checkpoint_suffix_geometry_v3(
+    trace: SchedulerGeometryTraceV3,
+    *,
+    checkpoint_computed_tokens: int,
+) -> SchedulerGeometryTraceV3:
+    """Rebase a committed decode suffix onto one exact cache checkpoint.
+
+    The checkpoint is an internal prover optimization, not a new statement.
+    The replay prompt appends the next authenticated output token, while the
+    retained cache supplies every token through ``checkpoint_computed_tokens``.
+    Consequently the first replay step is a one-token prefill at the original
+    absolute sequence coordinate and later target geometry remains unchanged.
+
+    Only scheduler-step boundaries are admissible. Companion cohort numbers
+    are compacted after slicing because cohorts that finished before the
+    checkpoint no longer participate in the replay.
+    """
+
+    return decode_checkpoint_window_geometry_v3(
+        trace,
+        checkpoint_computed_tokens=checkpoint_computed_tokens,
+        stop_computed_tokens=trace.sequence_token_count,
+    )
+
+
+def decode_checkpoint_window_geometry_v3(
+    trace: SchedulerGeometryTraceV3,
+    *,
+    checkpoint_computed_tokens: int,
+    stop_computed_tokens: int,
+) -> SchedulerGeometryTraceV3:
+    """Rebase one exact committed decode window onto a cache checkpoint.
+
+    ``stop_computed_tokens`` is an exclusive absolute execution-row boundary.
+    Both boundaries must coincide with committed target scheduler steps.  The
+    returned trace preserves the original batch geometry only inside that
+    window; rows outside it remain authenticated by the pre-nonce execution
+    anchor and are never replayed.
+    """
+
+    if not isinstance(trace, SchedulerGeometryTraceV3):
+        raise ProofV3Error("decode-checkpoint replay geometry has an unexpected type")
+    checkpoint = _u32(
+        checkpoint_computed_tokens,
+        "decode-checkpoint computed token count",
+        positive=True,
+    )
+    stop = _u32(
+        stop_computed_tokens,
+        "decode-checkpoint stop token count",
+        positive=True,
+    )
+    if (
+        checkpoint < trace.context_token_count
+        or checkpoint >= stop
+        or stop > trace.sequence_token_count
+    ):
+        raise ProofV3Error("decode-checkpoint replay window is outside the decode suffix")
+
+    target_slots = tuple(step.slots[step.target_index] for step in trace.steps)
+    try:
+        start = next(
+            index for index, slot in enumerate(target_slots) if slot.computed_tokens == checkpoint
+        )
+    except StopIteration as exc:
+        raise ProofV3Error("decode-checkpoint replay boundary is not a scheduler step") from exc
+
+    try:
+        end = next(
+            index + 1
+            for index, slot in enumerate(target_slots[start:], start=start)
+            if slot.computed_tokens + slot.scheduled_tokens == stop
+        )
+    except StopIteration as exc:
+        raise ProofV3Error("decode-checkpoint replay stop is not a scheduler step") from exc
+    if any(slot.computed_tokens + slot.scheduled_tokens > stop for slot in target_slots[start:end]):
+        raise ProofV3Error("decode-checkpoint replay stop crosses a scheduler step")
+
+    sliced = trace.steps[start:end]
+    retained_cohorts = sorted(
+        {slot.cohort_id for step in sliced for slot in step.slots if slot.cohort_id != 0}
+    )
+    cohort_map = {
+        original: canonical for canonical, original in enumerate(retained_cohorts, start=1)
+    }
+    replay_prompt_tokens = checkpoint + 1
+    steps = []
+    for step_index, step in enumerate(sliced):
+        slots = tuple(
+            SchedulerGeometrySlotV3(
+                cohort_id=(0 if slot.cohort_id == 0 else cohort_map[slot.cohort_id]),
+                prompt_tokens=(replay_prompt_tokens if slot.is_target else slot.prompt_tokens),
+                computed_tokens=slot.computed_tokens,
+                scheduled_tokens=slot.scheduled_tokens,
+                is_target=slot.is_target,
+            )
+            for slot in step.slots
+        )
+        steps.append(
+            SchedulerGeometryStepV3(
+                gap_steps_before=(0 if step_index == 0 else step.gap_steps_before),
+                total_scheduled_tokens=step.total_scheduled_tokens,
+                slots=slots,
+            )
+        )
+
+    return SchedulerGeometryTraceV3(
+        context_token_count=replay_prompt_tokens,
+        sequence_token_count=stop,
+        steps=tuple(steps),
+        initial_computed_tokens=checkpoint,
+    )
+
+
+def prompt_boundary_geometry_v3(
+    trace: SchedulerGeometryTraceV3,
+) -> SchedulerGeometryTraceV3:
+    """Return the exact cache-free prompt portion of a committed trace.
+
+    Segmented hard replay independently reconstructs the original prompt rows
+    before composing them with retained middle ranges and a restored decode
+    suffix. The prompt capture must stop at the original prompt boundary: a
+    decode row would overlap the suffix/range domains, while stopping inside a
+    scheduler step would change the authenticated execution geometry.
+    """
+
+    if not isinstance(trace, SchedulerGeometryTraceV3):
+        raise ProofV3Error(
+            "prompt-boundary replay geometry has an unexpected type"
+        )
+    if trace.initial_computed_tokens:
+        raise ProofV3Error(
+            "prompt-boundary replay requires a cache-free source trace"
+        )
+
+    boundary = trace.context_token_count
+    steps = []
+    reached = False
+    for step in trace.steps:
+        slot = step.slots[step.target_index]
+        end = slot.computed_tokens + slot.scheduled_tokens
+        if end > boundary:
+            raise ProofV3Error(
+                "prompt boundary falls inside a scheduler step"
+            )
+        steps.append(step)
+        if end == boundary:
+            reached = True
+            break
+    if not reached:
+        raise ProofV3Error(
+            "scheduler geometry does not reach the prompt boundary"
+        )
+    return SchedulerGeometryTraceV3(
+        context_token_count=boundary,
+        sequence_token_count=boundary,
+        steps=tuple(steps),
+        initial_computed_tokens=0,
+    )
 
 
 def prefix_cache_full_recompute_geometry_v3(

@@ -4016,7 +4016,13 @@ async def _stream_inference_batched(
         retain_finished_cache_for_proof = bool(
             proof_protocol_version == PROOF_PROTOCOL_V3
             and isinstance(proof_v3_tracker_options, dict)
-            and proof_v3_tracker_options.get("capture_prefix_cache", False)
+            and (
+                proof_v3_tracker_options.get("capture_prefix_cache", False)
+                or proof_v3_tracker_options.get(
+                    "capture_gdn_execution_checkpoints",
+                    False,
+                )
+            )
         )
         output_queue = batch_engine.add_request(
             request_id,
@@ -4029,6 +4035,11 @@ async def _stream_inference_batched(
                 int(proof_v3_tracker_options[
                     "prefix_cache_provenance_token_limit"
                 ])
+                if proof_v3_tracker_options.get(
+                    "capture_prefix_cache",
+                    False,
+                )
+                else 0
                 if retain_finished_cache_for_proof
                 else None
             ),
@@ -5160,6 +5171,41 @@ def _proof_v3_coordinator_record_capacity(
     return max(configured, admitted + 1)
 
 
+def _proof_v3_gdn_checkpoint_runtime(args):
+    """Construct the bounded, prover-local decode checkpoint accelerator."""
+
+    from verallm.miner.gdn_checkpoint_store import BoundedGdnCheckpointStore
+
+    global_bytes = int(
+        getattr(args, "proof_v3_gdn_checkpoint_max_bytes", 8 << 30)
+    )
+    request_bytes = int(
+        getattr(
+            args,
+            "proof_v3_gdn_checkpoint_request_max_bytes",
+            2 << 30,
+        )
+    )
+    interval_tokens = int(
+        getattr(args, "proof_v3_gdn_checkpoint_interval_tokens", 1024)
+    )
+    if global_bytes == 0 and request_bytes == 0:
+        if interval_tokens <= 0:
+            raise ValueError("proof-v3 GDN checkpoint interval must be positive")
+        return None, interval_tokens
+    if global_bytes <= 0 or request_bytes <= 0 or interval_tokens <= 0:
+        raise ValueError(
+            "proof-v3 GDN checkpoint budgets and interval must be positive"
+        )
+    return (
+        BoundedGdnCheckpointStore(
+            max_bytes=global_bytes,
+            max_bytes_per_request=request_bytes,
+        ),
+        interval_tokens,
+    )
+
+
 def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
     """Authenticate and install one explicit economic proof-v3 release."""
 
@@ -5429,6 +5475,9 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
             )
         ),
     )
+    checkpoint_store, checkpoint_interval = _proof_v3_gdn_checkpoint_runtime(
+        args
+    )
     runtime = EconomicProofV3LiveRuntime(
         runtime_release=release,
         weight_store=weight_store,
@@ -5437,6 +5486,8 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
         tracker=state.activation_tracker,
         miner_hotkey_ss58=miner_hotkey,
         admission=state.admission,
+        gdn_execution_checkpoint_store=checkpoint_store,
+        gdn_execution_checkpoint_target_interval_tokens=checkpoint_interval,
     )
     state.proof_v3_coordinator = coordinator
     state.proof_v3_runtime = runtime
@@ -5447,6 +5498,8 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
         f"challenge_weights={challenge_material_count} "
         f"catalog_runtime_rows={compatibility_operation_count} "
         f"retained_records={coordinator_record_capacity} "
+        f"bounded_checkpoints={'on' if checkpoint_store is not None else 'off'} "
+        f"checkpoint_interval={checkpoint_interval} "
         f"cache_reclaimed="
         f"{reclaimed_weight_cache_bytes / (1 << 30):.2f}GiB "
         f"lm_head_compute={lm_head_compute_bytes / (1 << 20):.1f}MiB"
@@ -7189,6 +7242,42 @@ def parse_args():
         type=int,
         default=8 << 30,
         help="Maximum retained v3 precommit witness bytes",
+    )
+    parser.add_argument(
+        "--proof-v3-gdn-checkpoint-max-bytes",
+        type=int,
+        default=int(
+            os.environ.get(
+                "VERATHOS_PROOF_V3_GDN_CHECKPOINT_MAX_BYTES",
+                8 << 30,
+            )
+        ),
+        help=(
+            "Maximum pageable host bytes for prover-local GDN decode "
+            "checkpoints; set this and the per-request cap to zero to disable"
+        ),
+    )
+    parser.add_argument(
+        "--proof-v3-gdn-checkpoint-request-max-bytes",
+        type=int,
+        default=int(
+            os.environ.get(
+                "VERATHOS_PROOF_V3_GDN_CHECKPOINT_REQUEST_MAX_BYTES",
+                2 << 30,
+            )
+        ),
+        help="Maximum pageable GDN checkpoint bytes retained per request",
+    )
+    parser.add_argument(
+        "--proof-v3-gdn-checkpoint-interval-tokens",
+        type=int,
+        default=int(
+            os.environ.get(
+                "VERATHOS_PROOF_V3_GDN_CHECKPOINT_INTERVAL_TOKENS",
+                1024,
+            )
+        ),
+        help="Target decode-token interval for prover-local GDN checkpoints",
     )
     parser.add_argument(
         "--proof-v3-ttl-seconds",

@@ -187,6 +187,7 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
                         execution_anchor_stage_suffixes=None,
                         execution_anchor_checkpoint_stride: int = 1,
                         enable_prefix_caching: bool = False,
+                        enable_finished_cache_retention: bool = False,
                         quant: str = "fp16",
                         ) -> CaptureMiner:
     import torch
@@ -247,9 +248,6 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
         extra["max_num_batched_tokens"] = int(max_num_batched_tokens)
     if enable_prefix_caching:
         extra["enable_prefix_caching"] = True
-        extra["scheduler_cls"] = (
-            "verallm.miner.proof_cache_scheduler.ProofCacheScheduler"
-        )
     elif (
         reduction_layers
         or os.environ.get("VERALLM_CAPTURE_FULL_ROWS", "") not in ("", "0")
@@ -262,6 +260,10 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
         # incomplete request; disabling prefix caching is the production
         # configuration for audit-tracked serving.
         extra["enable_prefix_caching"] = False
+    if enable_prefix_caching or enable_finished_cache_retention:
+        extra["scheduler_cls"] = (
+            "verallm.miner.proof_cache_scheduler.ProofCacheScheduler"
+        )
     miner = VllmMiner(model_path, temp_spec, None)
     miner.setup_vllm(quant=str(quant), gpu_memory_utilization=gpu_mem,
                      proof_v2_full_trace_capture=True,
