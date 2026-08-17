@@ -2031,7 +2031,7 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
         ),
         total_params_b=27.0, active_params_b=27.0,
         native_context_len=262144,
-        generation_quality=1.10,
+        generation_quality=1.15,  # Newer successor receives a bounded quality premium over Qwen3.6
         verified_inference=True,
         family="qwen3.8", provider="Qwen",
         notes="Multimodal dense hybrid model with 48 GDN and 16 gated "
