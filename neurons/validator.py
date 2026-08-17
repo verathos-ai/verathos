@@ -37,6 +37,8 @@ import math
 import os
 import signal
 import json
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -85,6 +87,7 @@ from neurons.capacity_audit_combined import (
     is_combined_proof_payload,
     verify_combined_proof_payload,
 )
+from neurons.capacity_audit_head_observer import STATE_SIZE as CAPACITY_HEAD_STATE_SIZE
 from neurons.config import NeuronConfig
 from neurons.discovery import ActiveMiner, discover_active_miners
 from neurons.subnet_runtime_config import (
@@ -171,6 +174,22 @@ class _CapacityAuditIngressHead:
     observed_at: float
     source: str
     trustworthy: bool
+
+
+def _capacity_audit_head_number(block_header: object) -> int:
+    """Decode one substrate header without importing validator state."""
+
+    value = getattr(block_header, "value", block_header)
+    if not isinstance(value, dict):
+        return 0
+    header = value.get("header") if isinstance(value.get("header"), dict) else value
+    number = header.get("number")
+    if number is None:
+        return 0
+    try:
+        return int(number, 0) if isinstance(number, str) else int(number)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _decode_scoring_authority_hotkey(ss58_address: str) -> bytes:
@@ -1055,6 +1074,13 @@ class ValidatorNeuron:
         self._capacity_audit_head_observed_monotonic = 0.0
         self._capacity_audit_head_source = ""
         self._capacity_audit_head_connected = False
+        # Receipt chronology must keep advancing even when validator-side
+        # native or metagraph work retains the Python GIL.  The isolated
+        # observer is started before the ingest server and is the production
+        # source of truth; the in-process fields above remain for narrow tests
+        # and validators with capacity auditing disabled.
+        self._capacity_audit_head_process = None
+        self._capacity_audit_head_shared = None
         # The stream watchdog can replace a subscription while its callback is
         # still completing a slow epoch close.  Serialize block delivery across
         # subscription generations so a stale reconnect cursor cannot dispatch
@@ -4367,11 +4393,25 @@ class ValidatorNeuron:
 
         @app.get("/capacity/audit/v1/health")
         async def _health():
+            head = self._capture_capacity_audit_ingress_head()
             return {
                 "status": "ok",
                 "service": "verathos-capacity-audit-ingest",
                 "capacity_audit": True,
                 "protocol_version": PROTOCOL_VERSION,
+                "receipt_chronology": {
+                    "block": int(head.block),
+                    "source": str(head.source),
+                    "trustworthy": bool(head.trustworthy),
+                    "observer_pid": int(
+                        getattr(
+                            getattr(self, "_capacity_audit_head_process", None),
+                            "pid",
+                            0,
+                        )
+                        or 0
+                    ),
+                },
                 "receipt_ingest": self._capacity_audit_receipt_metrics_snapshot(),
             }
 
@@ -13780,16 +13820,179 @@ class ValidatorNeuron:
 
     @staticmethod
     def _block_number_from_header(block_header: object) -> Optional[int]:
-        value = getattr(block_header, "value", block_header)
-        if isinstance(value, dict):
-            header = value.get("header") if isinstance(value.get("header"), dict) else value
-            number = header.get("number")
-            if number is not None:
-                try:
-                    return int(number, 0) if isinstance(number, str) else int(number)
-                except (TypeError, ValueError):
-                    return None
-        return None
+        number = _capacity_audit_head_number(block_header)
+        return number if number > 0 else None
+
+    def _ensure_isolated_capacity_audit_head_state(self) -> None:
+        if not hasattr(self, "_capacity_audit_head_process"):
+            self._capacity_audit_head_process = None
+            self._capacity_audit_head_shared = None
+
+    def _start_isolated_capacity_audit_head_observer(self) -> None:
+        """Start the sole process-isolated receipt chronology observer."""
+
+        if not self._capacity_audit_cfg.enabled:
+            return
+        self._ensure_isolated_capacity_audit_head_state()
+        process = self._capacity_audit_head_process
+        if process is not None and process.poll() is None:
+            return
+
+        runtime_dir = os.path.join(
+            os.environ.get("VERALLM_DATA_DIR", os.path.expanduser("~/.verathos")),
+            "run",
+        )
+        os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+        state_path = os.path.join(
+            runtime_dir,
+            f"capacity-head-{os.getpid()}.state",
+        )
+        try:
+            os.unlink(state_path)
+        except FileNotFoundError:
+            pass
+        state_fd = os.open(
+            state_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.ftruncate(state_fd, CAPACITY_HEAD_STATE_SIZE)
+        parent_read_fd, parent_write_fd = os.pipe()
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "neurons.capacity_audit_head_observer",
+                    "--network",
+                    str(self.config.subtensor_network),
+                    "--state-path",
+                    state_path,
+                    "--parent-pid",
+                    str(os.getpid()),
+                    "--parent-fd",
+                    str(parent_read_fd),
+                    "--poll-seconds",
+                    str(self._block_stream_fallback_poll_s()),
+                    "--watchdog-seconds",
+                    str(self._block_stream_watchdog_s()),
+                ],
+                close_fds=True,
+                pass_fds=(parent_read_fd,),
+            )
+        except Exception:
+            os.close(parent_read_fd)
+            os.close(parent_write_fd)
+            os.close(state_fd)
+            os.unlink(state_path)
+            raise
+        os.close(parent_read_fd)
+        self._capacity_audit_head_shared = SimpleNamespace(
+            fd=state_fd,
+            path=state_path,
+            parent_write_fd=parent_write_fd,
+        )
+        self._capacity_audit_head_process = process
+
+        deadline = time.monotonic() + max(15.0, self._block_stream_watchdog_s())
+        while time.monotonic() < deadline:
+            observation = self._capture_isolated_capacity_audit_ingress_head()
+            if observation is not None and observation.trustworthy:
+                bt.logging.info(
+                    "Capacity receipt chronology observer ready: "
+                    f"pid={process.pid} block={observation.block}"
+                )
+                return
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+        self._stop_isolated_capacity_audit_head_observer()
+        raise RuntimeError(
+            "process-isolated capacity receipt chronology observer did not become ready"
+        )
+
+    def _stop_isolated_capacity_audit_head_observer(self) -> None:
+        self._ensure_isolated_capacity_audit_head_state()
+        process = self._capacity_audit_head_process
+        shared = self._capacity_audit_head_shared
+        if shared is not None:
+            try:
+                os.close(int(shared.parent_write_fd))
+            except OSError:
+                pass
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+        if shared is not None:
+            try:
+                os.close(int(shared.fd))
+            except OSError:
+                pass
+            try:
+                os.unlink(str(shared.path))
+            except FileNotFoundError:
+                pass
+        self._capacity_audit_head_process = None
+        self._capacity_audit_head_shared = None
+
+    def _capture_isolated_capacity_audit_ingress_head(
+        self,
+    ) -> Optional[_CapacityAuditIngressHead]:
+        """Read one consistent lock-free snapshot from the observer process."""
+
+        self._ensure_isolated_capacity_audit_head_state()
+        shared = self._capacity_audit_head_shared
+        process = self._capacity_audit_head_process
+        if shared is None or process is None:
+            return None
+        alive = process.poll() is None
+        for _attempt in range(8):
+            payload = os.pread(
+                int(shared.fd),
+                CAPACITY_HEAD_STATE_SIZE,
+                0,
+            )
+            if len(payload) != CAPACITY_HEAD_STATE_SIZE:
+                continue
+            (
+                before,
+                block,
+                observed_wall_ns,
+                observed_mono_ns,
+                connected,
+                after,
+            ) = struct.unpack("<QQQQI4xQ", payload)
+            if before == after and not (int(after) & 1):
+                break
+        else:
+            return _CapacityAuditIngressHead(
+                block=0,
+                generation=0,
+                observed_at=0.0,
+                source="isolated_head_stream",
+                trustworthy=False,
+            )
+        age_s = (
+            max(0.0, (time.monotonic_ns() - observed_mono_ns) / 1_000_000_000)
+            if observed_mono_ns
+            else float("inf")
+        )
+        return _CapacityAuditIngressHead(
+            block=block,
+            generation=after // 2,
+            observed_at=observed_wall_ns / 1_000_000_000,
+            source="isolated_head_stream",
+            trustworthy=bool(
+                alive
+                and block > 0
+                and connected
+                and age_s <= self._block_stream_watchdog_s()
+            ),
+        )
 
     def _ensure_capacity_audit_head_state(self) -> None:
         """Initialize head state for narrow fixtures that bypass ``__init__``."""
@@ -13846,6 +14049,13 @@ class ValidatorNeuron:
 
     def _capture_capacity_audit_ingress_head(self) -> _CapacityAuditIngressHead:
         """Snapshot trustworthy chronology at completed-body HTTP ingress."""
+
+        isolated = self._capture_isolated_capacity_audit_ingress_head()
+        if isolated is not None:
+            # Once configured, the isolated observer is authoritative. Never
+            # hide its failure by falling back to a thread that may share the
+            # exact GIL starvation condition this boundary is meant to avoid.
+            return isolated
 
         self._ensure_capacity_audit_head_state()
         with self._capacity_audit_head_lock:
@@ -14336,6 +14546,7 @@ class ValidatorNeuron:
 
     def shutdown(self):
         self._running = False
+        self._stop_isolated_capacity_audit_head_observer()
         if self._capacity_audit_server is not None:
             self._capacity_audit_server.should_exit = True
         self._executor.shutdown(wait=False)
@@ -14730,6 +14941,10 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     neuron.setup()
+    # The receipt endpoint is not exposed until its process-isolated live-head
+    # source is ready. This prevents a restart from advertising a fail-closed
+    # but unusable capacity-ingest path.
+    neuron._start_isolated_capacity_audit_head_observer()
     neuron._start_capacity_audit_ingest_server()
     neuron._ensure_capacity_audit_axon_served()
 
