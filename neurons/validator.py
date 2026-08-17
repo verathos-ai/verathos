@@ -841,6 +841,7 @@ class ValidatorNeuron:
         self._evm_disabled: bool = bool(getattr(config, "no_evm", False))
         self._model_client = None
         self._miner_client = None
+        self._chain_provider = None
         self._subnet_config_client = None
         self._blacklisted_uids: set = set()
         self._blacklisted_addresses: set = set()  # lowercase EVM addrs
@@ -1959,6 +1960,7 @@ class ValidatorNeuron:
 
         bt.logging.info("Creating chain clients...")
         self._model_client, self._miner_client, self._payment_client = create_clients(self.config)
+        self._chain_provider = getattr(self._model_client, "_provider", None)
         self._load_proof_v2_manifests()
         runtime_config_loaded = self._refresh_subnet_runtime_config(force=True)
         if select_proof_protocol_version(
@@ -1981,7 +1983,10 @@ class ValidatorNeuron:
                     chain_id=getattr(self.config, "chain_id", 945),
                     subnet_config_address=_sn_config_addr,
                 )
-                self._subnet_config_client = SubnetConfigClient(_sn_chain_config)
+                self._subnet_config_client = SubnetConfigClient(
+                    _sn_chain_config,
+                    provider=self._chain_provider,
+                )
                 bt.logging.info(f"SubnetConfig client initialized: {_sn_config_addr}")
                 if not runtime_config_loaded:
                     # Chain scoring is fallback only when the public runtime
@@ -2101,7 +2106,10 @@ class ValidatorNeuron:
             return
         try:
             from verallm.chain.validator_registry import ValidatorRegistryClient
-            vr = ValidatorRegistryClient(self.config)
+            vr = ValidatorRegistryClient(
+                self.config,
+                provider=self._chain_provider,
+            )
         except Exception as e:
             bt.logging.debug(f"ValidatorRegistry not configured, skipping registration: {e}")
             return
@@ -2930,8 +2938,24 @@ class ValidatorNeuron:
         return int(current_block) <= int(audit_block) + recoverable_blocks
 
     def _capacity_audit_selection_recoverable(self, audit_block: int) -> bool:
-        last_seen_block = int(getattr(self, "_last_known_block", 0) or 0)
-        return ValidatorNeuron._capacity_audit_start_recoverable(self, audit_block, last_seen_block)
+        observe_head = getattr(self, "_observe_live_capacity_audit_head", None)
+        if callable(observe_head):
+            live_head, trustworthy = observe_head()
+            if not trustworthy:
+                # Never create a timing-sensitive obligation while the
+                # independent chronology source is unavailable.  In
+                # particular, a reconnect must not treat a replayed block as
+                # the live head and schedule an already-expired audit.
+                return False
+            current_block = int(live_head)
+        else:
+            # Compatibility for narrow fixtures without a chronology source.
+            current_block = int(getattr(self, "_last_known_block", 0) or 0)
+        return ValidatorNeuron._capacity_audit_start_recoverable(
+            self,
+            audit_block,
+            current_block,
+        )
 
     def _schedule_capacity_audit_window(
         self,
@@ -3153,14 +3177,38 @@ class ValidatorNeuron:
         observed_at = time.time()
         for window in windows:
             window_audit_block = int(window["audit_block"])
-            current_head = max(
-                int(audit_block),
-                int(getattr(self, "_last_known_block", 0) or 0),
-            )
             strict_timing_mode = str(getattr(self._capacity_audit_cfg, "mode", "observe") or "observe") in {
                 "score_gate",
                 "enforce",
             }
+            observe_head = getattr(
+                self,
+                "_observe_live_capacity_audit_head",
+                None,
+            )
+            if callable(observe_head):
+                live_head, trustworthy = observe_head()
+            else:
+                live_head, trustworthy = 0, False
+            if strict_timing_mode and callable(observe_head) and not trustworthy:
+                stale = self._db.mark_capacity_audit_window_stale(
+                    window["audit_id"],
+                    reason="validator_live_head_unavailable",
+                    released_at=observed_at,
+                )
+                if stale:
+                    self._write_shared_state()
+                bt.logging.warning(
+                    f"Capacity audit stale window skipped: audit_id={window['audit_id'][:12]} "
+                    f"B_start={window_audit_block} live_head=unavailable "
+                    f"released_slots={stale}"
+                )
+                continue
+            current_head = max(
+                int(audit_block),
+                int(getattr(self, "_last_known_block", 0) or 0),
+                int(live_head) if trustworthy else 0,
+            )
             if strict_timing_mode and current_head > window_audit_block:
                 reason = (
                     "validator_start_missed"
@@ -5480,6 +5528,10 @@ class ValidatorNeuron:
                     pending = self._canary_scheduler.get_pending_tests(
                         block_number
                     )
+                pending = self._filter_stale_canary_dispatches(
+                    pending,
+                    processed_block=block_number,
+                )
                 pending = self._defer_capacity_audit_drained_canaries(
                     pending,
                     block_number,
@@ -5751,6 +5803,51 @@ class ValidatorNeuron:
             and epoch_number
             not in getattr(self, "_sealed_canary_epochs", set())
         )
+
+    def _filter_stale_canary_dispatches(
+        self,
+        pending: List[CanaryTest],
+        *,
+        processed_block: int,
+    ) -> List[CanaryTest]:
+        """Neutralize obligations reached only through historical catch-up."""
+
+        if not pending:
+            return pending
+        observe_head = getattr(
+            self,
+            "_observe_live_capacity_audit_head",
+            None,
+        )
+        if not callable(observe_head):
+            return pending
+        live_head, trustworthy = observe_head()
+        if not trustworthy:
+            for test in pending:
+                self._neutralize_canary_obligation(test)
+            bt.logging.warning(
+                "Neutralized "
+                f"{len(pending)} canary obligation(s) because live chronology "
+                f"was unavailable at processed block {processed_block}"
+            )
+            return []
+        oldest_allowed = int(live_head) - 1
+        expired = [
+            test
+            for test in pending
+            if int(test.target_block) < oldest_allowed
+        ]
+        if not expired:
+            return pending
+        for test in expired:
+            self._neutralize_canary_obligation(test)
+        bt.logging.warning(
+            "Neutralized "
+            f"{len(expired)} stale canary obligation(s) during block catch-up: "
+            f"processed={processed_block} live_head={live_head}"
+        )
+        expired_ids = {id(test) for test in expired}
+        return [test for test in pending if id(test) not in expired_ids]
 
     @staticmethod
     def _canary_execution_id(
@@ -9797,7 +9894,10 @@ class ValidatorNeuron:
 
                 try:
                     from verallm.chain.validator_registry import ValidatorRegistryClient
-                    vr = ValidatorRegistryClient(self.config)
+                    vr = ValidatorRegistryClient(
+                        self.config,
+                        provider=self._chain_provider,
+                    )
                     min_stake_rao = vr.get_min_validator_stake()
                     self._cached_min_validator_stake = min_stake_rao / 1e9
                 except Exception as e:
