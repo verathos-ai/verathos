@@ -40,6 +40,7 @@ import json
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _FuturesTimeout
 from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -159,6 +160,17 @@ _PROOF_V3_ARTIFACT_REFRESH_SECONDS = 3600.0
 
 class _ProofV3ValidatorConfigurationError(RuntimeError):
     """Local v3 configuration is unavailable; the miner is not at fault."""
+
+
+@dataclass(frozen=True)
+class _CapacityAuditIngressHead:
+    """Validator-owned best-head observation captured before receipt queueing."""
+
+    block: int
+    generation: int
+    observed_at: float
+    source: str
+    trustworthy: bool
 
 
 def _decode_scoring_authority_hotkey(ss58_address: str) -> bytes:
@@ -1033,6 +1045,16 @@ class ValidatorNeuron:
         self._weight_update_lock = threading.Lock()
         self._weight_updates_pending: int = 0
         self._last_known_block: int = 0  # fallback for _get_current_block
+        # Receipt chronology is bound to the head observed when the HTTP body
+        # completes, not to a later worker-time RPC. The block stream is the
+        # sole writer; receipt workers only take an atomic snapshot.
+        self._capacity_audit_head_lock = threading.Lock()
+        self._capacity_audit_head_block = 0
+        self._capacity_audit_head_generation = 0
+        self._capacity_audit_head_observed_at = 0.0
+        self._capacity_audit_head_observed_monotonic = 0.0
+        self._capacity_audit_head_source = ""
+        self._capacity_audit_head_connected = False
         # The stream watchdog can replace a subscription while its callback is
         # still completing a slow epoch close.  Serialize block delivery across
         # subscription generations so a stale reconnect cursor cannot dispatch
@@ -1109,6 +1131,28 @@ class ValidatorNeuron:
         # validation and SQLite work off the ingest event loop so one receipt
         # cannot delay the timestamp assigned to another.
         self._capacity_audit_receipt_executor = ThreadPoolExecutor(max_workers=4)
+        self._capacity_audit_receipt_metrics_lock = threading.Lock()
+        self._capacity_audit_receipt_ticket = 0
+        self._capacity_audit_receipt_pending: dict[int, tuple[float, str]] = {}
+        self._capacity_audit_receipt_metrics: dict[str, object] = {
+            "submitted": 0,
+            "completed": 0,
+            "head_unavailable": 0,
+            "max_queue_depth": 0,
+            "max_queue_delay_s": 0.0,
+            "max_processing_s": 0.0,
+            "per_audit": {},
+        }
+        # Shared debug state is relatively expensive to serialize. Coalesce a
+        # receipt burst on a dedicated worker instead of making four ingest
+        # workers rebuild it independently.
+        self._capacity_audit_state_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="capacity-state",
+        )
+        self._capacity_audit_state_lock = threading.Lock()
+        self._capacity_audit_state_pending = False
+        self._capacity_audit_state_dirty = False
         self._miner_debug_executor = ThreadPoolExecutor(max_workers=1)
         # Analytics retention is best-effort maintenance, not an epoch-close
         # dependency.  A daemon worker keeps multi-million-row archives off the
@@ -3549,6 +3593,7 @@ class ValidatorNeuron:
         artifact: dict,
         *,
         received_at: Optional[float] = None,
+        ingress_head: Optional[_CapacityAuditIngressHead] = None,
     ) -> tuple[int, dict]:
         """Ingest a miner-published capacity audit artifact."""
         if not self._capacity_audit_cfg.enabled:
@@ -3618,12 +3663,13 @@ class ValidatorNeuron:
                         "ok": False,
                         "error": "proof challenge block required",
                     }
-                if str(row.get("proof_challenge_block_hash") or ""):
-                    final_observed_block, live_head_ok = (
-                        proof_challenge_block,
-                        True,
-                    )
+                if ingress_head is not None:
+                    final_observed_block = int(ingress_head.block)
+                    live_head_ok = bool(ingress_head.trustworthy)
                 else:
+                    # Direct in-process callers retain the same fail-closed
+                    # interface, but the implementation now reads only the
+                    # stream-owned cache and never performs worker-side RPC.
                     final_observed_block, live_head_ok = (
                         self._observe_live_capacity_audit_head()
                     )
@@ -3650,7 +3696,7 @@ class ValidatorNeuron:
                         received_at=ts,
                     )
                     if recorded:
-                        self._write_shared_state()
+                        self._schedule_capacity_audit_shared_state_write()
                         self._apply_finalized_capacity_audit_probations()
                     return 200, {
                         "ok": True,
@@ -3760,7 +3806,7 @@ class ValidatorNeuron:
                     model_index=model_index,
                     released_at=ts,
                 )
-            self._write_shared_state()
+            self._schedule_capacity_audit_shared_state_write()
             return 200, {"ok": True, "verdict": verdict, "timing_status": timing_status}
 
         if artifact_type == "capacity_audit_proof_payload":
@@ -4125,12 +4171,176 @@ class ValidatorNeuron:
         )
         return status, body
 
+    def _ensure_capacity_audit_receipt_metrics(self) -> None:
+        if hasattr(self, "_capacity_audit_receipt_metrics_lock"):
+            return
+        self._capacity_audit_receipt_metrics_lock = threading.Lock()
+        self._capacity_audit_receipt_ticket = 0
+        self._capacity_audit_receipt_pending = {}
+        self._capacity_audit_receipt_metrics = {
+            "submitted": 0,
+            "completed": 0,
+            "head_unavailable": 0,
+            "max_queue_depth": 0,
+            "max_queue_delay_s": 0.0,
+            "max_processing_s": 0.0,
+            "per_audit": {},
+        }
+
+    def _capacity_audit_receipt_enqueued(
+        self,
+        artifact: dict,
+        received_at: float,
+    ) -> int:
+        self._ensure_capacity_audit_receipt_metrics()
+        audit_id = str(artifact.get("audit_id") or "")
+        with self._capacity_audit_receipt_metrics_lock:
+            self._capacity_audit_receipt_ticket += 1
+            ticket = int(self._capacity_audit_receipt_ticket)
+            self._capacity_audit_receipt_pending[ticket] = (
+                float(received_at),
+                audit_id,
+            )
+            metrics = self._capacity_audit_receipt_metrics
+            metrics["submitted"] = int(metrics["submitted"]) + 1
+            depth = len(self._capacity_audit_receipt_pending)
+            metrics["max_queue_depth"] = max(
+                int(metrics["max_queue_depth"]),
+                depth,
+            )
+            per_audit = metrics["per_audit"]
+            assert isinstance(per_audit, dict)
+            item = per_audit.setdefault(
+                audit_id,
+                {
+                    "submitted": 0,
+                    "completed": 0,
+                    "head_unavailable": 0,
+                    "max_queue_delay_s": 0.0,
+                    "max_processing_s": 0.0,
+                    "last_received_at": 0.0,
+                },
+            )
+            item["submitted"] += 1
+            item["last_received_at"] = float(received_at)
+            # Bound process-lifetime diagnostic state. Active/most-recent
+            # audit IDs are retained; old completed IDs are evicted first.
+            if len(per_audit) > 64:
+                oldest = min(
+                    per_audit,
+                    key=lambda key: float(per_audit[key]["last_received_at"]),
+                )
+                if oldest != audit_id:
+                    per_audit.pop(oldest, None)
+            return ticket
+
+    def _capacity_audit_receipt_finished(
+        self,
+        *,
+        ticket: int,
+        queue_delay_s: float,
+        processing_s: float,
+        head_unavailable: bool,
+    ) -> None:
+        self._ensure_capacity_audit_receipt_metrics()
+        with self._capacity_audit_receipt_metrics_lock:
+            _received_at, audit_id = self._capacity_audit_receipt_pending.pop(
+                int(ticket),
+                (0.0, ""),
+            )
+            metrics = self._capacity_audit_receipt_metrics
+            metrics["completed"] = int(metrics["completed"]) + 1
+            metrics["max_queue_delay_s"] = max(
+                float(metrics["max_queue_delay_s"]),
+                float(queue_delay_s),
+            )
+            metrics["max_processing_s"] = max(
+                float(metrics["max_processing_s"]),
+                float(processing_s),
+            )
+            if head_unavailable:
+                metrics["head_unavailable"] = int(metrics["head_unavailable"]) + 1
+            per_audit = metrics["per_audit"]
+            assert isinstance(per_audit, dict)
+            item = per_audit.get(audit_id)
+            if item is not None:
+                item["completed"] += 1
+                item["max_queue_delay_s"] = max(
+                    float(item["max_queue_delay_s"]),
+                    float(queue_delay_s),
+                )
+                item["max_processing_s"] = max(
+                    float(item["max_processing_s"]),
+                    float(processing_s),
+                )
+                if head_unavailable:
+                    item["head_unavailable"] += 1
+
+    def _capacity_audit_receipt_metrics_snapshot(self) -> dict:
+        self._ensure_capacity_audit_receipt_metrics()
+        now = time.time()
+        with self._capacity_audit_receipt_metrics_lock:
+            pending = dict(self._capacity_audit_receipt_pending)
+            metrics = self._capacity_audit_receipt_metrics
+            return {
+                "queue_depth": len(pending),
+                "oldest_age_s": max(
+                    (max(0.0, now - row[0]) for row in pending.values()),
+                    default=0.0,
+                ),
+                "submitted": int(metrics["submitted"]),
+                "completed": int(metrics["completed"]),
+                "head_unavailable": int(metrics["head_unavailable"]),
+                "max_queue_depth": int(metrics["max_queue_depth"]),
+                "max_queue_delay_s": float(metrics["max_queue_delay_s"]),
+                "max_processing_s": float(metrics["max_processing_s"]),
+                "per_audit": {
+                    key: dict(value)
+                    for key, value in dict(metrics["per_audit"]).items()
+                },
+            }
+
+    def _schedule_capacity_audit_shared_state_write(self) -> None:
+        executor = getattr(self, "_capacity_audit_state_executor", None)
+        lock = getattr(self, "_capacity_audit_state_lock", None)
+        if executor is None or lock is None:
+            self._write_shared_state()
+            return
+        with lock:
+            self._capacity_audit_state_dirty = True
+            if self._capacity_audit_state_pending:
+                return
+            self._capacity_audit_state_pending = True
+
+        def _flush() -> None:
+            # One short debounce absorbs a full receipt fan-in without adding
+            # latency to the HTTP response or proof deadline.
+            time.sleep(0.05)
+            while True:
+                with lock:
+                    self._capacity_audit_state_dirty = False
+                try:
+                    self._write_shared_state()
+                except Exception as exc:
+                    bt.logging.warning(
+                        f"Capacity audit shared-state refresh failed: {exc}"
+                    )
+                with lock:
+                    if self._capacity_audit_state_dirty:
+                        continue
+                    self._capacity_audit_state_pending = False
+                    return
+
+        executor.submit(_flush)
+
     def _build_capacity_audit_ingest_app(self):
         from fastapi import FastAPI, Request
         from fastapi.responses import JSONResponse
         app = FastAPI(title="Verathos Capacity Audit Ingest")
 
-        async def _read_payload(request: Request) -> tuple[int, dict, float]:
+        async def _read_payload(
+            request: Request,
+        ) -> tuple[int, dict, float, _CapacityAuditIngressHead]:
             max_bytes = int(
                 getattr(
                     self._capacity_audit_cfg,
@@ -4141,18 +4351,19 @@ class ValidatorNeuron:
             )
             body = await request.body()
             received_at = time.time()
+            ingress_head = self._capture_capacity_audit_ingress_head()
             if len(body) > max_bytes:
                 return 413, {
                     "error": "payload_too_large",
                     "max_bytes": max_bytes,
-                }, received_at
+                }, received_at, ingress_head
             try:
                 payload = json.loads(body.decode("utf-8"))
             except Exception:
-                return 400, {"error": "invalid_json"}, received_at
+                return 400, {"error": "invalid_json"}, received_at, ingress_head
             if not isinstance(payload, dict):
-                return 400, {"error": "payload_must_be_object"}, received_at
-            return 200, payload, received_at
+                return 400, {"error": "payload_must_be_object"}, received_at, ingress_head
+            return 200, payload, received_at, ingress_head
 
         @app.get("/capacity/audit/v1/health")
         async def _health():
@@ -4161,6 +4372,7 @@ class ValidatorNeuron:
                 "service": "verathos-capacity-audit-ingest",
                 "capacity_audit": True,
                 "protocol_version": PROTOCOL_VERSION,
+                "receipt_ingest": self._capacity_audit_receipt_metrics_snapshot(),
             }
 
         @app.get("/v1/verdicts/current")
@@ -4199,20 +4411,23 @@ class ValidatorNeuron:
             )
 
         async def _receipt(request):
-            read_status, payload, received_at = await _read_payload(request)
+            read_status, payload, received_at, ingress_head = await _read_payload(request)
             if read_status != 200:
                 return JSONResponse(status_code=read_status, content=payload)
+            ticket = self._capacity_audit_receipt_enqueued(payload, received_at)
             loop = asyncio.get_running_loop()
             status, body = await loop.run_in_executor(
                 self._capacity_audit_receipt_executor,
                 self._ingest_capacity_audit_receipt,
                 payload,
                 received_at,
+                ingress_head,
+                ticket,
             )
             return JSONResponse(status_code=status, content=body)
 
         async def _proof(request):
-            read_status, payload, received_at = await _read_payload(request)
+            read_status, payload, received_at, _ingress_head = await _read_payload(request)
             if read_status != 200:
                 return JSONResponse(status_code=read_status, content=payload)
             status, body = self.submit_capacity_audit_proof_artifact(
@@ -4232,16 +4447,32 @@ class ValidatorNeuron:
         self,
         artifact: dict,
         received_at: float,
+        ingress_head: _CapacityAuditIngressHead,
+        ticket: int,
     ) -> tuple[int, dict]:
         processing_started_at = time.time()
+        status = 500
+        body: dict = {"ok": False, "error": "receipt worker failed"}
         try:
-            return self.ingest_capacity_audit_artifact(
+            status, body = self.ingest_capacity_audit_artifact(
                 artifact,
                 received_at=received_at,
+                ingress_head=ingress_head,
             )
+            return status, body
         finally:
             queue_delay_s = max(0.0, processing_started_at - received_at)
             processing_s = max(0.0, time.time() - processing_started_at)
+            head_unavailable = bool(
+                status == 503
+                and str(body.get("error") or "") == "live chain head unavailable"
+            )
+            self._capacity_audit_receipt_finished(
+                ticket=ticket,
+                queue_delay_s=queue_delay_s,
+                processing_s=processing_s,
+                head_unavailable=head_unavailable,
+            )
             if queue_delay_s >= 0.5 or processing_s >= 0.5:
                 bt.logging.warning(
                     "Capacity audit receipt ingest delay: "
@@ -13560,30 +13791,89 @@ class ValidatorNeuron:
                     return None
         return None
 
-    def _observe_live_capacity_audit_head(self) -> tuple[int, bool]:
-        """Read a validator-owned best-head observation directly from RPC.
+    def _ensure_capacity_audit_head_state(self) -> None:
+        """Initialize head state for narrow fixtures that bypass ``__init__``."""
 
-        Capacity proof v2 uses the future ``B_proof`` block as public
-        randomness.  A final transcript is usable only when the validator has
-        received it while its live node is still below that height.  The raw
-        RPC read avoids treating a delayed local block-processing callback as
-        evidence that the challenge was not yet observable.
-        """
-        known_head = max(0, int(getattr(self, "_last_known_block", 0) or 0))
-        target = getattr(self, "_subtensor", None)
-        substrate = getattr(target, "substrate", None)
-        if substrate is None:
-            return known_head, False
-        try:
-            response = substrate.rpc_request("chain_getHeader", [])
-            header = response.get("result") if isinstance(response, dict) else response
-            live_head = self._block_number_from_header(header)
-        except Exception as exc:
-            bt.logging.debug(f"Capacity audit live head observation failed: {exc}")
-            return known_head, False
-        if live_head is None or int(live_head) <= 0:
-            return known_head, False
-        return max(known_head, int(live_head)), True
+        if not hasattr(self, "_capacity_audit_head_lock"):
+            self._capacity_audit_head_lock = threading.Lock()
+            self._capacity_audit_head_block = 0
+            self._capacity_audit_head_generation = 0
+            self._capacity_audit_head_observed_at = 0.0
+            self._capacity_audit_head_observed_monotonic = 0.0
+            self._capacity_audit_head_source = ""
+            self._capacity_audit_head_connected = False
+
+    def _begin_capacity_audit_head_generation(self) -> int:
+        self._ensure_capacity_audit_head_state()
+        with self._capacity_audit_head_lock:
+            self._capacity_audit_head_generation += 1
+            generation = int(self._capacity_audit_head_generation)
+            self._capacity_audit_head_connected = False
+        return generation
+
+    def _record_capacity_audit_live_head(
+        self,
+        block: int,
+        *,
+        generation: Optional[int] = None,
+        source: str,
+    ) -> None:
+        """Publish one current-head observation without any receipt-side RPC."""
+
+        block_i = max(0, int(block))
+        if block_i <= 0:
+            return
+        self._ensure_capacity_audit_head_state()
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        with self._capacity_audit_head_lock:
+            current_generation = int(self._capacity_audit_head_generation)
+            if generation is not None and int(generation) != current_generation:
+                return
+            if block_i < int(self._capacity_audit_head_block):
+                return
+            self._capacity_audit_head_block = block_i
+            self._capacity_audit_head_observed_at = now_wall
+            self._capacity_audit_head_observed_monotonic = now_mono
+            self._capacity_audit_head_source = str(source)
+            self._capacity_audit_head_connected = True
+
+    def _end_capacity_audit_head_generation(self, generation: int) -> None:
+        self._ensure_capacity_audit_head_state()
+        with self._capacity_audit_head_lock:
+            if int(generation) == int(self._capacity_audit_head_generation):
+                self._capacity_audit_head_connected = False
+
+    def _capture_capacity_audit_ingress_head(self) -> _CapacityAuditIngressHead:
+        """Snapshot trustworthy chronology at completed-body HTTP ingress."""
+
+        self._ensure_capacity_audit_head_state()
+        with self._capacity_audit_head_lock:
+            block = int(self._capacity_audit_head_block)
+            generation = int(self._capacity_audit_head_generation)
+            observed_at = float(self._capacity_audit_head_observed_at)
+            observed_mono = float(self._capacity_audit_head_observed_monotonic)
+            source = str(self._capacity_audit_head_source)
+            connected = bool(self._capacity_audit_head_connected)
+        age_s = max(0.0, time.monotonic() - observed_mono) if observed_mono else float("inf")
+        trustworthy = bool(
+            block > 0
+            and connected
+            and age_s <= self._block_stream_watchdog_s()
+        )
+        return _CapacityAuditIngressHead(
+            block=block,
+            generation=generation,
+            observed_at=observed_at,
+            source=source,
+            trustworthy=trustworthy,
+        )
+
+    def _observe_live_capacity_audit_head(self) -> tuple[int, bool]:
+        """Return the stream-owned head cache; never read RPC from a worker."""
+
+        observation = self._capture_capacity_audit_ingress_head()
+        return int(observation.block), bool(observation.trustworthy)
 
     @staticmethod
     def _close_subtensor(subtensor_obj) -> None:
@@ -13727,11 +14017,29 @@ class ValidatorNeuron:
             confirmer(subtensor_obj)
         return last_block
 
-    def _poll_current_head_catch_up(self, last_block: int) -> int:
-        current, current_hash, current_hash_real = self._get_current_head_block_and_hash()
+    def _poll_current_head_catch_up(
+        self,
+        last_block: int,
+        subtensor_obj: object | None = None,
+        *,
+        head_generation: Optional[int] = None,
+    ) -> int:
+        if subtensor_obj is None:
+            current, current_hash, current_hash_real = (
+                self._get_current_head_block_and_hash()
+            )
+        else:
+            current, current_hash, current_hash_real = (
+                self._get_current_head_block_and_hash(subtensor_obj)
+            )
         if current <= 0:
             bt.logging.debug("Current-head catch-up skipped: no valid head block")
             return last_block
+        self._record_capacity_audit_live_head(
+            current,
+            generation=head_generation,
+            source="poll",
+        )
 
         # Show progress while waiting for sync block
         if current < self._sync_block:
@@ -13758,6 +14066,8 @@ class ValidatorNeuron:
         block_header: object,
         last_block: int,
         rpc_subtensor: object,
+        *,
+        head_generation: Optional[int] = None,
     ) -> int:
         """Process one streamed header without re-entering its RPC socket.
 
@@ -13772,6 +14082,14 @@ class ValidatorNeuron:
         block_number = self._block_number_from_header(block_header)
         if block_number is None:
             return last_block
+        # Publish chronology before hash lookup or block dispatch. Receipt
+        # ingestion must remain accurate even when those slower operations
+        # stall and the worker queue continues to drain.
+        self._record_capacity_audit_live_head(
+            block_number,
+            generation=head_generation,
+            source="stream",
+        )
         block_hash, block_hash_real = self._get_chain_block_hash(
             block_number,
             rpc_subtensor,
@@ -13794,16 +14112,28 @@ class ValidatorNeuron:
         while self._running:
             fresh_sub = None
             rpc_sub = None
+            head_sub = None
+            head_generation = self._begin_capacity_audit_head_generation()
             try:
                 bt.logging.info("Creating fresh Subtensor connection for current-head block stream...")
                 SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
                 fresh_sub = SubtensorCls(network=self.config.subtensor_network)
                 rpc_sub = SubtensorCls(network=self.config.subtensor_network)
+                head_sub = SubtensorCls(network=self.config.subtensor_network)
                 substrate = getattr(fresh_sub, "substrate", None)
                 subscribe = getattr(substrate, "subscribe_block_headers", None)
+                head_subscribe = getattr(
+                    getattr(head_sub, "substrate", None),
+                    "subscribe_block_headers",
+                    None,
+                )
                 if subscribe is None:
                     bt.logging.warning("Current-head block stream unavailable; using polling catch-up")
-                    last_block = self._poll_current_head_catch_up(last_block)
+                    last_block = self._poll_current_head_catch_up(
+                        last_block,
+                        rpc_sub,
+                        head_generation=head_generation,
+                    )
                     time.sleep(fallback_poll_s)
                     continue
 
@@ -13818,6 +14148,22 @@ class ValidatorNeuron:
                 process_lock = threading.Lock()
                 stop_event = threading.Event()
                 last_catch_up_at = 0.0
+                head_state = SimpleNamespace(error=None)
+
+                def head_callback(block_header):
+                    if not self._running or stop_event.is_set():
+                        raise StopIteration("Validator shutting down")
+                    block_number = self._block_number_from_header(block_header)
+                    if block_number is not None:
+                        # This subscriber does no hash lookup or block work, so
+                        # receipt chronology continues advancing even while the
+                        # main callback is processing a large audit cohort.
+                        self._record_capacity_audit_live_head(
+                            block_number,
+                            generation=head_generation,
+                            source="head_stream",
+                        )
+                    return None
 
                 def callback(block_header):
                     if not self._running or stop_event.is_set():
@@ -13833,6 +14179,7 @@ class ValidatorNeuron:
                                     block_header,
                                     base_block,
                                     rpc_sub,
+                                    head_generation=head_generation,
                                 )
                             )
                         finally:
@@ -13853,7 +14200,11 @@ class ValidatorNeuron:
                         try:
                             with lock:
                                 base_block = int(state.last_block)
-                            new_last = self._poll_current_head_catch_up(base_block)
+                            new_last = self._poll_current_head_catch_up(
+                                base_block,
+                                rpc_sub,
+                                head_generation=head_generation,
+                            )
                         finally:
                             process_lock.release()
                         with lock:
@@ -13876,12 +14227,27 @@ class ValidatorNeuron:
                         with lock:
                             state.error = exc
 
+                def run_head_subscription():
+                    if head_subscribe is None:
+                        return
+                    try:
+                        head_subscribe(head_callback, finalized_only=False)
+                    except Exception as exc:
+                        with lock:
+                            head_state.error = exc
+
                 thread = threading.Thread(
                     target=run_subscription,
                     name="validator-current-block-stream",
                     daemon=True,
                 )
                 thread.start()
+                head_thread = threading.Thread(
+                    target=run_head_subscription,
+                    name="validator-capacity-head-stream",
+                    daemon=True,
+                )
+                head_thread.start()
                 bt.logging.info(
                     f"Subscribing to current-head block headers "
                     f"(watchdog_s={watchdog_s:g}, fallback_poll_s={fallback_poll_s:g})"
@@ -13892,6 +14258,7 @@ class ValidatorNeuron:
                     now = time.monotonic()
                     with lock:
                         error = state.error
+                        head_error = head_state.error
                         active = bool(state.active)
                         last_header_at = float(state.last_header_at or 0.0)
                         last_block = int(state.last_block)
@@ -13899,6 +14266,11 @@ class ValidatorNeuron:
                     last_block = catch_up_if_due(now, last_block, active)
                     if error is not None:
                         bt.logging.warning(f"Current-head block stream ended: {error}")
+                        break
+                    if head_subscribe is not None and head_error is not None:
+                        bt.logging.warning(
+                            f"Capacity chronology head stream ended: {head_error}"
+                        )
                         break
                     reference_at = last_header_at or started_at
                     if now - reference_at > watchdog_s:
@@ -13911,11 +14283,14 @@ class ValidatorNeuron:
                         break
 
                 stop_event.set()
+                self._end_capacity_audit_head_generation(head_generation)
                 last_block = int(getattr(state, "last_block", last_block) or last_block)
                 self._close_subtensor(fresh_sub)
                 fresh_sub = None
                 self._close_subtensor(rpc_sub)
                 rpc_sub = None
+                self._close_subtensor(head_sub)
+                head_sub = None
                 if self._running:
                     last_block = self._poll_current_head_catch_up(last_block)
             except Exception as exc:
@@ -13923,10 +14298,13 @@ class ValidatorNeuron:
                 last_block = self._poll_current_head_catch_up(last_block)
                 time.sleep(fallback_poll_s)
             finally:
+                self._end_capacity_audit_head_generation(head_generation)
                 if fresh_sub is not None:
                     self._close_subtensor(fresh_sub)
                 if rpc_sub is not None:
                     self._close_subtensor(rpc_sub)
+                if head_sub is not None:
+                    self._close_subtensor(head_sub)
 
     def _run_with_polling(self):
         """Fallback: poll for new blocks periodically."""
@@ -13968,6 +14346,7 @@ class ValidatorNeuron:
         self._capacity_audit_executor.shutdown(wait=False)
         self._capacity_audit_discovery_executor.shutdown(wait=False)
         self._capacity_audit_receipt_executor.shutdown(wait=False)
+        self._capacity_audit_state_executor.shutdown(wait=False)
         self._miner_debug_executor.shutdown(wait=False)
         self._capacity_audit_proof_executor.shutdown(wait=False)
         self._shared_hard_prefetch_executor.shutdown(wait=False)

@@ -23,7 +23,7 @@ import sqlite3
 import statistics
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from neurons.shared_state import AuditDrain, MinerEntry, ValidatorSharedState
 
@@ -2422,16 +2422,30 @@ class ValidatorStateDB:
     ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
         verify_ms = None if proof_verify_ms is None else max(0.0, float(proof_verify_ms))
+        verified_success = proof_status in {
+            "combined_proof_verified",
+            "legacy_combined_proof_compatibility_accepted",
+            "legacy_combined_proof_grace_accepted",
+            "proof_verified",
+        }
         with self._lock:
             cur = self._conn.execute(
                 """UPDATE capacity_audit_slots
                    SET proof_received_at = COALESCE(proof_received_at, ?),
                        proof_status = ?,
                        proof_verify_ms = COALESCE(?, proof_verify_ms),
-                       verdict = ?,
-                       failure_reason = COALESCE(NULLIF(?, ''), failure_reason),
+                       verdict = CASE
+                           WHEN ? != 0 AND timing_status = 'pass'
+                               THEN 'timing_pass'
+                           ELSE ?
+                       END,
+                       failure_reason = CASE
+                           WHEN ? != 0 AND timing_status = 'pass' THEN NULL
+                           ELSE COALESCE(NULLIF(?, ''), failure_reason)
+                       END,
                        proof_artifact_path = COALESCE(NULLIF(?, ''), proof_artifact_path),
                        probation_required = CASE
+                           WHEN ? != 0 AND timing_status = 'pass' THEN 0
                            WHEN ? != 0 THEN 1 ELSE probation_required
                        END,
                        updated_at = ?
@@ -2445,9 +2459,12 @@ class ValidatorStateDB:
                     ts,
                     proof_status,
                     verify_ms,
+                    1 if verified_success else 0,
                     verdict,
+                    1 if verified_success else 0,
                     failure_reason,
                     proof_artifact_path,
+                    1 if verified_success else 0,
                     1 if probation_required else 0,
                     ts,
                     audit_id,
@@ -2457,6 +2474,243 @@ class ValidatorStateDB:
             )
             self._conn.commit()
         return (cur.rowcount or 0) == 1
+
+    def reconcile_capacity_audit_incident(
+        self,
+        audit_ids: Sequence[str],
+        *,
+        expected_epoch: int,
+        reason: str,
+        apply: bool = False,
+        reconciled_at: Optional[float] = None,
+    ) -> dict[str, object]:
+        """Neutralize an exact validator incident without touching other audits.
+
+        The caller must supply complete audit IDs and the expected epoch. A
+        probation entry is cleared only when it began in that epoch, at least
+        one targeted row applied it, and no independent same-or-later failure
+        exists. EMA values are deliberately not rewritten: their later update
+        history cannot be inverted safely from a mutable current value.
+        """
+
+        exact_ids = tuple(dict.fromkeys(str(value).strip() for value in audit_ids))
+        if not exact_ids or any(len(value) != 64 for value in exact_ids):
+            raise ValueError("complete 64-character audit IDs are required")
+        if not reason or len(reason) > 96:
+            raise ValueError("a bounded incident reason is required")
+        ts = time.time() if reconciled_at is None else float(reconciled_at)
+        placeholders = ",".join("?" for _ in exact_ids)
+        epoch_i = int(expected_epoch)
+
+        with self._lock:
+            windows = self._conn.execute(
+                f"""SELECT audit_id, epoch_number, status
+                    FROM capacity_audit_windows
+                    WHERE audit_id IN ({placeholders})
+                    ORDER BY audit_id""",
+                exact_ids,
+            ).fetchall()
+            found = {str(row["audit_id"]): int(row["epoch_number"]) for row in windows}
+            if set(found) != set(exact_ids):
+                missing = sorted(set(exact_ids) - set(found))
+                raise ValueError(f"incident audit IDs not found: {missing}")
+            wrong_epochs = {
+                audit_id: epoch
+                for audit_id, epoch in found.items()
+                if epoch != epoch_i
+            }
+            if wrong_epochs:
+                raise ValueError(
+                    f"incident audit epoch mismatch: expected={epoch_i} actual={wrong_epochs}"
+                )
+
+            slot_rows = self._conn.execute(
+                f"""SELECT audit_id, miner_address, model_index, verdict,
+                           timing_status, proof_status, failure_reason,
+                           probation_required, probation_applied_at
+                    FROM capacity_audit_slots
+                    WHERE audit_id IN ({placeholders})""",
+                exact_ids,
+            ).fetchall()
+            history_rows = self._conn.execute(
+                f"""SELECT audit_id, miner_address, model_index, verdict,
+                           timing_status, proof_status, failure_reason,
+                           probation_required, probation_applied_at
+                    FROM capacity_audit_history
+                    WHERE audit_id IN ({placeholders})""",
+                exact_ids,
+            ).fetchall()
+
+            applied_keys = {
+                (str(row["miner_address"]).lower(), int(row["model_index"]))
+                for row in (*slot_rows, *history_rows)
+                if row["probation_applied_at"] is not None
+            }
+            probation_candidates: list[tuple[str, int]] = []
+            retained_probation: list[dict[str, object]] = []
+            for address, model_index in sorted(applied_keys):
+                entry = self._conn.execute(
+                    """SELECT probation_entered_epoch
+                       FROM miner_entries
+                       WHERE address = ? AND model_index = ?""",
+                    (address, model_index),
+                ).fetchone()
+                if entry is None or entry["probation_entered_epoch"] is None:
+                    continue
+                entered_epoch = int(entry["probation_entered_epoch"])
+                blockers: list[str] = []
+                if entered_epoch != epoch_i:
+                    blockers.append("probation_started_in_other_epoch")
+                other_capacity = self._conn.execute(
+                    f"""SELECT 1
+                        FROM capacity_audit_slots s
+                        JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                        WHERE s.miner_address = ? AND s.model_index = ?
+                          AND w.epoch_number >= ?
+                          AND s.audit_id NOT IN ({placeholders})
+                          AND s.verdict IN ('timing_miss', 'hard_proof_miss', 'no_show')
+                          AND s.probation_required != 0
+                        UNION ALL
+                        SELECT 1
+                        FROM capacity_audit_history h
+                        WHERE h.miner_address = ? AND h.model_index = ?
+                          AND h.epoch_number >= ?
+                          AND h.audit_id NOT IN ({placeholders})
+                          AND h.verdict IN ('timing_miss', 'hard_proof_miss', 'no_show')
+                          AND h.probation_required != 0
+                        LIMIT 1""",
+                    (
+                        address,
+                        model_index,
+                        epoch_i,
+                        *exact_ids,
+                        address,
+                        model_index,
+                        epoch_i,
+                        *exact_ids,
+                    ),
+                ).fetchone()
+                if other_capacity is not None:
+                    blockers.append("independent_capacity_failure")
+                hard_failure = self._conn.execute(
+                    """SELECT 1 FROM proof_v3_hard_failures
+                       WHERE miner_address = ? AND model_index = ?
+                         AND source_epoch >= ? LIMIT 1""",
+                    (address, model_index, epoch_i),
+                ).fetchone()
+                if hard_failure is not None:
+                    blockers.append("independent_hard_proof_failure")
+                canary_failure = self._conn.execute(
+                    """SELECT 1 FROM canary_results
+                       WHERE miner_address = ? AND model_index = ?
+                         AND epoch_number >= ? AND proof_requested != 0
+                         AND COALESCE(proof_verified, 0) = 0
+                         AND COALESCE(proof_failure_reason, '') != ''
+                       LIMIT 1""",
+                    (address, model_index, epoch_i),
+                ).fetchone()
+                if canary_failure is not None:
+                    blockers.append("independent_canary_proof_failure")
+                if blockers:
+                    retained_probation.append(
+                        {
+                            "address": address,
+                            "model_index": model_index,
+                            "reasons": blockers,
+                        }
+                    )
+                else:
+                    probation_candidates.append((address, model_index))
+
+            result: dict[str, object] = {
+                "apply": bool(apply),
+                "expected_epoch": epoch_i,
+                "audit_ids": list(exact_ids),
+                "slot_rows_found": len(slot_rows),
+                "history_rows_found": len(history_rows),
+                "windows_to_mark": sum(
+                    1 for row in windows if str(row["status"]) != "validator_incident"
+                ),
+                "slots_to_neutralize": sum(
+                    1
+                    for row in slot_rows
+                    if str(row["verdict"]) != "timing_excused"
+                    or str(row["timing_status"]) != "excused"
+                    or str(row["failure_reason"] or "") != reason
+                    or int(row["probation_required"] or 0) != 0
+                ),
+                "history_to_neutralize": sum(
+                    1
+                    for row in history_rows
+                    if str(row["verdict"]) != "timing_excused"
+                    or str(row["timing_status"]) != "excused"
+                    or str(row["failure_reason"] or "") != reason
+                    or int(row["probation_required"] or 0) != 0
+                ),
+                "probation_to_clear": [
+                    {"address": address, "model_index": model_index}
+                    for address, model_index in probation_candidates
+                ],
+                "probation_retained": retained_probation,
+                "ema_restored": False,
+            }
+            if not apply:
+                return result
+
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                window_cur = self._conn.execute(
+                    f"""UPDATE capacity_audit_windows
+                    SET status = 'validator_incident', updated_at = ?
+                    WHERE audit_id IN ({placeholders})
+                      AND status != 'validator_incident'""",
+                    (ts, *exact_ids),
+                )
+                slot_cur = self._conn.execute(
+                    f"""UPDATE capacity_audit_slots
+                    SET verdict = 'timing_excused', timing_status = 'excused',
+                        failure_reason = ?, probation_required = 0,
+                        drain_until_ts = 0, updated_at = ?
+                    WHERE audit_id IN ({placeholders})
+                      AND (verdict != 'timing_excused'
+                           OR timing_status != 'excused'
+                           OR COALESCE(failure_reason, '') != ?
+                           OR probation_required != 0)""",
+                    (reason, ts, *exact_ids, reason),
+                )
+                history_cur = self._conn.execute(
+                    f"""UPDATE capacity_audit_history
+                    SET verdict = 'timing_excused', timing_status = 'excused',
+                        failure_reason = ?, probation_required = 0,
+                        slot_updated_at = ?
+                    WHERE audit_id IN ({placeholders})
+                      AND (verdict != 'timing_excused'
+                           OR timing_status != 'excused'
+                           OR COALESCE(failure_reason, '') != ?
+                           OR probation_required != 0)""",
+                    (reason, ts, *exact_ids, reason),
+                )
+                probation_changed = 0
+                for address, model_index in probation_candidates:
+                    cur = self._conn.execute(
+                        """UPDATE miner_entries
+                       SET probation_entered_epoch = NULL,
+                           probation_consecutive_passes = 0,
+                           updated_at = ?
+                       WHERE address = ? AND model_index = ?
+                         AND probation_entered_epoch = ?""",
+                        (ts, address, model_index, epoch_i),
+                    )
+                    probation_changed += int(cur.rowcount or 0)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            result["windows_changed"] = int(window_cur.rowcount or 0)
+            result["slots_changed"] = int(slot_cur.rowcount or 0)
+            result["history_changed"] = int(history_cur.rowcount or 0)
+            result["probation_changed"] = probation_changed
+            return result
 
     def apply_finalized_capacity_audit_probation_once(
         self,
