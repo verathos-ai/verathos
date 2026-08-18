@@ -9,12 +9,14 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from verallm.proof_v3.canary_policy import (
     CANARY_HARD_DECODE_ANCHORS_V3,
+    CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
     DEFAULT_CANARY_CANDIDATE_HARD_BPS_V3,
     DEFAULT_CANARY_CANDIDATE_TARGET_PER_EPOCH_V3,
     DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3,
     DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3,
     DEFAULT_CANARY_REPEAT_PREFIX_MIN_TOKENS_V3,
     DEFAULT_CANARY_REPEAT_PREFIX_TARGET_BPS_V3,
+    LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
     MIN_CANARY_HARD_DECODE_ANCHOR_BPS_V3,
     MIN_CANARY_HARD_DECODE_TAIL_BPS_V3,
     canary_prompt_token_tolerance_v3,
@@ -476,8 +478,15 @@ def _owner_full_prompt_target_v3(
     minimum: int,
     maximum: int,
     max_draw_bps: int,
+    sizing_abi_id: str = CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
 ) -> int:
-    """Draw an owner-only min-heavy context with an exact-ceiling tail."""
+    """Draw an owner-only min-heavy context with an exact-ceiling tail.
+
+    The explicit sizing ABI preserves the v6 uniform-band schedule while a
+    validator is still consuming that signed policy.  Policy v7 weights each
+    successive doubling band by one half, matching the lower-heavy mesh
+    schedule without making any prompt-length band impossible.
+    """
 
     low = int(minimum)
     high = int(maximum)
@@ -486,15 +495,36 @@ def _owner_full_prompt_target_v3(
         raise ValueError("owner full-prompt range is invalid")
     if not 0 < tail_bps <= 10_000:
         raise ValueError("owner full-prompt maximum rate is invalid")
-    if _seed_int(seed, b"owner_full_prompt_max_draw", 10_000) < tail_bps:
+    sizing_abi = str(sizing_abi_id)
+    if sizing_abi == LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3:
+        max_domain = b"owner_full_prompt_max_draw"
+        band_domain = b"owner_full_prompt_band"
+        offset_domain = b"owner_full_prompt_offset"
+    elif sizing_abi == CANARY_OWNER_CONTEXT_SIZING_ABI_V3:
+        max_domain = b"owner_geometric_prompt_max_draw"
+        band_domain = b"owner_geometric_prompt_band"
+        offset_domain = b"owner_geometric_prompt_offset"
+    else:
+        raise ValueError("owner full-prompt sizing ABI is unsupported")
+    if _seed_int(seed, max_domain, 10_000) < tail_bps:
         return high
     bands = _log_uniform_prompt_bands_v3(low, high)
-    lower, upper = bands[
-        _seed_int(seed, b"owner_full_prompt_band", len(bands))
-    ]
+    if sizing_abi == LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3:
+        band_index = _seed_int(seed, band_domain, len(bands))
+    else:
+        weights = [1 << (len(bands) - 1 - i) for i in range(len(bands))]
+        pick = _seed_int(seed, band_domain, sum(weights))
+        cumulative = 0
+        band_index = len(bands) - 1
+        for i, weight in enumerate(weights):
+            cumulative += weight
+            if pick < cumulative:
+                band_index = i
+                break
+    lower, upper = bands[band_index]
     return lower + _seed_int(
         seed,
-        b"owner_full_prompt_offset",
+        offset_domain,
         upper - lower + 1,
     )
 
@@ -901,6 +931,7 @@ class CanaryScheduler:
     owner_full_max_draw_bps: int = (
         DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3
     )
+    owner_context_sizing_abi_id: str = CANARY_OWNER_CONTEXT_SIZING_ABI_V3
     hard_decode_anchor_bps: int = MIN_CANARY_HARD_DECODE_ANCHOR_BPS_V3
     hard_decode_tail_bps: int = MIN_CANARY_HARD_DECODE_TAIL_BPS_V3
     late_decode_min_output_bps: int = 9_000
@@ -1174,6 +1205,7 @@ class CanaryScheduler:
                         minimum=self._owner_full_prompt_floor(advertised_max),
                         maximum=advertised_max,
                         max_draw_bps=self.owner_full_max_draw_bps,
+                        sizing_abi_id=self.owner_context_sizing_abi_id,
                     )
                     full_repeat_basis = min(
                         self._owner_full_prompt_floor(marked_full_max),
@@ -1317,6 +1349,7 @@ class CanaryScheduler:
                             minimum=self._owner_full_prompt_floor(target),
                             maximum=target,
                             max_draw_bps=self.owner_full_max_draw_bps,
+                            sizing_abi_id=self.owner_context_sizing_abi_id,
                         )
                     late_decode = (
                         max_new > self.low_context_max_decode_tokens

@@ -151,6 +151,7 @@ from verallm.proof_policy import (
     verify_with_proof_policy,
 )
 from verallm.proof_v3.canary_policy import (
+    CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
     MAX_CANARY_FULL_PAIR_HOLD_SECONDS_V3,
     canary_prompt_token_tolerance_v3,
 )
@@ -8079,6 +8080,11 @@ class ValidatorNeuron:
                 )
                 if canary_policy is not None
                 else 10_000
+            ),
+            owner_context_sizing_abi_id=(
+                canary_policy.owner_context_sizing_abi_id
+                if canary_policy is not None
+                else CANARY_OWNER_CONTEXT_SIZING_ABI_V3
             ),
             hard_decode_anchor_bps=(
                 canary_policy.hard_decode_anchor_bps

@@ -22,7 +22,8 @@ from verallm.proof_v3.errors import (
 
 
 LEGACY_CANARY_POLICY_ABI_V3 = "proof_v3.canary_policy.v5"
-CANARY_POLICY_ABI_V3 = "proof_v3.canary_policy.v6"
+UNIFORM_CANARY_POLICY_ABI_V3 = "proof_v3.canary_policy.v6"
+CANARY_POLICY_ABI_V3 = "proof_v3.canary_policy.v7"
 CANARY_PROMPT_RECIPE_ABI_V3 = "natural_composite.secret_seeded.long_form.v3"
 CANARY_CONTEXT_CONSTRUCTION_ABI_V3 = "validator_tokenizer.near_advertised.v2"
 CANARY_BUSY_POLICY_ABI_V3 = "validator_receipt_interval.one_epoch_debt.v1"
@@ -33,12 +34,16 @@ CANARY_HARD_DECODE_SELECTION_ABI_V3 = (
     "secret_seeded.independent_common_anchors_log_uniform_tail.v2"
 )
 CANARY_REPEAT_PREFIX_ABI_V3 = "validator_secret.shared_prefix_groups.v1"
-CANARY_OWNER_CONTEXT_SIZING_ABI_V3 = (
+LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3 = (
     "secret_seeded.min_heavy_log_uniform_prompt.bernoulli_max.v1"
 )
+CANARY_OWNER_CONTEXT_SIZING_ABI_V3 = (
+    "secret_seeded.min_heavy_geometric_prompt.bernoulli_max.v2"
+)
 MIN_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3 = 100
-DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3 = 1_000
-DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3 = 500
+LEGACY_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3 = 1_000
+DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3 = 500
+DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3 = 100
 CANARY_PROMPT_MIN_TOKEN_TOLERANCE_V3 = 64
 CANARY_HARD_DECODE_ANCHORS_V3 = (512, 1_024, 2_048, 4_096, 8_192)
 MIN_CANARY_HARD_DECODE_ANCHOR_BPS_V3 = 2_500
@@ -453,10 +458,10 @@ class CanaryPolicyV3:
             raise ProofV3DocumentError(
                 "owner_full_context_max_draw_bps exceeds 10000"
             )
-        if (
-            self.owner_context_sizing_abi_id
-            != CANARY_OWNER_CONTEXT_SIZING_ABI_V3
-        ):
+        if self.owner_context_sizing_abi_id not in {
+            LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
+            CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
+        }:
             raise ProofV3DocumentError(
                 "canary owner context-sizing ABI is unsupported"
             )
@@ -479,6 +484,7 @@ class CanaryPolicyV3:
             )
         if self.policy_abi_id not in {
             LEGACY_CANARY_POLICY_ABI_V3,
+            UNIFORM_CANARY_POLICY_ABI_V3,
             CANARY_POLICY_ABI_V3,
         }:
             raise ProofV3DocumentError("canary policy ABI is unsupported")
@@ -486,12 +492,28 @@ class CanaryPolicyV3:
             self.policy_abi_id == LEGACY_CANARY_POLICY_ABI_V3
             and (
                 owner_min_prompt_bps
-                != DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
+                != LEGACY_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
                 or owner_max_draw_bps != 10_000
             )
         ):
             raise ProofV3DocumentError(
                 "legacy canary policy must retain fixed context sizing"
+            )
+        if (
+            self.policy_abi_id == UNIFORM_CANARY_POLICY_ABI_V3
+            and self.owner_context_sizing_abi_id
+            != LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3
+        ):
+            raise ProofV3DocumentError(
+                "canary policy v6 must retain uniform owner context sizing"
+            )
+        if (
+            self.policy_abi_id == CANARY_POLICY_ABI_V3
+            and self.owner_context_sizing_abi_id
+            != CANARY_OWNER_CONTEXT_SIZING_ABI_V3
+        ):
+            raise ProofV3DocumentError(
+                "canary policy v7 must use geometric owner context sizing"
             )
         if self.prompt_recipe_abi_id != CANARY_PROMPT_RECIPE_ABI_V3:
             raise ProofV3DocumentError("canary prompt recipe ABI is unsupported")
@@ -643,7 +665,10 @@ class CanaryPolicyV3:
             "repeat_prefix_target_bps": self.repeat_prefix_target_bps,
             "schedule_selection_abi_id": self.schedule_selection_abi_id,
         }
-        if self.policy_abi_id == CANARY_POLICY_ABI_V3:
+        if self.policy_abi_id in {
+            UNIFORM_CANARY_POLICY_ABI_V3,
+            CANARY_POLICY_ABI_V3,
+        }:
             result.update(
                 {
                     "owner_context_sizing_abi_id": (
@@ -715,7 +740,10 @@ class CanaryPolicyV3:
         policy_abi_id = value.get("policy_abi_id")
         if policy_abi_id == LEGACY_CANARY_POLICY_ABI_V3:
             expected_keys = legacy_keys
-        elif policy_abi_id == CANARY_POLICY_ABI_V3:
+        elif policy_abi_id in {
+            UNIFORM_CANARY_POLICY_ABI_V3,
+            CANARY_POLICY_ABI_V3,
+        }:
             expected_keys = legacy_keys | {
                 "owner_context_sizing_abi_id",
                 "owner_full_context_max_draw_bps",
@@ -815,15 +843,17 @@ class CanaryPolicyV3:
                     value["owner_full_context_min_prompt_bps"],
                     "owner_full_context_min_prompt_bps",
                 )
-                if policy_abi_id == CANARY_POLICY_ABI_V3
-                else DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
+                if policy_abi_id
+                in {UNIFORM_CANARY_POLICY_ABI_V3, CANARY_POLICY_ABI_V3}
+                else LEGACY_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
             ),
             owner_full_context_max_draw_bps=(
                 _u32(
                     value["owner_full_context_max_draw_bps"],
                     "owner_full_context_max_draw_bps",
                 )
-                if policy_abi_id == CANARY_POLICY_ABI_V3
+                if policy_abi_id
+                in {UNIFORM_CANARY_POLICY_ABI_V3, CANARY_POLICY_ABI_V3}
                 else 10_000
             ),
             owner_context_sizing_abi_id=(
@@ -831,7 +861,8 @@ class CanaryPolicyV3:
                     value["owner_context_sizing_abi_id"],
                     "owner_context_sizing_abi_id",
                 )
-                if policy_abi_id == CANARY_POLICY_ABI_V3
+                if policy_abi_id
+                in {UNIFORM_CANARY_POLICY_ABI_V3, CANARY_POLICY_ABI_V3}
                 else CANARY_OWNER_CONTEXT_SIZING_ABI_V3
             ),
             policy_version=_u32(value["policy_version"], "policy_version"),
@@ -1109,6 +1140,8 @@ __all__ = [
     "MIN_CANARY_LATE_DECODE_OUTPUT_BPS_V3",
     "MIN_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3",
     "LEGACY_CANARY_POLICY_ABI_V3",
+    "LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3",
+    "UNIFORM_CANARY_POLICY_ABI_V3",
     "CanaryModelPolicyV3",
     "CanaryPolicyV3",
     "SignedCanaryPolicyDocumentV3",
