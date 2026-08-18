@@ -129,7 +129,7 @@ class NeuronConfig(ChainConfig):
 
     # Owner-selected inference proof versions. Maintenance forgiveness is
     # deliberately independent from protocol admission.
-    proof_protocol_allowed_versions: tuple[int, ...] = (1, 3)
+    proof_protocol_allowed_versions: tuple[int, ...] = (3,)
     proof_v3_canary_policy_path: str = ""
     proof_v3_hard_auditor_policy_enabled: bool = False
     proof_v3_hard_auditor_hotkey_ss58: str = ""

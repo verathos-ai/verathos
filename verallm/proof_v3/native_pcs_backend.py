@@ -27,6 +27,9 @@ import struct
 from typing import Final
 
 from verallm.proof_v3.errors import ProofV3Error
+from verallm.proof_v3.cuda_graph_capture import (
+    proof_cuda_graph_capture_v3,
+)
 from verallm.proof_v3.goldilocks_reference import (
     GOLDILOCKS_MODULUS,
     goldilocks_principal_root_of_unity,
@@ -991,7 +994,7 @@ def _eqfold_rounds_graphed(fold_extension, a, f, transcript: bytes,
                 _loop(a_s, f_s, t_s, dl_s, rounds_s, chal_s)  # warmup
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with proof_cuda_graph_capture_v3(graph):
                 a_out = _loop(a_s, f_s, t_s, dl_s, rounds_s, chal_s)
             entry = (graph, a_s, f_s, t_s, dl_s, rounds_s, chal_s, a_out)
         _EQFOLD_GRAPHS[key] = entry
@@ -1154,7 +1157,7 @@ def _open_fold_graphed(fold_extension, tree_extension, statement,
         torch.cuda.current_stream().wait_stream(stream)
         _fill(entry)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with proof_cuda_graph_capture_v3(graph):
             v_out, trees = _loop()
         entry["graph"] = graph
         entry["trees"] = trees
@@ -1258,7 +1261,7 @@ def _fs_rounds_graphed(fold_extension, kind: str, cols, transcript: bytes,
         torch.cuda.current_stream().wait_stream(stream)
         _fill()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with proof_cuda_graph_capture_v3(graph):
             out = _loop()
         entry = (graph, col_s, t_s, rounds_s, chal_s, out, _fill)
         _LOGUP_GRAPHS[key] = entry

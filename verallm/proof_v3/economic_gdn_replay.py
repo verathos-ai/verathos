@@ -287,16 +287,26 @@ def _replay(
         core_rows.append(runtime_output.copy())
         projection_rows.append(gated.reshape(-1).copy())
 
+    core_output = (
+        np.stack(core_rows)
+        if core_rows
+        else np.empty((0, len(selected), dv), dtype=np.float32)
+    )
+    projection_output = (
+        np.stack(projection_rows)
+        if projection_rows
+        else np.empty((0, len(selected) * dv), dtype=np.float32)
+    )
     return GDNReplayResultV2(
         conv_state_after=np.ascontiguousarray(conv_state, dtype=np.float32),
         recurrent_state_after=np.ascontiguousarray(
             recurrent_state, dtype=np.float32
         ),
         core_output=np.ascontiguousarray(
-            np.stack(core_rows), dtype=np.float32
+            core_output, dtype=np.float32
         ),
         out_projection_input=np.ascontiguousarray(
-            np.stack(projection_rows), dtype=np.float32
+            projection_output, dtype=np.float32
         ),
     )
 
@@ -1069,9 +1079,25 @@ def verify_lean_economic_gdn_replay_v3(
             else tuple(corridor.sequence_positions)
         )
         if not positions:
-            raise ProofV3VerificationError(
-                "lean GDN hard audit requires a decode window"
+            if challenge.decode_token_count != 1 or corridor is not None:
+                raise ProofV3VerificationError(
+                    "lean GDN decode window is unexpectedly empty"
+                )
+            if tuple(runtime_rows_by_layer[layer]):
+                raise ProofV3VerificationError(
+                    "one-token GDN audit carries nonexistent decode rows"
+                )
+            # The final prompt producer is checked by the compact transition,
+            # terminal, projection, residual, and MLP relations.  A one-token
+            # completion has no decode recurrence to replay.
+            results.append(
+                EconomicGdnReplayStatsV3(
+                    layer_index=layer,
+                    row_count=0,
+                    maximum_absolute_error=0.0,
+                )
             )
+            continue
         if len(positions) > signed.max_decode_replay_rows:
             raise ProofV3VerificationError(
                 "lean GDN decode replay exceeds the signed row bound"

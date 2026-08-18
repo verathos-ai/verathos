@@ -22,6 +22,9 @@ from dataclasses import dataclass
 from typing import Final
 
 from verallm.proof_v3.errors import ProofV3Error, ProofV3VerificationError
+from verallm.proof_v3.cuda_graph_capture import (
+    proof_cuda_graph_capture_v3,
+)
 from verallm.proof_v3.goldilocks_linear_relation_reference import _fixed32
 from verallm.proof_v3.goldilocks_multilinear_pcs_reference import (
     GoldilocksMultilinearOpeningProofV3,
@@ -832,7 +835,7 @@ def prove_succinct_eq_folds_batched_v3(
                   torch.tensor(list(seeds), dtype=torch.uint8,
                                device="cuda"))
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with proof_cuda_graph_capture_v3(graph):
                 a_out = _loop()
             graph.replay()
             entry = (graph, _fill, rounds_s, chal_s, a_out)
