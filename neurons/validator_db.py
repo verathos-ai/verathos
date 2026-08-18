@@ -2928,6 +2928,7 @@ class ValidatorStateDB:
         verdicts: Tuple[str, ...] = ("timing_miss", "hard_proof_miss", "no_show"),
         require_chain_confirmed: bool = False,
         require_consequence_eligible: bool = False,
+        before_epoch: Optional[int] = None,
     ) -> int:
         placeholders = ",".join("?" for _ in verdicts)
         confirmation_clause = ""
@@ -2947,6 +2948,7 @@ class ValidatorStateDB:
         eligibility_clause = (
             " AND s.probation_required != 0" if require_consequence_eligible else ""
         )
+        before_clause = " AND w.epoch_number < ?" if before_epoch is not None else ""
         with self._lock:
             identity_clause, identity_params = self._capacity_address_identity_filter_locked(
                 address
@@ -2958,12 +2960,14 @@ class ValidatorStateDB:
                     WHERE s.miner_address = ?
                       AND s.model_index = ?
                       AND w.epoch_number >= ?
+                      {before_clause}
                       AND s.verdict IN ({placeholders})
                       AND {identity_clause}
                       {eligibility_clause}
                       {confirmation_clause}""",
                 (
                     address.lower(), int(model_index), int(since_epoch),
+                    *((int(before_epoch),) if before_epoch is not None else ()),
                     *verdicts, *identity_params,
                 ),
             ).fetchone()
@@ -3072,6 +3076,7 @@ class ValidatorStateDB:
         since_epoch: int,
         require_chain_confirmed: bool = False,
         require_consequence_eligible: bool = False,
+        soft_failures_before_epoch: Optional[int] = None,
     ) -> Dict[Tuple[str, int], dict]:
         """Return finalized failure counts grouped by the registered endpoint slot."""
         confirmation_clause = ""
@@ -3090,6 +3095,17 @@ class ValidatorStateDB:
             )
         eligibility_clause = (
             " AND s.probation_required != 0" if require_consequence_eligible else ""
+        )
+        soft_before = (
+            int(soft_failures_before_epoch)
+            if soft_failures_before_epoch is not None
+            else None
+        )
+        no_show_epoch_clause = (
+            " AND w.epoch_number < ?" if soft_before is not None else ""
+        )
+        timing_epoch_clause = (
+            " AND w.epoch_number < ?" if soft_before is not None else ""
         )
         with self._lock:
             identity_clause, identity_params = self._capacity_uid_identity_filter_locked(uid)
@@ -3113,11 +3129,12 @@ class ValidatorStateDB:
                             THEN 1 ELSE 0 END
                         ) AS invalid_proof_failures,
                         SUM(CASE
-                            WHEN s.verdict IN ('hard_proof_miss', 'no_show')
+                            WHEN s.verdict = 'hard_proof_miss'
+                              OR (s.verdict = 'no_show'{no_show_epoch_clause})
                             THEN 1 ELSE 0 END
                         ) AS hard_failures,
                         SUM(CASE
-                            WHEN s.verdict = 'timing_miss'
+                            WHEN s.verdict = 'timing_miss'{timing_epoch_clause}
                             THEN 1 ELSE 0 END
                         ) AS timing_failures
                     FROM capacity_audit_slots s
@@ -3128,7 +3145,12 @@ class ValidatorStateDB:
                       {eligibility_clause}
                       {confirmation_clause}
                     GROUP BY s.miner_address, s.model_index""",
-                (int(since_epoch), *identity_params),
+                (
+                    *((soft_before,) if soft_before is not None else ()),
+                    *((soft_before,) if soft_before is not None else ()),
+                    int(since_epoch),
+                    *identity_params,
+                ),
             ).fetchall()
         return {
             (str(row["miner_address"]).lower(), int(row["model_index"])): {
@@ -3215,6 +3237,7 @@ class ValidatorStateDB:
                            ELSE timing_status
                        END,
                        failure_reason = ?,
+                       probation_required = 0,
                        drain_until_ts = CASE
                            WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
                        END,
@@ -3227,6 +3250,28 @@ class ValidatorStateDB:
                     reason,
                     ts,
                     ts,
+                    ts,
+                    audit_id,
+                    address.lower(),
+                    int(model_index),
+                ),
+            )
+            self._conn.execute(
+                """UPDATE capacity_audit_history
+                   SET verdict = 'timing_excused',
+                       timing_status = CASE
+                           WHEN timing_status IN ('miss', 'missing_final') THEN 'excused'
+                           ELSE timing_status
+                       END,
+                       failure_reason = ?,
+                       probation_required = 0,
+                       slot_updated_at = ?
+                   WHERE audit_id = ?
+                     AND miner_address = ?
+                     AND model_index = ?
+                     AND verdict IN ('timing_miss', 'no_show')""",
+                (
+                    reason,
                     ts,
                     audit_id,
                     address.lower(),

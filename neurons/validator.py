@@ -3005,6 +3005,23 @@ class ValidatorNeuron:
             return
         now = time.time()
         active = self._capacity_audit_slot_snapshot_for_selection(selection_block)
+        canary_busy_fn = getattr(self, "_owner_canary_busy_keys", None)
+        canary_busy_slots = (
+            canary_busy_fn() if callable(canary_busy_fn) else set()
+        )
+        if canary_busy_slots:
+            before = len(active)
+            active = [
+                (slot, row)
+                for slot, row in active
+                if (slot.address_lower, int(slot.model_index))
+                not in canary_busy_slots
+            ]
+            if before != len(active):
+                bt.logging.info(
+                    f"Capacity audit: skipped {before - len(active)} "
+                    f"owner-canary-busy slot(s) at block {selection_block}"
+                )
         drained_slots = {
             (drain.address.lower(), int(drain.model_index))
             for drain in self._db.get_capacity_drains(now=now)
@@ -4763,9 +4780,23 @@ class ValidatorNeuron:
             address,
             model_index,
             since_epoch=since_epoch,
-            verdicts=("hard_proof_miss", "no_show"),
+            verdicts=("hard_proof_miss",),
             require_chain_confirmed=True,
             require_consequence_eligible=True,
+        )
+        # A no-show/timing result can still be neutralized by authenticated
+        # work that was already running at the scoring boundary.  Mature these
+        # transport/timing-only outcomes for one epoch before applying any
+        # score or probation consequence. Cryptographically invalid hard
+        # proofs remain immediate.
+        hard_failures += self._db.recent_capacity_failures(
+            address,
+            model_index,
+            since_epoch=since_epoch,
+            verdicts=("no_show",),
+            require_chain_confirmed=True,
+            require_consequence_eligible=True,
+            before_epoch=int(epoch_number),
         )
         if hard_failures >= int(cfg.hard_proof_misses_for_zero_score):
             return f"{hard_failures} hard capacity-audit failures"
@@ -4777,6 +4808,7 @@ class ValidatorNeuron:
                 verdicts=("timing_miss",),
                 require_chain_confirmed=True,
                 require_consequence_eligible=True,
+                before_epoch=int(epoch_number),
             )
             if timing_failures >= int(cfg.timing_misses_for_zero_score):
                 return f"{timing_failures} timing capacity-audit misses"
@@ -4814,6 +4846,7 @@ class ValidatorNeuron:
             since_epoch=since_epoch,
             require_chain_confirmed=True,
             require_consequence_eligible=True,
+            soft_failures_before_epoch=int(epoch_number),
         )
         convicted: list[Tuple[str, int]] = []
         for key, row in counts.items():
@@ -7368,6 +7401,33 @@ class ValidatorNeuron:
                 continue
         return out
 
+    def _owner_canary_busy_keys(self) -> Set[Tuple[str, int]]:
+        """Return endpoint slots with owner canaries already in flight.
+
+        Capacity selection and canary admission share
+        ``_capacity_audit_schedule_lock``.  Reading the exact started
+        execution set while that lock is held closes the inverse race where a
+        capacity window could be created after a canary had already entered
+        normal inference.  Queued-but-unstarted canaries are intentionally not
+        included: they observe the capacity drain and requeue before HTTP.
+        """
+
+        lock = getattr(self, "_canary_accounting_lock", None)
+
+        def _snapshot() -> Set[Tuple[str, int]]:
+            started = set(getattr(self, "_cross_epoch_canaries", set()))
+            unfinished = getattr(self, "_unfinished_canary_tests", {})
+            return {
+                self._miner_model_key(test.miner_address, test.model_index)
+                for execution_id, test in tuple(unfinished.items())
+                if execution_id in started
+            }
+
+        if lock is None:
+            return _snapshot()
+        with lock:
+            return _snapshot()
+
     def _capacity_audit_key_drained(self, key: Tuple[str, int]) -> bool:
         address, model_index = key
         return self._miner_model_key(address, model_index) in self._capacity_audit_drained_keys()
@@ -8442,17 +8502,33 @@ class ValidatorNeuron:
                 f"rescheduled={rescheduled}"
             )
 
-        if self._requeue_capacity_audit_canary(
-            test,
-            epoch_number,
-            phase="pre_start",
-        ):
-            return
-
-        # Mark exact execution identity first so an epoch boundary between
-        # dequeue and HTTP setup cannot misclassify this as unstarted work.
-        self._mark_cross_epoch_canary_started(test, epoch_number)
-        self._mark_canary_started(epoch_number, key)
+        # Capacity selection holds the same lock.  Therefore either its drain
+        # exists first and this canary requeues, or this canary is marked
+        # started first and the capacity scheduler excludes the endpoint.
+        # There is no interval where both sides can independently admit work.
+        admission_lock = getattr(self, "_capacity_audit_schedule_lock", None)
+        if admission_lock is None:
+            if self._requeue_capacity_audit_canary(
+                test,
+                epoch_number,
+                phase="pre_start",
+            ):
+                return
+            self._mark_cross_epoch_canary_started(test, epoch_number)
+            self._mark_canary_started(epoch_number, key)
+        else:
+            with admission_lock:
+                if self._requeue_capacity_audit_canary(
+                    test,
+                    epoch_number,
+                    phase="pre_start",
+                ):
+                    return
+                # Mark exact execution identity first so an epoch boundary
+                # between dequeue and HTTP setup cannot misclassify this as
+                # unstarted work.
+                self._mark_cross_epoch_canary_started(test, epoch_number)
+                self._mark_canary_started(epoch_number, key)
 
         try:
             if not self._canary_execution_active(test, epoch_number):
@@ -9520,6 +9596,23 @@ class ValidatorNeuron:
                         failure_code="post_precommit_failure",
                         endpoint=test.miner_endpoint,
                     )
+                else:
+                    # A nonce-free v3 request can fail because the peer's
+                    # shared inference engine aborts one request while an
+                    # authenticated hard proof is running.  Preserve the
+                    # failure as endpoint evidence, but apply the same
+                    # distinct-source-epoch strike policy as a hard peer
+                    # failure instead of halving EMA on the first transient
+                    # service error.  This must not publish a hard-audit
+                    # outcome: no nonce or hard proof was requested here.
+                    penalty_required = self._record_hard_failure_strike(
+                        self._miner_model_key(
+                            test.miner_address,
+                            test.model_index,
+                        ),
+                        source_epoch=epoch_number,
+                        endpoint=test.miner_endpoint,
+                    )
                 if penalty_required:
                     self._on_proof_failure(
                         test.miner_address,
@@ -9559,7 +9652,7 @@ class ValidatorNeuron:
                         endpoint=test.miner_endpoint,
                         test_type=test.test_type,
                         test_index=test.test_index,
-                        proof_requested=1,
+                        proof_requested=1 if test.verify_proof else 0,
                         enable_thinking=1 if test.enable_thinking else 0,
                         temperature=test.temperature,
                         max_new_tokens=test.max_new_tokens,
@@ -12284,6 +12377,32 @@ class ValidatorNeuron:
                 f"(NOT attributed to miner {miner_address[:10]} "
                 f"model_index={model_index}): {exc}"
             )
+        else:
+            reconcile = getattr(
+                self,
+                "_reconcile_capacity_audit_timing_excuses",
+                None,
+            )
+            if callable(reconcile):
+                try:
+                    reconcile(
+                        SimpleNamespace(
+                            address=miner_address,
+                            model_index=int(model_index),
+                            model_id=model_id,
+                        ),
+                        [receipt],
+                        int(epoch_number),
+                    )
+                except Exception as exc:
+                    # The receipt remains durably available for ordinary
+                    # epoch-close reconciliation. A local reconciliation
+                    # failure is never miner evidence.
+                    bt.logging.warning(
+                        "Capacity overlap reconciliation failed locally "
+                        f"(NOT attributed to miner {miner_address[:10]} "
+                        f"model_index={model_index}): {exc}"
+                    )
         receipt_body = _json.dumps(receipt_dict).encode("utf-8")
         auth_headers = _sign(
             method="POST", path=receipt_path, body=receipt_body,
