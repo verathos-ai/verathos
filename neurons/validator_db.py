@@ -244,7 +244,22 @@ class ValidatorStateDB:
         self._analytics = analytics
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
+        # Receipt ingress has a hard HTTP response budget.  It must not queue
+        # behind long validator-side analytics/shared-state reads merely
+        # because those reads use the primary connection's Python lock.  WAL
+        # permits this dedicated connection to durably record receipts while
+        # the primary connection is reading.
+        self._capacity_ingress_lock = threading.Lock()
+        self._capacity_ingress_conn: sqlite3.Connection | None = None
         self._init_db()
+        self._capacity_ingress_conn = sqlite3.connect(
+            self._db_path,
+            timeout=4.0,
+            check_same_thread=False,
+        )
+        self._capacity_ingress_conn.row_factory = sqlite3.Row
+        self._capacity_ingress_conn.execute("PRAGMA journal_mode=WAL")
+        self._capacity_ingress_conn.execute("PRAGMA busy_timeout=4000")
 
     # ── Schema bootstrap ─────────────────────────────────────────────
 
@@ -2529,9 +2544,18 @@ class ValidatorStateDB:
             self._conn.commit()
         return expired_slots if return_slots else updated
 
-    def get_capacity_audit_slot(self, audit_id: str, address: str, model_index: int) -> Optional[dict]:
-        with self._lock:
-            row = self._conn.execute(
+    def get_capacity_audit_slot(
+        self,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        *,
+        receipt_ingress: bool = False,
+    ) -> Optional[dict]:
+        lock = self._capacity_ingress_lock if receipt_ingress else self._lock
+        conn = self._capacity_ingress_conn if receipt_ingress else self._conn
+        with lock:
+            row = conn.execute(
                 """SELECT s.*, w.epoch_number, w.selection_block, w.audit_block,
                           w.proof_challenge_block,
                           w.selection_block_hash, w.audit_block_hash,
@@ -2556,10 +2580,13 @@ class ValidatorStateDB:
         pass0_root: str,
         artifact: dict,
         received_at: Optional[float] = None,
+        receipt_ingress: bool = False,
     ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
-        with self._lock:
-            cur = self._conn.execute(
+        lock = self._capacity_ingress_lock if receipt_ingress else self._lock
+        conn = self._capacity_ingress_conn if receipt_ingress else self._conn
+        with lock:
+            cur = conn.execute(
                 """UPDATE capacity_audit_slots
                    SET pass0_received_at = COALESCE(pass0_received_at, ?),
                        pass0_root = ?,
@@ -2583,7 +2610,7 @@ class ValidatorStateDB:
                     int(model_index),
                 ),
             )
-            self._conn.commit()
+            conn.commit()
         return (cur.rowcount or 0) == 1
 
     def record_capacity_audit_final(
@@ -2601,6 +2628,7 @@ class ValidatorStateDB:
         probation_required: bool = False,
         final_observed_block: Optional[int] = None,
         received_at: Optional[float] = None,
+        receipt_ingress: bool = False,
     ) -> Tuple[Optional[dict], bool]:
         """Persist the first final receipt without letting retries retime it.
 
@@ -2617,8 +2645,10 @@ class ValidatorStateDB:
             else max(0, int(final_observed_block))
         )
         hard_override = verdict == "hard_proof_miss"
-        with self._lock:
-            cur = self._conn.execute(
+        lock = self._capacity_ingress_lock if receipt_ingress else self._lock
+        conn = self._capacity_ingress_conn if receipt_ingress else self._conn
+        with lock:
+            cur = conn.execute(
                 """UPDATE capacity_audit_slots
                    SET final_received_at = CASE
                            WHEN final_received_at IS NULL THEN ?
@@ -2680,13 +2710,13 @@ class ValidatorStateDB:
                     int(hard_override),
                 ),
             )
-            row = self._conn.execute(
+            row = conn.execute(
                 """SELECT *
                    FROM capacity_audit_slots
                    WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
                 (audit_id, address.lower(), int(model_index)),
             ).fetchone()
-            self._conn.commit()
+            conn.commit()
         return (dict(row) if row is not None else None, bool(cur.rowcount))
 
     def reconcile_capacity_audit_duplicate_timing_misses(
@@ -5554,6 +5584,10 @@ class ValidatorStateDB:
 
     def close(self) -> None:
         """Close the database connection."""
+        with self._capacity_ingress_lock:
+            if self._capacity_ingress_conn:
+                self._capacity_ingress_conn.close()
+                self._capacity_ingress_conn = None
         with self._lock:
             if self._conn:
                 self._conn.close()

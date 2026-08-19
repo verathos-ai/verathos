@@ -3668,7 +3668,12 @@ class ValidatorNeuron:
                     block_hash=challenge_hash,
                 )
 
-    def _validate_capacity_audit_artifact(self, artifact: dict) -> tuple[dict, Optional[str]]:
+    def _validate_capacity_audit_artifact(
+        self,
+        artifact: dict,
+        *,
+        receipt_ingress: bool = False,
+    ) -> tuple[dict, Optional[str]]:
         audit_id = str(artifact.get("audit_id") or "")
         address = str(artifact.get("address") or artifact.get("miner_address") or "").lower()
         try:
@@ -3684,10 +3689,20 @@ class ValidatorNeuron:
         if not verify_artifact_signature(artifact, address):
             return {}, "invalid miner_signature"
 
-        row = self._db.get_capacity_audit_slot(audit_id, address, model_index)
+        row = self._db.get_capacity_audit_slot(
+            audit_id,
+            address,
+            model_index,
+            receipt_ingress=receipt_ingress,
+        )
         if row is None:
             self._recover_capacity_audit_window_from_artifact(artifact)
-            row = self._db.get_capacity_audit_slot(audit_id, address, model_index)
+            row = self._db.get_capacity_audit_slot(
+                audit_id,
+                address,
+                model_index,
+                receipt_ingress=receipt_ingress,
+            )
         if row is None:
             return {}, "unknown audit slot"
         if str(row.get("chain_status") or "") == "reorged":
@@ -3732,6 +3747,7 @@ class ValidatorNeuron:
         *,
         received_at: Optional[float] = None,
         ingress_head: Optional[_CapacityAuditIngressHead] = None,
+        receipt_ingress: bool = False,
     ) -> tuple[int, dict]:
         """Ingest a miner-published capacity audit artifact."""
         if not self._capacity_audit_cfg.enabled:
@@ -3739,7 +3755,10 @@ class ValidatorNeuron:
         if not isinstance(artifact, dict):
             return 400, {"ok": False, "error": "artifact must be an object"}
         artifact_type = str(artifact.get("artifact_type") or artifact.get("type") or "")
-        row, error = self._validate_capacity_audit_artifact(artifact)
+        row, error = self._validate_capacity_audit_artifact(
+            artifact,
+            receipt_ingress=receipt_ingress,
+        )
         if error:
             return 400, {"ok": False, "error": error}
         if str(row.get("status") or "") == "validator_incident":
@@ -3765,6 +3784,7 @@ class ValidatorNeuron:
                 pass0_root=pass0_root,
                 artifact=artifact,
                 received_at=ts,
+                receipt_ingress=receipt_ingress,
             )
             return 200, {"ok": True, "verdict": "pass0_seen"}
 
@@ -3839,6 +3859,7 @@ class ValidatorNeuron:
                         ),
                         final_observed_block=final_observed_block,
                         received_at=ts,
+                        receipt_ingress=receipt_ingress,
                     )
                     return 200, {
                         "ok": True,
@@ -3864,6 +3885,7 @@ class ValidatorNeuron:
                     ),
                     final_observed_block=final_observed_block,
                     received_at=ts,
+                    receipt_ingress=receipt_ingress,
                 )
                 stored_verdict = str(
                     (stored or {}).get("verdict") or "hard_proof_miss"
@@ -3907,6 +3929,7 @@ class ValidatorNeuron:
                 ),
                 final_observed_block=final_observed_block,
                 received_at=ts,
+                receipt_ingress=receipt_ingress,
             )
             if stored is None:
                 return 404, {"ok": False, "error": "capacity audit slot not found"}
@@ -4657,6 +4680,7 @@ class ValidatorNeuron:
                 artifact,
                 received_at=received_at,
                 ingress_head=ingress_head,
+                receipt_ingress=True,
             )
             return status, body
         finally:
