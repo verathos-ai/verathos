@@ -747,6 +747,18 @@ def build_default_subnet_config_payload(
             "allow_timing_only_score_gate": bool(
                 neuron_config.capacity_audit_allow_timing_only_score_gate
             ),
+            "incident_quarantine_enabled": bool(
+                neuron_config.capacity_audit_incident_quarantine_enabled
+            ),
+            "incident_failure_fraction": float(
+                neuron_config.capacity_audit_incident_failure_fraction
+            ),
+            "incident_min_failures": int(
+                neuron_config.capacity_audit_incident_min_failures
+            ),
+            "incident_min_distinct_miners": int(
+                neuron_config.capacity_audit_incident_min_distinct_miners
+            ),
             "uid_escalation_enabled": bool(
                 neuron_config.capacity_audit_uid_escalation_enabled
             ),
@@ -861,6 +873,10 @@ def validate_subnet_config_payload(
     audit_data_with_defaults.setdefault("uid_escalation_min_entries", 2)
     audit_data_with_defaults.setdefault("uid_escalation_fraction", 0.10)
     audit_data_with_defaults.setdefault("uid_escalation_max_entries", 10)
+    audit_data_with_defaults.setdefault("incident_quarantine_enabled", True)
+    audit_data_with_defaults.setdefault("incident_failure_fraction", 0.30)
+    audit_data_with_defaults.setdefault("incident_min_failures", 5)
+    audit_data_with_defaults.setdefault("incident_min_distinct_miners", 5)
     capacity_audit = CapacityAuditRuntimeConfig(
         enabled=_require_bool(audit_data, "enabled"),
         mode=_require_str(
@@ -914,6 +930,23 @@ def validate_subnet_config_payload(
         ),
         allow_timing_only_score_gate=_require_bool(
             audit_data, "allow_timing_only_score_gate"
+        ),
+        incident_quarantine_enabled=_require_bool(
+            audit_data_with_defaults, "incident_quarantine_enabled"
+        ),
+        incident_failure_fraction=_require_float(
+            audit_data_with_defaults,
+            "incident_failure_fraction",
+            minimum=0.000001,
+            maximum=1.0,
+        ),
+        incident_min_failures=_require_int(
+            audit_data_with_defaults, "incident_min_failures", minimum=1
+        ),
+        incident_min_distinct_miners=_require_int(
+            audit_data_with_defaults,
+            "incident_min_distinct_miners",
+            minimum=1,
         ),
         uid_escalation_enabled=_require_bool(
             audit_data_with_defaults, "uid_escalation_enabled"
@@ -1001,6 +1034,12 @@ def validate_subnet_config_payload(
             capacity_audit.invalid_proof_misses_for_zero_score
         ),
         "allow_timing_only_score_gate": capacity_audit.allow_timing_only_score_gate,
+        "incident_quarantine_enabled": capacity_audit.incident_quarantine_enabled,
+        "incident_failure_fraction": capacity_audit.incident_failure_fraction,
+        "incident_min_failures": capacity_audit.incident_min_failures,
+        "incident_min_distinct_miners": (
+            capacity_audit.incident_min_distinct_miners
+        ),
         "uid_escalation_enabled": capacity_audit.uid_escalation_enabled,
         "uid_escalation_min_entries": capacity_audit.uid_escalation_min_entries,
         "uid_escalation_fraction": capacity_audit.uid_escalation_fraction,
@@ -1122,6 +1161,16 @@ def apply_runtime_config_to_neuron_config(
     )
     config.capacity_audit_allow_timing_only_score_gate = (
         audit.allow_timing_only_score_gate
+    )
+    config.capacity_audit_incident_quarantine_enabled = (
+        audit.incident_quarantine_enabled
+    )
+    config.capacity_audit_incident_failure_fraction = (
+        audit.incident_failure_fraction
+    )
+    config.capacity_audit_incident_min_failures = audit.incident_min_failures
+    config.capacity_audit_incident_min_distinct_miners = (
+        audit.incident_min_distinct_miners
     )
     config.capacity_audit_uid_escalation_enabled = audit.uid_escalation_enabled
     config.capacity_audit_uid_escalation_min_entries = (
@@ -1333,6 +1382,18 @@ def capacity_audit_config_from_neuron_config(config: Any) -> CapacityAuditRuntim
         ),
         allow_timing_only_score_gate=bool(
             getattr(config, "capacity_audit_allow_timing_only_score_gate", True)
+        ),
+        incident_quarantine_enabled=bool(
+            getattr(config, "capacity_audit_incident_quarantine_enabled", True)
+        ),
+        incident_failure_fraction=float(
+            getattr(config, "capacity_audit_incident_failure_fraction", 0.30)
+        ),
+        incident_min_failures=int(
+            getattr(config, "capacity_audit_incident_min_failures", 5)
+        ),
+        incident_min_distinct_miners=int(
+            getattr(config, "capacity_audit_incident_min_distinct_miners", 5)
         ),
         uid_escalation_enabled=bool(
             getattr(config, "capacity_audit_uid_escalation_enabled", False)

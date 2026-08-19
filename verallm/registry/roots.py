@@ -337,7 +337,8 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
 
     # Compute per-layer weight Merkle roots
     logger.info(
-        "Registry: Computing weight Merkle roots (%d layers, may take a few minutes). "
+        "Registry: Computing weight Merkle roots (%d layers; a cold boot on a "
+        "large model can take tens of minutes — this is one-time work). "
         "Cache at .model_root_cache/ is reusable — copy it to skip this on other instances.",
         num_layers)
     weight_block_merkle_roots = []
@@ -345,9 +346,22 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
     router_merkle_roots_map = {}  # layer_idx -> bytes (router/gate root)
     layers = get_layers(model)
     _root_t0 = time.perf_counter()
+    _progress_last = _root_t0
 
     for idx in range(num_layers):
         logger.debug("Registry: Layer %d/%d root...", idx + 1, num_layers)
+        _now = time.perf_counter()
+        if idx and _now - _progress_last >= 30.0:
+            _elapsed = _now - _root_t0
+            logger.info(
+                "Registry: weight roots %d/%d layers (%.0f%%) — %.0fs elapsed, ~%.0fs left",
+                idx,
+                num_layers,
+                100.0 * idx / num_layers,
+                _elapsed,
+                _elapsed / idx * (num_layers - idx),
+            )
+            _progress_last = _now
         if idx < len(layers):
             layer = layers[idx]
             mlp = get_mlp(layer) if layer is not None else None

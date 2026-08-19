@@ -481,6 +481,10 @@ class ValidatorStateDB:
                 cohort_seed          TEXT NOT NULL DEFAULT '',
                 status               TEXT NOT NULL DEFAULT 'scheduled',
                 chain_status         TEXT NOT NULL DEFAULT 'pending',
+                incident_review_status TEXT NOT NULL DEFAULT 'clear',
+                incident_reviewed_at REAL,
+                incident_signal_reason TEXT NOT NULL DEFAULT '',
+                incident_signaled_at REAL,
                 audit_start_observed_at REAL,
                 proof_challenge_observed_at REAL,
                 selection_finalized_at REAL,
@@ -636,6 +640,29 @@ class ValidatorStateDB:
         self._ensure_column(
             "capacity_audit_windows",
             "proof_challenge_finalized_at",
+            "REAL",
+        )
+        # Existing windows predate automatic cohort anomaly review and must
+        # never be retroactively reclassified on upgrade. The production
+        # scheduler explicitly opts each new window into pending review.
+        self._ensure_column(
+            "capacity_audit_windows",
+            "incident_review_status",
+            "TEXT NOT NULL DEFAULT 'clear'",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "incident_reviewed_at",
+            "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "incident_signal_reason",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._ensure_column(
+            "capacity_audit_windows",
+            "incident_signaled_at",
             "REAL",
         )
         self._ensure_column(
@@ -1733,15 +1760,20 @@ class ValidatorStateDB:
         cohort_seed: str,
         slots: List[dict],
         proof_challenge_block: int = 0,
+        incident_review_required: bool = False,
     ) -> None:
         """Insert one audit window and its selected endpoint slots."""
         now = time.time()
+        incident_review_status = (
+            "pending" if incident_review_required else "clear"
+        )
         with self._lock:
             self._conn.execute(
                 """INSERT OR IGNORE INTO capacity_audit_windows (
                     audit_id, epoch_number, selection_block, audit_block, proof_challenge_block,
-                    selection_block_hash, cohort_seed, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)""",
+                    selection_block_hash, cohort_seed, status,
+                    incident_review_status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?)""",
                 (
                     audit_id,
                     int(epoch_number),
@@ -1750,6 +1782,7 @@ class ValidatorStateDB:
                     int(proof_challenge_block),
                     selection_block_hash,
                     cohort_seed,
+                    incident_review_status,
                     now,
                     now,
                 ),
@@ -1977,6 +2010,315 @@ class ValidatorStateDB:
                 (int(finalized_block), int(finalized_block), int(finalized_block)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_capacity_audit_windows_for_incident_review(
+        self,
+        *,
+        now: Optional[float] = None,
+    ) -> List[dict]:
+        """Return finalized windows whose complete evidence interval elapsed.
+
+        Review is intentionally delayed through the payload deadline. This
+        prevents an early chain-finality callback from penalizing the first
+        late receipt before the validator can see whether the whole cohort was
+        affected by one local ingestion incident.
+        """
+
+        ts = time.time() if now is None else float(now)
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT w.audit_id, w.epoch_number,
+                          COUNT(s.model_index) AS slot_count,
+                          MAX(COALESCE(s.payload_deadline_s, 0.0)) AS payload_deadline_s
+                   FROM capacity_audit_windows w
+                   JOIN capacity_audit_slots s ON s.audit_id = w.audit_id
+                   WHERE w.chain_status = 'confirmed'
+                     AND w.incident_review_status = 'pending'
+                     AND w.proof_challenge_observed_at IS NOT NULL
+                   GROUP BY w.audit_id, w.epoch_number,
+                            w.proof_challenge_observed_at
+                   HAVING ? > (
+                       w.proof_challenge_observed_at
+                       + MAX(COALESCE(s.payload_deadline_s, 0.0))
+                   )
+                   ORDER BY w.proof_challenge_observed_at ASC""",
+                (ts,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def quarantine_capacity_audit_window(
+        self,
+        audit_id: str,
+        *,
+        reason: str,
+        reviewed_at: Optional[float] = None,
+    ) -> dict[str, int]:
+        """Fail-neutralize one window after a validator-owned timing failure.
+
+        This path is for direct validator evidence such as observing B_proof
+        only after the live chain has already advanced beyond it.  It is not a
+        miner forgiveness mechanism: independently established cryptographic
+        failures are preserved.
+        """
+
+        bounded_reason = str(reason or "").strip()
+        if not bounded_reason or len(bounded_reason) > 128:
+            raise ValueError("a bounded validator-incident reason is required")
+        ts = time.time() if reviewed_at is None else float(reviewed_at)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                window_cur = self._conn.execute(
+                    """UPDATE capacity_audit_windows
+                       SET status = 'validator_incident',
+                           incident_review_status = 'quarantined',
+                           incident_reviewed_at = ?, updated_at = ?
+                       WHERE audit_id = ?
+                         AND chain_status != 'reorged'
+                         AND incident_review_status != 'quarantined'""",
+                    (ts, ts, audit_id),
+                )
+                slot_cur = self._conn.execute(
+                    """UPDATE capacity_audit_slots
+                       SET verdict = 'timing_excused',
+                           timing_status = 'excused',
+                           failure_reason = ?, probation_required = 0,
+                           drain_until_ts = 0, updated_at = ?
+                       WHERE audit_id = ?
+                         AND NOT (
+                           verdict = 'hard_proof_miss'
+                           AND COALESCE(failure_reason, '') NOT IN (
+                             '', 'v2_final_commitment_not_pre_challenge'
+                           )
+                         )""",
+                    (bounded_reason, ts, audit_id),
+                )
+                history_cur = self._conn.execute(
+                    """UPDATE capacity_audit_history
+                       SET verdict = 'timing_excused',
+                           timing_status = 'excused',
+                           failure_reason = ?, probation_required = 0,
+                           slot_updated_at = ?
+                       WHERE audit_id = ?
+                         AND NOT (
+                           verdict = 'hard_proof_miss'
+                           AND COALESCE(failure_reason, '') NOT IN (
+                             '', 'v2_final_commitment_not_pre_challenge'
+                           )
+                         )""",
+                    (bounded_reason, ts, audit_id),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return {
+            "windows_changed": int(window_cur.rowcount or 0),
+            "slots_neutralized": int(slot_cur.rowcount or 0),
+            "history_neutralized": int(history_cur.rowcount or 0),
+        }
+
+    def mark_capacity_audit_validator_signal(
+        self,
+        audit_id: str,
+        *,
+        reason: str,
+        signaled_at: Optional[float] = None,
+    ) -> bool:
+        """Persist bounded validator-owned incident evidence for one window."""
+
+        bounded_reason = str(reason or "").strip()
+        if not bounded_reason or len(bounded_reason) > 128:
+            raise ValueError("a bounded validator-incident signal is required")
+        ts = time.time() if signaled_at is None else float(signaled_at)
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_windows
+                   SET incident_signal_reason = CASE
+                           WHEN incident_signal_reason = '' THEN ?
+                           ELSE incident_signal_reason
+                       END,
+                       incident_signaled_at = COALESCE(incident_signaled_at, ?),
+                       updated_at = ?
+                   WHERE audit_id = ?
+                     AND chain_status != 'reorged'
+                     AND incident_review_status = 'pending'
+                     AND incident_signal_reason = ''""",
+                (bounded_reason, ts, ts, audit_id),
+            )
+            self._conn.commit()
+        return bool(cur.rowcount or 0)
+
+    def review_capacity_audit_failure_cluster(
+        self,
+        audit_id: str,
+        *,
+        enabled: bool,
+        failure_fraction: float,
+        min_failures: int,
+        min_distinct_miners: int,
+        reviewed_at: Optional[float] = None,
+    ) -> dict[str, object]:
+        """Fail-neutralize a validator-shaped cohort failure cluster once.
+
+        Only receipt timing, missing-final, and pre-challenge chronology
+        outcomes participate. Cryptographic proof failures neither contribute
+        to the trigger nor get neutralized if an unrelated timing cluster
+        quarantines the same window.
+        """
+
+        ts = time.time() if reviewed_at is None else float(reviewed_at)
+        fraction = float(failure_fraction)
+        minimum = max(1, int(min_failures))
+        distinct_minimum = max(1, int(min_distinct_miners))
+        if fraction <= 0.0 or fraction > 1.0:
+            raise ValueError("failure_fraction must be in (0.0, 1.0]")
+
+        def _is_validator_sensitive_failure(row: sqlite3.Row) -> bool:
+            verdict = str(row["verdict"] or "")
+            reason = str(row["failure_reason"] or "")
+            return (
+                (verdict == "timing_miss" and reason == "deadline_exceeded")
+                or (verdict == "no_show" and reason in ("", "missing_final_receipt"))
+                or (
+                    verdict == "hard_proof_miss"
+                    and reason == "v2_final_commitment_not_pre_challenge"
+                )
+            )
+
+        with self._lock:
+            window = self._conn.execute(
+                """SELECT audit_id, epoch_number, status, chain_status,
+                          incident_review_status, incident_signal_reason
+                   FROM capacity_audit_windows WHERE audit_id = ?""",
+                (audit_id,),
+            ).fetchone()
+            if window is None:
+                raise ValueError("capacity audit window not found")
+            if str(window["chain_status"] or "") != "confirmed":
+                raise ValueError("capacity audit window is not chain-confirmed")
+            if str(window["incident_review_status"] or "") != "pending":
+                return {
+                    "audit_id": audit_id,
+                    "epoch_number": int(window["epoch_number"]),
+                    "reviewed": False,
+                    "status": str(window["incident_review_status"] or ""),
+                    "quarantined": str(window["status"] or "") == "validator_incident",
+                }
+
+            rows = self._conn.execute(
+                """SELECT miner_address, miner_uid, miner_hotkey_ss58,
+                          model_index, verdict, timing_status, proof_status,
+                          failure_reason, probation_required
+                   FROM capacity_audit_slots
+                   WHERE audit_id = ?
+                   ORDER BY miner_address, model_index""",
+                (audit_id,),
+            ).fetchall()
+            failures = [row for row in rows if _is_validator_sensitive_failure(row)]
+            identities = {
+                (
+                    f"hotkey:{str(row['miner_hotkey_ss58'])}"
+                    if str(row["miner_hotkey_ss58"] or "")
+                    else (
+                        f"uid:{int(row['miner_uid'])}"
+                        if row["miner_uid"] is not None
+                        else f"address:{str(row['miner_address']).lower()}"
+                    )
+                )
+                for row in failures
+            }
+            total = len(rows)
+            required = max(minimum, int(math.ceil(total * fraction)))
+            quarantine = bool(
+                enabled
+                and str(window["incident_signal_reason"] or "")
+                and total > 0
+                and len(failures) >= required
+                and len(identities) >= distinct_minimum
+            )
+            reason = (
+                "validator_failure_cluster:"
+                f"fail={len(failures)}/{total},miners={len(identities)}"
+            )
+
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if quarantine:
+                    self._conn.execute(
+                        """UPDATE capacity_audit_windows
+                           SET status = 'validator_incident',
+                               incident_review_status = 'quarantined',
+                               incident_reviewed_at = ?, updated_at = ?
+                           WHERE audit_id = ?
+                             AND incident_review_status = 'pending'""",
+                        (ts, ts, audit_id),
+                    )
+                    # Preserve independently invalid cryptographic proofs.
+                    # Every other outcome in the contaminated window is
+                    # neutral evidence: neither a pass nor a failure.
+                    slot_cur = self._conn.execute(
+                        """UPDATE capacity_audit_slots
+                           SET verdict = 'timing_excused',
+                               timing_status = 'excused',
+                               failure_reason = ?, probation_required = 0,
+                               drain_until_ts = 0, updated_at = ?
+                           WHERE audit_id = ?
+                             AND NOT (
+                               verdict = 'hard_proof_miss'
+                               AND COALESCE(failure_reason, '') !=
+                                   'v2_final_commitment_not_pre_challenge'
+                             )""",
+                        (reason, ts, audit_id),
+                    )
+                    history_cur = self._conn.execute(
+                        """UPDATE capacity_audit_history
+                           SET verdict = 'timing_excused',
+                               timing_status = 'excused',
+                               failure_reason = ?, probation_required = 0,
+                               slot_updated_at = ?
+                           WHERE audit_id = ?
+                             AND NOT (
+                               verdict = 'hard_proof_miss'
+                               AND COALESCE(failure_reason, '') !=
+                                   'v2_final_commitment_not_pre_challenge'
+                             )""",
+                        (reason, ts, audit_id),
+                    )
+                else:
+                    self._conn.execute(
+                        """UPDATE capacity_audit_windows
+                           SET incident_review_status = 'clear',
+                               incident_reviewed_at = ?, updated_at = ?
+                           WHERE audit_id = ?
+                             AND incident_review_status = 'pending'""",
+                        (ts, ts, audit_id),
+                    )
+                    slot_cur = None
+                    history_cur = None
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+        return {
+            "audit_id": audit_id,
+            "epoch_number": int(window["epoch_number"]),
+            "reviewed": True,
+            "status": "quarantined" if quarantine else "clear",
+            "quarantined": quarantine,
+            "slot_count": total,
+            "eligible_failures": len(failures),
+            "required_failures": required,
+            "distinct_failure_miners": len(identities),
+            "required_distinct_miners": distinct_minimum,
+            "validator_signal": str(window["incident_signal_reason"] or ""),
+            "reason": reason if quarantine else "",
+            "slots_neutralized": int(slot_cur.rowcount or 0) if slot_cur else 0,
+            "history_neutralized": (
+                int(history_cur.rowcount or 0) if history_cur else 0
+            ),
+        }
 
     def record_capacity_audit_finalization(
         self,
@@ -2229,6 +2571,7 @@ class ValidatorStateDB:
                        SELECT 1 FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
                          AND w.chain_status != 'reorged'
+                         AND w.incident_review_status != 'quarantined'
                      )""",
                 (
                     ts,
@@ -2313,6 +2656,7 @@ class ValidatorStateDB:
                        SELECT 1 FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
                          AND w.chain_status != 'reorged'
+                         AND w.incident_review_status != 'quarantined'
                      )
                      AND (
                        final_received_at IS NULL
@@ -2454,6 +2798,7 @@ class ValidatorStateDB:
                        SELECT 1 FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
                          AND w.chain_status != 'reorged'
+                         AND w.incident_review_status != 'quarantined'
                      )""",
                 (
                     ts,
@@ -2661,10 +3006,12 @@ class ValidatorStateDB:
             try:
                 window_cur = self._conn.execute(
                     f"""UPDATE capacity_audit_windows
-                    SET status = 'validator_incident', updated_at = ?
+                    SET status = 'validator_incident',
+                        incident_review_status = 'quarantined',
+                        incident_reviewed_at = ?, updated_at = ?
                     WHERE audit_id IN ({placeholders})
                       AND status != 'validator_incident'""",
-                    (ts, *exact_ids),
+                    (ts, ts, *exact_ids),
                 )
                 slot_cur = self._conn.execute(
                     f"""UPDATE capacity_audit_slots
@@ -2812,6 +3159,7 @@ class ValidatorStateDB:
                      AND s.probation_required != 0
                      AND s.probation_applied_at IS NULL
                      AND w.chain_status = 'confirmed'
+                     AND w.incident_review_status != 'pending'
                    ORDER BY s.updated_at ASC, s.audit_id ASC""",
             ).fetchall()
         return [dict(row) for row in rows]
@@ -2839,6 +3187,7 @@ class ValidatorStateDB:
                        SELECT 1 FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
                          AND w.chain_status != 'reorged'
+                         AND w.incident_review_status != 'quarantined'
                      )""",
                 (
                     ts,
@@ -2928,6 +3277,7 @@ class ValidatorStateDB:
         verdicts: Tuple[str, ...] = ("timing_miss", "hard_proof_miss", "no_show"),
         require_chain_confirmed: bool = False,
         require_consequence_eligible: bool = False,
+        require_incident_reviewed: bool = False,
         before_epoch: Optional[int] = None,
     ) -> int:
         placeholders = ",".join("?" for _ in verdicts)
@@ -2948,6 +3298,10 @@ class ValidatorStateDB:
         eligibility_clause = (
             " AND s.probation_required != 0" if require_consequence_eligible else ""
         )
+        review_clause = (
+            " AND w.incident_review_status != 'pending'"
+            if require_incident_reviewed else ""
+        )
         before_clause = " AND w.epoch_number < ?" if before_epoch is not None else ""
         with self._lock:
             identity_clause, identity_params = self._capacity_address_identity_filter_locked(
@@ -2964,6 +3318,7 @@ class ValidatorStateDB:
                       AND s.verdict IN ({placeholders})
                       AND {identity_clause}
                       {eligibility_clause}
+                      {review_clause}
                       {confirmation_clause}""",
                 (
                     address.lower(), int(model_index), int(since_epoch),
@@ -2981,6 +3336,7 @@ class ValidatorStateDB:
         since_epoch: int,
         require_chain_confirmed: bool = False,
         require_consequence_eligible: bool = False,
+        require_incident_reviewed: bool = False,
     ) -> int:
         confirmation_clause = ""
         if require_chain_confirmed:
@@ -2998,6 +3354,10 @@ class ValidatorStateDB:
             )
         eligibility_clause = (
             " AND s.probation_required != 0" if require_consequence_eligible else ""
+        )
+        review_clause = (
+            " AND w.incident_review_status != 'pending'"
+            if require_incident_reviewed else ""
         )
         with self._lock:
             identity_clause, identity_params = self._capacity_address_identity_filter_locked(
@@ -3024,6 +3384,7 @@ class ValidatorStateDB:
                       )
                       AND {identity_clause}
                       {eligibility_clause}
+                      {review_clause}
                       {confirmation_clause}""",
                 (
                     address.lower(), int(model_index), int(since_epoch),
@@ -3076,6 +3437,7 @@ class ValidatorStateDB:
         since_epoch: int,
         require_chain_confirmed: bool = False,
         require_consequence_eligible: bool = False,
+        require_incident_reviewed: bool = False,
         soft_failures_before_epoch: Optional[int] = None,
     ) -> Dict[Tuple[str, int], dict]:
         """Return finalized failure counts grouped by the registered endpoint slot."""
@@ -3095,6 +3457,10 @@ class ValidatorStateDB:
             )
         eligibility_clause = (
             " AND s.probation_required != 0" if require_consequence_eligible else ""
+        )
+        review_clause = (
+            " AND w.incident_review_status != 'pending'"
+            if require_incident_reviewed else ""
         )
         soft_before = (
             int(soft_failures_before_epoch)
@@ -3143,6 +3509,7 @@ class ValidatorStateDB:
                       AND ({identity_clause})
                       AND s.verdict IN ('hard_proof_miss', 'no_show', 'timing_miss')
                       {eligibility_clause}
+                      {review_clause}
                       {confirmation_clause}
                     GROUP BY s.miner_address, s.model_index""",
                 (
@@ -3774,6 +4141,7 @@ class ValidatorStateDB:
                 "   )"
                 " )"
                 " AND w.chain_status != 'reorged'"
+                " AND w.incident_review_status != 'pending'"
             )
             with self._lock:
                 gate_rows = [

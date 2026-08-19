@@ -386,6 +386,10 @@ class CapacityAuditRuntimeConfig:
     hard_proof_misses_for_zero_score: int = 2
     invalid_proof_misses_for_zero_score: int = 1
     allow_timing_only_score_gate: bool = True
+    incident_quarantine_enabled: bool = True
+    incident_failure_fraction: float = 0.30
+    incident_min_failures: int = 5
+    incident_min_distinct_miners: int = 5
     uid_escalation_enabled: bool = False
     uid_escalation_min_entries: int = 2
     uid_escalation_fraction: float = 0.10
@@ -485,6 +489,20 @@ def validate_capacity_audit_runtime_config(
         raise ValueError(
             "capacity audit uid_escalation_max_entries must be greater than or equal to "
             "uid_escalation_min_entries"
+        )
+    incident_fraction = float(
+        getattr(cfg, "incident_failure_fraction", 0.30) or 0.0
+    )
+    if incident_fraction <= 0.0 or incident_fraction > 1.0:
+        raise ValueError(
+            "capacity audit incident_failure_fraction must be greater than 0.0 "
+            "and at most 1.0"
+        )
+    if int(getattr(cfg, "incident_min_failures", 0) or 0) < 1:
+        raise ValueError("capacity audit incident_min_failures must be positive")
+    if int(getattr(cfg, "incident_min_distinct_miners", 0) or 0) < 1:
+        raise ValueError(
+            "capacity audit incident_min_distinct_miners must be positive"
         )
 
 

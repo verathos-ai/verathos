@@ -36,15 +36,19 @@ resolve_miner_runtime_stack() {
 
     if [ "$gpu_sm" -lt 89 ]; then
         printf '%s\n' 'ampere-cu128|0.19.1|2.10.0+cu128|12.8|cu128'
-    elif { [ "$gpu_sm" -eq 90 ] || [ "$gpu_sm" -ge 120 ]; } &&
-        [ "$driver_major" -ge 580 ]; then
-        # vLLM 0.20.2's published binary is CUDA 13-linked. Hopper and
-        # Blackwell hosts on a CUDA 13-capable driver must therefore use the
-        # coherent torch/vLLM CUDA 13 stack instead of forcing cu128 and then
-        # falling into an unnecessary source rebuild.
+    elif [ "$driver_major" -ge 580 ]; then
+        # vLLM 0.20.2's published binary is CUDA 13-linked, on EVERY
+        # sm_89+ arch - an Ada card forced onto cu128 torch imports vLLM
+        # against a libcudart.so.13 that a clean image does not have and
+        # dies in a pointless source rebuild (live 2026-08-18, RTX 4090
+        # on driver 595). Any sm_89+ host with a CUDA 13-capable driver
+        # gets the coherent CUDA 13 stack.
         printf '%s\n' 'hopper-blackwell-cu130|0.20.2|2.11.0+cu130|13.0|cu130'
     else
-        printf '%s\n' 'ada-hopper-cu128|0.20.2|2.11.0+cu128|12.8|cu128'
+        # sm_89+ on a pre-CUDA-13 driver cannot run vLLM 0.20.2's binary
+        # at all; the only coherent pairing is the 0.19.1/cu128 stack
+        # (same trade-offs as Ampere: no Qwen3.6/Gemma4).
+        printf '%s\n' 'legacy-cu128|0.19.1|2.10.0+cu128|12.8|cu128'
     fi
 }
 
@@ -1105,9 +1109,10 @@ if [ "$SKIP_INSTALL" = false ]; then
     #  - sm 90 or sm >= 120 with driver >= 580: vLLM 0.20.2 + torch
     #    2.11.0 + cu130
     #  - sm >= 89 otherwise: vLLM 0.20.2 + torch 2.11.0 + cu128
-    if [ "$VLLM_RUNTIME_STACK" = "ampere-cu128" ]; then
+    if [ "$VLLM_RUNTIME_STACK" = "ampere-cu128" ] ||
+        [ "$VLLM_RUNTIME_STACK" = "legacy-cu128" ]; then
         VLLM_SOURCE_TAG="v0.19.1"
-        echo "  Ampere GPU (sm_${GPU_SM}): installing vLLM 0.19.1 + torch 2.10.0+cu128..."
+        echo "  ${VLLM_RUNTIME_STACK} (sm_${GPU_SM}, driver ${GPU_DRIVER}): installing vLLM 0.19.1 + torch 2.10.0+cu128..."
         TORCH_CONSTRAINT="$(mktemp)"
         {
             echo "torch==2.10.0+cu128"
@@ -1156,35 +1161,8 @@ if [ "$SKIP_INSTALL" = false ]; then
             $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.20.2' 2>&1 | tail -5
         fi
     else
-        VLLM_SOURCE_TAG="v0.20.2"
-        echo "  Ada/Hopper/Blackwell (sm_${GPU_SM:-89+}): installing vLLM 0.20.2 + torch 2.11.0+cu128..."
-        TORCH_CONSTRAINT="$(mktemp)"
-        {
-            echo "torch==2.11.0+cu128"
-            echo "torchvision==0.26.0+cu128"
-            echo "torchaudio==2.11.0+cu128"
-        } > "$TORCH_CONSTRAINT"
-        $PYTHON -m pip install --no-cache-dir \
-            --extra-index-url https://download.pytorch.org/whl/cu128 \
-            -c "$TORCH_CONSTRAINT" \
-            "vllm==0.20.2" "${VLLM_RUNTIME_DEPS[@]}" 2>&1 | tail -20
-        rm -f "$TORCH_CONSTRAINT"
-        echo "  Verifying Ada/Hopper/Blackwell torch/vLLM pins..."
-        if torch_pin_ready "2.11.0+cu128" "12.8"; then
-            echo "  torch 2.11.0+cu128 already installed"
-        else
-            $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
-                "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" \
-                --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5
-        fi
-        if vllm_pin_ready "0.20.2"; then
-            echo "  vLLM 0.20.2 already installed"
-        else
-            $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.20.2' 2>&1 | tail -5
-        fi
-        if [ "${GPU_DRIVER_MAJOR:-0}" -lt 580 ] 2>/dev/null; then
-            echo "  Driver ${GPU_DRIVER} is < 580: using cu128 torch and validating the vLLM wheel before any rebuild."
-        fi
+        echo "  ERROR: unknown vLLM runtime stack '$VLLM_RUNTIME_STACK' - policy bug."
+        exit 1
     fi
 
     if ! configure_runtime_cuda_compiler; then

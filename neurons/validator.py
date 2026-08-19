@@ -1182,6 +1182,14 @@ class ValidatorNeuron:
         self._capacity_audit_state_pending = False
         self._capacity_audit_state_dirty = False
         self._miner_debug_executor = ThreadPoolExecutor(max_workers=1)
+        # Metagraph statistics are informational. A degraded RPC must never
+        # stall current-head processing, audit chronology, or canary dispatch.
+        self._metagraph_stats_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="metagraph-stats",
+        )
+        self._metagraph_stats_lock = threading.Lock()
+        self._metagraph_stats_in_flight = False
         # Analytics retention is best-effort maintenance, not an epoch-close
         # dependency.  A daemon worker keeps multi-million-row archives off the
         # block subscription thread; the DB layer streams them with bounded
@@ -3170,6 +3178,7 @@ class ValidatorNeuron:
             selection_block_hash=self._block_hash_hex(selection_block_hash),
             cohort_seed=cohort_seed,
             slots=rows,
+            incident_review_required=True,
         )
         self._write_shared_state()
         bt.logging.info(
@@ -3311,6 +3320,10 @@ class ValidatorNeuron:
             return
         observed_at = time.time()
         updated = 0
+        quarantined = 0
+        strict_timing_mode = str(
+            getattr(self._capacity_audit_cfg, "mode", "observe") or "observe"
+        ) in {"score_gate", "enforce"}
         for window in windows:
             challenge_block = int(window.get("proof_challenge_block") or 0)
             if challenge_block <= 0:
@@ -3336,8 +3349,38 @@ class ValidatorNeuron:
                 observed_at=observed_at,
             )
             updated += 1
+            if strict_timing_mode:
+                observe_head = getattr(
+                    self,
+                    "_observe_live_capacity_audit_head",
+                    None,
+                )
+                if callable(observe_head):
+                    live_head, trustworthy = observe_head()
+                    late_by = max(0, int(live_head) - challenge_block)
+                    if not trustworthy or late_by > 1:
+                        reason = (
+                            "validator_proof_challenge_head_unavailable"
+                            if not trustworthy
+                            else f"validator_proof_challenge_observed_late:{late_by}_blocks"
+                        )
+                        result = self._db.quarantine_capacity_audit_window(
+                            str(window["audit_id"]),
+                            reason=reason,
+                            reviewed_at=observed_at,
+                        )
+                        quarantined += int(result.get("windows_changed") or 0)
+                        bt.logging.error(
+                            "Capacity audit validator-incident quarantine: "
+                            f"audit_id={str(window['audit_id'])[:12]} "
+                            f"B_proof={challenge_block} live_head="
+                            f"{int(live_head) if trustworthy else 'unavailable'} "
+                            f"reason={reason}"
+                        )
         if updated:
             bt.logging.info(f"Capacity audit: recorded {updated} proof challenge hashes")
+        if quarantined:
+            self._schedule_capacity_audit_shared_state_write()
 
     def _confirm_capacity_audit_finalized_blocks(self, subtensor_obj: object | None = None) -> None:
         """Confirm current-head audit hashes after they become finalized."""
@@ -3696,6 +3739,13 @@ class ValidatorNeuron:
         row, error = self._validate_capacity_audit_artifact(artifact)
         if error:
             return 400, {"ok": False, "error": error}
+        if str(row.get("status") or "") == "validator_incident":
+            return 200, {
+                "ok": True,
+                "verdict": "timing_excused",
+                "timing_status": "excused",
+                "validator_incident": True,
+            }
         ts = time.time() if received_at is None else float(received_at)
         audit_id = str(row["audit_id"])
         address = str(row["miner_address"])
@@ -4160,6 +4210,13 @@ class ValidatorNeuron:
         row, error = self._validate_capacity_audit_artifact(artifact)
         if error:
             return 400, {"ok": False, "error": error}, None
+        if str(row.get("status") or "") == "validator_incident":
+            return 200, {
+                "ok": True,
+                "verdict": "timing_excused",
+                "timing_status": "excused",
+                "validator_incident": True,
+            }, None
         if not row or not row.get("transcript_root"):
             return 409, {"ok": False, "error": "final receipt required before proof payload"}, None
 
@@ -4333,8 +4390,10 @@ class ValidatorNeuron:
         queue_delay_s: float,
         processing_s: float,
         head_unavailable: bool,
+        accepted: bool,
     ) -> None:
         self._ensure_capacity_audit_receipt_metrics()
+        audit_id = ""
         with self._capacity_audit_receipt_metrics_lock:
             _received_at, audit_id = self._capacity_audit_receipt_pending.pop(
                 int(ticket),
@@ -4367,6 +4426,31 @@ class ValidatorNeuron:
                 )
                 if head_unavailable:
                     item["head_unavailable"] += 1
+        incident_reason = ""
+        if head_unavailable:
+            incident_reason = "validator_live_head_unavailable_at_receipt_ingress"
+        elif accepted and float(queue_delay_s) >= 5.0:
+            incident_reason = f"validator_receipt_queue_delay:{float(queue_delay_s):.3f}s"
+        elif accepted and float(processing_s) >= 5.0:
+            incident_reason = (
+                f"validator_receipt_processing_delay:{float(processing_s):.3f}s"
+            )
+        if audit_id and incident_reason:
+            try:
+                signaled = self._db.mark_capacity_audit_validator_signal(
+                    audit_id,
+                    reason=incident_reason,
+                )
+                if signaled:
+                    bt.logging.error(
+                        "Capacity audit validator incident signal: "
+                        f"audit_id={audit_id[:12]} reason={incident_reason}"
+                    )
+            except Exception as exc:
+                bt.logging.warning(
+                    "Capacity audit incident signal persistence failed: "
+                    f"audit_id={audit_id[:12]} error={exc}"
+                )
 
     def _capacity_audit_receipt_metrics_snapshot(self) -> dict:
         self._ensure_capacity_audit_receipt_metrics()
@@ -4578,6 +4662,7 @@ class ValidatorNeuron:
                 queue_delay_s=queue_delay_s,
                 processing_s=processing_s,
                 head_unavailable=head_unavailable,
+                accepted=bool(status == 200 and body.get("ok") is True),
             )
             if queue_delay_s >= 0.5 or processing_s >= 0.5:
                 bt.logging.warning(
@@ -4773,6 +4858,7 @@ class ValidatorNeuron:
             since_epoch=since_epoch,
             require_chain_confirmed=True,
             require_consequence_eligible=True,
+            require_incident_reviewed=True,
         )
         if invalid_failures >= int(cfg.invalid_proof_misses_for_zero_score):
             return f"{invalid_failures} cryptographically invalid capacity proof(s)"
@@ -4783,6 +4869,7 @@ class ValidatorNeuron:
             verdicts=("hard_proof_miss",),
             require_chain_confirmed=True,
             require_consequence_eligible=True,
+            require_incident_reviewed=True,
         )
         # A no-show/timing result can still be neutralized by authenticated
         # work that was already running at the scoring boundary.  Mature these
@@ -4796,6 +4883,7 @@ class ValidatorNeuron:
             verdicts=("no_show",),
             require_chain_confirmed=True,
             require_consequence_eligible=True,
+            require_incident_reviewed=True,
             before_epoch=int(epoch_number),
         )
         if hard_failures >= int(cfg.hard_proof_misses_for_zero_score):
@@ -4808,6 +4896,7 @@ class ValidatorNeuron:
                 verdicts=("timing_miss",),
                 require_chain_confirmed=True,
                 require_consequence_eligible=True,
+                require_incident_reviewed=True,
                 before_epoch=int(epoch_number),
             )
             if timing_failures >= int(cfg.timing_misses_for_zero_score):
@@ -4846,6 +4935,7 @@ class ValidatorNeuron:
             since_epoch=since_epoch,
             require_chain_confirmed=True,
             require_consequence_eligible=True,
+            require_incident_reviewed=True,
             soft_failures_before_epoch=int(epoch_number),
         )
         convicted: list[Tuple[str, int]] = []
@@ -5200,6 +5290,61 @@ class ValidatorNeuron:
             return False
         return True
 
+    def _review_capacity_audit_failure_clusters(self) -> int:
+        """Quarantine finalized validator-shaped cohort failures before penalties."""
+
+        cfg = self._epoch_close_value(
+            "_capacity_audit_cfg",
+            self._capacity_audit_cfg,
+        )
+        try:
+            windows = self._db.get_capacity_audit_windows_for_incident_review()
+        except Exception as exc:
+            bt.logging.warning(
+                f"Capacity audit incident review lookup failed: {exc}"
+            )
+            return 0
+
+        quarantined = 0
+        reviewed = 0
+        for window in windows:
+            audit_id = str(window.get("audit_id") or "")
+            if not audit_id:
+                continue
+            try:
+                result = self._db.review_capacity_audit_failure_cluster(
+                    audit_id,
+                    enabled=bool(cfg.incident_quarantine_enabled),
+                    failure_fraction=float(cfg.incident_failure_fraction),
+                    min_failures=int(cfg.incident_min_failures),
+                    min_distinct_miners=int(cfg.incident_min_distinct_miners),
+                )
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Capacity audit incident review failed: "
+                    f"audit_id={audit_id[:12]} error={exc}"
+                )
+                continue
+            if not result.get("reviewed"):
+                continue
+            reviewed += 1
+            if not result.get("quarantined"):
+                continue
+            quarantined += 1
+            bt.logging.error(
+                "Capacity audit validator-incident quarantine: "
+                f"audit_id={audit_id[:12]} "
+                f"epoch={int(result.get('epoch_number') or 0)} "
+                f"failures={int(result.get('eligible_failures') or 0)}/"
+                f"{int(result.get('slot_count') or 0)} "
+                f"distinct_miners={int(result.get('distinct_failure_miners') or 0)}; "
+                f"validator_signal={str(result.get('validator_signal') or '')}; "
+                "all non-cryptographic outcomes are neutral and require manual review"
+            )
+        if reviewed:
+            self._write_shared_state()
+        return quarantined
+
     def _apply_finalized_capacity_audit_probations(self) -> int:
         """Apply each chain-finalized capacity proof penalty exactly once."""
 
@@ -5210,6 +5355,11 @@ class ValidatorNeuron:
         )
         if callable(follower_mode) and follower_mode():
             return 0
+        # This review is deliberately earlier than maintenance-grace checks
+        # and candidate lookup. A validator-wide ingestion incident must be
+        # frozen as neutral evidence before any endpoint EMA or probation
+        # state can be mutated.
+        self._review_capacity_audit_failure_clusters()
         if self._maintenance_grace_active(
             action="suppress_capacity_score_gate"
         ) or self._maintenance_grace_active(action="suppress_probation"):
@@ -5480,15 +5630,12 @@ class ValidatorNeuron:
             f"| next_epoch_in={blocks_until_next} | pending_tests={sched_count}",
         )
 
-        # Refresh metagraph from RPC every 60 blocks (~12 min),
-        # re-log cached stats every 5 blocks (~1 min)
+        # Reformat cached metagraph statistics off-thread every 20 blocks and
+        # re-log them every five. Authoritative metagraph refresh already runs
+        # in background epoch setup/close; no periodic RPC belongs on this
+        # chronology-sensitive callback.
         if block_number % 20 == 0:
-            self._refresh_metagraph_stats()
-            # Re-enrich miners with SS58 + update shared state (~4 min cycle).
-            # Catches new miners within ~4 min instead of waiting for epoch boundary.
-            if self._epoch_miners:
-                self._enrich_miners_from_metagraph(self._epoch_miners)
-                self._write_shared_state()
+            self._schedule_metagraph_stats_refresh()
         refresh_blocks = int(getattr(self.config, "capacity_audit_slot_refresh_blocks", 60) or 0)
         if (
             self._capacity_audit_cfg.enabled
@@ -13942,15 +14089,49 @@ class ValidatorNeuron:
 
     _cached_metagraph_line: str = ""
 
+    def _schedule_metagraph_stats_refresh(self) -> bool:
+        """Refresh informational metagraph stats off the block callback."""
+
+        executor = getattr(self, "_metagraph_stats_executor", None)
+        lock = getattr(self, "_metagraph_stats_lock", None)
+        if executor is None or lock is None:
+            # Narrow fixtures constructed without __init__ retain deterministic
+            # behavior without weakening the production non-blocking path.
+            self._refresh_metagraph_stats()
+            return True
+        with lock:
+            if bool(getattr(self, "_metagraph_stats_in_flight", False)):
+                return False
+            self._metagraph_stats_in_flight = True
+
+        def _refresh() -> None:
+            started = time.monotonic()
+            try:
+                self._refresh_metagraph_stats()
+            finally:
+                elapsed = time.monotonic() - started
+                if elapsed > 12.0:
+                    bt.logging.warning(
+                        f"Background metagraph refresh took {elapsed:.1f}s; "
+                        "block processing remained independent"
+                    )
+                with lock:
+                    self._metagraph_stats_in_flight = False
+
+        try:
+            executor.submit(_refresh)
+        except Exception:
+            with lock:
+                self._metagraph_stats_in_flight = False
+            return False
+        return True
+
     def _refresh_metagraph_stats(self) -> None:
-        """Fetch metagraph from RPC and cache the stats line. Called every ~12 min."""
+        """Format the latest authoritative metagraph without issuing RPC."""
         try:
             mg = self._metagraph
             if mg is None:
-                mg = self._subtensor.metagraph(self.config.netuid)
-                self._metagraph = mg
-            else:
-                mg.sync(subtensor=self._subtensor, lite=True)
+                return
 
             uid = None
             ss58 = self._validator_hotkey_ss58
@@ -14485,7 +14666,7 @@ class ValidatorNeuron:
                     f"(block {self._sync_block}, ~{blocks_left * 12 // 60}min)",
                 )
             if current % 60 == 0:
-                self._refresh_metagraph_stats()
+                self._schedule_metagraph_stats_refresh()
             if current % 5 == 0 and hasattr(self, '_cached_metagraph_parts'):
                 bt.logging.info(f"Metagraph | block={current} | {' | '.join(self._cached_metagraph_parts)}")
 
@@ -14784,6 +14965,7 @@ class ValidatorNeuron:
         self._capacity_audit_receipt_executor.shutdown(wait=False)
         self._capacity_audit_state_executor.shutdown(wait=False)
         self._miner_debug_executor.shutdown(wait=False)
+        self._metagraph_stats_executor.shutdown(wait=False)
         self._capacity_audit_proof_executor.shutdown(wait=False)
         self._shared_hard_prefetch_executor.shutdown(wait=False)
 
