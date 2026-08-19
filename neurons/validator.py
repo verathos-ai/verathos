@@ -1171,9 +1171,11 @@ class ValidatorNeuron:
             "max_processing_s": 0.0,
             "per_audit": {},
         }
-        # Shared debug state is relatively expensive to serialize. Coalesce a
-        # receipt burst on a dedicated worker instead of making four ingest
-        # workers rebuild it independently.
+        # Shared debug state is relatively expensive to serialize. Receipt
+        # ingress never schedules a rebuild: its only synchronous duties are
+        # validating and durably recording the already-captured arrival
+        # timestamp/head. Terminal proof/window transitions use this trailing
+        # edge coalescer so a burst produces one rebuild after it goes quiet.
         self._capacity_audit_state_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="capacity-state",
@@ -1181,6 +1183,7 @@ class ValidatorNeuron:
         self._capacity_audit_state_lock = threading.Lock()
         self._capacity_audit_state_pending = False
         self._capacity_audit_state_dirty = False
+        self._capacity_audit_state_requested_at = 0.0
         self._miner_debug_executor = ThreadPoolExecutor(max_workers=1)
         # Metagraph statistics are informational. A degraded RPC must never
         # stall current-head processing, audit chronology, or canary dispatch.
@@ -3837,9 +3840,6 @@ class ValidatorNeuron:
                         final_observed_block=final_observed_block,
                         received_at=ts,
                     )
-                    if recorded:
-                        self._schedule_capacity_audit_shared_state_write()
-                        self._apply_finalized_capacity_audit_probations()
                     return 200, {
                         "ok": True,
                         "verdict": str(
@@ -3865,7 +3865,6 @@ class ValidatorNeuron:
                     final_observed_block=final_observed_block,
                     received_at=ts,
                 )
-                self._apply_finalized_capacity_audit_probations()
                 stored_verdict = str(
                     (stored or {}).get("verdict") or "hard_proof_miss"
                 )
@@ -3948,7 +3947,6 @@ class ValidatorNeuron:
                     model_index=model_index,
                     released_at=ts,
                 )
-            self._schedule_capacity_audit_shared_state_write()
             return 200, {"ok": True, "verdict": verdict, "timing_status": timing_status}
 
         if artifact_type == "capacity_audit_proof_payload":
@@ -3980,7 +3978,7 @@ class ValidatorNeuron:
                     ),
                     received_at=ts,
                 )
-                self._write_shared_state()
+                self._schedule_capacity_audit_shared_state_write()
                 self._apply_finalized_capacity_audit_probations()
                 body = {"ok": True, "verdict": "hard_proof_miss", "proof_status": "invalid_payload"}
                 if proof_verify_ms is not None:
@@ -4113,7 +4111,7 @@ class ValidatorNeuron:
                             model_index=model_index,
                             released_at=ts,
                         )
-                        self._write_shared_state()
+                        self._schedule_capacity_audit_shared_state_write()
                     bt.logging.warning(
                         f"Capacity audit proof verifier error: audit_id={audit_id[:12]} "
                         f"miner={address[:10]} model_index={model_index}: {exc}"
@@ -4178,7 +4176,7 @@ class ValidatorNeuron:
                         model_index=model_index,
                         released_at=ts,
                     )
-                    self._write_shared_state()
+                    self._schedule_capacity_audit_shared_state_write()
                 return 200, {
                     "ok": True,
                     "verdict": current_verdict,
@@ -4276,7 +4274,7 @@ class ValidatorNeuron:
                         model_index=model_index,
                         released_at=received_at,
                     )
-                    self._write_shared_state()
+                    self._schedule_capacity_audit_shared_state_write()
             except Exception:
                 pass
 
@@ -4311,7 +4309,7 @@ class ValidatorNeuron:
                 model_index=int(row["model_index"]),
                 released_at=ts,
             )
-            self._write_shared_state()
+            self._schedule_capacity_audit_shared_state_write()
             return status, body
         self._capacity_audit_proof_executor.submit(
             self._run_capacity_audit_proof_verification,
@@ -4484,16 +4482,27 @@ class ValidatorNeuron:
             return
         with lock:
             self._capacity_audit_state_dirty = True
+            self._capacity_audit_state_requested_at = time.monotonic()
             if self._capacity_audit_state_pending:
                 return
             self._capacity_audit_state_pending = True
 
         def _flush() -> None:
-            # One short debounce absorbs a full receipt fan-in without adding
-            # latency to the HTTP response or proof deadline.
-            time.sleep(0.05)
+            # Wait for a quiet trailing edge. The former dirty-loop started a
+            # full rebuild after 50 ms and immediately repeated it whenever a
+            # new completion landed during serialization; a normal cohort
+            # could therefore rebuild shared state dozens of times.
+            debounce_s = 0.5
             while True:
                 with lock:
+                    requested_at = float(self._capacity_audit_state_requested_at)
+                remaining = debounce_s - (time.monotonic() - requested_at)
+                if remaining > 0.0:
+                    time.sleep(remaining)
+                    continue
+                with lock:
+                    if requested_at != float(self._capacity_audit_state_requested_at):
+                        continue
                     self._capacity_audit_state_dirty = False
                 try:
                     self._write_shared_state()
