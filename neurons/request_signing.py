@@ -62,6 +62,8 @@ def sign_request(
     body: bytes,
     hotkey_ss58: str,
     hotkey_seed: bytes,
+    *,
+    timestamp: int | str | None = None,
 ) -> dict[str, str]:
     """Sign an HTTP request with Sr25519 and return auth headers.
 
@@ -71,14 +73,18 @@ def sign_request(
         body: Raw request body bytes.
         hotkey_ss58: SS58-encoded hotkey address.
         hotkey_seed: 32-byte seed (Mini secret key).
+        timestamp: Optional Unix-second override. Retry loops use this to
+            guarantee a distinct replay-protected signature per attempt.
 
     Returns:
         Dict of headers to add to the request.
     """
     from bittensor_wallet import Keypair
 
-    timestamp = str(int(time.time()))
-    message = build_signing_message(method, path, body, timestamp)
+    timestamp_text = str(int(time.time()) if timestamp is None else timestamp)
+    if not timestamp_text.isascii() or not timestamp_text.isdecimal():
+        raise ValueError("timestamp must be unsigned Unix seconds")
+    message = build_signing_message(method, path, body, timestamp_text)
 
     keypair = Keypair.create_from_seed(hotkey_seed[:32].hex())
     signature = keypair.sign(message)
@@ -86,7 +92,7 @@ def sign_request(
     return {
         HDR_HOTKEY: hotkey_ss58,
         HDR_SIGNATURE: signature.hex() if isinstance(signature, bytes) else signature,
-        HDR_TIMESTAMP: timestamp,
+        HDR_TIMESTAMP: timestamp_text,
     }
 
 

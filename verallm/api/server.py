@@ -693,7 +693,7 @@ class MinerState:
         # graph-integrated capture and the hard-opening coordinator are ready.
         self.proof_v3_runtime = None
         self.proof_v3_coordinator = None
-        self.allowed_proof_protocol_versions = (3,)
+        self.allowed_proof_protocol_versions = (1, 3)
 
 
 state = MinerState()
@@ -5206,25 +5206,6 @@ def _proof_v3_gdn_checkpoint_runtime(args):
     )
 
 
-def _proof_v3_vllm_cache_runtime_kwargs(
-    *,
-    prefix_cache_sharing: bool,
-) -> dict[str, object]:
-    """Install proof retention independently from shared-prefix admission.
-
-    Bounded post-nonce checkpoint replay needs the proof scheduler's exact
-    finished-request block lease even when the signed profile disables normal
-    prefix sharing. Only the latter controls vLLM's global prefix-cache lookup.
-    """
-
-    return {
-        "enable_prefix_caching": bool(prefix_cache_sharing),
-        "scheduler_cls": (
-            "verallm.miner.proof_cache_scheduler.ProofCacheScheduler"
-        ),
-    }
-
-
 def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
     """Authenticate and install one explicit economic proof-v3 release."""
 
@@ -5858,11 +5839,11 @@ def startup(args):
         prefix_cache_sharing = bool(
             getattr(args, "_proof_v3_prefix_cache_sharing", False)
         )
-        vllm_kwargs.update(
-            _proof_v3_vllm_cache_runtime_kwargs(
-                prefix_cache_sharing=prefix_cache_sharing,
+        vllm_kwargs["enable_prefix_caching"] = prefix_cache_sharing
+        if prefix_cache_sharing:
+            vllm_kwargs["scheduler_cls"] = (
+                "verallm.miner.proof_cache_scheduler.ProofCacheScheduler"
             )
-        )
     (
         full_execution_trace_capture,
         full_attention_state_capture,
@@ -7308,7 +7289,7 @@ def parse_args():
         "--allowed-proof-protocol-versions",
         default=os.environ.get(
             "VERATHOS_PROOF_PROTOCOL_ALLOWED_VERSIONS",
-            "3",
+            "1,3",
         ),
         help="Comma-separated owner-allowed inference proof versions",
     )

@@ -22,6 +22,12 @@ A proof plugin integrates directly into production [vLLM](https://github.com/vll
 
 The same proof system extends to training. The training prover verifies forward pass, backward pass (gradient GEMM), and optimizer step for full fine-tuning and LoRA (AdamW, SGD, Muon). A training job produces proofs that the correct base model was fine-tuned with the claimed data and optimizer. The protocol is implemented and tested but not yet active on the network.
 
+> **Sleipnir testnet release**: mesh serving currently ships on the
+> `feature/sleipnir` branch (netuid 405). Install with
+> `curl -fsSL https://raw.githubusercontent.com/verathos-ai/verathos/feature/sleipnir/install.sh | bash -s -- --branch feature/sleipnir --mesh-coordinator`
+> or clone with `git clone -b feature/sleipnir`. Mainnet
+> installs keep tracking `main`.
+
 ## What Gets Proven
 
 | Guarantee | How |
@@ -108,13 +114,39 @@ python -m neurons.miner \
 
 `--model-id auto` detects your GPU and picks the optimal model. See the [Setup Guide](docs/setup.md) for wallet creation, EVM funding, model selection, and production deployment with PM2.
 
+### As a GGUF Mesh Operator
+
+Serve large GGUF models across one or many GPU boxes with verified inference. A pool has one coordinator (control plane, no GPU needed) and any number of GPU workers. The vLLM miner path and the mesh path are independent; one machine can run both.
+
+**Coordinator** (creates the pool, prints the worker join token):
+```bash
+curl -fsSL https://verathos.ai/install.sh | bash -s -- --mesh-coordinator
+```
+
+**Each GPU worker** (token comes from the coordinator):
+```bash
+curl -fsSL https://verathos.ai/install.sh | bash -s -- --mesh-worker --token vtpool_...
+```
+
+**Go live on the subnet** (measures context, gates on light + hard proofs, registers on-chain):
+```bash
+verathos mesh deploy <model-id> --endpoint https://YOUR-DRIVER-HOST:9443 ...
+```
+
+`verathos mesh manage` is the interactive operator console; `verathos mesh apikey create` mints keys for the pool's private OpenAI-compatible API. See the [Mesh Quickstart](docs/mesh_quickstart.md) for the walkthrough and the [Mesh Operator Flow](docs/mesh_operator_flow.md) for the full role/command/port reference.
+
+Validate an install with the shipped mesh test subset:
+```bash
+.venv-mesh/bin/pytest tests/
+```
+
 ### As a Validator
 
 No GPU required.
 
 **Quick start:**
 ```bash
-curl -fsSL https://verathos.ai/install.sh | bash -s – --validator   # or: git clone ... && bash scripts/setup_validator.sh
+curl -fsSL https://verathos.ai/install.sh | bash -s -- --validator   # or: git clone ... && bash scripts/setup_validator.sh
 verathos setup validator                                              # interactive setup wizard
 verathos start validator                                              # start validating
 ```
@@ -139,9 +171,11 @@ verallm/        Verified inference – vLLM proof plugin, chain integration, mod
 neurons/        Bittensor subnet – miner, validator, gateway, scoring, credits
 contracts/      Smart contracts (Foundry/Solidity) – UUPS proxies on Bittensor EVM
 plugins/        Framework plugins – LiteLLM, LangChain, elizaOS, OpenClaw
-scripts/        Setup scripts – setup_miner.sh, setup_validator.sh
+scripts/        Setup scripts – setup_miner.sh, setup_validator.sh, setup_mesh.sh, join_pool.sh
+patches/        llama.cpp proof-capture patches + build.sh for the mesh runtime
 examples/       Client examples – OpenAI, streaming, x402
-dist/           Pre-built wheels – zkllm and hot-capacity CUDA kernels
+dist/           Pre-built wheels – zkllm, hot-capacity CUDA kernels, PCS native prebuilts
+tests/          Mesh test subset – validate an install with .venv-mesh/bin/pytest tests/
 docs/           Documentation
 ```
 
@@ -153,6 +187,8 @@ docs/           Documentation
 - **[Quickstart](docs/quickstart.md)** – First API call in 2 minutes
 - **[Setup Guide](docs/setup.md)** – Hardware requirements, miner and validator setup
 - **[User Guide](docs/user_guide.md)** – API keys, deposits, inference, withdrawals
+- **[Mesh Quickstart](docs/mesh_quickstart.md)** – Serve GGUF models across GPU boxes with verified inference
+- **[Mesh Operator Flow](docs/mesh_operator_flow.md)** – Roles, commands, ports, and the deploy pipeline
 - **[Integrations](docs/integrations.md)** – LiteLLM, LangChain, elizaOS, and more
 - **[API Reference](docs/api.md)** – Full HTTP API reference
 - **[Inference Protocol](docs/inference_protocol.md)** – Deep dive into sumcheck-based verification

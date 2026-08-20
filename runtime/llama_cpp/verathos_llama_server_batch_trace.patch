@@ -1,0 +1,83 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a7c4f7b..1fcdab8 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -10,6 +10,69 @@
+ #include "fit.h"
+ #include "llama.h"
+ #include "log.h"
++
++// Verathos proof sidecar extension: per-decode batch composition records.
++// One line per llama_decode batch view while trace capture is enabled, so
++// per-request slot views can be derived from contiguous split_simple ubatch
++// slices. See VERATHOS_LLAMA_BATCH_V1 in verallm/mesh/ggml_proof.py.
++#include <chrono>
++#include <fstream>
++
++static int64_t verathos_server_decode_seq = 0;
++
++static void verathos_server_write_batch_record(
++        llama_context * lctx,
++        const llama_batch & batch_view) {
++    const char * dir = std::getenv("VERATHOS_GGML_TRACE_DIR");
++    if (dir == nullptr || dir[0] == '\0') {
++        return;
++    }
++    const char * enable_file = std::getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file == nullptr || enable_file[0] == '\0') {
++        return;
++    }
++    std::ifstream enable(enable_file, std::ios::binary);
++    if (!enable) {
++        return;
++    }
++    std::string token;
++    std::getline(enable, token);
++    std::string digits;
++    for (char ch : token) {
++        if (ch < '0' || ch > '9' || digits.size() >= 64) {
++            break;
++        }
++        digits.push_back(ch);
++    }
++    const std::string path = std::string(dir) + "/batches" +
++        (digits.empty() ? std::string("") : "-" + digits) + ".vbatch";
++    std::ofstream out(path, std::ios::app);
++    if (!out) {
++        return;
++    }
++    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::system_clock::now().time_since_epoch()).count();
++    out << "VERATHOS_LLAMA_BATCH_V1";
++    out << "\t" << now_ns;
++    out << "\t" << ++verathos_server_decode_seq;
++    out << "\t" << llama_n_ubatch(lctx);
++    out << "\t" << batch_view.n_tokens;
++    out << "\t";
++    for (int32_t j = 0; j < batch_view.n_tokens; ++j) {
++        if (j > 0) {
++            out << ",";
++        }
++        const llama_seq_id seq_id =
++            (batch_view.n_seq_id != nullptr && batch_view.n_seq_id[j] > 0 &&
++             batch_view.seq_id != nullptr && batch_view.seq_id[j] != nullptr)
++            ? batch_view.seq_id[j][0]
++            : 0;
++        out << seq_id << ":" << batch_view.pos[j] << ":"
++            << ((batch_view.logits != nullptr && batch_view.logits[j]) ? 1 : 0);
++    }
++    out << "\n";
++    out.flush();
++}
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "mtmd.h"
+@@ -3196,6 +3259,8 @@ private:
+                 batch.logits   + i,
+             };
+ 
++            verathos_server_write_batch_record(ctx_tgt, batch_view);
++
+             const int ret = llama_decode(ctx_tgt, batch_view);
+ 
+             metrics.on_decoded(slots);

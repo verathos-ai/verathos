@@ -1,0 +1,818 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index a1003b3..8c949e1 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -7,8 +7,20 @@
+ #include "ggml-metal-context.h"
+ #include "ggml-metal-ops.h"
+ 
++#include <chrono>
++#include <cstdlib>
++#include <fstream>
+ #include <mutex>
++#include <sstream>
+ #include <string>
++#include <vector>
++#if defined(_WIN32)
++#include <direct.h>
++#include <io.h>
++#else
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ 
+ #define GGML_METAL_NAME "MTL"
+ #define GGML_METAL_MAX_DEVICES 16
+@@ -181,6 +193,751 @@ static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
+            buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
+ }
+ 
++static int64_t verathos_metal_trace_sequence = 0;
++static int64_t verathos_metal_manifest_sequence = 0;
++static std::string verathos_metal_trace_capture_token;
++static std::vector<int64_t> verathos_metal_selected_manifest_indexes;
++static std::ofstream verathos_metal_manifest_stream;
++static std::string verathos_metal_manifest_path;
++static std::string verathos_metal_manifest_buffer;
++static int64_t verathos_metal_graph_sequence = 0;
++static int64_t verathos_metal_intra_graph_index = 0;
++static int64_t verathos_metal_graph_dim_valid_ops = 0;
++static int64_t verathos_metal_graph_written_rows = 0;
++static int64_t verathos_metal_graph_max_src1_rows = 0;
++static std::vector<std::pair<int64_t, int64_t>> verathos_metal_selected_ops;
++
++static const char * verathos_metal_trace_dir() {
++    return std::getenv("VERATHOS_GGML_TRACE_DIR");
++}
++
++static int64_t verathos_metal_env_i64(const char * name, int64_t fallback) {
++    const char * raw = std::getenv(name);
++    if (raw == nullptr || raw[0] == '\0') {
++        return fallback;
++    }
++    try {
++        return std::stoll(raw);
++    } catch (...) {
++        return fallback;
++    }
++}
++
++static bool verathos_metal_env_bool(const char * name, bool fallback) {
++    const char * raw = std::getenv(name);
++    if (raw == nullptr || raw[0] == '\0') {
++        return fallback;
++    }
++    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' ||
++           raw[0] == 'y' || raw[0] == 'Y';
++}
++
++static int64_t verathos_metal_trace_max_ops() {
++    const char * per_capture = std::getenv("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE");
++    if (per_capture != nullptr && per_capture[0] != '\0') {
++        return verathos_metal_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE", 64);
++    }
++    return verathos_metal_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_TOTAL", 64);
++}
++
++static bool verathos_metal_read_capture_token(const char * path, std::string & token) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in) {
++        return false;
++    }
++    std::ostringstream out;
++    out << in.rdbuf();
++    token = out.str();
++    while (!token.empty() &&
++           (token.back() == '\n' || token.back() == '\r' || token.back() == ' ' || token.back() == '\t')) {
++        token.pop_back();
++    }
++    if (token.empty()) {
++        token = "present";
++    } else if (token.size() > 4095) {
++        token.resize(4095);
++    }
++    return true;
++}
++
++static void verathos_metal_parse_selected_manifest_indexes(const std::string & token) {
++    verathos_metal_selected_manifest_indexes.clear();
++    const std::string marker = "selected=";
++    size_t pos = token.find(marker);
++    if (pos == std::string::npos) {
++        return;
++    }
++    pos += marker.size();
++    while (pos < token.size() && verathos_metal_selected_manifest_indexes.size() < 64) {
++        while (pos < token.size() && (token[pos] == ' ' || token[pos] == '\t' || token[pos] == ',')) {
++            ++pos;
++        }
++        if (pos >= token.size() || token[pos] < '0' || token[pos] > '9') {
++            break;
++        }
++        size_t end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        try {
++            verathos_metal_selected_manifest_indexes.push_back(std::stoll(token.substr(pos, end - pos)));
++        } catch (...) {
++            break;
++        }
++        pos = end;
++    }
++}
++
++static void verathos_metal_parse_selected_ops(const std::string & token) {
++    verathos_metal_selected_ops.clear();
++    const std::string marker = "selected_v3=";
++    size_t pos = token.find(marker);
++    if (pos == std::string::npos) {
++        return;
++    }
++    pos += marker.size();
++    while (pos < token.size() && verathos_metal_selected_ops.size() < 64) {
++        while (pos < token.size() && (token[pos] == ' ' || token[pos] == '\t' || token[pos] == ',')) {
++            ++pos;
++        }
++        if (pos >= token.size() || token[pos] < '0' || token[pos] > '9') {
++            break;
++        }
++        size_t end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        if (end >= token.size() || token[end] != ':') {
++            break;
++        }
++        int64_t graph_value = 0;
++        int64_t intra_value = 0;
++        try {
++            graph_value = std::stoll(token.substr(pos, end - pos));
++        } catch (...) {
++            break;
++        }
++        pos = end + 1;
++        end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        if (end == pos) {
++            break;
++        }
++        try {
++            intra_value = std::stoll(token.substr(pos, end - pos));
++        } catch (...) {
++            break;
++        }
++        verathos_metal_selected_ops.emplace_back(graph_value, intra_value);
++        pos = end;
++    }
++}
++
++static bool verathos_metal_should_dump_selected_op(int64_t graph_sequence, int64_t intra_index) {
++    for (const auto & item : verathos_metal_selected_ops) {
++        if (item.first == graph_sequence && item.second == intra_index) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool verathos_metal_should_dump_manifest_index(int64_t manifest_index) {
++    if (!verathos_metal_selected_manifest_indexes.empty()) {
++        for (int64_t selected : verathos_metal_selected_manifest_indexes) {
++            if (selected == manifest_index) {
++                return true;
++            }
++        }
++        return false;
++    }
++    const int64_t max_total = verathos_metal_trace_max_ops();
++    return max_total < 0 || verathos_metal_trace_sequence < max_total;
++}
++
++static void verathos_metal_flush_manifest_buffer() {
++    if (!verathos_metal_manifest_buffer.empty() && verathos_metal_manifest_stream.is_open()) {
++        verathos_metal_manifest_stream << verathos_metal_manifest_buffer;
++        verathos_metal_manifest_buffer.clear();
++    }
++}
++
++static void verathos_metal_refresh_capture_token(const char * enable_file) {
++    std::string token;
++    if (!verathos_metal_read_capture_token(enable_file, token)) {
++        token = "present";
++    }
++    if (token != verathos_metal_trace_capture_token) {
++        verathos_metal_trace_capture_token = token;
++        verathos_metal_trace_sequence = 0;
++        verathos_metal_manifest_sequence = 0;
++        verathos_metal_graph_sequence = 0;
++        verathos_metal_intra_graph_index = 0;
++        verathos_metal_graph_dim_valid_ops = 0;
++        verathos_metal_graph_written_rows = 0;
++        verathos_metal_graph_max_src1_rows = 0;
++        verathos_metal_parse_selected_manifest_indexes(token);
++        verathos_metal_parse_selected_ops(token);
++        if (verathos_metal_manifest_stream.is_open()) {
++            verathos_metal_flush_manifest_buffer();
++            verathos_metal_manifest_stream.flush();
++            verathos_metal_manifest_stream.close();
++        }
++        verathos_metal_manifest_buffer.clear();
++        verathos_metal_manifest_path.clear();
++    }
++}
++
++static bool verathos_metal_trace_enabled() {
++    const char * dir = verathos_metal_trace_dir();
++    if (dir == nullptr || dir[0] == '\0') {
++        return false;
++    }
++    const char * enable_file = std::getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file != nullptr && enable_file[0] != '\0') {
++#if defined(_WIN32)
++        if (_access(enable_file, 0) != 0) {
++#else
++        if (access(enable_file, F_OK) != 0) {
++#endif
++            return false;
++        }
++        verathos_metal_refresh_capture_token(enable_file);
++    }
++    return true;
++}
++
++static int64_t verathos_metal_unix_ns() {
++    using namespace std::chrono;
++    return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
++}
++
++static void verathos_metal_trace_mkdir(const char * dir) {
++    if (dir == nullptr || dir[0] == '\0') {
++        return;
++    }
++#if defined(_WIN32)
++    _mkdir(dir);
++#else
++    mkdir(dir, 0755);
++#endif
++}
++
++static std::string verathos_metal_json_escape(const char * raw) {
++    std::ostringstream out;
++    for (const char * p = raw ? raw : ""; *p; ++p) {
++        switch (*p) {
++            case '\\': out << "\\\\"; break;
++            case '"': out << "\\\""; break;
++            case '\n': out << "\\n"; break;
++            case '\r': out << "\\r"; break;
++            case '\t': out << "\\t"; break;
++            default: out << *p; break;
++        }
++    }
++    return out.str();
++}
++
++static std::string verathos_metal_hex_escape(const char * raw) {
++    static const char * hex = "0123456789abcdef";
++    std::string out;
++    for (const unsigned char * p = reinterpret_cast<const unsigned char *>(raw ? raw : ""); *p; ++p) {
++        out.push_back(hex[*p >> 4]);
++        out.push_back(hex[*p & 0x0f]);
++    }
++    return out;
++}
++
++static std::string verathos_metal_compact_field(const char * raw) {
++    std::string out(raw ? raw : "");
++    for (char & ch : out) {
++        if (ch == '\t' || ch == '\n' || ch == '\r') {
++            ch = ' ';
++        }
++    }
++    return out;
++}
++
++static bool verathos_metal_manifest_v3() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && std::string(raw) == "compact-raw-v3";
++}
++
++static bool verathos_metal_manifest_compact() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "compact" ||
++        std::string(raw) == "compact-raw" ||
++        std::string(raw) == "compact-raw-v2" ||
++        std::string(raw) == "compact-raw-v3" ||
++        std::string(raw) == "raw" ||
++        std::string(raw) == "decode" ||
++        std::string(raw) == "decode-only");
++}
++
++static bool verathos_metal_manifest_any() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && raw[0] != '\0' && std::string(raw) != "none";
++}
++
++// Candidate-profile fast path (same contract as the CUDA hook's
++// capture_work_pending gate): once the per-window witness budget is spent,
++// no replay ops are selected, and no manifest rows are being written, the
++// post-compute hook has nothing left to do — skip the full-pipeline
++// ggml_metal_synchronize and node scan, which otherwise cost per-token
++// time for the whole generation.
++static bool verathos_metal_capture_work_pending() {
++    if (!verathos_metal_selected_manifest_indexes.empty()) {
++        return true;
++    }
++    if (!verathos_metal_selected_ops.empty()) {
++        return true;
++    }
++    if (verathos_metal_manifest_any()) {
++        return true;
++    }
++    const int64_t max_total = verathos_metal_trace_max_ops();
++    return max_total < 0 || verathos_metal_trace_sequence < max_total;
++}
++
++static bool verathos_metal_manifest_compact_raw() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "compact-raw" ||
++        std::string(raw) == "compact-raw-v2" ||
++        std::string(raw) == "compact-raw-v3" ||
++        std::string(raw) == "raw");
++}
++
++static bool verathos_metal_manifest_disabled() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "none" ||
++        std::string(raw) == "off" ||
++        std::string(raw) == "0");
++}
++
++static bool verathos_metal_manifest_decode_only() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "decode" ||
++        std::string(raw) == "decode-only");
++}
++
++static std::string verathos_metal_filename(const std::string & path) {
++    const size_t slash = path.find_last_of("/\\");
++    return slash == std::string::npos ? path : path.substr(slash + 1);
++}
++
++static bool verathos_metal_ends_with(const std::string & value, const std::string & suffix) {
++    return value.size() >= suffix.size() &&
++        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
++}
++
++static bool verathos_metal_is_decode_candidate(
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * dst) {
++    const std::string tensor_name = src0 != nullptr ? src0->name : "";
++    const std::string src1_name = src1 != nullptr ? src1->name : "";
++    const std::string dst_name = dst != nullptr ? dst->name : "";
++    if (tensor_name == "output.weight" ||
++        tensor_name == "lm_head.weight" ||
++        verathos_metal_ends_with(tensor_name, ".lm_head.weight")) {
++        return true;
++    }
++    if (tensor_name.find("attn_output") != std::string::npos) {
++        return false;
++    }
++    return dst_name == "logits" ||
++        dst_name == "result_output" ||
++        (dst_name.find("result_output") != std::string::npos &&
++         (src1_name.find("result_norm") != std::string::npos ||
++          src1_name.find("final") != std::string::npos));
++}
++
++static std::string verathos_metal_manifest_suffix() {
++    std::string suffix;
++    for (char ch : verathos_metal_trace_capture_token) {
++        if (ch < '0' || ch > '9') {
++            break;
++        }
++        if (suffix.size() >= 64) {
++            break;
++        }
++        suffix.push_back(ch);
++    }
++    return suffix.empty() ? "" : "-" + suffix;
++}
++
++static bool verathos_metal_write_f32(const std::string & path, const std::vector<float> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size() * sizeof(float));
++    return bool(out);
++}
++
++static bool verathos_metal_write_raw(const std::string & path, const std::vector<uint8_t> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size());
++    return bool(out);
++}
++
++static std::ostream * verathos_metal_manifest_for_capture(const char * dir) {
++    if (verathos_metal_manifest_disabled()) {
++        return nullptr;
++    }
++    const std::string path = std::string(dir) + "/manifest" + verathos_metal_manifest_suffix() +
++        (verathos_metal_manifest_compact() ? ".vmanifest" : ".jsonl");
++    if (verathos_metal_manifest_path != path || !verathos_metal_manifest_stream.is_open()) {
++        if (verathos_metal_manifest_stream.is_open()) {
++            verathos_metal_flush_manifest_buffer();
++            verathos_metal_manifest_stream.flush();
++            verathos_metal_manifest_stream.close();
++        }
++        verathos_metal_manifest_buffer.clear();
++        verathos_metal_manifest_path = path;
++        verathos_metal_manifest_stream.open(path, std::ios::app);
++    }
++    if (!verathos_metal_manifest_stream) {
++        return nullptr;
++    }
++    return &verathos_metal_manifest_stream;
++}
++
++static void verathos_metal_write_manifest_entry(
++        const char * dir,
++        int64_t now_ns,
++        int64_t manifest_index,
++        const char * device_name,
++        bool proof_eligible,
++        int64_t graph_sequence,
++        int64_t intra_graph_index,
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * dst) {
++    if (verathos_metal_manifest_decode_only() && !verathos_metal_is_decode_candidate(src0, src1, dst)) {
++        return;
++    }
++    std::ostream * manifest_stream = verathos_metal_manifest_for_capture(dir);
++    if (manifest_stream == nullptr) {
++        return;
++    }
++    std::ostream & manifest = *manifest_stream;
++    if (verathos_metal_manifest_compact()) {
++        const bool raw_compact = verathos_metal_manifest_compact_raw();
++        const char * manifest_format = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++        const bool raw_compact_v3 = verathos_metal_manifest_v3();
++        const bool raw_compact_v2 = raw_compact_v3 ||
++            (manifest_format != nullptr && std::string(manifest_format) == "compact-raw-v2");
++        const std::string graph_id = std::string("metal-mul-mat-") + std::to_string(manifest_index);
++        std::string line;
++        line.reserve(384);
++        auto append_field = [&](const std::string & value) {
++            line.push_back('\t');
++            line += value;
++        };
++        auto append_shape = [&](const ggml_tensor * tensor) {
++            line.push_back('\t');
++            line += std::to_string(tensor->ne[0]);
++            line.push_back(',');
++            line += std::to_string(tensor->ne[1]);
++            line.push_back(',');
++            line += std::to_string(tensor->ne[2]);
++            line.push_back(',');
++            line += std::to_string(tensor->ne[3]);
++        };
++        if (raw_compact_v2) {
++            line += raw_compact_v3
++                ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V3"
++                : "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V2";
++            append_field(std::to_string(now_ns));
++            append_field(std::to_string(manifest_index));
++            append_field(verathos_metal_compact_field(src0->name));
++            append_field(verathos_metal_compact_field(src1->name));
++            append_field(verathos_metal_compact_field(dst->name));
++            append_shape(src0);
++            append_shape(src1);
++            append_shape(dst);
++            append_field(ggml_type_name((ggml_type) src0->type));
++            append_field(ggml_type_name((ggml_type) src1->type));
++            append_field(ggml_type_name((ggml_type) dst->type));
++            append_field("llama_cpp_metal");
++            append_field(verathos_metal_compact_field(device_name));
++            append_field(proof_eligible ? "1" : "0");
++            if (raw_compact_v3) {
++                append_field(std::to_string(graph_sequence));
++                append_field(std::to_string(intra_graph_index));
++            }
++            line.push_back('\n');
++            verathos_metal_manifest_buffer += line;
++            return;
++        }
++        line += (raw_compact ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V1" : "VERATHOS_GGML_OP_MANIFEST_COMPACT_V1");
++        append_field(std::to_string(now_ns));
++        append_field(std::to_string(manifest_index));
++        append_field(raw_compact ? verathos_metal_compact_field(graph_id.c_str()) : verathos_metal_hex_escape(graph_id.c_str()));
++        append_field(std::to_string(manifest_index));
++        append_field(raw_compact ? verathos_metal_compact_field(src0->name) : verathos_metal_hex_escape(src0->name));
++        append_field(raw_compact ? verathos_metal_compact_field(src0->name) : verathos_metal_hex_escape(src0->name));
++        append_field(raw_compact ? verathos_metal_compact_field(src1->name) : verathos_metal_hex_escape(src1->name));
++        append_field(raw_compact ? verathos_metal_compact_field(dst->name) : verathos_metal_hex_escape(dst->name));
++        append_shape(src0);
++        append_shape(src1);
++        append_shape(dst);
++        append_field(ggml_type_name((ggml_type) src0->type));
++        append_field(ggml_type_name((ggml_type) src1->type));
++        append_field(ggml_type_name((ggml_type) dst->type));
++        append_field(raw_compact ? verathos_metal_compact_field("llama_cpp_metal") : verathos_metal_hex_escape("llama_cpp_metal"));
++        append_field(raw_compact ? verathos_metal_compact_field(device_name) : verathos_metal_hex_escape(device_name));
++        append_field(proof_eligible ? "1" : "0");
++        line.push_back('\n');
++        verathos_metal_manifest_buffer += line;
++        return;
++    }
++    manifest << "{\"version\":1";
++    manifest << ",\"created_unix_ns\":" << now_ns;
++    manifest << ",\"manifest_index\":" << manifest_index;
++    manifest << ",\"graph_id\":\"metal-mul-mat-" << manifest_index << "\"";
++    manifest << ",\"op_index\":" << manifest_index;
++    manifest << ",\"op_type\":\"GGML_OP_MUL_MAT\"";
++    manifest << ",\"tensor_name\":\"" << verathos_metal_json_escape(src0->name) << "\"";
++    manifest << ",\"src0_name\":\"" << verathos_metal_json_escape(src0->name) << "\"";
++    manifest << ",\"src1_name\":\"" << verathos_metal_json_escape(src1->name) << "\"";
++    manifest << ",\"dst_name\":\"" << verathos_metal_json_escape(dst->name) << "\"";
++    manifest << ",\"src0_shape\":[" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "]";
++    manifest << ",\"src1_shape\":[" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3] << "]";
++    manifest << ",\"dst_shape\":[" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << "]";
++    manifest << ",\"source_types\":{\"src0\":\"" << ggml_type_name((ggml_type) src0->type)
++             << "\",\"src1\":\"" << ggml_type_name((ggml_type) src1->type)
++             << "\",\"dst\":\"" << ggml_type_name((ggml_type) dst->type) << "\"}";
++    manifest << ",\"backend\":\"llama_cpp_metal\"";
++    manifest << ",\"device\":\"" << verathos_metal_json_escape(device_name) << "\"";
++    manifest << ",\"proof_eligible\":" << (proof_eligible ? "true" : "false") << "}\n";
++}
++
++static bool verathos_metal_tensor_raw_to_host(
++        ggml_metal_t ctx,
++        const ggml_tensor * tensor,
++        std::vector<uint8_t> & raw) {
++    if (ctx == nullptr || tensor == nullptr || tensor->data == nullptr || tensor->buffer == nullptr) {
++        return false;
++    }
++    if (!ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    const size_t nbytes = ggml_nbytes(tensor);
++    if (nbytes == 0) {
++        return false;
++    }
++    raw.resize(nbytes);
++    if (ggml_backend_buffer_is_metal(tensor->buffer)) {
++        ggml_metal_get_tensor_async(ctx, tensor, raw.data(), 0, nbytes);
++        ggml_metal_synchronize(ctx);
++        return true;
++    }
++    if (ggml_backend_buffer_is_host(tensor->buffer)) {
++        memcpy(raw.data(), tensor->data, nbytes);
++        return true;
++    }
++    return false;
++}
++
++static bool verathos_metal_raw_to_f32(
++        const ggml_tensor * tensor,
++        const std::vector<uint8_t> & raw,
++        std::vector<float> & out) {
++    const int64_t n = ggml_nelements(tensor);
++    if (n <= 0) {
++        return false;
++    }
++    out.resize(n);
++    if (tensor->type == GGML_TYPE_F32) {
++        if (raw.size() != sizeof(float) * (size_t) n) {
++            return false;
++        }
++        memcpy(out.data(), raw.data(), raw.size());
++        return true;
++    }
++    const ggml_type_traits * traits = ggml_get_type_traits((ggml_type) tensor->type);
++    if (traits == nullptr || traits->to_float == nullptr) {
++        return false;
++    }
++    traits->to_float(raw.data(), out.data(), n);
++    return true;
++}
++
++static bool verathos_metal_is_stable_after_graph(
++        const ggml_cgraph * cgraph,
++        int node_idx,
++        const ggml_tensor * dst) {
++    if (dst == nullptr) {
++        return false;
++    }
++    if ((dst->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
++        return true;
++    }
++    if (cgraph == nullptr || node_idx < 0 || node_idx >= cgraph->n_nodes) {
++        return false;
++    }
++    return ggml_node_get_use_count(cgraph, node_idx) == 0;
++}
++
++static void verathos_metal_try_dump_mul_mat_trace(
++        ggml_metal_t ctx,
++        const ggml_cgraph * cgraph,
++        int node_idx,
++        const ggml_tensor * dst) {
++    if (!verathos_metal_trace_enabled()) {
++        return;
++    }
++    const char * dir = verathos_metal_trace_dir();
++    if (dir == nullptr || dir[0] == '\0' || ctx == nullptr || dst == nullptr || dst->op != GGML_OP_MUL_MAT) {
++        return;
++    }
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    if (src0 == nullptr || src1 == nullptr) {
++        return;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        dst->ne[2]  != 1 || dst->ne[3]  != 1) {
++        return;
++    }
++    if (src0->ne[0] != src1->ne[0] ||
++        dst->ne[0]  != src0->ne[1] ||
++        dst->ne[1]  != src1->ne[1]) {
++        return;
++    }
++
++    // Intra-graph index counts every dim-valid MUL_MAT regardless of size or
++    // stability eligibility, so it stays stable across batch row counts.
++    const int64_t intra_graph_index = verathos_metal_intra_graph_index++;
++    verathos_metal_graph_dim_valid_ops++;
++    if (src1->ne[1] > verathos_metal_graph_max_src1_rows) {
++        verathos_metal_graph_max_src1_rows = src1->ne[1];
++    }
++
++    verathos_metal_trace_mkdir(dir);
++    const int64_t now_ns = verathos_metal_unix_ns();
++    const int64_t manifest_index = ++verathos_metal_manifest_sequence;
++    const int64_t total_elems = ggml_nelements(src0) + ggml_nelements(src1) + ggml_nelements(dst);
++    const int64_t max_elems = verathos_metal_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    const bool graph_output = verathos_metal_is_stable_after_graph(cgraph, node_idx, dst);
++    const bool proof_eligible = graph_output && (
++        verathos_metal_is_decode_candidate(src0, src1, dst) ||
++        !(max_elems > 0 && total_elems > max_elems));
++    if (!proof_eligible) {
++        return;
++    }
++    verathos_metal_write_manifest_entry(
++        dir, now_ns, manifest_index, ggml_metal_get_name(ctx), proof_eligible,
++        verathos_metal_graph_sequence, intra_graph_index, src0, src1, dst);
++    verathos_metal_graph_written_rows++;
++    const bool selected_op_dump = !verathos_metal_selected_ops.empty() &&
++        verathos_metal_should_dump_selected_op(verathos_metal_graph_sequence, intra_graph_index);
++    if (!selected_op_dump && !verathos_metal_selected_ops.empty()) {
++        return;
++    }
++    if (!selected_op_dump && !verathos_metal_should_dump_manifest_index(manifest_index)) {
++        return;
++    }
++    const int64_t sequence = ++verathos_metal_trace_sequence;
++
++    const bool skip_src0_dump = verathos_metal_env_bool("VERATHOS_GGML_TRACE_SKIP_SRC0_DUMP", false);
++    std::vector<uint8_t> src0_raw;
++    std::vector<uint8_t> src1_raw;
++    std::vector<uint8_t> dst_raw;
++    if ((!skip_src0_dump && !verathos_metal_tensor_raw_to_host(ctx, src0, src0_raw)) ||
++        !verathos_metal_tensor_raw_to_host(ctx, src1, src1_raw) ||
++        !verathos_metal_tensor_raw_to_host(ctx, dst, dst_raw)) {
++        return;
++    }
++
++    std::vector<float> src0_f32;
++    std::vector<float> src1_f32;
++    std::vector<float> dst_f32;
++    if ((!skip_src0_dump && !verathos_metal_raw_to_f32(src0, src0_raw, src0_f32)) ||
++        !verathos_metal_raw_to_f32(src1, src1_raw, src1_f32) ||
++        !verathos_metal_raw_to_f32(dst, dst_raw, dst_f32)) {
++        return;
++    }
++
++    std::ostringstream prefix;
++    prefix << dir << "/trace-" << now_ns << "-metal-op" << manifest_index;
++    const std::string src0_path = prefix.str() + "-src0.f32";
++    const std::string src0_raw_path = prefix.str() + "-src0.raw";
++    const std::string src1_path = prefix.str() + "-src1.f32";
++    const std::string dst_path  = prefix.str() + "-dst.f32";
++    const std::string json_path = prefix.str() + ".json";
++    if ((!skip_src0_dump && !verathos_metal_write_f32(src0_path, src0_f32)) ||
++        (!skip_src0_dump && !verathos_metal_write_raw(src0_raw_path, src0_raw)) ||
++        !verathos_metal_write_f32(src1_path, src1_f32) ||
++        !verathos_metal_write_f32(dst_path, dst_f32)) {
++        return;
++    }
++
++    std::ofstream meta(json_path);
++    if (!meta) {
++        return;
++    }
++    meta << "{\n";
++    meta << "  \"version\": 1,\n";
++    meta << "  \"created_unix_ns\": " << now_ns << ",\n";
++    meta << "  \"manifest_index\": " << manifest_index << ",\n";
++    meta << "  \"graph_seq\": " << verathos_metal_graph_sequence << ",\n";
++    meta << "  \"intra_graph_index\": " << intra_graph_index << ",\n";
++    meta << "  \"graph_id\": \"metal-mul-mat-" << manifest_index << "\",\n";
++    meta << "  \"op_index\": " << manifest_index << ",\n";
++    meta << "  \"op_type\": \"GGML_OP_MUL_MAT\",\n";
++    meta << "  \"tensor_name\": \"" << verathos_metal_json_escape(src0->name) << "\",\n";
++    meta << "  \"src0_name\": \"" << verathos_metal_json_escape(src0->name) << "\",\n";
++    meta << "  \"src1_name\": \"" << verathos_metal_json_escape(src1->name) << "\",\n";
++    meta << "  \"dst_name\": \"" << verathos_metal_json_escape(dst->name) << "\",\n";
++    meta << "  \"src0_shape\": [" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "],\n";
++    meta << "  \"src1_shape\": [" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3] << "],\n";
++    meta << "  \"dst_shape\": [" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << "],\n";
++    if (!skip_src0_dump) {
++        meta << "  \"src0_f32\": \"" << verathos_metal_filename(src0_path) << "\",\n";
++        meta << "  \"src0_raw\": \"" << verathos_metal_filename(src0_raw_path) << "\",\n";
++    }
++    meta << "  \"src0_raw_type\": \"" << ggml_type_name((ggml_type) src0->type) << "\",\n";
++    meta << "  \"src1_f32\": \"" << verathos_metal_filename(src1_path) << "\",\n";
++    meta << "  \"dst_f32\": \"" << verathos_metal_filename(dst_path) << "\",\n";
++    meta << "  \"source_types\": {\"src0\": \"" << ggml_type_name((ggml_type) src0->type)
++         << "\", \"src1\": \"" << ggml_type_name((ggml_type) src1->type)
++         << "\", \"dst\": \"" << ggml_type_name((ggml_type) dst->type) << "\"},\n";
++    meta << "  \"backend\": \"llama_cpp_metal\",\n";
++    meta << "  \"device\": \"" << verathos_metal_json_escape(ggml_metal_get_name(ctx)) << "\"\n";
++    meta << "}\n";
++}
++
++static void verathos_metal_write_graph_marker(const char * device_name) {
++    if (!verathos_metal_manifest_v3() || verathos_metal_graph_dim_valid_ops <= 0) {
++        return;
++    }
++    const char * dir = verathos_metal_trace_dir();
++    if (dir == nullptr || dir[0] == '\0') {
++        return;
++    }
++    if (verathos_metal_manifest_for_capture(dir) == nullptr) {
++        return;
++    }
++    std::string line = "VERATHOS_GGML_GRAPH_V1";
++    line += "\t" + std::to_string(verathos_metal_unix_ns());
++    line += "\t" + std::to_string(verathos_metal_graph_sequence);
++    line += "\t" + std::to_string(verathos_metal_graph_dim_valid_ops);
++    line += "\t" + std::to_string(verathos_metal_graph_written_rows);
++    line += "\t" + std::to_string(verathos_metal_graph_max_src1_rows);
++    line += "\tllama_cpp_metal\t";
++    line += device_name == nullptr ? "Metal" : device_name;
++    line.push_back('\n');
++    verathos_metal_manifest_buffer += line;
++}
++
++static void verathos_metal_try_dump_graph_trace(ggml_metal_t ctx, const ggml_cgraph * cgraph) {
++    if (!verathos_metal_trace_enabled() || ctx == nullptr || cgraph == nullptr) {
++        return;
++    }
++    if (!verathos_metal_capture_work_pending()) {
++        return;
++    }
++    verathos_metal_graph_sequence++;
++    verathos_metal_intra_graph_index = 0;
++    verathos_metal_graph_dim_valid_ops = 0;
++    verathos_metal_graph_written_rows = 0;
++    verathos_metal_graph_max_src1_rows = 0;
++    ggml_metal_synchronize(ctx);
++    for (int i = 0; i < cgraph->n_nodes && verathos_metal_trace_enabled(); ++i) {
++        verathos_metal_try_dump_mul_mat_trace(ctx, cgraph, i, cgraph->nodes[i]);
++    }
++    verathos_metal_write_graph_marker(ggml_metal_get_name(ctx));
++    verathos_metal_flush_manifest_buffer();
++    if (verathos_metal_manifest_stream.is_open()) {
++        verathos_metal_manifest_stream.flush();
++    }
++}
++
+ //
+ // buffer types
+ //
+@@ -534,7 +1291,11 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
+ static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_metal_t ctx = (ggml_metal_t)backend->context;
+ 
+-    return ggml_metal_graph_compute(ctx, cgraph);
++    enum ggml_status status = ggml_metal_graph_compute(ctx, cgraph);
++    if (status == GGML_STATUS_SUCCESS) {
++        verathos_metal_try_dump_graph_trace(ctx, cgraph);
++    }
++    return status;
+ }
+ 
+ static void ggml_backend_metal_event_record(ggml_backend_t backend, ggml_backend_event_t event) {

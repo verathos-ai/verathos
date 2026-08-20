@@ -76,6 +76,14 @@ _PUBLIC_GROUP_PREFIXES = (
     "ip_model:",
     "ip24_model:",
     "regdom_model:",
+    # Mesh roster host hints. A mesh slot's chain endpoint names ONE host,
+    # but its GPUs live on every roster worker's host; these tokens let
+    # cohort selection stress co-located mesh workers together. The bare
+    # ip24:/regdom: forms are ALSO emitted from roster hints so a mesh
+    # worker sharing a /24 with a vLLM endpoint collides into the same
+    # group despite the different runtime.
+    "mesh_ip24:",
+    "mesh_regdom:",
 )
 
 
@@ -143,6 +151,22 @@ DEFAULT_GPU_CLASSES: tuple[CapacityGpuClass, ...] = (
         32,
         passes=337,
         capacity_passes=337,
+        capacity_rounds=8,
+        calibrated=True,
+    ),
+    CapacityGpuClass(
+        # Calibrated from a live 4x concurrent audit window (model
+        # resident, drained): 311 passes took 31.4-33.3s
+        # per GPU = 101-107ms/pass. Single-GPU pace is 63.7ms/pass; this
+        # PCIe-host class drifts ~1.6x under honest 4-way simultaneous
+        # proving (unlike SXM A100 topology evidence), so the row encodes
+        # the concurrent pace: 20.0s hot target / ~105ms = 190 passes.
+        # vram_gb=96 covers the mesh roster reading (95) and the legacy 98
+        # within the +/-2 match tolerance.
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        96,
+        passes=190,
+        capacity_passes=190,
         capacity_rounds=8,
         calibrated=True,
     ),
@@ -884,7 +908,38 @@ def registered_domain_from_host(host: str) -> str:
     return suffix2
 
 
-def capacity_slot_group_keys(slot: CapacitySlot) -> tuple[str, ...]:
+def mesh_roster_group_tokens(roster: Mapping[str, Any] | None) -> set[str]:
+    """Public grouping tokens from a mesh capacity roster's host hints.
+
+    Pure and deterministic from the roster document alone: both the
+    selected miner (self-deriving its own selection) and the validator
+    (scheduling the cohort) must compute the identical token set or their
+    selections diverge.  Emits both the mesh-scoped token and the bare
+    ``ip24:``/``regdom:`` form so mesh workers co-located with vLLM
+    endpoints land in the same stress group across runtimes.
+    """
+
+    tokens: set[str] = set()
+    if not isinstance(roster, Mapping):
+        return tokens
+    for row in roster.get("workers") or []:
+        if not isinstance(row, Mapping):
+            continue
+        ip24 = _group_token_value(str(row.get("host_ip24", "") or ""))
+        regdom = _group_token_value(str(row.get("host_regdom", "") or ""))
+        if ip24:
+            tokens.add(f"mesh_ip24:{ip24}")
+            tokens.add(f"ip24:{ip24}")
+        if regdom:
+            tokens.add(f"mesh_regdom:{regdom}")
+            tokens.add(f"regdom:{regdom}")
+    return tokens
+
+
+def capacity_slot_group_keys(
+    slot: CapacitySlot,
+    roster: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
     tokens = {
         token.strip()
         for token in str(slot.group_key or "").split("|")
@@ -897,6 +952,10 @@ def capacity_slot_group_keys(slot: CapacitySlot) -> tuple[str, ...]:
             model_id=slot.model_id,
         )
     )
+    # Roster determinism contract: callers must only pass a roster whose
+    # roster_epoch is at most current_epoch - 1, so both sides of the
+    # non-interactive protocol group on the same frozen document.
+    tokens.update(mesh_roster_group_tokens(roster))
     return tuple(sorted(tokens))
 
 
@@ -933,6 +992,7 @@ def capacity_audit_slot_selected(
     slot: CapacitySlot,
     audit_seed_hex: str,
     cfg: CapacityAuditRuntimeConfig,
+    roster: Mapping[str, Any] | None = None,
 ) -> bool:
     """Return whether one endpoint slot is selected without global state."""
     target = _selection_probability(cfg)
@@ -943,7 +1003,7 @@ def capacity_audit_slot_selected(
     if _selection_hit(audit_seed_hex, "base", slot_id(slot), base_p):
         return True
 
-    keys = capacity_slot_group_keys(slot)
+    keys = capacity_slot_group_keys(slot, roster)
     if not keys or group_fraction <= 0.0:
         return False
     per_key_p = min(1.0, target * group_fraction)
@@ -957,17 +1017,25 @@ def select_capacity_audit_slots(
     slots: Iterable[CapacitySlot],
     audit_seed_hex: str,
     cfg: CapacityAuditRuntimeConfig,
+    rosters: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[CapacitySlot]:
     """Select slots by per-slot public hash predicates.
 
     The selection is deterministic from the public seed plus each endpoint's
     chain-advertised metadata. It intentionally does not require miners to know
     the global miner set or exact cohort budget.
+
+    ``rosters`` maps ``slot_id`` to a mesh capacity roster whose group tokens
+    join the selection domain. Same determinism contract as
+    ``capacity_slot_group_keys``: only pass rosters with
+    ``roster_epoch <= current_epoch - 1`` so the mesh worker's self-selection
+    over its own frozen roster matches the validator's.
     """
     unique = {slot_id(slot): slot for slot in slots}
+    roster_map = rosters or {}
     selected = [
-        slot for slot in unique.values()
-        if capacity_audit_slot_selected(slot, audit_seed_hex, cfg)
+        slot for sid, slot in unique.items()
+        if capacity_audit_slot_selected(slot, audit_seed_hex, cfg, roster_map.get(sid))
     ]
     return sorted(selected, key=lambda s: (s.address_lower, s.model_index, s.endpoint))
 

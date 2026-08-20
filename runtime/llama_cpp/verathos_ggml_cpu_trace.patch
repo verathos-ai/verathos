@@ -1,0 +1,807 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index af7827a..412874b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -34,6 +34,13 @@
+ #include <limits.h>
+ #include <stdarg.h>
+ #include <signal.h>
++#if defined(_WIN32)
++#include <direct.h>
++#include <io.h>
++#else
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ #if defined(__gnu_linux__)
+ #include <syscall.h>
+ #endif
+@@ -1152,6 +1159,747 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+
+ // ggml_compute_forward_mul_mat
+
++static int64_t verathos_cpu_trace_sequence = 0;
++static int64_t verathos_cpu_manifest_sequence = 0;
++static char verathos_cpu_trace_capture_token[4096] = {0};
++static int64_t verathos_cpu_selected_manifest_indexes[64] = {0};
++static int verathos_cpu_selected_manifest_count = 0;
++static int64_t verathos_cpu_graph_sequence = 0;
++static int64_t verathos_cpu_intra_graph_index = 0;
++static int64_t verathos_cpu_graph_dim_valid_ops = 0;
++static int64_t verathos_cpu_graph_written_rows = 0;
++static int64_t verathos_cpu_graph_max_src1_rows = 0;
++static int64_t verathos_cpu_selected_ops_graph[64] = {0};
++static int64_t verathos_cpu_selected_ops_intra[64] = {0};
++static int verathos_cpu_selected_ops_count = 0;
++static FILE * verathos_cpu_manifest_file = NULL;
++static char verathos_cpu_manifest_path[8192] = {0};
++
++static const char * verathos_cpu_trace_dir(void) {
++    return getenv("VERATHOS_GGML_TRACE_DIR");
++}
++
++static int64_t verathos_cpu_env_i64(const char * name, int64_t fallback) {
++    const char * raw = getenv(name);
++    if (raw == NULL || raw[0] == '\0') {
++        return fallback;
++    }
++    char * end = NULL;
++    const long long parsed = strtoll(raw, &end, 10);
++    if (end == raw) {
++        return fallback;
++    }
++    return (int64_t) parsed;
++}
++
++static bool verathos_cpu_env_bool(const char * name, bool fallback) {
++    const char * raw = getenv(name);
++    if (raw == NULL || raw[0] == '\0') {
++        return fallback;
++    }
++    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' ||
++           raw[0] == 'y' || raw[0] == 'Y';
++}
++
++static int64_t verathos_cpu_trace_max_ops(void) {
++    const char * per_capture = getenv("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE");
++    if (per_capture != NULL && per_capture[0] != '\0') {
++        return verathos_cpu_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE", 64);
++    }
++    return verathos_cpu_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_TOTAL", 64);
++}
++
++static bool verathos_cpu_read_capture_token(const char * path, char * out, size_t out_size) {
++    if (out == NULL || out_size == 0) {
++        return false;
++    }
++    out[0] = '\0';
++    FILE * file = fopen(path, "rb");
++    if (file == NULL) {
++        return false;
++    }
++    size_t n = fread(out, 1, out_size - 1, file);
++    fclose(file);
++    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\t')) {
++        n--;
++    }
++    out[n] = '\0';
++    if (n == 0) {
++        snprintf(out, out_size, "present");
++    }
++    return true;
++}
++
++static void verathos_cpu_parse_selected_manifest_indexes(const char * token) {
++    verathos_cpu_selected_manifest_count = 0;
++    if (token == NULL) {
++        return;
++    }
++    const char * selected = strstr(token, "selected=");
++    if (selected == NULL) {
++        return;
++    }
++    selected += 9;
++    while (*selected != '\0' && verathos_cpu_selected_manifest_count < 64) {
++        while (*selected == ' ' || *selected == '\t' || *selected == ',') {
++            selected++;
++        }
++        if (*selected < '0' || *selected > '9') {
++            break;
++        }
++        char * end = NULL;
++        long long value = strtoll(selected, &end, 10);
++        if (end == selected) {
++            break;
++        }
++        verathos_cpu_selected_manifest_indexes[verathos_cpu_selected_manifest_count++] = (int64_t) value;
++        selected = end;
++    }
++}
++
++static void verathos_cpu_parse_selected_ops(const char * token) {
++    verathos_cpu_selected_ops_count = 0;
++    if (token == NULL) {
++        return;
++    }
++    const char * selected = strstr(token, "selected_v3=");
++    if (selected == NULL) {
++        return;
++    }
++    selected += 12;
++    while (*selected != '\0' && verathos_cpu_selected_ops_count < 64) {
++        while (*selected == ' ' || *selected == '\t' || *selected == ',') {
++            selected++;
++        }
++        if (*selected < '0' || *selected > '9') {
++            break;
++        }
++        char * end = NULL;
++        long long graph_value = strtoll(selected, &end, 10);
++        if (end == selected || *end != ':') {
++            break;
++        }
++        selected = end + 1;
++        long long intra_value = strtoll(selected, &end, 10);
++        if (end == selected) {
++            break;
++        }
++        verathos_cpu_selected_ops_graph[verathos_cpu_selected_ops_count] = (int64_t) graph_value;
++        verathos_cpu_selected_ops_intra[verathos_cpu_selected_ops_count] = (int64_t) intra_value;
++        verathos_cpu_selected_ops_count++;
++        selected = end;
++    }
++}
++
++static bool verathos_cpu_should_dump_selected_op(int64_t graph_sequence, int64_t intra_index) {
++    for (int i = 0; i < verathos_cpu_selected_ops_count; ++i) {
++        if (verathos_cpu_selected_ops_graph[i] == graph_sequence &&
++            verathos_cpu_selected_ops_intra[i] == intra_index) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool verathos_cpu_should_dump_manifest_index(int64_t manifest_index) {
++    if (verathos_cpu_selected_manifest_count > 0) {
++        for (int i = 0; i < verathos_cpu_selected_manifest_count; ++i) {
++            if (verathos_cpu_selected_manifest_indexes[i] == manifest_index) {
++                return true;
++            }
++        }
++        return false;
++    }
++    const int64_t max_total = verathos_cpu_trace_max_ops();
++    return max_total < 0 || verathos_cpu_trace_sequence < max_total;
++}
++
++static void verathos_cpu_refresh_capture_token(const char * enable_file) {
++    char token[sizeof(verathos_cpu_trace_capture_token)];
++    if (!verathos_cpu_read_capture_token(enable_file, token, sizeof(token))) {
++        snprintf(token, sizeof(token), "present");
++    }
++    if (strncmp(verathos_cpu_trace_capture_token, token, sizeof(verathos_cpu_trace_capture_token)) != 0) {
++        snprintf(verathos_cpu_trace_capture_token, sizeof(verathos_cpu_trace_capture_token), "%s", token);
++        verathos_cpu_trace_sequence = 0;
++        verathos_cpu_manifest_sequence = 0;
++        verathos_cpu_graph_sequence = 0;
++        verathos_cpu_intra_graph_index = 0;
++        verathos_cpu_graph_dim_valid_ops = 0;
++        verathos_cpu_graph_written_rows = 0;
++        verathos_cpu_graph_max_src1_rows = 0;
++        verathos_cpu_parse_selected_manifest_indexes(token);
++        verathos_cpu_parse_selected_ops(token);
++        if (verathos_cpu_manifest_file != NULL) {
++            fflush(verathos_cpu_manifest_file);
++            fclose(verathos_cpu_manifest_file);
++            verathos_cpu_manifest_file = NULL;
++        }
++        verathos_cpu_manifest_path[0] = '\0';
++    }
++}
++
++static bool verathos_cpu_trace_enabled(void) {
++    const char * dir = verathos_cpu_trace_dir();
++    if (dir == NULL || dir[0] == '\0') {
++        return false;
++    }
++    const char * enable_file = getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file != NULL && enable_file[0] != '\0') {
++#if defined(_WIN32)
++        if (_access(enable_file, 0) != 0) {
++#else
++        if (access(enable_file, F_OK) != 0) {
++#endif
++            return false;
++        }
++        verathos_cpu_refresh_capture_token(enable_file);
++    }
++    return true;
++}
++
++static int64_t verathos_cpu_unix_ns(void) {
++    struct timespec ts;
++#if defined(_WIN32)
++    timespec_get(&ts, TIME_UTC);
++#else
++    clock_gettime(CLOCK_REALTIME, &ts);
++#endif
++    return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
++}
++
++static void verathos_cpu_trace_mkdir(const char * dir) {
++    if (dir == NULL || dir[0] == '\0') {
++        return;
++    }
++#if defined(_WIN32)
++    _mkdir(dir);
++#else
++    mkdir(dir, 0755);
++#endif
++}
++
++static bool verathos_cpu_tensor_to_f32(const struct ggml_tensor * tensor, float * out) {
++    if (tensor == NULL || tensor->data == NULL || out == NULL) {
++        return false;
++    }
++    if (!ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    const int64_t n = ggml_nelements(tensor);
++    if (n <= 0) {
++        return false;
++    }
++    if (tensor->type == GGML_TYPE_F32) {
++        memcpy(out, tensor->data, (size_t) n * sizeof(float));
++        return true;
++    }
++    const struct ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
++    if (traits == NULL || traits->to_float == NULL) {
++        return false;
++    }
++    traits->to_float(tensor->data, out, n);
++    return true;
++}
++
++static bool verathos_cpu_write_f32(const char * path, const float * values, int64_t n) {
++    FILE * out = fopen(path, "wb");
++    if (out == NULL) {
++        return false;
++    }
++    const size_t written = fwrite(values, sizeof(float), (size_t) n, out);
++    const int close_rc = fclose(out);
++    return written == (size_t) n && close_rc == 0;
++}
++
++static bool verathos_cpu_write_raw(const char * path, const void * data, size_t nbytes) {
++    FILE * out = fopen(path, "wb");
++    if (out == NULL) {
++        return false;
++    }
++    const size_t written = fwrite(data, 1, nbytes, out);
++    const int close_rc = fclose(out);
++    return written == nbytes && close_rc == 0;
++}
++
++static void verathos_cpu_json_escape(FILE * out, const char * raw) {
++    for (const char * p = raw == NULL ? "" : raw; *p != '\0'; ++p) {
++        switch (*p) {
++            case '\\': fputs("\\\\", out); break;
++            case '"':  fputs("\\\"", out); break;
++            case '\n': fputs("\\n", out); break;
++            case '\r': fputs("\\r", out); break;
++            case '\t': fputs("\\t", out); break;
++            default:   fputc(*p, out); break;
++        }
++    }
++}
++
++static void verathos_cpu_hex_escape(FILE * out, const char * raw) {
++    static const char * hex = "0123456789abcdef";
++    for (const unsigned char * p = (const unsigned char *)(raw == NULL ? "" : raw); *p != '\0'; ++p) {
++        fputc(hex[*p >> 4], out);
++        fputc(hex[*p & 0x0f], out);
++    }
++}
++
++static void verathos_cpu_compact_field(FILE * out, const char * raw) {
++    for (const char * p = raw == NULL ? "" : raw; *p != '\0'; ++p) {
++        if (*p == '\t' || *p == '\n' || *p == '\r') {
++            fputc(' ', out);
++        } else {
++            fputc(*p, out);
++        }
++    }
++}
++
++static bool verathos_cpu_manifest_compact(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && (
++        strcmp(raw, "compact") == 0 ||
++        strcmp(raw, "compact-raw") == 0 ||
++        strcmp(raw, "compact-raw-v2") == 0 ||
++        strcmp(raw, "compact-raw-v3") == 0 ||
++        strcmp(raw, "raw") == 0 ||
++        strcmp(raw, "decode") == 0 ||
++        strcmp(raw, "decode-only") == 0);
++}
++
++static bool verathos_cpu_manifest_compact_raw(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && (
++        strcmp(raw, "compact-raw") == 0 ||
++        strcmp(raw, "compact-raw-v2") == 0 ||
++        strcmp(raw, "compact-raw-v3") == 0 ||
++        strcmp(raw, "raw") == 0);
++}
++
++static bool verathos_cpu_manifest_v3(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && strcmp(raw, "compact-raw-v3") == 0;
++}
++
++static bool verathos_cpu_manifest_disabled(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && (
++        strcmp(raw, "none") == 0 ||
++        strcmp(raw, "off") == 0 ||
++        strcmp(raw, "0") == 0);
++}
++
++static bool verathos_cpu_manifest_decode_only(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && (
++        strcmp(raw, "decode") == 0 ||
++        strcmp(raw, "decode-only") == 0);
++}
++
++static bool verathos_cpu_str_ends_with(const char * value, const char * suffix) {
++    const size_t value_len = strlen(value == NULL ? "" : value);
++    const size_t suffix_len = strlen(suffix == NULL ? "" : suffix);
++    return value_len >= suffix_len &&
++        strncmp(value + value_len - suffix_len, suffix, suffix_len) == 0;
++}
++
++static bool verathos_cpu_is_decode_candidate(
++        const struct ggml_tensor * src0,
++        const struct ggml_tensor * src1,
++        const struct ggml_tensor * dst) {
++    const char * tensor_name = src0 != NULL ? src0->name : "";
++    const char * src1_name = src1 != NULL ? src1->name : "";
++    const char * dst_name = dst != NULL ? dst->name : "";
++    if (strncmp(tensor_name, "output.weight", 14) == 0 ||
++        strncmp(tensor_name, "lm_head.weight", 15) == 0 ||
++        verathos_cpu_str_ends_with(tensor_name, ".lm_head.weight")) {
++        return true;
++    }
++    if (strstr(tensor_name, "attn_output") != NULL) {
++        return false;
++    }
++    return strncmp(dst_name, "logits", 7) == 0 ||
++        strncmp(dst_name, "result_output", 14) == 0 ||
++        (strstr(dst_name, "result_output") != NULL &&
++         (strstr(src1_name, "result_norm") != NULL ||
++          strstr(src1_name, "final") != NULL));
++}
++
++static void verathos_cpu_manifest_suffix(char * out, size_t out_size) {
++    if (out == NULL || out_size == 0) {
++        return;
++    }
++    out[0] = '\0';
++    size_t in = 0;
++    size_t n = 0;
++    const char * token = verathos_cpu_trace_capture_token;
++    while (token[in] >= '0' && token[in] <= '9' && n + 2 < out_size && in < 64) {
++        if (n == 0) {
++            out[n++] = '-';
++        }
++        out[n++] = token[in++];
++    }
++    out[n] = '\0';
++    if (n == 1) {
++        out[0] = '\0';
++    }
++}
++
++static FILE * verathos_cpu_manifest_for_capture(const char * dir) {
++    if (verathos_cpu_manifest_disabled()) {
++        return NULL;
++    }
++    char suffix[80];
++    char manifest_path[sizeof(verathos_cpu_manifest_path)];
++    verathos_cpu_manifest_suffix(suffix, sizeof(suffix));
++    snprintf(
++            manifest_path,
++            sizeof(manifest_path),
++            "%s/manifest%s.%s",
++            dir,
++            suffix,
++            verathos_cpu_manifest_compact() ? "vmanifest" : "jsonl");
++    if (verathos_cpu_manifest_file == NULL ||
++            strncmp(verathos_cpu_manifest_path, manifest_path, sizeof(verathos_cpu_manifest_path)) != 0) {
++        if (verathos_cpu_manifest_file != NULL) {
++            fflush(verathos_cpu_manifest_file);
++            fclose(verathos_cpu_manifest_file);
++        }
++        snprintf(verathos_cpu_manifest_path, sizeof(verathos_cpu_manifest_path), "%s", manifest_path);
++        verathos_cpu_manifest_file = fopen(verathos_cpu_manifest_path, "ab");
++    }
++    return verathos_cpu_manifest_file;
++}
++
++static void verathos_cpu_write_manifest_entry(
++        const char * dir,
++        int64_t now_ns,
++        int64_t manifest_index,
++        bool proof_eligible,
++        int64_t graph_sequence,
++        int64_t intra_graph_index,
++        const struct ggml_tensor * src0,
++        const struct ggml_tensor * src1,
++        const struct ggml_tensor * dst) {
++    if (verathos_cpu_manifest_decode_only() && !verathos_cpu_is_decode_candidate(src0, src1, dst)) {
++        return;
++    }
++    FILE * manifest = verathos_cpu_manifest_for_capture(dir);
++    if (manifest == NULL) {
++        return;
++    }
++    if (verathos_cpu_manifest_compact()) {
++        const bool raw_compact = verathos_cpu_manifest_compact_raw();
++        const char * manifest_format = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++        const bool raw_compact_v3 = verathos_cpu_manifest_v3();
++        const bool raw_compact_v2 = raw_compact_v3 ||
++            (manifest_format != NULL && strcmp(manifest_format, "compact-raw-v2") == 0);
++        if (raw_compact_v2) {
++            fprintf(manifest, raw_compact_v3
++                    ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V3"
++                    : "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V2");
++            fprintf(manifest, "\t%lld", (long long) now_ns);
++            fprintf(manifest, "\t%lld", (long long) manifest_index);
++            fprintf(manifest, "\t"); verathos_cpu_compact_field(manifest, src0->name);
++            fprintf(manifest, "\t"); verathos_cpu_compact_field(manifest, src1->name);
++            fprintf(manifest, "\t"); verathos_cpu_compact_field(manifest, dst->name);
++            fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                    (long long) src0->ne[0], (long long) src0->ne[1],
++                    (long long) src0->ne[2], (long long) src0->ne[3]);
++            fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                    (long long) src1->ne[0], (long long) src1->ne[1],
++                    (long long) src1->ne[2], (long long) src1->ne[3]);
++            fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                    (long long) dst->ne[0], (long long) dst->ne[1],
++                    (long long) dst->ne[2], (long long) dst->ne[3]);
++            fprintf(manifest, "\t%s\t%s\t%s",
++                    ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
++            fprintf(manifest, "\tllama_cpp_cpu\tCPU");
++            fprintf(manifest, "\t%s", proof_eligible ? "1" : "0");
++            if (raw_compact_v3) {
++                fprintf(manifest, "\t%lld\t%lld",
++                        (long long) graph_sequence, (long long) intra_graph_index);
++            }
++            fprintf(manifest, "\n");
++            fflush(manifest);
++            return;
++        }
++        fprintf(manifest, "%s", raw_compact ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V1" : "VERATHOS_GGML_OP_MANIFEST_COMPACT_V1");
++        fprintf(manifest, "\t%lld", (long long) now_ns);
++        fprintf(manifest, "\t%lld", (long long) manifest_index);
++        fprintf(manifest, "\t");
++        char graph_id[96];
++        snprintf(graph_id, sizeof(graph_id), "cpu-mul-mat-%lld", (long long) manifest_index);
++        if (raw_compact) { verathos_cpu_compact_field(manifest, graph_id); } else { verathos_cpu_hex_escape(manifest, graph_id); }
++        fprintf(manifest, "\t%lld", (long long) manifest_index);
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, src0->name); } else { verathos_cpu_hex_escape(manifest, src0->name); }
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, src0->name); } else { verathos_cpu_hex_escape(manifest, src0->name); }
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, src1->name); } else { verathos_cpu_hex_escape(manifest, src1->name); }
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, dst->name); } else { verathos_cpu_hex_escape(manifest, dst->name); }
++        fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                (long long) src0->ne[0], (long long) src0->ne[1],
++                (long long) src0->ne[2], (long long) src0->ne[3]);
++        fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                (long long) src1->ne[0], (long long) src1->ne[1],
++                (long long) src1->ne[2], (long long) src1->ne[3]);
++        fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                (long long) dst->ne[0], (long long) dst->ne[1],
++                (long long) dst->ne[2], (long long) dst->ne[3]);
++        fprintf(manifest, "\t%s\t%s\t%s",
++                ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, "llama_cpp_cpu"); } else { verathos_cpu_hex_escape(manifest, "llama_cpp_cpu"); }
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, "CPU"); } else { verathos_cpu_hex_escape(manifest, "CPU"); }
++        fprintf(manifest, "\t%s\n", proof_eligible ? "1" : "0");
++        fflush(manifest);
++        return;
++    }
++    fprintf(manifest, "{\"version\":1");
++    fprintf(manifest, ",\"created_unix_ns\":%lld", (long long) now_ns);
++    fprintf(manifest, ",\"manifest_index\":%lld", (long long) manifest_index);
++    fprintf(manifest, ",\"graph_id\":\"cpu-mul-mat-%lld\"", (long long) manifest_index);
++    fprintf(manifest, ",\"op_index\":%lld", (long long) manifest_index);
++    fprintf(manifest, ",\"op_type\":\"GGML_OP_MUL_MAT\"");
++    fprintf(manifest, ",\"tensor_name\":\"");
++    verathos_cpu_json_escape(manifest, src0->name);
++    fprintf(manifest, "\"");
++    fprintf(manifest, ",\"src0_name\":\"");
++    verathos_cpu_json_escape(manifest, src0->name);
++    fprintf(manifest, "\"");
++    fprintf(manifest, ",\"src1_name\":\"");
++    verathos_cpu_json_escape(manifest, src1->name);
++    fprintf(manifest, "\"");
++    fprintf(manifest, ",\"dst_name\":\"");
++    verathos_cpu_json_escape(manifest, dst->name);
++    fprintf(manifest, "\"");
++    fprintf(manifest, ",\"src0_shape\":[%lld,%lld,%lld,%lld]",
++            (long long) src0->ne[0], (long long) src0->ne[1],
++            (long long) src0->ne[2], (long long) src0->ne[3]);
++    fprintf(manifest, ",\"src1_shape\":[%lld,%lld,%lld,%lld]",
++            (long long) src1->ne[0], (long long) src1->ne[1],
++            (long long) src1->ne[2], (long long) src1->ne[3]);
++    fprintf(manifest, ",\"dst_shape\":[%lld,%lld,%lld,%lld]",
++            (long long) dst->ne[0], (long long) dst->ne[1],
++            (long long) dst->ne[2], (long long) dst->ne[3]);
++    fprintf(manifest, ",\"source_types\":{\"src0\":\"%s\",\"src1\":\"%s\",\"dst\":\"%s\"}",
++            ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
++    fprintf(manifest, ",\"backend\":\"llama_cpp_cpu\"");
++    fprintf(manifest, ",\"device\":\"CPU\"");
++    fprintf(manifest, ",\"proof_eligible\":%s}\n", proof_eligible ? "true" : "false");
++    fflush(manifest);
++}
++
++static void verathos_cpu_try_dump_mul_mat_trace(const struct ggml_tensor * dst) {
++    const char * dir = verathos_cpu_trace_dir();
++    if (dir == NULL || dir[0] == '\0' || dst == NULL || dst->op != GGML_OP_MUL_MAT) {
++        return;
++    }
++    const struct ggml_tensor * src0 = dst->src[0];
++    const struct ggml_tensor * src1 = dst->src[1];
++    if (src0 == NULL || src1 == NULL) {
++        return;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        dst->ne[2]  != 1 || dst->ne[3]  != 1) {
++        return;
++    }
++    if (src0->ne[0] != src1->ne[0] ||
++        dst->ne[0]  != src0->ne[1] ||
++        dst->ne[1]  != src1->ne[1]) {
++        return;
++    }
++
++    // Intra-graph index counts every dim-valid MUL_MAT regardless of size
++    // eligibility, so it stays stable across batch row counts (co-batched
++    // organic graphs vs solo replay graphs address the same structural op).
++    const int64_t intra_graph_index = verathos_cpu_intra_graph_index++;
++    verathos_cpu_graph_dim_valid_ops++;
++    if (src1->ne[1] > verathos_cpu_graph_max_src1_rows) {
++        verathos_cpu_graph_max_src1_rows = src1->ne[1];
++    }
++
++    verathos_cpu_trace_mkdir(dir);
++    const int64_t now_ns = verathos_cpu_unix_ns();
++    const int64_t manifest_index = ++verathos_cpu_manifest_sequence;
++    const int64_t src0_ne = ggml_nelements(src0);
++    const int64_t src1_ne = ggml_nelements(src1);
++    const int64_t dst_ne  = ggml_nelements(dst);
++    const int64_t total_elems = src0_ne + src1_ne + dst_ne;
++    const int64_t max_elems = verathos_cpu_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    const bool proof_eligible =
++        verathos_cpu_is_decode_candidate(src0, src1, dst) ||
++        !(max_elems > 0 && total_elems > max_elems);
++    if (!proof_eligible) {
++        return;
++    }
++    verathos_cpu_write_manifest_entry(
++            dir, now_ns, manifest_index, proof_eligible,
++            verathos_cpu_graph_sequence, intra_graph_index, src0, src1, dst);
++    verathos_cpu_graph_written_rows++;
++
++    const bool selected_op_dump = verathos_cpu_selected_ops_count > 0 &&
++        verathos_cpu_should_dump_selected_op(verathos_cpu_graph_sequence, intra_graph_index);
++    if (!selected_op_dump && verathos_cpu_selected_ops_count > 0) {
++        return;
++    }
++    if (!selected_op_dump && !verathos_cpu_should_dump_manifest_index(manifest_index)) {
++        return;
++    }
++    const bool skip_src0_dump = verathos_cpu_env_bool("VERATHOS_GGML_TRACE_SKIP_SRC0_DUMP", false);
++    float * src0_f32 = skip_src0_dump ? NULL : (float *) malloc((size_t) src0_ne * sizeof(float));
++    float * src1_f32 = (float *) malloc((size_t) src1_ne * sizeof(float));
++    float * dst_f32  = (float *) malloc((size_t) dst_ne  * sizeof(float));
++    if ((!skip_src0_dump && src0_f32 == NULL) || src1_f32 == NULL || dst_f32 == NULL) {
++        free(src0_f32);
++        free(src1_f32);
++        free(dst_f32);
++        return;
++    }
++    if ((!skip_src0_dump && !verathos_cpu_tensor_to_f32(src0, src0_f32)) ||
++        !verathos_cpu_tensor_to_f32(src1, src1_f32) ||
++        !verathos_cpu_tensor_to_f32(dst, dst_f32)) {
++        free(src0_f32);
++        free(src1_f32);
++        free(dst_f32);
++        return;
++    }
++
++    char base[4096];
++    char src0_path[8192];
++    char src0_raw_path[8192];
++    char src1_path[8192];
++    char dst_path[8192];
++    char json_path[8192];
++    snprintf(base, sizeof(base), "%s/trace-%lld-cpu-op%lld",
++             dir, (long long) now_ns, (long long) manifest_index);
++    snprintf(src0_path, sizeof(src0_path), "%s-src0.f32", base);
++    snprintf(src0_raw_path, sizeof(src0_raw_path), "%s-src0.raw", base);
++    snprintf(src1_path, sizeof(src1_path), "%s-src1.f32", base);
++    snprintf(dst_path,  sizeof(dst_path),  "%s-dst.f32",  base);
++    snprintf(json_path, sizeof(json_path), "%s.json",     base);
++    if ((!skip_src0_dump && !verathos_cpu_write_f32(src0_path, src0_f32, src0_ne)) ||
++        (!skip_src0_dump && !verathos_cpu_write_raw(src0_raw_path, src0->data, ggml_nbytes(src0))) ||
++        !verathos_cpu_write_f32(src1_path, src1_f32, src1_ne) ||
++        !verathos_cpu_write_f32(dst_path,  dst_f32,  dst_ne)) {
++        free(src0_f32);
++        free(src1_f32);
++        free(dst_f32);
++        return;
++    }
++    free(src0_f32);
++    free(src1_f32);
++    free(dst_f32);
++
++    FILE * meta = fopen(json_path, "wb");
++    if (meta == NULL) {
++        return;
++    }
++    fprintf(meta, "{\n");
++    fprintf(meta, "  \"version\": 1,\n");
++    fprintf(meta, "  \"created_unix_ns\": %lld,\n", (long long) now_ns);
++    fprintf(meta, "  \"manifest_index\": %lld,\n", (long long) manifest_index);
++    fprintf(meta, "  \"graph_seq\": %lld,\n", (long long) verathos_cpu_graph_sequence);
++    fprintf(meta, "  \"intra_graph_index\": %lld,\n", (long long) intra_graph_index);
++    fprintf(meta, "  \"graph_id\": \"cpu-mul-mat-%lld\",\n", (long long) manifest_index);
++    fprintf(meta, "  \"op_index\": %lld,\n", (long long) manifest_index);
++    fprintf(meta, "  \"op_type\": \"GGML_OP_MUL_MAT\",\n");
++    fprintf(meta, "  \"tensor_name\": \"");
++    verathos_cpu_json_escape(meta, src0->name);
++    fprintf(meta, "\",\n");
++    fprintf(meta, "  \"src0_name\": \"");
++    verathos_cpu_json_escape(meta, src0->name);
++    fprintf(meta, "\",\n");
++    fprintf(meta, "  \"src1_name\": \"");
++    verathos_cpu_json_escape(meta, src1->name);
++    fprintf(meta, "\",\n");
++    fprintf(meta, "  \"dst_name\": \"");
++    verathos_cpu_json_escape(meta, dst->name);
++    fprintf(meta, "\",\n");
++    fprintf(meta, "  \"src0_shape\": [%lld,%lld,%lld,%lld],\n",
++            (long long) src0->ne[0], (long long) src0->ne[1],
++            (long long) src0->ne[2], (long long) src0->ne[3]);
++    fprintf(meta, "  \"src1_shape\": [%lld,%lld,%lld,%lld],\n",
++            (long long) src1->ne[0], (long long) src1->ne[1],
++            (long long) src1->ne[2], (long long) src1->ne[3]);
++    fprintf(meta, "  \"dst_shape\": [%lld,%lld,%lld,%lld],\n",
++            (long long) dst->ne[0], (long long) dst->ne[1],
++            (long long) dst->ne[2], (long long) dst->ne[3]);
++    const char * src0_file = strrchr(src0_path, '/');
++    const char * src0_raw_file = strrchr(src0_raw_path, '/');
++    const char * src1_file = strrchr(src1_path, '/');
++    const char * dst_file  = strrchr(dst_path,  '/');
++#if defined(_WIN32)
++    const char * src0_file_win = strrchr(src0_path, '\\');
++    const char * src0_raw_file_win = strrchr(src0_raw_path, '\\');
++    const char * src1_file_win = strrchr(src1_path, '\\');
++    const char * dst_file_win  = strrchr(dst_path,  '\\');
++    if (src0_file_win != NULL && (src0_file == NULL || src0_file_win > src0_file)) src0_file = src0_file_win;
++    if (src0_raw_file_win != NULL && (src0_raw_file == NULL || src0_raw_file_win > src0_raw_file)) src0_raw_file = src0_raw_file_win;
++    if (src1_file_win != NULL && (src1_file == NULL || src1_file_win > src1_file)) src1_file = src1_file_win;
++    if (dst_file_win  != NULL && (dst_file  == NULL || dst_file_win  > dst_file))  dst_file  = dst_file_win;
++#endif
++    if (!skip_src0_dump) {
++        fprintf(meta, "  \"src0_f32\": \"%s\",\n", src0_file == NULL ? src0_path : src0_file + 1);
++        fprintf(meta, "  \"src0_raw\": \"%s\",\n", src0_raw_file == NULL ? src0_raw_path : src0_raw_file + 1);
++    }
++    fprintf(meta, "  \"src0_raw_type\": \"%s\",\n", ggml_type_name(src0->type));
++    fprintf(meta, "  \"src1_f32\": \"%s\",\n", src1_file == NULL ? src1_path : src1_file + 1);
++    fprintf(meta, "  \"dst_f32\": \"%s\",\n",  dst_file  == NULL ? dst_path  : dst_file  + 1);
++    fprintf(meta, "  \"source_types\": {\"src0\": \"%s\", \"src1\": \"%s\", \"dst\": \"%s\"},\n",
++            ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
++    fprintf(meta, "  \"backend\": \"llama_cpp_cpu\",\n");
++    fprintf(meta, "  \"device\": \"CPU\"\n");
++    fprintf(meta, "}\n");
++    fclose(meta);
++}
++
++static void verathos_cpu_trace_begin_graph(void) {
++    if (!verathos_cpu_trace_enabled()) {
++        return;
++    }
++    verathos_cpu_graph_sequence++;
++    verathos_cpu_intra_graph_index = 0;
++    verathos_cpu_graph_dim_valid_ops = 0;
++    verathos_cpu_graph_written_rows = 0;
++    verathos_cpu_graph_max_src1_rows = 0;
++}
++
++static void verathos_cpu_trace_end_graph(void) {
++    if (verathos_cpu_graph_dim_valid_ops <= 0) {
++        return;
++    }
++    const char * dir = verathos_cpu_trace_dir();
++    if (dir == NULL || dir[0] == '\0' || !verathos_cpu_manifest_v3()) {
++        return;
++    }
++    FILE * manifest = verathos_cpu_manifest_for_capture(dir);
++    if (manifest == NULL) {
++        return;
++    }
++    fprintf(manifest, "VERATHOS_GGML_GRAPH_V1\t%lld\t%lld\t%lld\t%lld\t%lld\tllama_cpp_cpu\tCPU\n",
++            (long long) verathos_cpu_unix_ns(),
++            (long long) verathos_cpu_graph_sequence,
++            (long long) verathos_cpu_graph_dim_valid_ops,
++            (long long) verathos_cpu_graph_written_rows,
++            (long long) verathos_cpu_graph_max_src1_rows);
++    fflush(manifest);
++}
++
++static void verathos_cpu_trace_after_mul_mat(
++        const struct ggml_compute_params * params,
++        const struct ggml_tensor * dst) {
++    if (!verathos_cpu_trace_enabled()) {
++        return;
++    }
++    if (params->threadpool != NULL && params->nth > 1) {
++        ggml_barrier(params->threadpool);
++    }
++    if (params->ith == 0) {
++        verathos_cpu_try_dump_mul_mat_trace(dst);
++    }
++    if (params->threadpool != NULL && params->nth > 1) {
++        ggml_barrier(params->threadpool);
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_one_chunk(
+     const struct ggml_compute_params * params,
+     struct ggml_tensor * dst,
+@@ -1305,6 +2053,7 @@ void ggml_compute_forward_mul_mat(
+                                      src1->type,
+                                      dst->type))
+                     goto UseGgmlGemm1;
++        verathos_cpu_trace_after_mul_mat(params, dst);
+         return;
+     }
+ UseGgmlGemm1:;
+@@ -1373,6 +2122,7 @@ UseGgmlGemm1:;
+                                      vec_dot_type,
+                                      dst->type))
+                     goto UseGgmlGemm2;
++        verathos_cpu_trace_after_mul_mat(params, dst);
+         return;
+     }
+ UseGgmlGemm2:;
+@@ -1440,6 +2190,7 @@ UseGgmlGemm2:;
+
+         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+     }
++    verathos_cpu_trace_after_mul_mat(params, dst);
+ }
+
+ // ggml_compute_forward_mul_mat_id
+@@ -3312,6 +4063,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     GGML_ASSERT(cplan->n_threads > 0);
+     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
+
++    verathos_cpu_trace_begin_graph();
++
+     int n_threads                               = cplan->n_threads;
+     struct ggml_threadpool * threadpool = cplan->threadpool;
+
+@@ -3379,5 +4132,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+         ggml_threadpool_free(threadpool);
+     }
+
++    verathos_cpu_trace_end_graph();
++
+     return ret;
+ }

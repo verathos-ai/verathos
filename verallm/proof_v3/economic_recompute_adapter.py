@@ -3173,7 +3173,7 @@ def verify_economic_recompute_v3(
             )
         if lean:
             from verallm.proof_v3.gdn_decode_corridor import (
-                gdn_decode_corridor_sequence_positions_v3,
+                derive_gdn_decode_corridor_for_challenge_v3,
             )
             from verallm.proof_v3.lean_execution_anchor import (
                 lean_projection_row_layouts_v3,
@@ -3195,11 +3195,15 @@ def verify_economic_recompute_v3(
             )
             gdn_decode_positions = (
                 {
-                    layer: gdn_decode_corridor_sequence_positions_v3(
-                        challenge=challenge,
-                        semantics=(
-                            artifacts.gdn_runtime_semantics.layer_for(layer)
-                        ),
+                    layer: (
+                        derive_gdn_decode_corridor_for_challenge_v3(
+                            challenge=challenge,
+                            semantics=(
+                                artifacts.gdn_runtime_semantics.layer_for(
+                                    layer
+                                )
+                            ),
+                        ).sequence_positions
                     )
                     for layer in gdn_decode_layers
                 }
@@ -5724,10 +5728,7 @@ def verify_economic_recompute_v3(
         layer_tokens = projection_tokens_by_layer[layer]
         norm_source_rows_by_token = {}
         if lean:
-            if (
-                not coupling.runtime_rows
-                and challenge.decode_token_count != 1
-            ):
+            if not coupling.runtime_rows:
                 raise _fail(
                     f"lean GDN coupling l{layer} has no runtime replay rows"
                 )

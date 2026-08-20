@@ -70,33 +70,24 @@ class Web3Provider:
         self.config = config
 
         if config.rpc_url.startswith("wss://") or config.rpc_url.startswith("ws://"):
-            self._http_session = None
             self.w3 = Web3(Web3.WebsocketProvider(config.rpc_url))
         else:
-            # web3 otherwise keeps one requests.Session per calling thread.
-            # Validators use bounded worker pools for epoch setup, so that
-            # default can create dozens of idle RPC sockets and exhaust a
-            # node's connection limit.  Supplying an explicit session makes
-            # every worker share this bounded pool.  ``pool_block=True`` is
-            # required: pool_maxsize alone only limits retained connections,
-            # not concurrently created overflow sockets.
-            import requests
+            # Limit connection pool to prevent CLOSE-WAIT socket accumulation
+            # during RPC rate limiting (429s leave dangling connections).
             from requests.adapters import HTTPAdapter
             from urllib3.util.retry import Retry as _Retry
-            adapter = HTTPAdapter(
-                pool_connections=2,
-                pool_maxsize=5,
-                pool_block=True,
-                max_retries=_Retry(total=0),  # we handle retries ourselves
-            )
-            self._http_session = requests.Session()
-            self._http_session.mount("https://", adapter)
-            self._http_session.mount("http://", adapter)
             provider = Web3.HTTPProvider(
                 config.rpc_url,
                 request_kwargs={"timeout": 15},
-                session=self._http_session,
             )
+            adapter = HTTPAdapter(
+                pool_connections=2,
+                pool_maxsize=5,
+                max_retries=_Retry(total=0),  # we handle retries ourselves
+            )
+            provider._session = __import__("requests").Session()
+            provider._session.mount("https://", adapter)
+            provider._session.mount("http://", adapter)
             self.w3 = Web3(provider)
 
         # Bittensor EVM is a PoA chain — inject middleware for extraData
@@ -122,14 +113,6 @@ class Web3Provider:
         if self._is_public_rpc and config.max_retries < 5:
             config.max_retries = 5
             config.retry_delay = 3.0
-
-    def close(self) -> None:
-        """Close the owned HTTP session, if any."""
-
-        session = self._http_session
-        self._http_session = None
-        if session is not None:
-            session.close()
 
     def get_contract(self, address: str, abi_name: str):
         """Load a contract instance by address and ABI name."""

@@ -54,6 +54,13 @@ class ChainConfig:
     proof_v3_artifact_base_urls: tuple[str, ...] = ()
     proof_v3_artifact_cache_dir: str = ""
 
+    # Content-addressed mesh tensor-manifest distribution (same style and,
+    # by default, the same hosting directory as the GLEIPNIR artifact
+    # store: the two stores use different index filenames, so they coexist
+    # under one base URL). Discovery metadata only; every download is
+    # verified against the on-chain committed tensor manifest root.
+    mesh_manifest_base_urls: tuple = ()
+
     # EVM private key for signing transactions (hex string, no 0x prefix)
     evm_private_key: str = ""
 
@@ -109,6 +116,16 @@ class ChainConfig:
         _validate_address(self.validator_registry_address, "validator_registry_address")
         _validate_address(self.checkpoint_registry_address, "checkpoint_registry_address")
         _validate_address(self.subnet_config_address, "subnet_config_address")
+        urls = self.mesh_manifest_base_urls
+        if isinstance(urls, str):
+            raise ValueError("mesh_manifest_base_urls must be a list of URLs")
+        urls = tuple(str(url).strip().rstrip("/") for url in (urls or ()))
+        for url in urls:
+            if not url.startswith(("https://", "http://")):
+                raise ValueError(
+                    f"mesh_manifest_base_urls entries must be http(s): {url!r}"
+                )
+        object.__setattr__(self, "mesh_manifest_base_urls", urls)
 
     def require_addresses(self) -> None:
         """Raise if contract addresses are not configured.

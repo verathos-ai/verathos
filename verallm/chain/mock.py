@@ -411,19 +411,15 @@ def create_clients(config: ChainConfig):
     try:
         from verallm.chain.model_registry import ModelRegistryClient
         from verallm.chain.miner_registry import MinerRegistryClient
-        from verallm.chain.provider import Web3Provider
 
-        provider = Web3Provider(config)
         payment = None
         if config.payment_gateway_address:
             from verallm.chain.payment import PaymentGatewayClient
+            from verallm.chain.provider import Web3Provider
+            provider = Web3Provider(config)
             payment = PaymentGatewayClient(config, provider=provider)
 
-        return (
-            ModelRegistryClient(config, provider=provider),
-            MinerRegistryClient(config, provider=provider),
-            payment,
-        )
+        return ModelRegistryClient(config), MinerRegistryClient(config), payment
     except ImportError:
         logger.warning("web3 not installed, falling back to mock chain clients")
         payment = MockPaymentGatewayClient(config) if config.payment_gateway_address else None

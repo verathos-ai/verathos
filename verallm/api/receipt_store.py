@@ -144,7 +144,7 @@ class ReceiptStore:
         """Add a receipt and persist to disk. Returns count for this epoch."""
         with self._lock:
             if epoch not in self._cache:
-                self._cache[epoch] = []
+                self._load_epoch_locked(epoch)
             self._cache[epoch].append(receipt_dict)
 
             self._conn.execute(
@@ -153,6 +153,45 @@ class ReceiptStore:
             )
             self._conn.commit()
             return len(self._cache[epoch])
+
+    def add_unique(
+        self,
+        epoch: int,
+        receipt_dict: dict,
+        *,
+        unique_fields: tuple[str, ...],
+    ) -> tuple[int, bool]:
+        """Persist a receipt once for the supplied canonical identity fields.
+
+        The lookup and insert share the store lock, so concurrent HTTP handler
+        threads cannot race the same signed receipt into SQLite twice.  The
+        returned boolean is ``False`` for an idempotent duplicate.
+        """
+
+        if not unique_fields:
+            raise ValueError("unique_fields must not be empty")
+        try:
+            identity = tuple(receipt_dict[field] for field in unique_fields)
+        except KeyError as exc:
+            raise ValueError(
+                f"receipt is missing uniqueness field: {exc.args[0]}"
+            ) from exc
+
+        with self._lock:
+            if epoch not in self._cache:
+                self._load_epoch_locked(epoch)
+            receipts = self._cache[epoch]
+            for existing in receipts:
+                if tuple(existing.get(field) for field in unique_fields) == identity:
+                    return len(receipts), False
+
+            receipts.append(receipt_dict)
+            self._conn.execute(
+                "INSERT INTO receipts (epoch, receipt_json) VALUES (?, ?)",
+                (epoch, json.dumps(receipt_dict)),
+            )
+            self._conn.commit()
+            return len(receipts), True
 
     def get(self, epoch: int) -> List[dict]:
         """Get all receipts for an epoch."""

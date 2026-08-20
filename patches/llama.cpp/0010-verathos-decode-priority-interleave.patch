@@ -1,0 +1,101 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c2fd01b6b..c27ad775a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3231,15 +3231,80 @@ private:
+         int32_t n_batch  = llama_n_batch(ctx_tgt);
+         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+ 
++        // Verathos decode-priority interleave: while at least one slot is
++        // generating and another slot is mid-prompt-processing, (1) cap how
++        // many prompt tokens ride in a mixed batch so a decode result is
++        // never more than one small prefill chunk away, and (2) interpose
++        // decode-only passes between prefill chunks, their count derived
++        // from the measured duration of the previous prompt-carrying pass,
++        // so interactive streams keep a steady token cadence during long
++        // prefills at a bounded prefill-throughput cost. Which tokens get
++        // computed and their order within each slot are unchanged; only the
++        // grouping into batches changes.
++        static const bool vera_dp_enabled = [] {
++            const char * v = std::getenv("VERATHOS_DECODE_PRIORITY");
++            return v == nullptr || atoi(v) != 0;
++        }();
++        static const int32_t vera_dp_prefill_cap = [] {
++            const char * v = std::getenv("VERATHOS_DECODE_PRIORITY_PREFILL_CAP");
++            return std::max(v ? atoi(v) : 512, 16);
++        }();
++        static const int64_t vera_dp_interval_us = [] {
++            const char * v = std::getenv("VERATHOS_DECODE_PRIORITY_INTERVAL_MS");
++            return (int64_t) std::max(v ? atoi(v) : 250, 10) * 1000;
++        }();
++        static const int64_t vera_dp_max_decode_passes = [] {
++            const char * v = std::getenv("VERATHOS_DECODE_PRIORITY_MAX_DECODE_PASSES");
++            return (int64_t) std::max(v ? atoi(v) : 32, 0);
++        }();
++
++        // scheduler state across update_slots passes (one server_context per process)
++        static int     vera_dp_decode_only_left = 0;
++        static int64_t vera_dp_prompt_pass_t0   = -1;
++
++        bool    vera_dp_skip_prompt = false;
++        int32_t n_batch_prompt      = n_batch;
++
++        bool vera_dp_prompt_pending = false;
++        for (const auto & slot : slots) {
++            if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
++                vera_dp_prompt_pending = true;
++                break;
++            }
++        }
++
++        // batch.size() > 0 here means the batch already carries sampled
++        // tokens from generating slots (decode work is pending)
++        if (vera_dp_enabled && batch.size() > 0 && vera_dp_prompt_pending) {
++            if (vera_dp_prompt_pass_t0 >= 0) {
++                // the previous pass carried prompt tokens; size the decode-only
++                // run from its wall-clock duration so the added prefill overhead
++                // stays a bounded fraction regardless of model speed
++                const int64_t d = ggml_time_us() - vera_dp_prompt_pass_t0;
++                vera_dp_prompt_pass_t0   = -1;
++                vera_dp_decode_only_left = (int) std::min(vera_dp_max_decode_passes, d / vera_dp_interval_us);
++            }
++            if (vera_dp_decode_only_left > 0) {
++                vera_dp_decode_only_left--;
++                vera_dp_skip_prompt = true;
++            } else {
++                vera_dp_prompt_pass_t0 = ggml_time_us();
++                n_batch_prompt = std::min(n_batch, batch.size() + vera_dp_prefill_cap);
++            }
++        } else {
++            vera_dp_decode_only_left = 0;
++            vera_dp_prompt_pass_t0   = -1;
++        }
++
+         auto & alora_scale       = batch.alora_scale;
+         auto & alora_disabled_id = batch.alora_disabled_id;
+ 
+         // next, batch any pending prompts without exceeding n_batch
+-        if (params_base.cont_batching || batch.size() == 0) {
++        if (!vera_dp_skip_prompt && (params_base.cont_batching || batch.size() == 0)) {
+             bool add_ok = true; // false means the batch is full, skip remaining slots
+ 
+             iterate(slots, [&](server_slot & slot) {
+-                if (!add_ok || batch.size() >= n_batch) {
++                if (!add_ok || batch.size() >= n_batch_prompt) {
+                     return; // batch is full, skip remaining slots
+                 }
+ 
+@@ -3701,8 +3766,12 @@ private:
+                     const auto & spans = slot.task->params.message_spans;
+                     const auto last_user_pos = spans.last_user_message_pos();
+ 
++                    // decode-priority prefill cap applies only to splittable
++                    // prompts; a non-splittable prompt must land in one batch
++                    const int32_t n_batch_fill = slot.can_split() ? n_batch_prompt : n_batch;
++
+                     // add prompt tokens for processing in the current batch
+-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
++                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_fill) {
+                         // get next token to process
+                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+                         if (cur_tok == LLAMA_TOKEN_NULL) {

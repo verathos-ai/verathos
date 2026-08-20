@@ -27,7 +27,6 @@ __all__ = [
     "derive_gdn_decode_corridor_from_selection_seed_v3",
     "derive_gdn_decode_corridor_for_challenge_v3",
     "derive_gdn_decode_corridor_plan_v3",
-    "gdn_decode_corridor_sequence_positions_v3",
     "derive_gdn_projection_binding_positions_v3",
     "gdn_decode_checkpoint_offsets_v3",
 ]
@@ -232,16 +231,8 @@ def derive_gdn_decode_corridor_from_selection_seed_v3(
     decode_token_count: int,
     checkpoint_stride: int,
     committed_checkpoint_offsets: tuple[int, ...],
-) -> GdnDecodeCorridorPlanV3 | None:
-    """Derive the exact window from an already transcript-bound seed.
-
-    A one-token completion is produced by the final prompt forward and has no
-    decode recurrence row.  Its canonical checkpoint inventory is therefore
-    the single authenticated prompt-boundary state and there is no corridor
-    to select.  Returning ``None`` represents that exact zero-row geometry;
-    callers must continue auditing the prompt producer and may omit only the
-    nonexistent decode recurrence.
-    """
+) -> GdnDecodeCorridorPlanV3:
+    """Derive the exact window from an already transcript-bound seed."""
 
     if not isinstance(selection_seed, bytes) or len(selection_seed) != 32:
         raise ProofV3Error(
@@ -277,7 +268,9 @@ def derive_gdn_decode_corridor_from_selection_seed_v3(
             "GDN decode-corridor checkpoint inventory is not canonical"
         )
     if len(expected) < 2:
-        return None
+        raise ProofV3Error(
+            "GDN decode-corridor hard audit requires a forwarded row"
+        )
     seed = hashlib.sha256(
         _SELECTION_DOMAIN
         + selection_seed
@@ -301,7 +294,7 @@ def derive_gdn_decode_corridor_plan_v3(
     decode_token_count: int,
     checkpoint_stride: int,
     committed_checkpoint_offsets: tuple[int, ...],
-) -> GdnDecodeCorridorPlanV3 | None:
+) -> GdnDecodeCorridorPlanV3:
     """Replay the validator's unbiased window draw after roots are frozen."""
 
     for value, name in (
@@ -331,12 +324,7 @@ def derive_gdn_decode_corridor_for_challenge_v3(
     challenge,
     semantics,
 ) -> GdnDecodeCorridorPlanV3 | None:
-    """Return the signed checkpoint window, or ``None`` when none exists.
-
-    ``None`` covers legacy semantics and the canonical one-token completion,
-    whose final prompt forward produces the output without forwarding a
-    decode row.
-    """
+    """Return the signed checkpoint window, or ``None`` for legacy semantics."""
 
     stride = int(getattr(semantics, "decode_checkpoint_stride", 0))
     if stride == 0:
@@ -360,17 +348,3 @@ def derive_gdn_decode_corridor_for_challenge_v3(
         checkpoint_stride=stride,
         committed_checkpoint_offsets=offsets,
     )
-
-
-def gdn_decode_corridor_sequence_positions_v3(
-    *,
-    challenge,
-    semantics,
-) -> tuple[int, ...]:
-    """Return the canonical forwarded rows, including the empty geometry."""
-
-    corridor = derive_gdn_decode_corridor_for_challenge_v3(
-        challenge=challenge,
-        semantics=semantics,
-    )
-    return () if corridor is None else tuple(corridor.sequence_positions)

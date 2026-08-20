@@ -129,7 +129,7 @@ class NeuronConfig(ChainConfig):
 
     # Owner-selected inference proof versions. Maintenance forgiveness is
     # deliberately independent from protocol admission.
-    proof_protocol_allowed_versions: tuple[int, ...] = (3,)
+    proof_protocol_allowed_versions: tuple[int, ...] = (1, 3)
     proof_v3_canary_policy_path: str = ""
     proof_v3_hard_auditor_policy_enabled: bool = False
     proof_v3_hard_auditor_hotkey_ss58: str = ""
@@ -193,6 +193,13 @@ class NeuronConfig(ChainConfig):
     capacity_audit_slot_refresh_blocks: int = 0
     capacity_audit_slot_snapshot_stale_blocks: int = 0
     capacity_audit_proof_verify_workers: int = 4
+    # First epoch at which mesh (GGUF) entries are gated/convicted by the
+    # capacity audit; 0 = disabled (mesh scheduling/ingest still run, observe
+    # mode only). Ships dark until the owner flips it via the hosted config.
+    mesh_capacity_audit_enforcement_epoch: int = 0
+    # Epochs a mesh entry may serve with no learnable signed roster before
+    # the capacity-audit model gate closes on it (0 = never gate on absence).
+    mesh_capacity_roster_grace_epochs: int = 2
 
     @classmethod
     def from_env(cls, **overrides) -> NeuronConfig:
@@ -289,6 +296,8 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_slot_refresh_blocks": "VERATHOS_CAPACITY_AUDIT_SLOT_REFRESH_BLOCKS",
             "capacity_audit_slot_snapshot_stale_blocks": "VERATHOS_CAPACITY_AUDIT_SLOT_SNAPSHOT_STALE_BLOCKS",
             "capacity_audit_proof_verify_workers": "VERATHOS_CAPACITY_AUDIT_PROOF_VERIFY_WORKERS",
+            "mesh_capacity_audit_enforcement_epoch": "VERATHOS_MESH_CAPACITY_AUDIT_ENFORCEMENT_EPOCH",
+            "mesh_capacity_roster_grace_epochs": "VERATHOS_MESH_CAPACITY_ROSTER_GRACE_EPOCHS",
         }
 
         _float_fields = {
@@ -330,6 +339,8 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_slot_snapshot_stale_blocks",
             "capacity_audit_proof_verify_workers",
             "capacity_audit_max_proof_payload_bytes",
+            "mesh_capacity_audit_enforcement_epoch",
+            "mesh_capacity_roster_grace_epochs",
             "maintenance_grace_until_epoch", "maintenance_grace_until_unix_ts",
         }
         _bool_fields = {

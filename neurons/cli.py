@@ -13,6 +13,7 @@ Usage::
     verathos logs               # pm2 logs miner
     verathos models             # show model recommendations for your GPU
     verathos network            # network status dashboard
+    verathos mesh               # GGUF mesh control plane
 """
 
 from __future__ import annotations
@@ -31,8 +32,12 @@ def _find_repo_root() -> str:
 def cmd_setup(args: list[str]) -> None:
     """Launch the interactive setup wizard."""
     role = args[0] if args else "miner"
+    if role in ("mesh-coordinator", "mesh-worker"):
+        from neurons.mesh_wizard import run_mesh_wizard
+        run_mesh_wizard(role, args[1:])
+        return
     if role not in ("miner", "validator"):
-        print(f"Unknown role: {role}. Use 'miner' or 'validator'.")
+        print(f"Unknown role: {role}. Use 'miner', 'validator', 'mesh-coordinator', or 'mesh-worker'.")
         sys.exit(1)
     from neurons.wizard import run_wizard
     run_wizard(role)
@@ -87,6 +92,12 @@ def cmd_network(args: list[str]) -> None:
     _cmd_network(args)
 
 
+def cmd_mesh(args: list[str]) -> None:
+    """Create, inspect, and probe verified GGUF mesh nodes."""
+    from verallm.mesh.cli import main as mesh_main
+    mesh_main(args)
+
+
 def cmd_help() -> None:
     """Print usage."""
     print("""
@@ -94,12 +105,15 @@ def cmd_help() -> None:
 
   Usage:
     verathos setup [miner|validator]   Interactive setup wizard
+    verathos setup mesh-coordinator    Create a GGUF mesh pool + manager
+    verathos setup mesh-worker --token <t>  Join a mesh pool as a GPU worker
     verathos status                    Preflight readiness check
     verathos start [miner|validator]   Start via PM2
     verathos stop [miner|validator]    Stop via PM2
     verathos logs [miner|validator]    Tail PM2 logs
     verathos models [--category ...]   Model recommendations for your GPU
     verathos network [--json|--watch]  Network status dashboard
+    verathos mesh <command>            GGUF mesh control plane
     verathos help                      Show this help
 """)
 
@@ -112,6 +126,7 @@ COMMANDS = {
     "logs": cmd_logs,
     "models": cmd_models,
     "network": cmd_network,
+    "mesh": cmd_mesh,
 }
 
 
@@ -130,6 +145,8 @@ def main() -> None:
         sys.exit(1)
 
     handler(cmd_args)
+    sys.stdout.flush()
+    sys.stderr.flush()
     os._exit(0)  # Force-exit: bt.Subtensor WebSocket keeps non-daemon threads alive
 
 

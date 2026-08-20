@@ -1,0 +1,771 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 2dd8cd2..2cc65cf 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1,5 +1,8 @@
+ #include "ggml-vulkan.h"
+ #include <vulkan/vulkan_core.h>
++#include <chrono>
++#include <cstdlib>
++#include <fstream>
+ #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
+ #include <chrono>
+ #include "ggml-cpu.h"
+@@ -66,6 +69,13 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
+ #include <mutex>
+ #include <future>
+ #include <condition_variable>
++#if defined(_WIN32)
++#include <direct.h>
++#include <io.h>
++#else
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ #include <thread>
+
+ #if defined(_MSC_VER)
+@@ -142,6 +152,8 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
+ #endif // GGML_VULKAN_DEBUG
+
+ struct ggml_backend_vk_context;
++static bool verathos_vk_trace_enabled();
++static void verathos_vk_try_dump_mul_mat_trace(ggml_backend_vk_context * ctx, const ggml_tensor * dst);
+
+ #define MAX_PARAMETER_COUNT 12
+ // Max number of adds that can be fused without exceeding MAX_PARAMETER_COUNT.
+@@ -14393,6 +14405,11 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
+         }
+         ctx->submit_pending = true;
+
++        if (tensor->op == GGML_OP_MUL_MAT && verathos_vk_trace_enabled()) {
++            ggml_vk_synchronize(ctx);
++            verathos_vk_try_dump_mul_mat_trace(ctx, tensor);
++        }
++
+ #ifdef GGML_VULKAN_CHECK_RESULTS
+         ggml_vk_synchronize(ctx);
+         ggml_vk_check_results_1(ctx, cgraph, tensor_idx);
+@@ -14613,6 +14630,656 @@ static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, c
+     ggml_vk_buffer_read_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_tensor, stride_data, size, n_copies);
+ }
+
++static int64_t verathos_vk_trace_sequence = 0;
++static int64_t verathos_vk_manifest_sequence = 0;
++static std::string verathos_vk_trace_capture_token;
++static std::vector<int64_t> verathos_vk_selected_manifest_indexes;
++static int64_t verathos_vk_graph_sequence = 0;
++static int64_t verathos_vk_intra_graph_index = 0;
++static int64_t verathos_vk_graph_dim_valid_ops = 0;
++static int64_t verathos_vk_graph_written_rows = 0;
++static int64_t verathos_vk_graph_max_src1_rows = 0;
++static std::vector<std::pair<int64_t, int64_t>> verathos_vk_selected_ops;
++static std::ofstream verathos_vk_manifest_stream;
++static std::string verathos_vk_manifest_path;
++
++static const char * verathos_vk_trace_dir() {
++    return std::getenv("VERATHOS_GGML_TRACE_DIR");
++}
++
++static int64_t verathos_vk_env_i64(const char * name, int64_t fallback) {
++    const char * raw = std::getenv(name);
++    if (raw == nullptr || raw[0] == '\0') {
++        return fallback;
++    }
++    try {
++        return std::stoll(raw);
++    } catch (...) {
++        return fallback;
++    }
++}
++
++static bool verathos_vk_env_bool(const char * name, bool fallback) {
++    const char * raw = std::getenv(name);
++    if (raw == nullptr || raw[0] == '\0') {
++        return fallback;
++    }
++    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' ||
++           raw[0] == 'y' || raw[0] == 'Y';
++}
++
++static int64_t verathos_vk_trace_max_ops() {
++    const char * per_capture = std::getenv("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE");
++    if (per_capture != nullptr && per_capture[0] != '\0') {
++        return verathos_vk_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE", 64);
++    }
++    return verathos_vk_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_TOTAL", 64);
++}
++
++static bool verathos_vk_read_capture_token(const char * path, std::string & token) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in) {
++        return false;
++    }
++    std::ostringstream out;
++    out << in.rdbuf();
++    token = out.str();
++    while (!token.empty() &&
++           (token.back() == '\n' || token.back() == '\r' || token.back() == ' ' || token.back() == '\t')) {
++        token.pop_back();
++    }
++    if (token.empty()) {
++        token = "present";
++    } else if (token.size() > 4095) {
++        token.resize(4095);
++    }
++    return true;
++}
++
++static void verathos_vk_parse_selected_manifest_indexes(const std::string & token) {
++    verathos_vk_selected_manifest_indexes.clear();
++    const std::string marker = "selected=";
++    size_t pos = token.find(marker);
++    if (pos == std::string::npos) {
++        return;
++    }
++    pos += marker.size();
++    while (pos < token.size() && verathos_vk_selected_manifest_indexes.size() < 64) {
++        while (pos < token.size() && (token[pos] == ' ' || token[pos] == '\t' || token[pos] == ',')) {
++            ++pos;
++        }
++        if (pos >= token.size() || token[pos] < '0' || token[pos] > '9') {
++            break;
++        }
++        size_t end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        try {
++            verathos_vk_selected_manifest_indexes.push_back(std::stoll(token.substr(pos, end - pos)));
++        } catch (...) {
++            break;
++        }
++        pos = end;
++    }
++}
++
++static void verathos_vk_parse_selected_ops(const std::string & token) {
++    verathos_vk_selected_ops.clear();
++    const std::string marker = "selected_v3=";
++    size_t pos = token.find(marker);
++    if (pos == std::string::npos) {
++        return;
++    }
++    pos += marker.size();
++    while (pos < token.size() && verathos_vk_selected_ops.size() < 64) {
++        while (pos < token.size() && (token[pos] == ' ' || token[pos] == '\t' || token[pos] == ',')) {
++            ++pos;
++        }
++        if (pos >= token.size() || token[pos] < '0' || token[pos] > '9') {
++            break;
++        }
++        size_t end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        if (end >= token.size() || token[end] != ':') {
++            break;
++        }
++        int64_t graph_value = 0;
++        int64_t intra_value = 0;
++        try {
++            graph_value = std::stoll(token.substr(pos, end - pos));
++        } catch (...) {
++            break;
++        }
++        pos = end + 1;
++        end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        if (end == pos) {
++            break;
++        }
++        try {
++            intra_value = std::stoll(token.substr(pos, end - pos));
++        } catch (...) {
++            break;
++        }
++        verathos_vk_selected_ops.emplace_back(graph_value, intra_value);
++        pos = end;
++    }
++}
++
++static bool verathos_vk_should_dump_selected_op(int64_t graph_sequence, int64_t intra_index) {
++    for (const auto & item : verathos_vk_selected_ops) {
++        if (item.first == graph_sequence && item.second == intra_index) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool verathos_vk_should_dump_manifest_index(int64_t manifest_index) {
++    if (!verathos_vk_selected_manifest_indexes.empty()) {
++        for (int64_t selected : verathos_vk_selected_manifest_indexes) {
++            if (selected == manifest_index) {
++                return true;
++            }
++        }
++        return false;
++    }
++    const int64_t max_total = verathos_vk_trace_max_ops();
++    return max_total < 0 || verathos_vk_trace_sequence < max_total;
++}
++
++static void verathos_vk_refresh_capture_token(const char * enable_file) {
++    std::string token;
++    if (!verathos_vk_read_capture_token(enable_file, token)) {
++        token = "present";
++    }
++    if (token != verathos_vk_trace_capture_token) {
++        verathos_vk_trace_capture_token = token;
++        verathos_vk_trace_sequence = 0;
++        verathos_vk_manifest_sequence = 0;
++        verathos_vk_graph_sequence = 0;
++        verathos_vk_intra_graph_index = 0;
++        verathos_vk_graph_dim_valid_ops = 0;
++        verathos_vk_graph_written_rows = 0;
++        verathos_vk_graph_max_src1_rows = 0;
++        verathos_vk_parse_selected_manifest_indexes(token);
++        verathos_vk_parse_selected_ops(token);
++        if (verathos_vk_manifest_stream.is_open()) {
++            verathos_vk_manifest_stream.flush();
++            verathos_vk_manifest_stream.close();
++        }
++        verathos_vk_manifest_path.clear();
++    }
++}
++
++static bool verathos_vk_trace_enabled() {
++    const char * dir = verathos_vk_trace_dir();
++    if (dir == nullptr || dir[0] == '\0') {
++        return false;
++    }
++    const char * enable_file = std::getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file != nullptr && enable_file[0] != '\0') {
++#if defined(_WIN32)
++        if (_access(enable_file, 0) != 0) {
++#else
++        if (access(enable_file, F_OK) != 0) {
++#endif
++            return false;
++        }
++        verathos_vk_refresh_capture_token(enable_file);
++    }
++    return true;
++}
++
++static int64_t verathos_vk_unix_ns() {
++    using namespace std::chrono;
++    return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
++}
++
++static void verathos_vk_trace_mkdir(const char * dir) {
++    if (dir == nullptr || dir[0] == '\0') {
++        return;
++    }
++#if defined(_WIN32)
++    _mkdir(dir);
++#else
++    mkdir(dir, 0755);
++#endif
++}
++
++static std::string verathos_vk_json_escape(const char * raw) {
++    std::ostringstream out;
++    for (const char * p = raw ? raw : ""; *p; ++p) {
++        switch (*p) {
++            case '\\': out << "\\\\"; break;
++            case '"': out << "\\\""; break;
++            case '\n': out << "\\n"; break;
++            case '\r': out << "\\r"; break;
++            case '\t': out << "\\t"; break;
++            default: out << *p; break;
++        }
++    }
++    return out.str();
++}
++
++static std::string verathos_vk_hex_escape(const char * raw) {
++    static const char * hex = "0123456789abcdef";
++    std::string out;
++    for (const unsigned char * p = reinterpret_cast<const unsigned char *>(raw ? raw : ""); *p; ++p) {
++        out.push_back(hex[*p >> 4]);
++        out.push_back(hex[*p & 0x0f]);
++    }
++    return out;
++}
++
++static std::string verathos_vk_compact_field(const char * raw) {
++    std::string out(raw ? raw : "");
++    for (char & ch : out) {
++        if (ch == '\t' || ch == '\n' || ch == '\r') {
++            ch = ' ';
++        }
++    }
++    return out;
++}
++
++static bool verathos_vk_manifest_v3() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && std::string(raw) == "compact-raw-v3";
++}
++
++static bool verathos_vk_manifest_compact() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "compact" ||
++        std::string(raw) == "compact-raw" ||
++        std::string(raw) == "compact-raw-v2" ||
++        std::string(raw) == "compact-raw-v3" ||
++        std::string(raw) == "raw" ||
++        std::string(raw) == "decode" ||
++        std::string(raw) == "decode-only");
++}
++
++static bool verathos_vk_manifest_compact_raw() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "compact-raw" ||
++        std::string(raw) == "compact-raw-v2" ||
++        std::string(raw) == "compact-raw-v3" ||
++        std::string(raw) == "raw");
++}
++
++static bool verathos_vk_manifest_disabled() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "none" ||
++        std::string(raw) == "off" ||
++        std::string(raw) == "0");
++}
++
++static bool verathos_vk_manifest_decode_only() {
++    const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "decode" ||
++        std::string(raw) == "decode-only");
++}
++
++static std::string verathos_vk_filename(const std::string & path) {
++    const size_t slash = path.find_last_of("/\\");
++    return slash == std::string::npos ? path : path.substr(slash + 1);
++}
++
++static bool verathos_vk_ends_with(const std::string & value, const std::string & suffix) {
++    return value.size() >= suffix.size() &&
++        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
++}
++
++static bool verathos_vk_is_decode_candidate(
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * dst) {
++    const std::string tensor_name = src0 != nullptr ? src0->name : "";
++    const std::string src1_name = src1 != nullptr ? src1->name : "";
++    const std::string dst_name = dst != nullptr ? dst->name : "";
++    if (tensor_name == "output.weight" ||
++        tensor_name == "lm_head.weight" ||
++        verathos_vk_ends_with(tensor_name, ".lm_head.weight")) {
++        return true;
++    }
++    if (tensor_name.find("attn_output") != std::string::npos) {
++        return false;
++    }
++    return dst_name == "logits" ||
++        dst_name == "result_output" ||
++        (dst_name.find("result_output") != std::string::npos &&
++         (src1_name.find("result_norm") != std::string::npos ||
++          src1_name.find("final") != std::string::npos));
++}
++
++static std::string verathos_vk_manifest_suffix() {
++    std::string suffix;
++    for (char ch : verathos_vk_trace_capture_token) {
++        if (ch < '0' || ch > '9') {
++            break;
++        }
++        if (suffix.size() >= 64) {
++            break;
++        }
++        suffix.push_back(ch);
++    }
++    return suffix.empty() ? "" : "-" + suffix;
++}
++
++static bool verathos_vk_write_f32(const std::string & path, const std::vector<float> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size() * sizeof(float));
++    return bool(out);
++}
++
++static bool verathos_vk_write_raw(const std::string & path, const std::vector<uint8_t> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size());
++    return bool(out);
++}
++
++static std::ostream * verathos_vk_manifest_for_capture(const char * dir) {
++    if (verathos_vk_manifest_disabled()) {
++        return nullptr;
++    }
++    const std::string path = std::string(dir) + "/manifest" + verathos_vk_manifest_suffix() +
++        (verathos_vk_manifest_compact() ? ".vmanifest" : ".jsonl");
++    if (verathos_vk_manifest_path != path || !verathos_vk_manifest_stream.is_open()) {
++        if (verathos_vk_manifest_stream.is_open()) {
++            verathos_vk_manifest_stream.flush();
++            verathos_vk_manifest_stream.close();
++        }
++        verathos_vk_manifest_path = path;
++        verathos_vk_manifest_stream.open(path, std::ios::app);
++    }
++    if (!verathos_vk_manifest_stream) {
++        return nullptr;
++    }
++    return &verathos_vk_manifest_stream;
++}
++
++static void verathos_vk_write_manifest_entry(
++        const char * dir,
++        int64_t now_ns,
++        int64_t manifest_index,
++        const char * device_name,
++        bool proof_eligible,
++        int64_t graph_sequence,
++        int64_t intra_graph_index,
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * dst) {
++    if (verathos_vk_manifest_decode_only() && !verathos_vk_is_decode_candidate(src0, src1, dst)) {
++        return;
++    }
++    std::ostream * manifest_stream = verathos_vk_manifest_for_capture(dir);
++    if (manifest_stream == nullptr) {
++        return;
++    }
++    std::ostream & manifest = *manifest_stream;
++    if (verathos_vk_manifest_compact()) {
++        const bool raw_compact = verathos_vk_manifest_compact_raw();
++        const char * manifest_format = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++        const bool raw_compact_v3 = verathos_vk_manifest_v3();
++        const bool raw_compact_v2 = raw_compact_v3 ||
++            (manifest_format != nullptr && std::string(manifest_format) == "compact-raw-v2");
++        const std::string graph_id = std::string("vulkan-mul-mat-") + std::to_string(manifest_index);
++        if (raw_compact_v2) {
++            manifest << (raw_compact_v3
++                ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V3"
++                : "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V2");
++            manifest << "\t" << now_ns;
++            manifest << "\t" << manifest_index;
++            manifest << "\t" << verathos_vk_compact_field(src0->name);
++            manifest << "\t" << verathos_vk_compact_field(src1->name);
++            manifest << "\t" << verathos_vk_compact_field(dst->name);
++            manifest << "\t" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3];
++            manifest << "\t" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3];
++            manifest << "\t" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3];
++            manifest << "\t" << ggml_type_name((ggml_type) src0->type);
++            manifest << "\t" << ggml_type_name((ggml_type) src1->type);
++            manifest << "\t" << ggml_type_name((ggml_type) dst->type);
++            manifest << "\t" << "llama_cpp_vulkan";
++            manifest << "\t" << verathos_vk_compact_field(device_name);
++            manifest << "\t" << (proof_eligible ? "1" : "0");
++            if (raw_compact_v3) {
++                manifest << "\t" << graph_sequence << "\t" << intra_graph_index;
++            }
++            manifest << "\n";
++            manifest.flush();
++            return;
++        }
++        manifest << (raw_compact ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V1" : "VERATHOS_GGML_OP_MANIFEST_COMPACT_V1");
++        manifest << "\t" << now_ns;
++        manifest << "\t" << manifest_index;
++        manifest << "\t" << (raw_compact ? verathos_vk_compact_field(graph_id.c_str()) : verathos_vk_hex_escape(graph_id.c_str()));
++        manifest << "\t" << manifest_index;
++        manifest << "\t" << (raw_compact ? verathos_vk_compact_field(src0->name) : verathos_vk_hex_escape(src0->name));
++        manifest << "\t" << (raw_compact ? verathos_vk_compact_field(src0->name) : verathos_vk_hex_escape(src0->name));
++        manifest << "\t" << (raw_compact ? verathos_vk_compact_field(src1->name) : verathos_vk_hex_escape(src1->name));
++        manifest << "\t" << (raw_compact ? verathos_vk_compact_field(dst->name) : verathos_vk_hex_escape(dst->name));
++        manifest << "\t" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3];
++        manifest << "\t" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3];
++        manifest << "\t" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3];
++        manifest << "\t" << ggml_type_name((ggml_type) src0->type);
++        manifest << "\t" << ggml_type_name((ggml_type) src1->type);
++        manifest << "\t" << ggml_type_name((ggml_type) dst->type);
++        manifest << "\t" << (raw_compact ? verathos_vk_compact_field("llama_cpp_vulkan") : verathos_vk_hex_escape("llama_cpp_vulkan"));
++        manifest << "\t" << (raw_compact ? verathos_vk_compact_field(device_name) : verathos_vk_hex_escape(device_name));
++        manifest << "\t" << (proof_eligible ? "1" : "0") << "\n";
++        manifest.flush();
++        return;
++    }
++    manifest << "{\"version\":1";
++    manifest << ",\"created_unix_ns\":" << now_ns;
++    manifest << ",\"manifest_index\":" << manifest_index;
++    manifest << ",\"graph_id\":\"vulkan-mul-mat-" << manifest_index << "\"";
++    manifest << ",\"op_index\":" << manifest_index;
++    manifest << ",\"op_type\":\"GGML_OP_MUL_MAT\"";
++    manifest << ",\"tensor_name\":\"" << verathos_vk_json_escape(src0->name) << "\"";
++    manifest << ",\"src0_name\":\"" << verathos_vk_json_escape(src0->name) << "\"";
++    manifest << ",\"src1_name\":\"" << verathos_vk_json_escape(src1->name) << "\"";
++    manifest << ",\"dst_name\":\"" << verathos_vk_json_escape(dst->name) << "\"";
++    manifest << ",\"src0_shape\":[" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "]";
++    manifest << ",\"src1_shape\":[" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3] << "]";
++    manifest << ",\"dst_shape\":[" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << "]";
++    manifest << ",\"source_types\":{\"src0\":\"" << ggml_type_name((ggml_type) src0->type)
++             << "\",\"src1\":\"" << ggml_type_name((ggml_type) src1->type)
++             << "\",\"dst\":\"" << ggml_type_name((ggml_type) dst->type) << "\"}";
++    manifest << ",\"backend\":\"llama_cpp_vulkan\"";
++    manifest << ",\"device\":\"" << verathos_vk_json_escape(device_name) << "\"";
++    manifest << ",\"proof_eligible\":" << (proof_eligible ? "true" : "false") << "}\n";
++    manifest.flush();
++}
++
++static bool verathos_vk_tensor_raw_to_host(const ggml_tensor * tensor, std::vector<uint8_t> & raw) {
++    if (tensor == nullptr || tensor->data == nullptr || tensor->buffer == nullptr) {
++        return false;
++    }
++    if (!ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    const size_t nbytes = ggml_nbytes(tensor);
++    if (nbytes == 0) {
++        return false;
++    }
++    raw.resize(nbytes);
++    if (ggml_backend_buffer_is_vk(tensor->buffer)) {
++        ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
++        vk_buffer & buffer_gpu = buf_ctx->dev_buffer;
++        ggml_vk_buffer_read(buffer_gpu, vk_tensor_offset(tensor) + tensor->view_offs, raw.data(), nbytes);
++        return true;
++    }
++    if (ggml_backend_buffer_is_host(tensor->buffer)) {
++        memcpy(raw.data(), tensor->data, nbytes);
++        return true;
++    }
++    return false;
++}
++
++static bool verathos_vk_raw_to_f32(
++        const ggml_tensor * tensor,
++        const std::vector<uint8_t> & raw,
++        std::vector<float> & out) {
++    const int64_t n = ggml_nelements(tensor);
++    if (n <= 0) {
++        return false;
++    }
++    out.resize(n);
++    if (tensor->type == GGML_TYPE_F32) {
++        if (raw.size() != sizeof(float) * (size_t) n) {
++            return false;
++        }
++        memcpy(out.data(), raw.data(), raw.size());
++        return true;
++    }
++    const ggml_type_traits * traits = ggml_get_type_traits((ggml_type) tensor->type);
++    if (traits == nullptr || traits->to_float == nullptr) {
++        return false;
++    }
++    traits->to_float(raw.data(), out.data(), n);
++    return true;
++}
++
++static void verathos_vk_try_dump_mul_mat_trace(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
++    if (!verathos_vk_trace_enabled()) {
++        return;
++    }
++    const char * dir = verathos_vk_trace_dir();
++    if (dir == nullptr || dir[0] == '\0' || ctx == nullptr || dst == nullptr || dst->op != GGML_OP_MUL_MAT) {
++        return;
++    }
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    if (src0 == nullptr || src1 == nullptr) {
++        return;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        dst->ne[2]  != 1 || dst->ne[3]  != 1) {
++        return;
++    }
++    if (src0->ne[0] != src1->ne[0] ||
++        dst->ne[0]  != src0->ne[1] ||
++        dst->ne[1]  != src1->ne[1]) {
++        return;
++    }
++
++    // Intra-graph index counts every dim-valid MUL_MAT regardless of size
++    // eligibility, so it stays stable across batch row counts.
++    const int64_t intra_graph_index = verathos_vk_intra_graph_index++;
++    verathos_vk_graph_dim_valid_ops++;
++    if (src1->ne[1] > verathos_vk_graph_max_src1_rows) {
++        verathos_vk_graph_max_src1_rows = src1->ne[1];
++    }
++
++    verathos_vk_trace_mkdir(dir);
++    const int64_t now_ns = verathos_vk_unix_ns();
++    const int64_t manifest_index = ++verathos_vk_manifest_sequence;
++    const int64_t total_elems = ggml_nelements(src0) + ggml_nelements(src1) + ggml_nelements(dst);
++    const int64_t max_elems = verathos_vk_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    const bool proof_eligible =
++        verathos_vk_is_decode_candidate(src0, src1, dst) ||
++        !(max_elems > 0 && total_elems > max_elems);
++    if (!proof_eligible) {
++        return;
++    }
++    verathos_vk_write_manifest_entry(
++        dir, now_ns, manifest_index, ctx->name.c_str(), proof_eligible,
++        verathos_vk_graph_sequence, intra_graph_index, src0, src1, dst);
++    verathos_vk_graph_written_rows++;
++    const bool selected_op_dump = !verathos_vk_selected_ops.empty() &&
++        verathos_vk_should_dump_selected_op(verathos_vk_graph_sequence, intra_graph_index);
++    if (!selected_op_dump && !verathos_vk_selected_ops.empty()) {
++        return;
++    }
++    if (!selected_op_dump && !verathos_vk_should_dump_manifest_index(manifest_index)) {
++        return;
++    }
++    const int64_t sequence = ++verathos_vk_trace_sequence;
++
++    const bool skip_src0_dump = verathos_vk_env_bool("VERATHOS_GGML_TRACE_SKIP_SRC0_DUMP", false);
++    std::vector<uint8_t> src0_raw;
++    std::vector<uint8_t> src1_raw;
++    std::vector<uint8_t> dst_raw;
++    if ((!skip_src0_dump && !verathos_vk_tensor_raw_to_host(src0, src0_raw)) ||
++        !verathos_vk_tensor_raw_to_host(src1, src1_raw) ||
++        !verathos_vk_tensor_raw_to_host(dst, dst_raw)) {
++        return;
++    }
++
++    std::vector<float> src0_f32;
++    std::vector<float> src1_f32;
++    std::vector<float> dst_f32;
++    if ((!skip_src0_dump && !verathos_vk_raw_to_f32(src0, src0_raw, src0_f32)) ||
++        !verathos_vk_raw_to_f32(src1, src1_raw, src1_f32) ||
++        !verathos_vk_raw_to_f32(dst, dst_raw, dst_f32)) {
++        return;
++    }
++
++    std::ostringstream prefix;
++    prefix << dir << "/trace-" << now_ns << "-vulkan-op" << manifest_index;
++    const std::string src0_path = prefix.str() + "-src0.f32";
++    const std::string src0_raw_path = prefix.str() + "-src0.raw";
++    const std::string src1_path = prefix.str() + "-src1.f32";
++    const std::string dst_path  = prefix.str() + "-dst.f32";
++    const std::string json_path = prefix.str() + ".json";
++    if ((!skip_src0_dump && !verathos_vk_write_f32(src0_path, src0_f32)) ||
++        (!skip_src0_dump && !verathos_vk_write_raw(src0_raw_path, src0_raw)) ||
++        !verathos_vk_write_f32(src1_path, src1_f32) ||
++        !verathos_vk_write_f32(dst_path, dst_f32)) {
++        return;
++    }
++
++    std::ofstream meta(json_path);
++    if (!meta) {
++        return;
++    }
++    meta << "{\n";
++    meta << "  \"version\": 1,\n";
++    meta << "  \"created_unix_ns\": " << now_ns << ",\n";
++    meta << "  \"manifest_index\": " << manifest_index << ",\n";
++    meta << "  \"graph_seq\": " << verathos_vk_graph_sequence << ",\n";
++    meta << "  \"intra_graph_index\": " << intra_graph_index << ",\n";
++    meta << "  \"graph_id\": \"vulkan-mul-mat-" << manifest_index << "\",\n";
++    meta << "  \"op_index\": " << manifest_index << ",\n";
++    meta << "  \"op_type\": \"GGML_OP_MUL_MAT\",\n";
++    meta << "  \"tensor_name\": \"" << verathos_vk_json_escape(src0->name) << "\",\n";
++    meta << "  \"src0_name\": \"" << verathos_vk_json_escape(src0->name) << "\",\n";
++    meta << "  \"src1_name\": \"" << verathos_vk_json_escape(src1->name) << "\",\n";
++    meta << "  \"dst_name\": \"" << verathos_vk_json_escape(dst->name) << "\",\n";
++    meta << "  \"src0_shape\": [" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "],\n";
++    meta << "  \"src1_shape\": [" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3] << "],\n";
++    meta << "  \"dst_shape\": [" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << "],\n";
++    if (!skip_src0_dump) {
++        meta << "  \"src0_f32\": \"" << verathos_vk_filename(src0_path) << "\",\n";
++        meta << "  \"src0_raw\": \"" << verathos_vk_filename(src0_raw_path) << "\",\n";
++    }
++    meta << "  \"src0_raw_type\": \"" << ggml_type_name((ggml_type) src0->type) << "\",\n";
++    meta << "  \"src1_f32\": \"" << verathos_vk_filename(src1_path) << "\",\n";
++    meta << "  \"dst_f32\": \"" << verathos_vk_filename(dst_path) << "\",\n";
++    meta << "  \"source_types\": {\"src0\": \"" << ggml_type_name((ggml_type) src0->type)
++         << "\", \"src1\": \"" << ggml_type_name((ggml_type) src1->type)
++         << "\", \"dst\": \"" << ggml_type_name((ggml_type) dst->type) << "\"},\n";
++    meta << "  \"backend\": \"llama_cpp_vulkan\",\n";
++    meta << "  \"device\": \"" << verathos_vk_json_escape(ctx->name.c_str()) << "\"\n";
++    meta << "}\n";
++}
++
+ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+     if (ggml_nbytes(src) == 0) {
+         return true;
+@@ -15584,10 +16251,47 @@ static int32_t find_first_set(uint32_t x) {
+     return ret;
+ }
+
++static void verathos_vk_trace_begin_graph() {
++    if (!verathos_vk_trace_enabled()) {
++        return;
++    }
++    verathos_vk_graph_sequence++;
++    verathos_vk_intra_graph_index = 0;
++    verathos_vk_graph_dim_valid_ops = 0;
++    verathos_vk_graph_written_rows = 0;
++    verathos_vk_graph_max_src1_rows = 0;
++}
++
++static void verathos_vk_trace_end_graph(const char * device_name) {
++    if (!verathos_vk_manifest_v3() || verathos_vk_graph_dim_valid_ops <= 0) {
++        return;
++    }
++    const char * dir = verathos_vk_trace_dir();
++    if (dir == nullptr || dir[0] == '\0') {
++        return;
++    }
++    std::ostream * manifest_stream = verathos_vk_manifest_for_capture(dir);
++    if (manifest_stream == nullptr) {
++        return;
++    }
++    std::ostream & manifest = *manifest_stream;
++    manifest << "VERATHOS_GGML_GRAPH_V1";
++    manifest << "\t" << verathos_vk_unix_ns();
++    manifest << "\t" << verathos_vk_graph_sequence;
++    manifest << "\t" << verathos_vk_graph_dim_valid_ops;
++    manifest << "\t" << verathos_vk_graph_written_rows;
++    manifest << "\t" << verathos_vk_graph_max_src1_rows;
++    manifest << "\tllama_cpp_vulkan\t" << verathos_vk_compact_field(device_name);
++    manifest << "\n";
++    manifest.flush();
++}
++
+ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
++    verathos_vk_trace_begin_graph();
++
+     if (vk_instance.debug_utils_support) {
+         vk::DebugUtilsLabelEXT dul = {};
+         dul.pLabelName = "ggml_backend_vk_graph_compute";
+@@ -15687,7 +16391,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
+         const char *fusion_string {};
+-        if (!ctx->device->disable_fusion) {
++        if (!ctx->device->disable_fusion && !verathos_vk_trace_enabled()) {
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+             if (num_adds) {
+                 ctx->num_additional_fused_ops = num_adds - 1;
+@@ -15982,6 +16686,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ggml_vk_synchronize(ctx);
+     }
+
++    verathos_vk_trace_end_graph(ctx->name.c_str());
++
+     return GGML_STATUS_SUCCESS;
+
+     UNUSED(backend);

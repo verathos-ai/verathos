@@ -65,7 +65,7 @@ import bittensor as bt
 import os
 import struct
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Set, Tuple
 
 from neurons.receipts import ServiceReceipt
@@ -117,6 +117,17 @@ class EpochOutcome:
     expected_own_receipt_count: int = 0
     # Exact signed v4 obligations: id -> (kind, target prompt tokens).
     expected_canary_obligations: Dict[bytes, Tuple[str, int]] = field(
+        default_factory=dict
+    )
+    # Obligations this validator ALSO scheduled for the same epoch/entry but
+    # that are no longer part of the active plan (a mid-epoch validator
+    # restart re-plans the epoch under a fresh secret salt; obligations of
+    # the discarded plan may already have produced signed receipts). A
+    # receipt matching one of these is validator-produced residue: it is
+    # validated but never scored and never treated as a forgery. Receipt
+    # count cannot inflate score — scoring uses the expected obligation
+    # inventory, not the receipt count.
+    superseded_canary_obligations: Dict[bytes, Tuple[str, int]] = field(
         default_factory=dict
     )
 
@@ -197,7 +208,16 @@ def compute_model_base_utility(
     )
     utility = math.log2(max(quality_params, 1.0)) ** 1.8
     ctx_value = math.log2(max(max_context_len / 1024, 1))
-    quant_q = QUANT_QUALITY.get(quant, 0.80)
+    quant_q = QUANT_QUALITY.get(quant)
+    if quant_q is None and quant.startswith("gguf_"):
+        # Mesh profiles carry the exact GGUF scheme (gguf_iq2_m, ...): a
+        # q4_k_m and an iq2_m of the same model must not score the same
+        # quality. The per-scheme table lives with the catalogue.
+        from verallm.registry.models import gguf_quant_quality
+
+        quant_q = gguf_quant_quality(quant[len("gguf_"):])
+    if quant_q is None:
+        quant_q = 0.80
     return utility * ctx_value * quant_q * generation_quality
 
 
@@ -293,6 +313,31 @@ def select_scoring_authority_receipts(
     ]
 
 
+def _receipt_matches_canary_obligation(
+    receipt: ServiceReceipt,
+    expected: Tuple[str, int],
+) -> bool:
+    """Check one signed canary receipt against one planned obligation.
+
+    Kind, exact target and the materializer's prompt-token tolerance must
+    all agree — a receipt claiming an obligation with mismatched geometry
+    is misattributed or forged and must never be excused.
+    """
+
+    expected_kind, expected_target = expected
+    actual_target = int(
+        getattr(receipt, "canary_target_prompt_tokens", 0) or 0
+    )
+    prompt_tokens = int(receipt.prompt_tokens or 0)
+    tolerance = canary_prompt_token_tolerance_v3(int(expected_target))
+    return (
+        str(getattr(receipt, "canary_kind", "") or "") == expected_kind
+        and actual_target == int(expected_target)
+        and 0 < prompt_tokens <= int(expected_target)
+        and int(expected_target) - prompt_tokens <= tolerance
+    )
+
+
 def compute_epoch_entry_score(
     outcome: EpochOutcome,
     active_params_b: float,
@@ -331,41 +376,51 @@ def compute_epoch_entry_score(
 
     expected_obligations = dict(outcome.expected_canary_obligations)
     if expected_obligations:
+        superseded_obligations = dict(
+            getattr(outcome, "superseded_canary_obligations", {}) or {}
+        )
         seen: Dict[bytes, ServiceReceipt] = {}
         invalid = False
         for receipt in outcome.own_receipts:
+            if not receipt.is_canary:
+                continue
             obligation_id = bytes(
                 getattr(receipt, "canary_obligation_id", b"") or b""
             )
             if obligation_id in outcome.neutral_hard_obligation_ids:
+                # Main's neutral-hard scoping: obligations the validator
+                # itself neutralized must not zero the miner.
                 continue
-            if not receipt.is_canary:
+            if int(getattr(receipt, "receipt_version", 1) or 1) < 4:
+                invalid = True
                 continue
             expected_item = expected_obligations.get(obligation_id)
-            if (
-                int(getattr(receipt, "receipt_version", 1) or 1) < 4
-                or expected_item is None
-                or obligation_id in seen
-            ):
+            if expected_item is None:
+                superseded_item = superseded_obligations.get(obligation_id)
+                if superseded_item is not None and (
+                    _receipt_matches_canary_obligation(
+                        receipt, superseded_item
+                    )
+                ):
+                    # Benign validator-side residue: this validator scheduled
+                    # and verified the test under an earlier plan of the same
+                    # epoch (mid-epoch restart re-plan). Ignoring it cannot
+                    # inflate score; zeroing it would fail an honest serve.
+                    continue
+                # A receipt for a test never scheduled in this epoch is a
+                # forged or misattributed receipt -> hard integrity failure.
                 invalid = True
                 continue
-            expected_kind, expected_target = expected_item
-            actual_target = int(
-                getattr(receipt, "canary_target_prompt_tokens", 0) or 0
-            )
-            prompt_tokens = int(receipt.prompt_tokens or 0)
-            tolerance = canary_prompt_token_tolerance_v3(
-                int(expected_target)
-            )
-            if (
-                str(getattr(receipt, "canary_kind", "") or "")
-                != expected_kind
-                or actual_target != int(expected_target)
-                or prompt_tokens <= 0
-                or prompt_tokens > int(expected_target)
-                or int(expected_target) - prompt_tokens > tolerance
-            ):
+            if not _receipt_matches_canary_obligation(receipt, expected_item):
                 invalid = True
+                continue
+            if obligation_id in seen:
+                # Benign duplicate of an already-satisfied obligation
+                # (retry/dispatch duplication, e.g. across a mid-epoch mesh
+                # roll). The obligation is fulfilled and count inflation
+                # cannot increase score, so the duplicate is ignored. A
+                # duplicate with mismatched geometry fails the check above
+                # and still zeroes.
                 continue
             seen[obligation_id] = receipt
         missing = set(expected_obligations).difference(seen)
@@ -1019,6 +1074,27 @@ class CompositeScorer:
                 bt.logging.info(f"EMA halved for {address[:10]} model_index={model_index}: {old:.4f} -> {entry.ema_score:.4f}")
                 return
 
+    def zero_ema(self, address: str, model_index: int) -> None:
+        """Zero the EMA score after a broken commitment.
+
+        Halving assumes a single failure is recoverable, which is right for a
+        miner having a bad epoch. A coordinator that broke a commitment it had
+        already made keeps most of its accumulated score under geometric
+        decay, so that case starts from zero instead.
+        """
+        for _uid, mstate in self.states.items():
+            if mstate.address.lower() != address.lower():
+                continue
+            entry = mstate.entries.get(model_index)
+            if entry is not None:
+                old = entry.ema_score
+                entry.ema_score = 0.0
+                bt.logging.info(
+                    f"EMA zeroed for {address[:10]} model_index={model_index} "
+                    f"(binding violation): {old:.4f} -> 0.0000"
+                )
+                return
+
     def _update_entry_ema(
         self,
         entry: ModelEntryScore,
@@ -1107,6 +1183,40 @@ class ProbationTracker:
                 )
                 bt.logging.info(f"Probation ENTERED for {key[0][:10]} model_index={key[1]} at epoch {epoch} endpoint={endpoint} (must pass {self.required_passes} consecutive epochs to exit)")
             self._save()
+
+    def reconcile_probation(
+        self,
+        key: Tuple[str, int],
+        *,
+        entered_at_epoch: int,
+        consecutive_passes: int,
+        endpoint: str = "",
+    ) -> None:
+        """Replace one local probation row with authoritative DB state."""
+
+        with self._lock:
+            current = self._probation.get(key)
+            self._probation[key] = ProbationState(
+                entered_at_epoch=int(entered_at_epoch),
+                consecutive_passes=max(0, int(consecutive_passes)),
+                required_passes=(
+                    current.required_passes if current else self.required_passes
+                ),
+                escalation_epochs=(
+                    current.escalation_epochs
+                    if current
+                    else self.escalation_epochs
+                ),
+                endpoint=endpoint or (current.endpoint if current else ""),
+            )
+            self._save()
+
+    def reconcile_not_on_probation(self, key: Tuple[str, int]) -> None:
+        """Remove a stale local row after authoritative DB reconciliation."""
+
+        with self._lock:
+            if self._probation.pop(key, None) is not None:
+                self._save()
 
     def record_pass(self, key: Tuple[str, int]) -> bool:
         """Record a clean epoch (all proofs passed) for a probation entry.
@@ -1199,7 +1309,23 @@ class ProbationTracker:
             if key not in self._probation:
                 return False
             state = self._probation[key]
-            return (current_epoch - state.entered_at_epoch) >= state.escalation_epochs
+            elapsed = current_epoch - state.entered_at_epoch
+            if elapsed < 0 or elapsed > 10 * max(1, state.escalation_epochs):
+                # Epoch NUMBERING changed under the stored entry (the owner
+                # retimed epoch_blocks via the hosted config: 360 -> 180 doubled
+                # every epoch number) or the clock ran
+                # backwards. The stored age is meaningless either way — re-anchor
+                # to now instead of instantly escalating a healthy rehab to
+                # reportOffline.
+                bt.logging.warning(
+                    f"Probation age for {key[0][:10]} idx={key[1]} is implausible "
+                    f"(entered_at_epoch={state.entered_at_epoch}, current="
+                    f"{current_epoch}); re-anchoring to the current epoch"
+                )
+                self._probation[key] = replace(state, entered_at_epoch=int(current_epoch))
+                self._save()
+                return False
+            return elapsed >= state.escalation_epochs
 
     def get_probation_entries(self) -> Set[Tuple[str, int]]:
         """Get all (miner_address, model_index) pairs currently on probation."""
@@ -1233,6 +1359,7 @@ class ProbationTracker:
             self._probation.clear()
             self._save()
             return count
+
 
     def _save(self) -> None:
         """Persist probation state to disk (atomic write)."""

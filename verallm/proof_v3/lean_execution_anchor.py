@@ -468,33 +468,18 @@ def lean_projection_row_layouts_v3(
                     )
                 )
             if (
-                decode_positions
-                and (
-                    decode_positions
-                    != tuple(sorted(set(decode_positions)))
-                    or any(
-                        position < challenge.context_token_count
-                        or position >= challenge.sequence_token_count
-                        for position in decode_positions
-                    )
+                not decode_positions
+                or decode_positions
+                != tuple(sorted(set(decode_positions)))
+                or any(
+                    position < challenge.context_token_count
+                    or position >= challenge.sequence_token_count
+                    for position in decode_positions
                 )
             ):
                 raise ProofV3Error(
                     "lean GDN transition rows are malformed"
                 )
-            if not decode_positions:
-                if challenge.decode_token_count != 1:
-                    raise ProofV3Error(
-                        "lean GDN transition rows are unexpectedly empty"
-                    )
-                if layer in gdn_layers:
-                    raise ProofV3Error(
-                        "selected-trace GDN audit requires a forwarded row"
-                    )
-                # Compact v9 still audits the final prompt producer through
-                # the ordinary transition layout.  There is no decode
-                # recurrence or projection-binding row to append.
-                continue
             if layer in gdn_layers:
                 positions_by_layer[layer] = set(decode_positions)
             else:
@@ -774,17 +759,9 @@ def expected_lean_execution_anchor_reveals_v3(
                         )
                     )
             if not decode_positions:
-                if challenge.decode_token_count != 1:
-                    raise ProofV3Error(
-                        "lean GDN replay rows are unexpectedly empty"
-                    )
-                if complete_gdn_projection_window:
-                    raise ProofV3Error(
-                        "selected-trace GDN audit requires a forwarded row"
-                    )
-                # The final prompt forward remains in the ordinary compact
-                # transition proof.  No decode recurrence rows exist here.
-                continue
+                raise ProofV3Error(
+                    "lean GDN replay requires a forwarded decode row"
+                )
             expected.setdefault(
                 f"l{layer}.residual_out", set()
             ).update(decode_positions)

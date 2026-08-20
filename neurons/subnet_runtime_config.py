@@ -49,7 +49,7 @@ class MaintenanceGraceConfig:
     suppress_proxy_proof_strikes: bool = True
 
 
-DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS = (3,)
+DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS = (1, 3)
 LOCAL_PROOF_PROTOCOL_VERSIONS = (1, 3)
 _RESERVED_INFERENCE_PROOF_PROTOCOL_VERSIONS = frozenset({2})
 _MAX_PROOF_PROTOCOL_VERSION = 255
@@ -130,6 +130,11 @@ class RuntimeSubnetConfig:
     capacity_audit_slot_refresh_blocks: int
     capacity_audit_slot_snapshot_stale_blocks: int
     capacity_audit_proof_verify_workers: int
+    # First epoch at which mesh (GGUF) entries are gated/convicted by the
+    # capacity audit. 0 = disabled: scheduling and ingest still run for mesh
+    # slots (observe-mode evidence) but no mesh entry is ever gated.
+    mesh_capacity_audit_enforcement_epoch: int
+    mesh_capacity_roster_grace_epochs: int
     proof_protocol_rollout: ProofProtocolRolloutConfig
     proof_v3_hard_auditor: ProofV3HardAuditorConfig
     proof_v3_failure_policy: ProofV3FailurePolicyConfig
@@ -337,6 +342,30 @@ def _parse_gpu_classes(data: Mapping[str, Any]) -> tuple[CapacityGpuClass, ...]:
     if not isinstance(raw, list) or not raw:
         raise SubnetRuntimeConfigError("capacity_audit.gpu_classes must be a non-empty list")
     return tuple(_parse_gpu_class(row, idx) for idx, row in enumerate(raw))
+
+
+def _coerce_gpu_classes(raw: Any) -> tuple[CapacityGpuClass, ...]:
+    """Neuron-config round-trip for the gpu_classes workload table.
+
+    apply_runtime_config_to_neuron_config stores the hosted table as parsed
+    CapacityGpuClass rows on the neuron config; a config that never saw a
+    hosted payload falls back to the code defaults. Mapping rows (a config
+    that was serialized through JSON) go through the same per-row parser the
+    hosted payload uses so there is exactly one coercion path.
+    """
+    if not raw:
+        return DEFAULT_GPU_CLASSES
+    rows: list[CapacityGpuClass] = []
+    for idx, row in enumerate(raw):
+        if isinstance(row, CapacityGpuClass):
+            rows.append(row)
+        elif isinstance(row, Mapping):
+            rows.append(_parse_gpu_class(row, idx))
+        else:
+            raise SubnetRuntimeConfigError(
+                f"gpu_classes[{idx}] must be a CapacityGpuClass or an object"
+            )
+    return tuple(rows)
 
 
 def _maintenance_grace_to_dict(row: MaintenanceGraceConfig) -> dict[str, Any]:
@@ -764,7 +793,18 @@ def build_default_subnet_config_payload(
                 neuron_config.capacity_audit_slot_snapshot_stale_blocks
             ),
             "proof_verify_workers": int(neuron_config.capacity_audit_proof_verify_workers),
-            "gpu_classes": [_gpu_class_to_dict(row) for row in DEFAULT_GPU_CLASSES],
+            "mesh_capacity_audit_enforcement_epoch": int(
+                neuron_config.mesh_capacity_audit_enforcement_epoch
+            ),
+            "mesh_capacity_roster_grace_epochs": int(
+                neuron_config.mesh_capacity_roster_grace_epochs
+            ),
+            "gpu_classes": [
+                _gpu_class_to_dict(row)
+                for row in _coerce_gpu_classes(
+                    getattr(neuron_config, "capacity_audit_gpu_classes", None)
+                )
+            ],
         },
         "proof_protocol_rollout": _proof_protocol_rollout_to_dict(
             proof_protocol_rollout_config_from_neuron_config(neuron_config)
@@ -942,6 +982,22 @@ def validate_subnet_config_payload(
         audit_data, "slot_snapshot_stale_blocks", minimum=0
     )
     proof_verify_workers = _require_int(audit_data, "proof_verify_workers", minimum=1)
+    # Additive field: hosted configs published before the mesh audit rollout
+    # omit it, which must parse as "mesh gating disabled".
+    audit_data_with_defaults.setdefault("mesh_capacity_audit_enforcement_epoch", 0)
+    mesh_capacity_audit_enforcement_epoch = _require_int(
+        audit_data_with_defaults,
+        "mesh_capacity_audit_enforcement_epoch",
+        minimum=0,
+    )
+    # Additive field: hosted configs published before the roster-refusal gate
+    # omit it, which must parse as the code default (2), not "disabled".
+    audit_data_with_defaults.setdefault("mesh_capacity_roster_grace_epochs", 2)
+    mesh_capacity_roster_grace_epochs = _require_int(
+        audit_data_with_defaults,
+        "mesh_capacity_roster_grace_epochs",
+        minimum=0,
+    )
     proof_protocol_rollout = _parse_proof_protocol_rollout(payload)
     proof_v3_hard_auditor = _parse_proof_v3_hard_auditor(payload)
     proof_v3_failure_policy = _parse_proof_v3_failure_policy(payload)
@@ -1008,6 +1064,8 @@ def validate_subnet_config_payload(
         "slot_refresh_blocks": slot_refresh_blocks,
         "slot_snapshot_stale_blocks": slot_snapshot_stale_blocks,
         "proof_verify_workers": proof_verify_workers,
+        "mesh_capacity_audit_enforcement_epoch": mesh_capacity_audit_enforcement_epoch,
+        "mesh_capacity_roster_grace_epochs": mesh_capacity_roster_grace_epochs,
         "gpu_classes": [_gpu_class_to_dict(row) for row in gpu_classes],
     }
     normalized["proof_protocol_rollout"] = _proof_protocol_rollout_to_dict(
@@ -1047,6 +1105,8 @@ def validate_subnet_config_payload(
         capacity_audit_slot_refresh_blocks=slot_refresh_blocks,
         capacity_audit_slot_snapshot_stale_blocks=slot_snapshot_stale_blocks,
         capacity_audit_proof_verify_workers=proof_verify_workers,
+        mesh_capacity_audit_enforcement_epoch=mesh_capacity_audit_enforcement_epoch,
+        mesh_capacity_roster_grace_epochs=mesh_capacity_roster_grace_epochs,
         proof_protocol_rollout=proof_protocol_rollout,
         proof_v3_hard_auditor=proof_v3_hard_auditor,
         proof_v3_failure_policy=proof_v3_failure_policy,
@@ -1131,6 +1191,14 @@ def apply_runtime_config_to_neuron_config(
     config.capacity_audit_uid_escalation_max_entries = (
         audit.uid_escalation_max_entries
     )
+    # The hosted gpu_classes workload table must survive the neuron-config
+    # round-trip. Without this line every consumer that rebuilds its runtime
+    # config via capacity_audit_config_from_neuron_config (the mesh capacity
+    # audit worker at each epoch boundary) silently resolves pass counts
+    # against the import-time DEFAULT_GPU_CLASSES while the validator uses
+    # the hosted rows: every artifact fails "pass_count mismatch" until the
+    # worker daemon is restarted.
+    config.capacity_audit_gpu_classes = audit.gpu_classes
     config.capacity_audit_slot_refresh_blocks = (
         runtime.capacity_audit_slot_refresh_blocks
     )
@@ -1139,6 +1207,12 @@ def apply_runtime_config_to_neuron_config(
     )
     config.capacity_audit_proof_verify_workers = (
         runtime.capacity_audit_proof_verify_workers
+    )
+    config.mesh_capacity_audit_enforcement_epoch = (
+        runtime.mesh_capacity_audit_enforcement_epoch
+    )
+    config.mesh_capacity_roster_grace_epochs = (
+        runtime.mesh_capacity_roster_grace_epochs
     )
     rollout = runtime.proof_protocol_rollout
     config.proof_protocol_allowed_versions = rollout.allowed_protocol_versions
@@ -1345,6 +1419,9 @@ def capacity_audit_config_from_neuron_config(config: Any) -> CapacityAuditRuntim
         ),
         uid_escalation_max_entries=int(
             getattr(config, "capacity_audit_uid_escalation_max_entries", 10)
+        ),
+        gpu_classes=_coerce_gpu_classes(
+            getattr(config, "capacity_audit_gpu_classes", None)
         ),
         validator_urls=tuple(
             u.strip()

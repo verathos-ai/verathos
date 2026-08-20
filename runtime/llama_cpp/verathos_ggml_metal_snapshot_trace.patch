@@ -1,0 +1,677 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.h b/ggml/src/ggml-metal/ggml-metal-context.h
+index abf4b06..965185a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.h
++++ b/ggml/src/ggml-metal/ggml-metal-context.h
+@@ -33,6 +33,7 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
+ 
+ void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
+ void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data);
++void ggml_metal_set_trace_callback  (ggml_metal_t ctx, ggml_metal_trace_callback_t callback, void * user_data);
+ bool ggml_metal_supports_family     (ggml_metal_t ctx, int family);
+ void ggml_metal_capture_next_compute(ggml_metal_t ctx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 32d97cd..712d6dd 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -76,6 +76,10 @@ struct ggml_metal {
+     ggml_abort_callback abort_callback;
+     void *              abort_callback_data;
+ 
++    // optional verifier tracing hook used only for selected proof replay
++    ggml_metal_trace_callback_t trace_callback;
++    void *                      trace_callback_user_data;
++
+     // error state - set when a command buffer fails during synchronize
+     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
+     bool has_error;
+@@ -703,6 +707,10 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+             ctx->capture_compute,
+             ctx->debug_graph,
+             ctx->debug_fusion);
++        ggml_metal_op_set_trace_callback(
++            ctx_op,
++            ctx->trace_callback,
++            ctx->trace_callback_user_data);
+ 
+         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+             const int res = ggml_metal_op_encode(ctx_op, idx);
+@@ -726,6 +734,11 @@ void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_c
+     ctx->abort_callback_data = user_data;
+ }
+ 
++void ggml_metal_set_trace_callback(ggml_metal_t ctx, ggml_metal_trace_callback_t callback, void * user_data) {
++    ctx->trace_callback = callback;
++    ctx->trace_callback_user_data = user_data;
++}
++
+ bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
+     GGML_ASSERT(ctx->dev != nil);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 4a3ebb5..1b47702 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -91,6 +91,22 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
+ 
+ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
+ 
++typedef void * ggml_metal_trace_snapshot_t;
++typedef void (*ggml_metal_trace_callback_t)(
++        void * user_data,
++        ggml_metal_encoder_t encoder,
++        ggml_metal_cmd_buf_t cmd_buf,
++        int graph_node_index,
++        const struct ggml_tensor * node);
++
++ggml_metal_trace_snapshot_t ggml_metal_encoder_snapshot_buffer(
++        ggml_metal_encoder_t encoder,
++        ggml_metal_cmd_buf_t cmd_buf,
++        struct ggml_metal_buffer_id src,
++        size_t size);
++bool ggml_metal_trace_snapshot_read(ggml_metal_trace_snapshot_t snapshot, void * data, size_t size);
++void ggml_metal_trace_snapshot_free(ggml_metal_trace_snapshot_t snapshot);
++
+ //
+ // MTLLibrary wrapper
+ //
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 05d7f43..16be3cf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -458,12 +458,14 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
+ 
+ struct ggml_metal_encoder {
+     id<MTLComputeCommandEncoder> obj;
++    bool concurrent;
+ };
+ 
+ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
+     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+ 
+     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
++    res->concurrent = concurrent;
+ 
+     if (concurrent) {
+         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+@@ -517,6 +519,63 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+     [encoder->obj endEncoding];
+ }
+ 
++ggml_metal_trace_snapshot_t ggml_metal_encoder_snapshot_buffer(
++        ggml_metal_encoder_t encoder,
++        ggml_metal_cmd_buf_t cmd_buf_raw,
++        struct ggml_metal_buffer_id src,
++        size_t size) {
++    if (encoder == NULL || encoder->obj == nil || cmd_buf_raw == NULL || src.metal == NULL || size == 0) {
++        return NULL;
++    }
++
++    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
++    id<MTLBuffer> buf_src = (id<MTLBuffer>) src.metal;
++    id<MTLDevice> device = [buf_src device];
++    id<MTLBuffer> buf_dst = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
++    if (buf_dst == nil) {
++        return NULL;
++    }
++
++    [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
++    [encoder->obj endEncoding];
++    [encoder->obj release];
++
++    id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
++    [blit copyFromBuffer:buf_src
++            sourceOffset:src.offs
++                toBuffer:buf_dst
++       destinationOffset:0
++                    size:size];
++    [blit endEncoding];
++
++    if (encoder->concurrent) {
++        encoder->obj = [cmd_buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
++    } else {
++        encoder->obj = [cmd_buf computeCommandEncoder];
++    }
++    [encoder->obj retain];
++
++    return (ggml_metal_trace_snapshot_t) buf_dst;
++}
++
++bool ggml_metal_trace_snapshot_read(ggml_metal_trace_snapshot_t snapshot, void * data, size_t size) {
++    if (snapshot == NULL || data == NULL || size == 0) {
++        return false;
++    }
++    id<MTLBuffer> buffer = (id<MTLBuffer>) snapshot;
++    if ([buffer length] < size || [buffer contents] == NULL) {
++        return false;
++    }
++    memcpy(data, [buffer contents], size);
++    return true;
++}
++
++void ggml_metal_trace_snapshot_free(ggml_metal_trace_snapshot_t snapshot) {
++    if (snapshot != NULL) {
++        [(id<MTLBuffer>) snapshot release];
++    }
++}
++
+ struct ggml_metal_device {
+     id<MTLDevice> mtl_device;
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index e2ce56e..feaeb6a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -39,6 +39,7 @@ struct ggml_metal_op {
+         int  debug_fusion) {
+         this->dev             = dev;
+         this->lib             = ggml_metal_device_get_library(dev);
++        this->cmd_buf         = cmd_buf;
+         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
+         this->idx_start       = idx_start;
+@@ -77,6 +78,11 @@ struct ggml_metal_op {
+         return ggml_graph_node(gf, idxs[i]);
+     }
+ 
++    int node_index(int i) const {
++        assert(i >= 0 && i < (int) idxs.size());
++        return idxs[i];
++    }
++
+     bool can_fuse(int i0, const ggml_op * ops, int n_ops) const {
+         assert(use_fusion);
+         assert(i0 >= 0 && i0 < n_nodes());
+@@ -90,6 +96,7 @@ struct ggml_metal_op {
+ 
+     ggml_metal_device_t  dev;
+     ggml_metal_library_t lib;
++    ggml_metal_cmd_buf_t cmd_buf;
+     ggml_metal_encoder_t enc;
+     ggml_mem_ranges_t    mem_ranges;
+ 
+@@ -100,6 +107,9 @@ struct ggml_metal_op {
+     int debug_graph;
+     int debug_fusion;
+ 
++    ggml_metal_trace_callback_t trace_callback = nullptr;
++    void * trace_callback_user_data = nullptr;
++
+ private:
+     ggml_cgraph * gf;
+ 
+@@ -144,6 +154,14 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
+     return ctx->n_nodes();
+ }
+ 
++void ggml_metal_op_set_trace_callback(
++        ggml_metal_op_t ctx,
++        ggml_metal_trace_callback_t callback,
++        void * user_data) {
++    ctx->trace_callback = callback;
++    ctx->trace_callback_user_data = user_data;
++}
++
+ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
+     if (!ctx->mem_ranges) {
+         return true;
+@@ -509,7 +527,16 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+     if (ctx->use_capture) {
+         ggml_metal_encoder_debug_group_pop(ctx->enc);
+     }
+-
++    if (ctx->trace_callback != nullptr) {
++        for (int i = 0; i < res && idx + i < ctx->n_nodes(); ++i) {
++            ctx->trace_callback(
++                ctx->trace_callback_user_data,
++                ctx->enc,
++                ctx->cmd_buf,
++                ctx->node_index(idx + i),
++                ctx->node(idx + i));
++        }
++    }
+     return res;
+ }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 36c6107..f97e0f9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -24,6 +24,11 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
+ 
+ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
+ 
++void ggml_metal_op_set_trace_callback(
++        ggml_metal_op_t ctx,
++        ggml_metal_trace_callback_t callback,
++        void * user_data);
++
+ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
+ 
+ //
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 8c949e1..aa07e96 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -13,6 +13,7 @@
+ #include <mutex>
+ #include <sstream>
+ #include <string>
++#include <utility>
+ #include <vector>
+ #if defined(_WIN32)
+ #include <direct.h>
+@@ -200,6 +201,39 @@ static std::vector<int64_t> verathos_metal_selected_manifest_indexes;
+ static std::ofstream verathos_metal_manifest_stream;
+ static std::string verathos_metal_manifest_path;
+ static std::string verathos_metal_manifest_buffer;
++static std::mutex verathos_metal_snapshot_mutex;
++
++struct verathos_metal_planned_snapshot {
++    int graph_node_index = -1;
++    int64_t created_unix_ns = 0;
++    int64_t manifest_index = 0;
++    int64_t graph_seq = -1;
++    int64_t intra_graph_index = -1;
++};
++
++struct verathos_metal_tensor_snapshot {
++    const ggml_tensor * tensor = nullptr;
++    ggml_metal_trace_snapshot_t metal = nullptr;
++    std::vector<uint8_t> host_raw;
++    size_t nbytes = 0;
++};
++
++struct verathos_metal_snapshot_record {
++    int64_t created_unix_ns = 0;
++    int64_t manifest_index = 0;
++    int64_t graph_seq = -1;
++    int64_t intra_graph_index = -1;
++    const ggml_tensor * src0 = nullptr;
++    const ggml_tensor * src1 = nullptr;
++    const ggml_tensor * dst = nullptr;
++    bool skip_src0_dump = false;
++    verathos_metal_tensor_snapshot src0_snapshot;
++    verathos_metal_tensor_snapshot src1_snapshot;
++    verathos_metal_tensor_snapshot dst_snapshot;
++};
++
++static std::vector<verathos_metal_planned_snapshot> verathos_metal_planned_snapshots;
++static std::vector<verathos_metal_snapshot_record> verathos_metal_snapshot_records;
+ static int64_t verathos_metal_graph_sequence = 0;
+ static int64_t verathos_metal_intra_graph_index = 0;
+ static int64_t verathos_metal_graph_dim_valid_ops = 0;
+@@ -938,6 +972,357 @@ static void verathos_metal_try_dump_graph_trace(ggml_metal_t ctx, const ggml_cgr
+     }
+ }
+ 
++static bool verathos_metal_mul_mat_candidate(const ggml_tensor * dst) {
++    if (dst == nullptr || dst->op != GGML_OP_MUL_MAT) {
++        return false;
++    }
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    if (src0 == nullptr || src1 == nullptr) {
++        return false;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        dst->ne[2]  != 1 || dst->ne[3]  != 1) {
++        return false;
++    }
++    return src0->ne[0] == src1->ne[0] &&
++        dst->ne[0] == src0->ne[1] &&
++        dst->ne[1] == src1->ne[1];
++}
++
++static bool verathos_metal_manifest_index_selected(int64_t manifest_index) {
++    for (int64_t selected : verathos_metal_selected_manifest_indexes) {
++        if (selected == manifest_index) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void verathos_metal_release_tensor_snapshot(verathos_metal_tensor_snapshot & snapshot) {
++    if (snapshot.metal != nullptr) {
++        ggml_metal_trace_snapshot_free(snapshot.metal);
++        snapshot.metal = nullptr;
++    }
++    snapshot.host_raw.clear();
++    snapshot.nbytes = 0;
++    snapshot.tensor = nullptr;
++}
++
++static void verathos_metal_release_snapshot_record(verathos_metal_snapshot_record & record) {
++    verathos_metal_release_tensor_snapshot(record.src0_snapshot);
++    verathos_metal_release_tensor_snapshot(record.src1_snapshot);
++    verathos_metal_release_tensor_snapshot(record.dst_snapshot);
++}
++
++static void verathos_metal_clear_snapshot_state() {
++    std::lock_guard<std::mutex> lock(verathos_metal_snapshot_mutex);
++    for (verathos_metal_snapshot_record & record : verathos_metal_snapshot_records) {
++        verathos_metal_release_snapshot_record(record);
++    }
++    verathos_metal_snapshot_records.clear();
++    verathos_metal_planned_snapshots.clear();
++}
++
++static bool verathos_metal_capture_tensor_snapshot(
++        ggml_metal_encoder_t encoder,
++        ggml_metal_cmd_buf_t cmd_buf,
++        const ggml_tensor * tensor,
++        verathos_metal_tensor_snapshot & snapshot) {
++    if (tensor == nullptr || tensor->data == nullptr || tensor->buffer == nullptr || !ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    const size_t nbytes = ggml_nbytes(tensor);
++    if (nbytes == 0) {
++        return false;
++    }
++    snapshot.tensor = tensor;
++    snapshot.nbytes = nbytes;
++
++    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    if (buffer == nullptr) {
++        return false;
++    }
++    if (ggml_backend_buffer_is_metal(buffer)) {
++        struct ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(
++            (ggml_metal_buffer_t) buffer->context, tensor);
++        snapshot.metal = ggml_metal_encoder_snapshot_buffer(encoder, cmd_buf, bid, nbytes);
++        return snapshot.metal != nullptr;
++    }
++    if (ggml_backend_buffer_is_host(buffer)) {
++        snapshot.host_raw.resize(nbytes);
++        memcpy(snapshot.host_raw.data(), tensor->data, nbytes);
++        return true;
++    }
++    return false;
++}
++
++static bool verathos_metal_snapshot_raw(
++        verathos_metal_tensor_snapshot & snapshot,
++        std::vector<uint8_t> & raw) {
++    raw.clear();
++    if (snapshot.tensor == nullptr || snapshot.nbytes == 0) {
++        return false;
++    }
++    raw.resize(snapshot.nbytes);
++    if (snapshot.metal != nullptr) {
++        const bool ok = ggml_metal_trace_snapshot_read(snapshot.metal, raw.data(), snapshot.nbytes);
++        ggml_metal_trace_snapshot_free(snapshot.metal);
++        snapshot.metal = nullptr;
++        return ok;
++    }
++    if (snapshot.host_raw.size() == snapshot.nbytes) {
++        memcpy(raw.data(), snapshot.host_raw.data(), snapshot.nbytes);
++        return true;
++    }
++    return false;
++}
++
++static void verathos_metal_trace_after_encode(
++        void * user_data,
++        ggml_metal_encoder_t encoder,
++        ggml_metal_cmd_buf_t cmd_buf,
++        int graph_node_index,
++        const ggml_tensor * dst) {
++    GGML_UNUSED(user_data);
++    if (!verathos_metal_mul_mat_candidate(dst)) {
++        return;
++    }
++
++    verathos_metal_planned_snapshot planned;
++    bool should_capture = false;
++    {
++        std::lock_guard<std::mutex> lock(verathos_metal_snapshot_mutex);
++        for (auto it = verathos_metal_planned_snapshots.begin(); it != verathos_metal_planned_snapshots.end(); ++it) {
++            if (it->graph_node_index == graph_node_index) {
++                planned = *it;
++                verathos_metal_planned_snapshots.erase(it);
++                should_capture = true;
++                break;
++            }
++        }
++    }
++    if (!should_capture) {
++        return;
++    }
++
++    verathos_metal_snapshot_record record;
++    record.created_unix_ns = planned.created_unix_ns;
++    record.manifest_index = planned.manifest_index;
++    record.graph_seq = planned.graph_seq;
++    record.intra_graph_index = planned.intra_graph_index;
++    record.src0 = dst->src[0];
++    record.src1 = dst->src[1];
++    record.dst = dst;
++    record.skip_src0_dump = verathos_metal_env_bool("VERATHOS_GGML_TRACE_SKIP_SRC0_DUMP", false);
++
++    const bool ok =
++        (record.skip_src0_dump ||
++         verathos_metal_capture_tensor_snapshot(encoder, cmd_buf, record.src0, record.src0_snapshot)) &&
++        verathos_metal_capture_tensor_snapshot(encoder, cmd_buf, record.src1, record.src1_snapshot) &&
++        verathos_metal_capture_tensor_snapshot(encoder, cmd_buf, record.dst, record.dst_snapshot);
++    if (!ok) {
++        verathos_metal_release_snapshot_record(record);
++        return;
++    }
++
++    std::lock_guard<std::mutex> lock(verathos_metal_snapshot_mutex);
++    verathos_metal_snapshot_records.push_back(std::move(record));
++}
++
++static bool verathos_metal_plan_graph_trace(ggml_metal_t ctx, const ggml_cgraph * cgraph) {
++    verathos_metal_clear_snapshot_state();
++    if (ctx == nullptr || cgraph == nullptr || !verathos_metal_trace_enabled()) {
++        if (ctx != nullptr) {
++            ggml_metal_set_trace_callback(ctx, nullptr, nullptr);
++        }
++        return false;
++    }
++    const char * dir = verathos_metal_trace_dir();
++    if (dir == nullptr || dir[0] == '\0') {
++        ggml_metal_set_trace_callback(ctx, nullptr, nullptr);
++        return false;
++    }
++    verathos_metal_trace_mkdir(dir);
++
++    verathos_metal_graph_sequence++;
++    verathos_metal_intra_graph_index = 0;
++    verathos_metal_graph_dim_valid_ops = 0;
++    verathos_metal_graph_written_rows = 0;
++    verathos_metal_graph_max_src1_rows = 0;
++
++    std::vector<verathos_metal_planned_snapshot> planned;
++    const int64_t max_elems = verathos_metal_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    const int64_t max_snapshots = verathos_metal_trace_max_ops();
++    int64_t planned_snapshot_count = 0;
++
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        const ggml_tensor * dst = cgraph->nodes[i];
++        if (!verathos_metal_mul_mat_candidate(dst)) {
++            continue;
++        }
++        const ggml_tensor * src0 = dst->src[0];
++        const ggml_tensor * src1 = dst->src[1];
++        // Intra-graph index counts every dim-valid MUL_MAT regardless of
++        // size eligibility, so it stays stable across batch row counts.
++        const int64_t intra_graph_index = verathos_metal_intra_graph_index++;
++        verathos_metal_graph_dim_valid_ops++;
++        if (src1->ne[1] > verathos_metal_graph_max_src1_rows) {
++            verathos_metal_graph_max_src1_rows = src1->ne[1];
++        }
++        const int64_t total_elems = ggml_nelements(src0) + ggml_nelements(src1) + ggml_nelements(dst);
++        const bool proof_eligible =
++            verathos_metal_is_decode_candidate(src0, src1, dst) ||
++            !(max_elems > 0 && total_elems > max_elems);
++        if (!proof_eligible) {
++            continue;
++        }
++
++        const int64_t now_ns = verathos_metal_unix_ns();
++        const int64_t manifest_index = ++verathos_metal_manifest_sequence;
++        verathos_metal_write_manifest_entry(
++            dir, now_ns, manifest_index, ggml_metal_get_name(ctx), true,
++            verathos_metal_graph_sequence, intra_graph_index, src0, src1, dst);
++        verathos_metal_graph_written_rows++;
++
++        bool capture = false;
++        if (!verathos_metal_selected_ops.empty()) {
++            capture = verathos_metal_should_dump_selected_op(
++                verathos_metal_graph_sequence, intra_graph_index);
++        } else if (!verathos_metal_selected_manifest_indexes.empty()) {
++            capture = verathos_metal_manifest_index_selected(manifest_index);
++        } else if (max_snapshots < 0 || planned_snapshot_count < max_snapshots) {
++            capture = true;
++        }
++        if (!capture) {
++            continue;
++        }
++        ++planned_snapshot_count;
++        planned.push_back({
++            /* .graph_node_index  = */ i,
++            /* .created_unix_ns   = */ now_ns,
++            /* .manifest_index    = */ manifest_index,
++            /* .graph_seq         = */ verathos_metal_graph_sequence,
++            /* .intra_graph_index = */ intra_graph_index,
++        });
++    }
++    verathos_metal_write_graph_marker(ggml_metal_get_name(ctx));
++    if (verathos_metal_manifest_stream.is_open()) {
++        verathos_metal_flush_manifest_buffer();
++        verathos_metal_manifest_stream.flush();
++    } else {
++        verathos_metal_flush_manifest_buffer();
++    }
++
++    const bool enabled = !planned.empty();
++    {
++        std::lock_guard<std::mutex> lock(verathos_metal_snapshot_mutex);
++        verathos_metal_planned_snapshots = std::move(planned);
++    }
++    ggml_metal_set_trace_callback(ctx, enabled ? verathos_metal_trace_after_encode : nullptr, nullptr);
++    return enabled;
++}
++
++static void verathos_metal_flush_snapshots(ggml_metal_t ctx) {
++    std::vector<verathos_metal_snapshot_record> records;
++    {
++        std::lock_guard<std::mutex> lock(verathos_metal_snapshot_mutex);
++        if (verathos_metal_snapshot_records.empty()) {
++            return;
++        }
++    }
++    ggml_metal_synchronize(ctx);
++    {
++        std::lock_guard<std::mutex> lock(verathos_metal_snapshot_mutex);
++        records.swap(verathos_metal_snapshot_records);
++    }
++
++    const char * dir = verathos_metal_trace_dir();
++    if (dir == nullptr || dir[0] == '\0') {
++        for (verathos_metal_snapshot_record & record : records) {
++            verathos_metal_release_snapshot_record(record);
++        }
++        return;
++    }
++
++    for (verathos_metal_snapshot_record & record : records) {
++        std::vector<uint8_t> src0_raw;
++        std::vector<uint8_t> src1_raw;
++        std::vector<uint8_t> dst_raw;
++        if ((!record.skip_src0_dump &&
++             !verathos_metal_snapshot_raw(record.src0_snapshot, src0_raw)) ||
++            !verathos_metal_snapshot_raw(record.src1_snapshot, src1_raw) ||
++            !verathos_metal_snapshot_raw(record.dst_snapshot, dst_raw)) {
++            verathos_metal_release_snapshot_record(record);
++            continue;
++        }
++
++        std::vector<float> src0_f32;
++        std::vector<float> src1_f32;
++        std::vector<float> dst_f32;
++        if ((!record.skip_src0_dump &&
++             !verathos_metal_raw_to_f32(record.src0, src0_raw, src0_f32)) ||
++            !verathos_metal_raw_to_f32(record.src1, src1_raw, src1_f32) ||
++            !verathos_metal_raw_to_f32(record.dst, dst_raw, dst_f32)) {
++            verathos_metal_release_snapshot_record(record);
++            continue;
++        }
++
++        ++verathos_metal_trace_sequence;
++        std::ostringstream prefix;
++        prefix << dir << "/trace-" << record.created_unix_ns << "-metal-op" << record.manifest_index;
++        const std::string src0_path = prefix.str() + "-src0.f32";
++        const std::string src0_raw_path = prefix.str() + "-src0.raw";
++        const std::string src1_path = prefix.str() + "-src1.f32";
++        const std::string dst_path  = prefix.str() + "-dst.f32";
++        const std::string json_path = prefix.str() + ".json";
++        if ((!record.skip_src0_dump && !verathos_metal_write_f32(src0_path, src0_f32)) ||
++            (!record.skip_src0_dump && !verathos_metal_write_raw(src0_raw_path, src0_raw)) ||
++            !verathos_metal_write_f32(src1_path, src1_f32) ||
++            !verathos_metal_write_f32(dst_path, dst_f32)) {
++            verathos_metal_release_snapshot_record(record);
++            continue;
++        }
++
++        std::ofstream meta(json_path);
++        if (!meta) {
++            verathos_metal_release_snapshot_record(record);
++            continue;
++        }
++        meta << "{\n";
++        meta << "  \"version\": 1,\n";
++        meta << "  \"created_unix_ns\": " << record.created_unix_ns << ",\n";
++        meta << "  \"manifest_index\": " << record.manifest_index << ",\n";
++        meta << "  \"graph_seq\": " << record.graph_seq << ",\n";
++        meta << "  \"intra_graph_index\": " << record.intra_graph_index << ",\n";
++        meta << "  \"graph_id\": \"metal-mul-mat-" << record.manifest_index << "\",\n";
++        meta << "  \"op_index\": " << record.manifest_index << ",\n";
++        meta << "  \"op_type\": \"GGML_OP_MUL_MAT\",\n";
++        meta << "  \"tensor_name\": \"" << verathos_metal_json_escape(record.src0->name) << "\",\n";
++        meta << "  \"src0_name\": \"" << verathos_metal_json_escape(record.src0->name) << "\",\n";
++        meta << "  \"src1_name\": \"" << verathos_metal_json_escape(record.src1->name) << "\",\n";
++        meta << "  \"dst_name\": \"" << verathos_metal_json_escape(record.dst->name) << "\",\n";
++        meta << "  \"src0_shape\": [" << record.src0->ne[0] << "," << record.src0->ne[1] << "," << record.src0->ne[2] << "," << record.src0->ne[3] << "],\n";
++        meta << "  \"src1_shape\": [" << record.src1->ne[0] << "," << record.src1->ne[1] << "," << record.src1->ne[2] << "," << record.src1->ne[3] << "],\n";
++        meta << "  \"dst_shape\": [" << record.dst->ne[0] << "," << record.dst->ne[1] << "," << record.dst->ne[2] << "," << record.dst->ne[3] << "],\n";
++        if (!record.skip_src0_dump) {
++            meta << "  \"src0_f32\": \"" << verathos_metal_filename(src0_path) << "\",\n";
++            meta << "  \"src0_raw\": \"" << verathos_metal_filename(src0_raw_path) << "\",\n";
++        }
++        meta << "  \"src0_raw_type\": \"" << ggml_type_name((ggml_type) record.src0->type) << "\",\n";
++        meta << "  \"src1_f32\": \"" << verathos_metal_filename(src1_path) << "\",\n";
++        meta << "  \"dst_f32\": \"" << verathos_metal_filename(dst_path) << "\",\n";
++        meta << "  \"source_types\": {\"src0\": \"" << ggml_type_name((ggml_type) record.src0->type)
++             << "\", \"src1\": \"" << ggml_type_name((ggml_type) record.src1->type)
++             << "\", \"dst\": \"" << ggml_type_name((ggml_type) record.dst->type) << "\"},\n";
++        meta << "  \"backend\": \"llama_cpp_metal\",\n";
++        meta << "  \"device\": \"" << verathos_metal_json_escape(ggml_metal_get_name(ctx)) << "\"\n";
++        meta << "}\n";
++        verathos_metal_release_snapshot_record(record);
++    }
++}
++
+ //
+ // buffer types
+ //
+@@ -1291,10 +1676,14 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
+ static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_metal_t ctx = (ggml_metal_t)backend->context;
+ 
++    verathos_metal_plan_graph_trace(ctx, cgraph);
+     enum ggml_status status = ggml_metal_graph_compute(ctx, cgraph);
+     if (status == GGML_STATUS_SUCCESS) {
+-        verathos_metal_try_dump_graph_trace(ctx, cgraph);
++        verathos_metal_flush_snapshots(ctx);
++    } else {
++        verathos_metal_clear_snapshot_state();
+     }
++    ggml_metal_set_trace_callback(ctx, nullptr, nullptr);
+     return status;
+ }
+ 

@@ -19,11 +19,12 @@ import logging
 import math
 import bittensor as bt
 import os
+import re
 import sqlite3
 import statistics
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from neurons.shared_state import AuditDrain, MinerEntry, ValidatorSharedState
 
@@ -277,6 +278,7 @@ class ValidatorStateDB:
                 ema_score       REAL NOT NULL DEFAULT 0.0,
                 total_epochs    INTEGER NOT NULL DEFAULT 0,
                 scored_epochs   INTEGER NOT NULL DEFAULT 0,
+                last_scored_epoch INTEGER,
 
                 probation_entered_epoch     INTEGER,
                 probation_consecutive_passes INTEGER NOT NULL DEFAULT 0,
@@ -328,6 +330,150 @@ class ValidatorStateDB:
             CREATE TABLE IF NOT EXISTS validator_meta (
                 key     TEXT PRIMARY KEY,
                 value   TEXT NOT NULL
+            );
+
+            -- Signed, endpoint-free verification views for private meshes.
+            -- Every accepted generation remains immutable for audit.
+            CREATE TABLE IF NOT EXISTS mesh_verification_snapshots (
+                coordinator_address TEXT NOT NULL,
+                model_index          INTEGER NOT NULL,
+                epoch_number         INTEGER NOT NULL,
+                generation           INTEGER NOT NULL,
+                snapshot_hash        TEXT NOT NULL,
+                snapshot_json        TEXT NOT NULL,
+                fetched_at           REAL NOT NULL,
+                expires_at_unix      INTEGER NOT NULL,
+
+                PRIMARY KEY (
+                    coordinator_address,
+                    model_index,
+                    epoch_number,
+                    generation
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mesh_verification_snapshot_latest
+                ON mesh_verification_snapshots (
+                    coordinator_address,
+                    model_index,
+                    epoch_number,
+                    generation DESC
+                );
+
+            CREATE INDEX IF NOT EXISTS idx_mesh_verification_snapshot_expiry
+                ON mesh_verification_snapshots(expires_at_unix);
+
+            -- Immutable identity of the topology that produced each completed
+            -- score sample.  The EMA itself remains scoped to the registered
+            -- coordinator/model slot and can therefore carry across a mesh
+            -- relaunch; this table prevents an older sample from being
+            -- presented as evidence for the replacement topology.
+            CREATE TABLE IF NOT EXISTS score_samples (
+                coordinator_address TEXT NOT NULL,
+                model_index          INTEGER NOT NULL,
+                score_epoch          INTEGER NOT NULL,
+                model_id             TEXT NOT NULL,
+                ema_score            REAL NOT NULL,
+                chain_id             INTEGER,
+                netuid               INTEGER,
+                mesh_id              TEXT,
+                snapshot_hash        TEXT,
+                snapshot_generation  INTEGER,
+                recorded_at          REAL NOT NULL,
+
+                PRIMARY KEY (
+                    coordinator_address,
+                    model_index,
+                    score_epoch
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_score_samples_latest
+                ON score_samples (
+                    coordinator_address,
+                    model_index,
+                    score_epoch DESC
+                );
+
+            -- Exactly-once journal for proof failures relayed by the local
+            -- proxy. The event insert and financial/probation mutation share
+            -- one SQLite transaction, so a replay cannot halve EMA twice.
+            CREATE TABLE IF NOT EXISTS proxy_proof_failure_events (
+                event_id           TEXT PRIMARY KEY,
+                miner_address      TEXT NOT NULL,
+                model_index        INTEGER NOT NULL,
+                epoch_number       INTEGER NOT NULL,
+                event_timestamp    INTEGER NOT NULL,
+                applied_at         REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_proxy_proof_failure_slot
+                ON proxy_proof_failure_events (
+                    miner_address,
+                    model_index,
+                    epoch_number
+                );
+
+            -- Persistent ordered epoch-close queue.  A row is created when an
+            -- epoch starts and sealed with its immutable scoring context at the
+            -- next boundary.  Failed/running rows survive validator restarts;
+            -- callers always retry the lowest epoch first.
+            CREATE TABLE IF NOT EXISTS epoch_close_queue (
+                epoch_number       INTEGER PRIMARY KEY,
+                start_block        INTEGER NOT NULL,
+                close_block        INTEGER NOT NULL,
+                context_json       TEXT,
+                status             TEXT NOT NULL DEFAULT 'collecting',
+                attempt_count      INTEGER NOT NULL DEFAULT 0,
+                last_error         TEXT NOT NULL DEFAULT '',
+                abandoned          INTEGER NOT NULL DEFAULT 0,
+                created_at         REAL NOT NULL,
+                updated_at         REAL NOT NULL,
+                completed_at       REAL,
+                CHECK (status IN ('collecting', 'pending', 'running', 'completed'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_epoch_close_queue_pending
+                ON epoch_close_queue(status, epoch_number);
+
+            -- Per-slot close checkpoint.  Score application and the checkpoint
+            -- update share one transaction; completion is written only after
+            -- every deterministic probation/penalty event for the slot ran.
+            CREATE TABLE IF NOT EXISTS epoch_close_slots (
+                epoch_number       INTEGER NOT NULL,
+                miner_address      TEXT NOT NULL,
+                model_index        INTEGER NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'pending',
+                score_applied      INTEGER NOT NULL DEFAULT 0,
+                epoch_score        REAL,
+                epoch_score_is_null INTEGER NOT NULL DEFAULT 0,
+                ema_score          REAL,
+                total_epochs       INTEGER,
+                scored_epochs      INTEGER,
+                last_scored_epoch  INTEGER,
+                created_at         REAL NOT NULL,
+                updated_at         REAL NOT NULL,
+                completed_at       REAL,
+                PRIMARY KEY (epoch_number, miner_address, model_index),
+                CHECK (status IN ('pending', 'completed'))
+            );
+
+            -- Deterministic close-side mutations (probation passes/failures,
+            -- EMA penalties, and score gates).  The event insert is committed
+            -- atomically with its miner_entries mutation.
+            CREATE TABLE IF NOT EXISTS epoch_close_slot_events (
+                epoch_number       INTEGER NOT NULL,
+                miner_address      TEXT NOT NULL,
+                model_index        INTEGER NOT NULL,
+                event_kind         TEXT NOT NULL,
+                payload_json       TEXT NOT NULL DEFAULT '{}',
+                applied_at         REAL NOT NULL,
+                PRIMARY KEY (
+                    epoch_number,
+                    miner_address,
+                    model_index,
+                    event_kind
+                )
             );
 
             -- Analytics: individual canary test results
@@ -424,6 +570,27 @@ class ValidatorStateDB:
                     epoch_number, miner_address, model_index
                 );
 
+            -- Journal of every canary obligation this validator planned for
+            -- an epoch, written at plan time.  A mid-epoch validator restart
+            -- re-plans the epoch under a fresh secret salt; receipts signed
+            -- under the discarded plan survive (locally and on the miner)
+            -- and must be recognized at close as validator-produced residue
+            -- rather than forgeries.  INSERT OR IGNORE keyed on
+            -- (epoch, obligation_id) accumulates every plan of the epoch.
+            CREATE TABLE IF NOT EXISTS planned_canary_obligations (
+                epoch_number         INTEGER NOT NULL,
+                obligation_id        TEXT NOT NULL,
+                miner_address        TEXT NOT NULL,
+                model_index          INTEGER NOT NULL,
+                kind                 TEXT NOT NULL,
+                target_prompt_tokens INTEGER NOT NULL,
+                created_at           REAL NOT NULL,
+                PRIMARY KEY (epoch_number, obligation_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_planned_canary_obligations_epoch
+                ON planned_canary_obligations(epoch_number);
+
             CREATE TABLE IF NOT EXISTS proof_v3_hard_failures (
                 outcome_digest      TEXT PRIMARY KEY,
                 source_epoch        INTEGER NOT NULL,
@@ -511,6 +678,7 @@ class ValidatorStateDB:
                 lease_id             TEXT NOT NULL,
                 claimed_gpu_class    TEXT NOT NULL DEFAULT '',
                 gpu_index            INTEGER NOT NULL DEFAULT 0,
+                roster_digest        TEXT NOT NULL DEFAULT '',
                 pass_count           INTEGER NOT NULL DEFAULT 0,
                 workload_spec        TEXT NOT NULL DEFAULT '{}',
                 deadline_s           REAL NOT NULL DEFAULT 0.0,
@@ -536,7 +704,7 @@ class ValidatorStateDB:
                 proof_artifact_path  TEXT,
                 created_at           REAL NOT NULL,
                 updated_at           REAL NOT NULL,
-                PRIMARY KEY (audit_id, miner_address, model_index)
+                PRIMARY KEY (audit_id, miner_address, model_index, gpu_index)
             );
 
             CREATE INDEX IF NOT EXISTS idx_capacity_audit_slot
@@ -584,7 +752,7 @@ class ValidatorStateDB:
                 slot_created_at      REAL NOT NULL,
                 slot_updated_at      REAL NOT NULL,
                 archived_at          REAL NOT NULL,
-                PRIMARY KEY (audit_id, miner_address, model_index)
+                PRIMARY KEY (audit_id, miner_address, model_index, gpu_index)
             );
 
             CREATE INDEX IF NOT EXISTS idx_capacity_audit_history_archived
@@ -595,9 +763,50 @@ class ValidatorStateDB:
 
             CREATE INDEX IF NOT EXISTS idx_capacity_audit_history_outcome
                 ON capacity_audit_history(verdict, proof_status, archived_at);
+
+            -- Signed mesh GPU rosters, keyed by digest so a re-signed
+            -- membership change creates a new row instead of destroying the
+            -- document an in-flight audit was scheduled against.
+            CREATE TABLE IF NOT EXISTS capacity_rosters (
+                slot_id       TEXT NOT NULL,
+                roster_epoch  INTEGER NOT NULL,
+                roster_digest TEXT NOT NULL,
+                roster_json   TEXT NOT NULL,
+                signature     TEXT NOT NULL,
+                received_at   REAL NOT NULL,
+                PRIMARY KEY (slot_id, roster_digest)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_capacity_rosters_slot
+                ON capacity_rosters(slot_id, received_at);
+
+            -- Mesh slots whose signed roster could not be learned (route
+            -- refused/unreachable and no receipt-embedded copy). Tracks the
+            -- first epoch the absence was observed so refusal can be gated
+            -- after a grace window instead of exempting the entry forever.
+            CREATE TABLE IF NOT EXISTS capacity_roster_probes (
+                slot_id             TEXT PRIMARY KEY,
+                first_missing_epoch INTEGER NOT NULL,
+                last_missing_epoch  INTEGER NOT NULL
+            );
         """)
         self._conn.commit()
 
+        self._ensure_column(
+            "miner_entries",
+            "last_scored_epoch",
+            "INTEGER",
+        )
+        self._ensure_column(
+            "miner_entries",
+            "probation_source",
+            "TEXT",
+        )
+        self._ensure_column(
+            "epoch_close_queue",
+            "abandoned",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         self._ensure_column(
             "capacity_audit_windows",
             "audit_start_observed_at",
@@ -693,6 +902,15 @@ class ValidatorStateDB:
             "miner_hotkey_ss58",
             "TEXT NOT NULL DEFAULT ''",
         )
+        self._ensure_column(
+            "capacity_audit_slots",
+            "roster_digest",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        # Mesh audits fan one audit_id out to one row per roster GPU ordinal,
+        # so gpu_index must join the primary key. Runs after _ensure_column so
+        # the rebuilt table copy sees every current column.
+        self._migrate_capacity_audit_gpu_index_pk()
 
         # One-time migration: prune historical duplicate rows then install
         # the unique index. Guard it with a DB marker and the actual index
@@ -792,7 +1010,24 @@ class ValidatorStateDB:
             ).fetchone()
 
             if row is None:
-                # New entry
+                # A brand-new slot for an address that is already serving out
+                # probation inherits it.  Otherwise re-registering under a
+                # fresh model_index is a free reset: probation costs a few
+                # epochs of emission, re-registration costs at most one UID
+                # burn, and with a changed endpoint URL it costs nothing.
+                # Only genuinely new slots inherit; a long-standing sibling
+                # entry is untouched, so an operator running several models is
+                # not punished across all of them for one bad slot.
+                inherited = self._conn.execute(
+                    """SELECT MIN(probation_entered_epoch) AS entered
+                       FROM miner_entries
+                       WHERE address = ?
+                         AND probation_entered_epoch IS NOT NULL""",
+                    (address,),
+                ).fetchone()
+                inherited_epoch = (
+                    inherited["entered"] if inherited is not None else None
+                )
                 self._conn.execute(
                     """INSERT INTO miner_entries (
                         address, model_index, model_id, endpoint, quant,
@@ -800,21 +1035,33 @@ class ValidatorStateDB:
                         is_active, ema_score, total_epochs, scored_epochs,
                         probation_entered_epoch, probation_consecutive_passes,
                         probation_required_passes, probation_escalation_epochs,
+                        probation_source,
                         tee_enabled, tee_platform,
                         gpu_name, gpu_count, vram_gb, compute_capability, gpu_uuids,
                         hotkey_ss58, coldkey_ss58, created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0.0, 0, 0,
-                              NULL, 0, 3, 5, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                              ?, 0, 3, 5, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (address, model_index, model_id, endpoint, quant,
-                     max_context_len, epoch, epoch,
+                     max_context_len, epoch, epoch, inherited_epoch,
+                     "inherited" if inherited_epoch is not None else None,
                      1 if tee_enabled else 0, tee_platform,
                      gpu_name, gpu_count, vram_gb, compute_capability, _gpu_uuids_json,
                      hotkey_ss58, coldkey_ss58, now, now),
                 )
+                if inherited_epoch is not None:
+                    bt.logging.info(
+                        f"Probation inherited by new entry {address[:10]} "
+                        f"idx={model_index} from epoch {inherited_epoch}"
+                    )
             else:
                 old_model_id = row["model_id"]
                 if old_model_id != model_id:
-                    # Model switch: reset score and probation
+                    # Model switch: reset the score, keep probation.  Past
+                    # performance does not carry to a different model, but a
+                    # proof failure is a penalty on the operator, and clearing
+                    # it here made switching model_id a free probation reset.
+                    # The pass counter restarts so the clean epochs have to be
+                    # served on the model now being offered.
                     model_switched = True
                     self._conn.execute(
                         """UPDATE miner_entries SET
@@ -822,7 +1069,7 @@ class ValidatorStateDB:
                             max_context_len = ?, last_seen_epoch = ?,
                             is_active = 1, ema_score = 0.0,
                             total_epochs = 0, scored_epochs = 0,
-                            probation_entered_epoch = NULL,
+                            last_scored_epoch = NULL,
                             probation_consecutive_passes = 0,
                             tee_enabled = ?, tee_platform = ?,
                             gpu_name = ?, gpu_count = ?, vram_gb = ?,
@@ -930,6 +1177,7 @@ class ValidatorStateDB:
                        scored_epochs = 0,
                        probation_entered_epoch = NULL,
                        probation_consecutive_passes = 0,
+                       probation_source = NULL,
                        updated_at = ?
                    WHERE address = ?""",
                 (time.time(), address),
@@ -945,6 +1193,7 @@ class ValidatorStateDB:
                 """UPDATE miner_entries SET
                        probation_entered_epoch = NULL,
                        probation_consecutive_passes = 0,
+                       probation_source = NULL,
                        updated_at = ?
                    WHERE address = ?
                      AND probation_entered_epoch IS NOT NULL""",
@@ -992,6 +1241,7 @@ class ValidatorStateDB:
                     """UPDATE miner_entries SET
                            probation_entered_epoch = NULL,
                            probation_consecutive_passes = 0,
+                           probation_source = NULL,
                            updated_at = ?
                        WHERE probation_entered_epoch IS NOT NULL""",
                     (now,),
@@ -1056,6 +1306,303 @@ class ValidatorStateDB:
             cursor = self._conn.execute("SELECT * FROM miner_entries")
             return [dict(row) for row in cursor.fetchall()]
 
+    # ── Persistent epoch-close queue ─────────────────────────────────
+
+    @staticmethod
+    def _validate_epoch_close_int(value: object, field_name: str) -> int:
+        if type(value) is not int or not 0 <= value < 2**63:
+            raise ValueError(f"{field_name} must be a non-negative 63-bit integer")
+        return value
+
+    @staticmethod
+    def _canonical_epoch_close_context(context: Mapping[str, Any]) -> str:
+        if not isinstance(context, Mapping):
+            raise ValueError("epoch close context must be an object")
+        try:
+            canonical = json.dumps(
+                dict(context),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("epoch close context must be canonical JSON") from exc
+        if len(canonical.encode("utf-8")) > 16 * 1024 * 1024:
+            raise ValueError("epoch close context exceeds 16 MiB")
+        return canonical
+
+    def schedule_epoch_close(
+        self,
+        *,
+        epoch_number: int,
+        start_block: int,
+        close_block: int,
+    ) -> dict[str, Any]:
+        """Create the immutable collecting row for one epoch.
+
+        Re-scheduling the same boundaries is idempotent.  A conflicting
+        boundary is rejected so a retry cannot silently move the grace gate.
+        """
+
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        start_block = self._validate_epoch_close_int(start_block, "start_block")
+        close_block = self._validate_epoch_close_int(close_block, "close_block")
+        if close_block < start_block:
+            raise ValueError("close_block must not precede start_block")
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM epoch_close_queue WHERE epoch_number = ?",
+                (epoch_number,),
+            ).fetchone()
+            if row is not None:
+                if (
+                    int(row["start_block"]) != start_block
+                    or int(row["close_block"]) != close_block
+                ):
+                    raise ValueError("conflicting epoch-close boundary")
+                return dict(row)
+            self._conn.execute(
+                """INSERT INTO epoch_close_queue (
+                       epoch_number, start_block, close_block, status,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, 'collecting', ?, ?)""",
+                (epoch_number, start_block, close_block, now, now),
+            )
+            self._conn.commit()
+            return dict(
+                self._conn.execute(
+                    "SELECT * FROM epoch_close_queue WHERE epoch_number = ?",
+                    (epoch_number,),
+                ).fetchone()
+            )
+
+    def seal_epoch_close(
+        self,
+        *,
+        epoch_number: int,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Seal a collecting epoch with its immutable close context."""
+
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        canonical = self._canonical_epoch_close_context(context)
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM epoch_close_queue WHERE epoch_number = ?",
+                (epoch_number,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("epoch close was not scheduled")
+            existing = row["context_json"]
+            if existing is not None and str(existing) != canonical:
+                raise ValueError("conflicting sealed epoch-close context")
+            if row["status"] == "completed":
+                return dict(row)
+            self._conn.execute(
+                """UPDATE epoch_close_queue SET
+                       context_json = ?, status = 'pending', updated_at = ?
+                   WHERE epoch_number = ?""",
+                (canonical, now, epoch_number),
+            )
+            self._conn.commit()
+            return dict(
+                self._conn.execute(
+                    "SELECT * FROM epoch_close_queue WHERE epoch_number = ?",
+                    (epoch_number,),
+                ).fetchone()
+            )
+
+    def get_epoch_close(self, epoch_number: int) -> Optional[dict[str, Any]]:
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM epoch_close_queue WHERE epoch_number = ?",
+                (epoch_number,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_pending_epoch_closes(self) -> List[dict[str, Any]]:
+        """Return sealed unfinished closes in strict epoch order."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM epoch_close_queue
+                   WHERE status IN ('pending', 'running')
+                     AND context_json IS NOT NULL
+                   ORDER BY epoch_number ASC"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def abandon_collecting_epoch_closes(
+        self,
+        *,
+        through_epoch: int,
+        reason: str,
+    ) -> int:
+        """Terminally neutralize unsealed rows whose RAM context was lost.
+
+        A collecting row has no immutable miner/accounting snapshot and must
+        never be reconstructed from a later epoch.  Marking it abandoned is a
+        fail-neutral audit record; it is intentionally not treated as a scored
+        or successfully closed epoch.
+        """
+
+        through_epoch = self._validate_epoch_close_int(
+            through_epoch, "through_epoch"
+        )
+        now = time.time()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE epoch_close_queue SET
+                       status = 'completed', abandoned = 1,
+                       last_error = ?, updated_at = ?,
+                       completed_at = COALESCE(completed_at, ?)
+                   WHERE status = 'collecting' AND epoch_number <= ?""",
+                (str(reason)[:1000], now, now, through_epoch),
+            )
+            self._conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def mark_epoch_close_running(self, epoch_number: int) -> dict[str, Any]:
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM epoch_close_queue WHERE epoch_number = ?",
+                (epoch_number,),
+            ).fetchone()
+            if row is None or row["context_json"] is None:
+                raise ValueError("epoch close is not sealed")
+            if row["status"] == "completed":
+                return dict(row)
+            self._conn.execute(
+                """UPDATE epoch_close_queue SET
+                       status = 'running', attempt_count = attempt_count + 1,
+                       last_error = '', updated_at = ?
+                   WHERE epoch_number = ?""",
+                (now, epoch_number),
+            )
+            self._conn.commit()
+            return dict(
+                self._conn.execute(
+                    "SELECT * FROM epoch_close_queue WHERE epoch_number = ?",
+                    (epoch_number,),
+                ).fetchone()
+            )
+
+    def mark_epoch_close_failed(self, epoch_number: int, error: str) -> None:
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        with self._lock:
+            self._conn.execute(
+                """UPDATE epoch_close_queue SET
+                       status = CASE
+                           WHEN status = 'completed' THEN status ELSE 'pending' END,
+                       last_error = CASE
+                           WHEN status = 'completed' THEN last_error ELSE ? END,
+                       updated_at = ?
+                   WHERE epoch_number = ?""",
+                (str(error)[:1000], time.time(), epoch_number),
+            )
+            self._conn.commit()
+
+    def mark_epoch_close_completed(self, epoch_number: int) -> None:
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT context_json FROM epoch_close_queue WHERE epoch_number = ?",
+                (epoch_number,),
+            ).fetchone()
+            if row is None or row["context_json"] is None:
+                raise ValueError("epoch close is not sealed")
+            try:
+                context = json.loads(str(row["context_json"]))
+                miners = context["miners"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("sealed epoch-close context has no miner list") from exc
+            if not isinstance(miners, list):
+                raise ValueError("sealed epoch-close context has no miner list")
+            expected_slots = set()
+            for miner in miners:
+                try:
+                    key = (
+                        str(miner["address"]).lower(),
+                        int(miner["model_index"]),
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("sealed epoch-close miner key is invalid") from exc
+                if key in expected_slots:
+                    raise ValueError("sealed epoch-close context has duplicate slots")
+                expected_slots.add(key)
+            completed_slots = {
+                (str(slot["miner_address"]), int(slot["model_index"]))
+                for slot in self._conn.execute(
+                    """SELECT miner_address, model_index
+                       FROM epoch_close_slots
+                       WHERE epoch_number = ? AND status = 'completed'""",
+                    (epoch_number,),
+                ).fetchall()
+            }
+            missing = expected_slots - completed_slots
+            if missing:
+                raise RuntimeError(
+                    f"epoch close has {len(missing)} unfinished slot(s)"
+                )
+            self._conn.execute(
+                """UPDATE epoch_close_queue SET
+                       status = 'completed', last_error = '',
+                       updated_at = ?, completed_at = COALESCE(completed_at, ?)
+                   WHERE epoch_number = ?""",
+                (now, now, epoch_number),
+            )
+            self._conn.commit()
+
+    def get_epoch_close_slot(
+        self,
+        epoch_number: int,
+        address: str,
+        model_index: int,
+    ) -> Optional[dict[str, Any]]:
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        address = str(address).lower()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM epoch_close_slots
+                   WHERE epoch_number = ? AND miner_address = ?
+                     AND model_index = ?""",
+                (epoch_number, address, int(model_index)),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def mark_epoch_close_slot_completed(
+        self,
+        epoch_number: int,
+        address: str,
+        model_index: int,
+    ) -> None:
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        address = str(address).lower()
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO epoch_close_slots (
+                       epoch_number, miner_address, model_index,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (epoch_number, address, int(model_index), now, now),
+            )
+            self._conn.execute(
+                """UPDATE epoch_close_slots SET
+                       status = 'completed', updated_at = ?,
+                       completed_at = COALESCE(completed_at, ?)
+                   WHERE epoch_number = ? AND miner_address = ?
+                     AND model_index = ?""",
+                (now, now, epoch_number, address, int(model_index)),
+            )
+            self._conn.commit()
+
     # ── Scoring ──────────────────────────────────────────────────────
 
     def save_score(
@@ -1065,19 +1612,522 @@ class ValidatorStateDB:
         ema_score: float,
         total_epochs: int,
         scored_epochs: int,
-    ) -> None:
-        """Persist EMA score state for a miner-model entry."""
+        *,
+        last_scored_epoch: Optional[int] = None,
+        score_provenance: Optional[Mapping[str, Any]] = None,
+        epoch_close_number: Optional[int] = None,
+        epoch_score: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Persist EMA score state for a miner-model entry.
+
+        ``last_scored_epoch`` is supplied only when this write follows an
+        actual epoch scoring result.  Penalties, routing/offline zeroing, and
+        other score mutations omit it so they preserve the last real scoring
+        evidence.  Mesh scores additionally supply ``score_provenance`` so the
+        completed EMA sample is bound to the exact signed topology that was
+        verified.  The slot EMA can carry across later mesh generations, but
+        the sample record cannot silently follow it.
+        """
         address = address.lower()
-        with self._lock:
+        normalized_last_scored_epoch: Optional[int] = None
+        if last_scored_epoch is not None:
+            if isinstance(last_scored_epoch, bool):
+                raise ValueError("last_scored_epoch must be a non-negative integer")
+            normalized_last_scored_epoch = int(last_scored_epoch)
+            if not 0 <= normalized_last_scored_epoch < 2**63:
+                raise ValueError("last_scored_epoch must be a non-negative integer")
+            if int(scored_epochs) <= 0:
+                raise ValueError(
+                    "last_scored_epoch requires at least one scored epoch"
+                )
+            try:
+                completed_ema = float(ema_score)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("completed EMA score must be finite") from exc
+            if not float("-inf") < completed_ema < float("inf"):
+                raise ValueError("completed EMA score must be finite")
+        if score_provenance is not None and normalized_last_scored_epoch is None:
+            raise ValueError("score_provenance requires last_scored_epoch")
+
+        normalized_close_epoch: Optional[int] = None
+        normalized_epoch_score: Optional[float] = None
+        if epoch_close_number is not None:
+            if type(epoch_close_number) is not int or not 0 <= epoch_close_number < 2**63:
+                raise ValueError("epoch_close_number must be a non-negative integer")
+            normalized_close_epoch = epoch_close_number
+            if epoch_score is not None:
+                try:
+                    normalized_epoch_score = float(epoch_score)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("epoch_score must be finite or None") from exc
+                if not math.isfinite(normalized_epoch_score):
+                    raise ValueError("epoch_score must be finite or None")
+        elif epoch_score is not None:
+            raise ValueError("epoch_score requires epoch_close_number")
+
+        normalized_provenance: Optional[dict[str, Any]] = None
+        if score_provenance is not None:
+            required = {
+                "chain_id",
+                "netuid",
+                "coordinator_address",
+                "model_index",
+                "model_id",
+                "mesh_id",
+                "verification_snapshot_hash",
+                "snapshot_generation",
+                "score_epoch",
+            }
+            if set(score_provenance) != required:
+                raise ValueError(
+                    "score_provenance must contain the exact mesh score binding"
+                )
+            chain_id = score_provenance.get("chain_id")
+            netuid = score_provenance.get("netuid")
+            provenance_model_index = score_provenance.get("model_index")
+            snapshot_generation = score_provenance.get("snapshot_generation")
+            score_epoch = score_provenance.get("score_epoch")
+            if type(chain_id) is not int or not 1 <= chain_id < 2**63:
+                raise ValueError("score_provenance chain_id is invalid")
+            if type(netuid) is not int or not 0 <= netuid <= 65_535:
+                raise ValueError("score_provenance netuid is invalid")
+            if (
+                type(provenance_model_index) is not int
+                or provenance_model_index < 0
+                or provenance_model_index != int(model_index)
+            ):
+                raise ValueError("score_provenance model_index does not match score slot")
+            if (
+                type(score_epoch) is not int
+                or score_epoch != normalized_last_scored_epoch
+            ):
+                raise ValueError("score_provenance score_epoch does not match score")
+            if (
+                type(snapshot_generation) is not int
+                or not 1 <= snapshot_generation < 2**63
+            ):
+                raise ValueError("score_provenance snapshot_generation is invalid")
+            if any(
+                type(score_provenance.get(field)) is not str
+                for field in (
+                    "coordinator_address",
+                    "model_id",
+                    "mesh_id",
+                    "verification_snapshot_hash",
+                )
+            ):
+                raise ValueError("score_provenance string fields are invalid")
+            provenance_address = score_provenance["coordinator_address"].lower()
+            if provenance_address != address:
+                raise ValueError(
+                    "score_provenance coordinator_address does not match score slot"
+                )
+            model_id = score_provenance["model_id"]
+            mesh_id = score_provenance["mesh_id"]
+            snapshot_hash = score_provenance["verification_snapshot_hash"]
+            if not model_id or not mesh_id:
+                raise ValueError("score_provenance model_id and mesh_id are required")
+            if len(snapshot_hash) != 64:
+                raise ValueError(
+                    "score_provenance verification_snapshot_hash is invalid"
+                )
+            try:
+                bytes.fromhex(snapshot_hash)
+            except ValueError as exc:
+                raise ValueError(
+                    "score_provenance verification_snapshot_hash is invalid"
+                ) from exc
+            normalized_provenance = {
+                "chain_id": chain_id,
+                "netuid": netuid,
+                "coordinator_address": provenance_address,
+                "model_index": provenance_model_index,
+                "model_id": model_id,
+                "mesh_id": mesh_id,
+                "snapshot_hash": snapshot_hash.lower(),
+                "snapshot_generation": snapshot_generation,
+                "score_epoch": score_epoch,
+            }
+        with self._lock, self._conn:
+            entry = self._conn.execute(
+                """SELECT model_id FROM miner_entries
+                   WHERE address = ? AND model_index = ?""",
+                (address, model_index),
+            ).fetchone()
+            if (
+                normalized_provenance is not None
+                and (
+                    entry is None
+                    or str(entry["model_id"]) != normalized_provenance["model_id"]
+                )
+            ):
+                raise ValueError(
+                    "score_provenance model_id does not match registered score slot"
+                )
+
+            if normalized_close_epoch is not None:
+                now = time.time()
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO epoch_close_slots (
+                           epoch_number, miner_address, model_index,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (normalized_close_epoch, address, model_index, now, now),
+                )
+                checkpoint = self._conn.execute(
+                    """SELECT score_applied, epoch_score, epoch_score_is_null,
+                              ema_score, total_epochs, scored_epochs,
+                              last_scored_epoch
+                       FROM epoch_close_slots
+                       WHERE epoch_number = ? AND miner_address = ?
+                         AND model_index = ?""",
+                    (normalized_close_epoch, address, model_index),
+                ).fetchone()
+                if checkpoint is not None and int(checkpoint["score_applied"]):
+                    existing_epoch_score = (
+                        None
+                        if int(checkpoint["epoch_score_is_null"])
+                        else float(checkpoint["epoch_score"])
+                    )
+                    incoming_state = (
+                        normalized_epoch_score,
+                        float(ema_score),
+                        int(total_epochs),
+                        int(scored_epochs),
+                        normalized_last_scored_epoch,
+                    )
+                    existing_state = (
+                        existing_epoch_score,
+                        float(checkpoint["ema_score"]),
+                        int(checkpoint["total_epochs"]),
+                        int(checkpoint["scored_epochs"]),
+                        checkpoint["last_scored_epoch"],
+                    )
+                    if existing_state != incoming_state:
+                        self._conn.rollback()
+                        raise ValueError(
+                            "conflicting replay of an applied epoch-close score"
+                        )
+                    self._conn.commit()
+                    return {
+                        "applied": False,
+                        "epoch_score": existing_epoch_score,
+                        "ema_score": existing_state[1],
+                        "total_epochs": existing_state[2],
+                        "scored_epochs": existing_state[3],
+                        "last_scored_epoch": existing_state[4],
+                    }
+
+            if normalized_last_scored_epoch is not None and entry is not None:
+                existing_sample = self._conn.execute(
+                    """SELECT model_id, ema_score, chain_id, netuid, mesh_id,
+                              snapshot_hash, snapshot_generation
+                       FROM score_samples
+                       WHERE coordinator_address = ? AND model_index = ?
+                         AND score_epoch = ?""",
+                    (address, model_index, normalized_last_scored_epoch),
+                ).fetchone()
+                incoming_identity = (
+                    (
+                        normalized_provenance["model_id"],
+                        normalized_provenance["chain_id"],
+                        normalized_provenance["netuid"],
+                        normalized_provenance["mesh_id"],
+                        normalized_provenance["snapshot_hash"],
+                        normalized_provenance["snapshot_generation"],
+                    )
+                    if normalized_provenance is not None
+                    else (
+                        str(entry["model_id"]) if entry is not None else "",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                )
+                if existing_sample is not None:
+                    existing_identity = (
+                        str(existing_sample["model_id"]),
+                        existing_sample["chain_id"],
+                        existing_sample["netuid"],
+                        existing_sample["mesh_id"],
+                        existing_sample["snapshot_hash"],
+                        existing_sample["snapshot_generation"],
+                    )
+                    if existing_identity != incoming_identity:
+                        if normalized_close_epoch is not None:
+                            self._conn.rollback()
+                        raise ValueError(
+                            "conflicting score provenance for completed epoch"
+                        )
+                    if float(existing_sample["ema_score"]) != completed_ema:
+                        if normalized_close_epoch is not None:
+                            self._conn.rollback()
+                        raise ValueError(
+                            "conflicting completed EMA for score slot and epoch"
+                        )
+                self._conn.execute(
+                    """INSERT INTO score_samples (
+                           coordinator_address, model_index, score_epoch,
+                           model_id, ema_score, chain_id, netuid, mesh_id,
+                           snapshot_hash, snapshot_generation, recorded_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (
+                           coordinator_address, model_index, score_epoch
+                       ) DO NOTHING""",
+                    (
+                        address,
+                        model_index,
+                        normalized_last_scored_epoch,
+                        incoming_identity[0],
+                        completed_ema,
+                        incoming_identity[1],
+                        incoming_identity[2],
+                        incoming_identity[3],
+                        incoming_identity[4],
+                        incoming_identity[5],
+                        time.time(),
+                    ),
+                )
             self._conn.execute(
                 """UPDATE miner_entries SET
                     ema_score = ?, total_epochs = ?, scored_epochs = ?,
+                    last_scored_epoch = CASE
+                        WHEN ? IS NULL THEN last_scored_epoch
+                        WHEN last_scored_epoch IS NULL
+                          OR ? > last_scored_epoch THEN ?
+                        ELSE last_scored_epoch
+                    END,
                     updated_at = ?
                 WHERE address = ? AND model_index = ?""",
-                (ema_score, total_epochs, scored_epochs, time.time(),
+                (ema_score, total_epochs, scored_epochs,
+                 normalized_last_scored_epoch,
+                 normalized_last_scored_epoch,
+                 normalized_last_scored_epoch,
+                 time.time(),
                  address, model_index),
             )
-            self._conn.commit()
+            if normalized_close_epoch is not None:
+                self._conn.execute(
+                    """UPDATE epoch_close_slots SET
+                           score_applied = 1,
+                           epoch_score = ?,
+                           epoch_score_is_null = ?,
+                           ema_score = ?,
+                           total_epochs = ?,
+                           scored_epochs = ?,
+                           last_scored_epoch = ?,
+                           updated_at = ?
+                       WHERE epoch_number = ? AND miner_address = ?
+                         AND model_index = ?""",
+                    (
+                        normalized_epoch_score,
+                        1 if normalized_epoch_score is None else 0,
+                        float(ema_score),
+                        int(total_epochs),
+                        int(scored_epochs),
+                        normalized_last_scored_epoch,
+                        time.time(),
+                        normalized_close_epoch,
+                        address,
+                        model_index,
+                    ),
+                )
+            try:
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            if normalized_close_epoch is not None:
+                return {
+                    "applied": True,
+                    "epoch_score": normalized_epoch_score,
+                    "ema_score": float(ema_score),
+                    "total_epochs": int(total_epochs),
+                    "scored_epochs": int(scored_epochs),
+                    "last_scored_epoch": normalized_last_scored_epoch,
+                }
+            return None
+
+    def apply_epoch_close_slot_event(
+        self,
+        *,
+        epoch_number: int,
+        address: str,
+        model_index: int,
+        event_kind: str,
+        action: str,
+    ) -> dict[str, Any]:
+        """Atomically apply one deterministic close-side mutation once.
+
+        ``event_kind`` identifies the semantic occurrence inside the epoch
+        (for example ``busy_skip_penalty``).  ``action`` is deliberately a
+        small closed set so replay cannot smuggle arbitrary SQL state:
+
+        - ``probation_failure`` enters probation or resets its pass counter;
+        - ``probation_pass`` records exactly one clean pass;
+        - ``proof_penalty`` enters/resets probation and halves the EMA;
+        - ``binding_violation`` enters/resets probation and zeroes the EMA;
+        - ``score_zero`` sets the live slot EMA to zero.
+
+        ``binding_violation`` is for a coordinator that broke a commitment it
+        had already made rather than merely failing a check.  Halving assumes
+        a single failure is recoverable, which is right for a miner having a
+        bad epoch and wrong for one that shipped a shrunken challenge universe
+        or a weight root that does not match its own receipt.
+
+        The event row and miner entry update commit together.  Replays return
+        the authoritative current entry without applying the mutation again.
+        """
+
+        epoch_number = self._validate_epoch_close_int(epoch_number, "epoch_number")
+        address = str(address).lower()
+        if not event_kind or len(event_kind) > 128:
+            raise ValueError("event_kind must be 1..128 characters")
+        if action not in {
+            "probation_failure",
+            "probation_pass",
+            "proof_penalty",
+            "binding_violation",
+            "score_zero",
+        }:
+            raise ValueError("unsupported epoch-close slot action")
+        payload = json.dumps(
+            {"action": action}, sort_keys=True, separators=(",", ":")
+        )
+        now = time.time()
+
+        with self._lock:
+            existing_event = self._conn.execute(
+                """SELECT payload_json FROM epoch_close_slot_events
+                   WHERE epoch_number = ? AND miner_address = ?
+                     AND model_index = ? AND event_kind = ?""",
+                (epoch_number, address, int(model_index), event_kind),
+            ).fetchone()
+            row = self._conn.execute(
+                """SELECT ema_score, total_epochs, scored_epochs,
+                          last_scored_epoch, probation_entered_epoch,
+                          probation_consecutive_passes,
+                          probation_required_passes
+                   FROM miner_entries
+                   WHERE address = ? AND model_index = ?""",
+                (address, int(model_index)),
+            ).fetchone()
+            if row is None:
+                return {
+                    "applied": False,
+                    "entry_found": False,
+                    "ema_score": None,
+                    "probation_entered_epoch": None,
+                    "probation_consecutive_passes": 0,
+                }
+            if existing_event is not None:
+                if str(existing_event["payload_json"]) != payload:
+                    raise ValueError("conflicting epoch-close event replay")
+                return {
+                    "applied": False,
+                    "entry_found": True,
+                    "ema_score": float(row["ema_score"]),
+                    "total_epochs": int(row["total_epochs"]),
+                    "scored_epochs": int(row["scored_epochs"]),
+                    "last_scored_epoch": row["last_scored_epoch"],
+                    "probation_entered_epoch": row["probation_entered_epoch"],
+                    "probation_consecutive_passes": int(
+                        row["probation_consecutive_passes"]
+                    ),
+                }
+
+            ema_score = float(row["ema_score"])
+            entered_epoch = row["probation_entered_epoch"]
+            consecutive_passes = int(row["probation_consecutive_passes"])
+            if action in {
+                "probation_failure", "proof_penalty", "binding_violation",
+            }:
+                if entered_epoch is None:
+                    entered_epoch = epoch_number
+                consecutive_passes = 0
+            elif action == "probation_pass" and entered_epoch is not None:
+                consecutive_passes += 1
+                if consecutive_passes >= int(row["probation_required_passes"]):
+                    entered_epoch = None
+                    consecutive_passes = 0
+            if action == "proof_penalty":
+                ema_score *= 0.5
+            elif action in {"binding_violation", "score_zero"}:
+                ema_score = 0.0
+
+            try:
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO epoch_close_slots (
+                           epoch_number, miner_address, model_index,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (epoch_number, address, int(model_index), now, now),
+                )
+                self._conn.execute(
+                    """UPDATE miner_entries SET
+                           ema_score = ?, probation_entered_epoch = ?,
+                           probation_consecutive_passes = ?, updated_at = ?
+                       WHERE address = ? AND model_index = ?""",
+                    (
+                        ema_score,
+                        entered_epoch,
+                        consecutive_passes,
+                        now,
+                        address,
+                        int(model_index),
+                    ),
+                )
+                self._conn.execute(
+                    """INSERT INTO epoch_close_slot_events (
+                           epoch_number, miner_address, model_index,
+                           event_kind, payload_json, applied_at
+                       ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        epoch_number,
+                        address,
+                        int(model_index),
+                        event_kind,
+                        payload,
+                        now,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+            return {
+                "applied": True,
+                "entry_found": True,
+                "ema_score": ema_score,
+                "total_epochs": int(row["total_epochs"]),
+                "scored_epochs": int(row["scored_epochs"]),
+                "last_scored_epoch": row["last_scored_epoch"],
+                "probation_entered_epoch": entered_epoch,
+                "probation_consecutive_passes": consecutive_passes,
+            }
+
+    def _get_latest_score_samples(self) -> Dict[Tuple[str, int], dict]:
+        """Return the sample selected by each slot's scoring high-water mark."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT s.coordinator_address, s.model_index,
+                          s.score_epoch, s.model_id, s.ema_score,
+                          s.chain_id, s.netuid, s.mesh_id, s.snapshot_hash,
+                          s.snapshot_generation
+                   FROM score_samples s
+                   JOIN miner_entries m
+                     ON m.address = s.coordinator_address
+                    AND m.model_index = s.model_index
+                    AND m.last_scored_epoch = s.score_epoch"""
+            ).fetchall()
+        return {
+            (str(row["coordinator_address"]), int(row["model_index"])): dict(row)
+            for row in rows
+        }
 
     def halve_ema(self, address: str, model_index: int) -> None:
         """Halve EMA score on proof failure (geometric decay)."""
@@ -1091,17 +2141,31 @@ class ValidatorStateDB:
             )
             self._conn.commit()
 
+    def zero_ema(self, address: str, model_index: int) -> None:
+        """Zero the EMA score after a broken commitment."""
+        address = address.lower()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE miner_entries SET
+                    ema_score = 0.0, updated_at = ?
+                WHERE address = ? AND model_index = ?""",
+                (time.time(), address, model_index),
+            )
+            self._conn.commit()
+
     def load_all_scores(self) -> Dict[Tuple[str, int], dict]:
         """Load all entries with scoring data.
 
         Returns:
             Dict mapping ``(address, model_index)`` to a dict with keys
-            ``model_id``, ``ema_score``, ``total_epochs``, ``scored_epochs``.
+            ``model_id``, ``ema_score``, ``total_epochs``, ``scored_epochs``,
+            and ``last_scored_epoch``.
         """
         with self._lock:
             cursor = self._conn.execute(
                 """SELECT address, model_index, model_id,
-                          ema_score, total_epochs, scored_epochs
+                          ema_score, total_epochs, scored_epochs,
+                          last_scored_epoch
                    FROM miner_entries
                    WHERE is_active = 1"""
             )
@@ -1113,6 +2177,7 @@ class ValidatorStateDB:
                     "ema_score": row["ema_score"],
                     "total_epochs": row["total_epochs"],
                     "scored_epochs": row["scored_epochs"],
+                    "last_scored_epoch": row["last_scored_epoch"],
                 }
             return result
 
@@ -1168,6 +2233,7 @@ class ValidatorStateDB:
                     """UPDATE miner_entries SET
                         probation_entered_epoch = ?,
                         probation_consecutive_passes = 0,
+                        probation_source = 'earned',
                         updated_at = ?
                     WHERE address = ? AND model_index = ?""",
                     (epoch, time.time(), address, model_index),
@@ -1200,6 +2266,7 @@ class ValidatorStateDB:
                     """UPDATE miner_entries SET
                         probation_entered_epoch = NULL,
                         probation_consecutive_passes = 0,
+                        probation_source = NULL,
                         updated_at = ?
                     WHERE address = ? AND model_index = ?""",
                     (time.time(), address, model_index),
@@ -1231,6 +2298,108 @@ class ValidatorStateDB:
                 (time.time(), address, model_index),
             )
             self._conn.commit()
+
+    def apply_proxy_proof_failure_event(
+        self,
+        *,
+        event_id: str,
+        address: str,
+        model_index: int,
+        epoch_number: int,
+        event_timestamp: int,
+    ) -> dict[str, Any]:
+        """Atomically apply one proxy proof-failure event at most once.
+
+        Returns the authoritative post-transaction EMA and probation state so
+        the validator can reconcile its in-memory scorer/tracker after a crash
+        without repeating the financial mutation.
+        """
+
+        normalized_address = str(address).lower()
+        now = time.time()
+        with self._lock:
+            existing = self._conn.execute(
+                """SELECT event_id FROM proxy_proof_failure_events
+                   WHERE event_id = ?""",
+                (event_id,),
+            ).fetchone()
+            row = self._conn.execute(
+                """SELECT ema_score, probation_entered_epoch,
+                          probation_consecutive_passes
+                   FROM miner_entries
+                   WHERE address = ? AND model_index = ?""",
+                (normalized_address, model_index),
+            ).fetchone()
+            if row is None:
+                return {
+                    "applied": False,
+                    "entry_found": False,
+                    "ema_score": None,
+                    "probation_entered_epoch": None,
+                    "probation_consecutive_passes": 0,
+                }
+            if existing is not None:
+                return {
+                    "applied": False,
+                    "entry_found": True,
+                    "ema_score": float(row["ema_score"]),
+                    "probation_entered_epoch": row[
+                        "probation_entered_epoch"
+                    ],
+                    "probation_consecutive_passes": int(
+                        row["probation_consecutive_passes"]
+                    ),
+                }
+
+            entered_epoch = row["probation_entered_epoch"]
+            if entered_epoch is None:
+                entered_epoch = int(epoch_number)
+            new_ema = float(row["ema_score"]) * 0.5
+            try:
+                self._conn.execute(
+                    """UPDATE miner_entries SET
+                        probation_entered_epoch = ?,
+                        probation_consecutive_passes = 0,
+                        ema_score = ?,
+                        updated_at = ?
+                    WHERE address = ? AND model_index = ?""",
+                    (
+                        entered_epoch,
+                        new_ema,
+                        now,
+                        normalized_address,
+                        model_index,
+                    ),
+                )
+                self._conn.execute(
+                    """INSERT INTO proxy_proof_failure_events (
+                        event_id,
+                        miner_address,
+                        model_index,
+                        epoch_number,
+                        event_timestamp,
+                        applied_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        event_id,
+                        normalized_address,
+                        model_index,
+                        epoch_number,
+                        event_timestamp,
+                        now,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            return {
+                "applied": True,
+                "entry_found": True,
+                "ema_score": new_ema,
+                "probation_entered_epoch": entered_epoch,
+                "probation_consecutive_passes": 0,
+            }
 
     def clear_probation(self, address: str, model_index: int) -> None:
         """Explicitly clear probation for an entry."""
@@ -1720,7 +2889,502 @@ class ValidatorStateDB:
         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         self._conn.commit()
 
-    # ── Hot-capacity audit state ──────────────────────────────────────
+    _CAPACITY_AUDIT_PK_INDEX_DDL = """
+        CREATE INDEX IF NOT EXISTS idx_capacity_audit_slot
+            ON capacity_audit_slots(miner_address, model_index, created_at);
+        CREATE INDEX IF NOT EXISTS idx_capacity_audit_verdict
+            ON capacity_audit_slots(verdict, created_at);
+        CREATE INDEX IF NOT EXISTS idx_capacity_audit_drains
+            ON capacity_audit_slots(drain_until_ts, verdict);
+        CREATE INDEX IF NOT EXISTS idx_capacity_audit_history_archived
+            ON capacity_audit_history(archived_at);
+        CREATE INDEX IF NOT EXISTS idx_capacity_audit_history_uid
+            ON capacity_audit_history(miner_uid, archived_at);
+        CREATE INDEX IF NOT EXISTS idx_capacity_audit_history_outcome
+            ON capacity_audit_history(verdict, proof_status, archived_at);
+    """
+
+    def _migrate_capacity_audit_gpu_index_pk(self) -> None:
+        """One-time PK rebuild adding gpu_index to the audit slot keys.
+
+        Mesh audits store one row per roster GPU ordinal under a shared
+        audit_id, which the historical ``(audit_id, miner_address,
+        model_index)`` primary key cannot hold. SQLite cannot alter a primary
+        key in place, so tables created before this key shape are rebuilt via
+        copy-and-rename; existing rows keep their gpu_index 0. Idempotent:
+        tables already keyed on gpu_index are left untouched.
+        """
+        rebuilt = False
+        for table in ("capacity_audit_slots", "capacity_audit_history"):
+            info = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            pk_cols = [row["name"] for row in info if int(row["pk"] or 0) > 0]
+            if not pk_cols or "gpu_index" in pk_cols:
+                continue
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            sql = str(row["sql"] if row is not None else "")
+            new_sql, pk_hits = re.subn(
+                r"PRIMARY KEY\s*\(\s*audit_id\s*,\s*miner_address\s*,\s*model_index\s*\)",
+                "PRIMARY KEY (audit_id, miner_address, model_index, gpu_index)",
+                sql,
+                count=1,
+            )
+            new_sql, name_hits = re.subn(
+                rf"CREATE TABLE\s+(?:IF NOT EXISTS\s+)?\"?{table}\"?",
+                f"CREATE TABLE {table}_pkmig",
+                new_sql,
+                count=1,
+            )
+            if pk_hits != 1 or name_hits != 1:
+                # Fail-safe: an unexpected DDL shape keeps the old key rather
+                # than risking a lossy rebuild.
+                bt.logging.warning(
+                    f"{table}: gpu_index PK migration skipped (unrecognized DDL)"
+                )
+                continue
+            columns = ", ".join(str(r["name"]) for r in info)
+            self._conn.execute(new_sql)
+            self._conn.execute(
+                f"INSERT INTO {table}_pkmig ({columns}) SELECT {columns} FROM {table}"
+            )
+            self._conn.execute(f"DROP TABLE {table}")
+            self._conn.execute(f"ALTER TABLE {table}_pkmig RENAME TO {table}")
+            rebuilt = True
+        if rebuilt:
+            self._conn.executescript(self._CAPACITY_AUDIT_PK_INDEX_DDL)
+            self._conn.commit()
+            bt.logging.info(
+                "capacity audit tables rebuilt with per-GPU primary key"
+            )
+
+    # ── Mesh verification snapshots ─────────────────────────────────
+
+    @staticmethod
+    def _normalize_mesh_snapshot_address(address: str) -> str:
+        """Return a canonical EVM coordinator address for snapshot keys."""
+
+        if not isinstance(address, str):
+            raise ValueError("coordinator_address must be a string")
+        normalized = address.lower()
+        if len(normalized) != 42 or not normalized.startswith("0x"):
+            raise ValueError("coordinator_address must be a 20-byte EVM address")
+        try:
+            int(normalized[2:], 16)
+        except ValueError as exc:
+            raise ValueError(
+                "coordinator_address must be a 20-byte EVM address"
+            ) from exc
+        return normalized
+
+    @staticmethod
+    def _validate_mesh_snapshot_key_int(
+        value: int,
+        *,
+        field_name: str,
+        minimum: int,
+    ) -> int:
+        """Validate an integer used in the immutable snapshot primary key."""
+
+        if type(value) is not int or value < minimum or value >= 2**63:
+            relation = "positive" if minimum == 1 else "non-negative"
+            raise ValueError(f"{field_name} must be a {relation} 63-bit integer")
+        return value
+
+    @staticmethod
+    def _normalize_mesh_snapshot_hash(snapshot_hash: str) -> str:
+        """Return a canonical lowercase 32-byte snapshot digest."""
+
+        if not isinstance(snapshot_hash, str):
+            raise ValueError("snapshot_hash must be a string")
+        normalized = snapshot_hash.lower()
+        if normalized.startswith("0x"):
+            normalized = normalized[2:]
+        if len(normalized) != 64:
+            raise ValueError("snapshot_hash must be a 32-byte hex digest")
+        try:
+            int(normalized, 16)
+        except ValueError as exc:
+            raise ValueError("snapshot_hash must be a 32-byte hex digest") from exc
+        return normalized
+
+    @staticmethod
+    def _canonicalize_mesh_snapshot_json(
+        snapshot_json: str | Mapping[str, Any],
+    ) -> tuple[Any, str]:
+        """Parse and canonically serialize a signed endpoint-free snapshot."""
+
+        if isinstance(snapshot_json, str):
+            try:
+                payload = json.loads(snapshot_json)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("snapshot_json must contain valid JSON") from exc
+        elif isinstance(snapshot_json, Mapping):
+            payload = dict(snapshot_json)
+        else:
+            raise ValueError("snapshot_json must be a JSON object or object string")
+
+        if not isinstance(payload, dict):
+            raise ValueError("snapshot_json must contain a JSON object")
+
+        # Parse the closed protocol schema at the persistence boundary.  This
+        # re-runs the endpoint privacy guard and prevents malformed or unsigned
+        # envelopes from entering the validator's trusted cache.
+        from verallm.mesh.types import canonical_json_bytes
+        from verallm.mesh.verification_snapshot import MeshVerificationSnapshot
+
+        snapshot = MeshVerificationSnapshot.from_dict(payload)
+        snapshot.validate(require_signature=True)
+        canonical = canonical_json_bytes(snapshot.to_dict()).decode("utf-8")
+        return snapshot, canonical
+
+    def upsert_mesh_verification_snapshot(
+        self,
+        *,
+        coordinator_address: str,
+        model_index: int,
+        epoch: int,
+        generation: int,
+        snapshot_hash: str,
+        snapshot_json: str | Mapping[str, Any],
+        fetched_at: float | None = None,
+        allow_mesh_change: bool = False,
+    ) -> bool:
+        """Pin one already-authenticated mesh verification snapshot.
+
+        Snapshot generations are monotonic within one coordinator/model/epoch
+        tuple. A lower generation is a rollback and a changed hash or payload
+        at the same generation is an equivocation, so both are rejected. A
+        higher generation is inserted as a new row; earlier rows are retained
+        unchanged for audit.
+
+        ``allow_mesh_change`` is reserved for validator-INITIATED re-pins
+        (restart bootstrap, refusal re-pin): the validator is explicitly
+        fetching and signing off on a new mesh lineage, so a differing
+        ``mesh_id`` supersedes the dead lineage's rows for this epoch instead
+        of being rejected as an unsolicited mid-epoch swap.
+
+        The caller remains responsible for verifying the coordinator signature
+        and its chain registration before this persistence boundary.
+
+        Returns:
+            ``True`` when a new generation was inserted and ``False`` when the
+            exact snapshot was already pinned.
+        """
+
+        address = self._normalize_mesh_snapshot_address(coordinator_address)
+        model_index = self._validate_mesh_snapshot_key_int(
+            model_index,
+            field_name="model_index",
+            minimum=0,
+        )
+        epoch = self._validate_mesh_snapshot_key_int(
+            epoch,
+            field_name="epoch",
+            minimum=0,
+        )
+        generation = self._validate_mesh_snapshot_key_int(
+            generation,
+            field_name="generation",
+            minimum=1,
+        )
+        normalized_hash = self._normalize_mesh_snapshot_hash(snapshot_hash)
+        snapshot, canonical_json = self._canonicalize_mesh_snapshot_json(snapshot_json)
+
+        if snapshot.epoch != epoch:
+            raise ValueError("snapshot epoch does not match the cache key")
+        if snapshot.generation != generation:
+            raise ValueError("snapshot generation does not match the cache key")
+        payload_expiry = snapshot.expires_at_unix
+        if snapshot.coordinator.coordinator_evm_address != address:
+            raise ValueError("snapshot coordinator address does not match the cache key")
+        if snapshot.coordinator.model_index != model_index:
+            raise ValueError("snapshot model_index does not match the cache key")
+        if snapshot.snapshot_hash_hex() != normalized_hash:
+            raise ValueError("snapshot_hash does not match the snapshot payload")
+
+        if fetched_at is None:
+            fetched_at = time.time()
+        if not isinstance(fetched_at, (int, float)) or isinstance(fetched_at, bool):
+            raise ValueError("fetched_at must be a Unix timestamp")
+        fetched_at = float(fetched_at)
+        if fetched_at <= 0 or fetched_at == float("inf") or fetched_at != fetched_at:
+            raise ValueError("fetched_at must be a finite positive Unix timestamp")
+        if fetched_at >= payload_expiry:
+            raise ValueError("cannot pin an already-expired mesh verification snapshot")
+
+        with self._lock:
+            try:
+                # Reserve the writer before checking the high-water mark so
+                # separate ValidatorStateDB instances cannot race a rollback.
+                self._conn.execute("BEGIN IMMEDIATE")
+                latest = self._conn.execute(
+                    """SELECT generation, snapshot_hash, snapshot_json,
+                              fetched_at, expires_at_unix
+                       FROM mesh_verification_snapshots
+                       WHERE coordinator_address = ?
+                         AND model_index = ?
+                         AND epoch_number = ?
+                       ORDER BY generation DESC
+                       LIMIT 1""",
+                    (address, model_index, epoch),
+                ).fetchone()
+
+                if latest is not None:
+                    latest_payload = json.loads(str(latest["snapshot_json"]))
+                    latest_mesh_id = str(latest_payload.get("mesh_id", ""))
+                    if snapshot.mesh_id != latest_mesh_id:
+                        if not allow_mesh_change:
+                            raise ValueError(
+                                "mesh verification snapshot mesh_id changed within epoch"
+                            )
+                        # Validator-initiated adoption: the old lineage is
+                        # dead and its rows would shadow the new lineage's
+                        # (lower) generations in every latest-row lookup.
+                        self._conn.execute(
+                            """DELETE FROM mesh_verification_snapshots
+                               WHERE coordinator_address = ?
+                                 AND model_index = ?
+                                 AND epoch_number = ?""",
+                            (address, model_index, epoch),
+                        )
+                        latest = None
+
+                if latest is not None and generation < int(latest["generation"]):
+                    raise ValueError(
+                        "mesh verification snapshot generation rollback rejected"
+                    )
+
+                if latest is not None and generation == int(latest["generation"]):
+                    if normalized_hash != str(latest["snapshot_hash"]):
+                        raise ValueError(
+                            "conflicting mesh verification snapshot hash at pinned generation"
+                        )
+                    if canonical_json != str(latest["snapshot_json"]):
+                        raise ValueError(
+                            "conflicting mesh verification snapshot payload at pinned generation"
+                        )
+                    if payload_expiry != int(latest["expires_at_unix"]):
+                        raise ValueError(
+                            "conflicting mesh verification snapshot expiry at pinned generation"
+                        )
+                    self._conn.commit()
+                    return False
+
+                self._conn.execute(
+                    """INSERT INTO mesh_verification_snapshots (
+                           coordinator_address, model_index, epoch_number,
+                           generation, snapshot_hash, snapshot_json,
+                           fetched_at, expires_at_unix
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        address,
+                        model_index,
+                        epoch,
+                        generation,
+                        normalized_hash,
+                        canonical_json,
+                        fetched_at,
+                        payload_expiry,
+                    ),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def get_latest_mesh_verification_snapshot_for_epoch(
+        self,
+        *,
+        coordinator_address: str,
+        model_index: int,
+        epoch: int,
+    ) -> Optional[dict]:
+        """Return the highest pinned generation for one epoch, if present.
+
+        Expired rows remain queryable because expiration is a verification-time
+        decision and immutable history is also used for audit.
+        """
+
+        address = self._normalize_mesh_snapshot_address(coordinator_address)
+        model_index = self._validate_mesh_snapshot_key_int(
+            model_index,
+            field_name="model_index",
+            minimum=0,
+        )
+        epoch = self._validate_mesh_snapshot_key_int(
+            epoch,
+            field_name="epoch",
+            minimum=0,
+        )
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT coordinator_address, model_index, epoch_number,
+                          generation, snapshot_hash, snapshot_json,
+                          fetched_at, expires_at_unix
+                   FROM mesh_verification_snapshots
+                   WHERE coordinator_address = ?
+                     AND model_index = ?
+                     AND epoch_number = ?
+                   ORDER BY generation DESC
+                   LIMIT 1""",
+                (address, model_index, epoch),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def get_mesh_verification_snapshot_history(
+        self,
+        *,
+        coordinator_address: str,
+        model_index: int,
+        epoch: int,
+    ) -> List[dict]:
+        """Return all pinned generations for an epoch in ascending order."""
+
+        address = self._normalize_mesh_snapshot_address(coordinator_address)
+        model_index = self._validate_mesh_snapshot_key_int(
+            model_index,
+            field_name="model_index",
+            minimum=0,
+        )
+        epoch = self._validate_mesh_snapshot_key_int(
+            epoch,
+            field_name="epoch",
+            minimum=0,
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT coordinator_address, model_index, epoch_number,
+                          generation, snapshot_hash, snapshot_json,
+                          fetched_at, expires_at_unix
+                   FROM mesh_verification_snapshots
+                   WHERE coordinator_address = ?
+                     AND model_index = ?
+                     AND epoch_number = ?
+                   ORDER BY generation ASC""",
+                (address, model_index, epoch),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    # ── Hot-capacity audit state ─────────────────────────────────
+
+    CAPACITY_ROSTER_RETENTION_SECONDS = 30 * 24 * 60 * 60
+
+    def record_capacity_roster(
+        self,
+        *,
+        slot_id: str,
+        roster_epoch: int,
+        roster_digest: str,
+        roster_json: str,
+        signature: str,
+        received_at: Optional[float] = None,
+    ) -> None:
+        """Upsert one verified mesh roster document; prunes stale rows."""
+        ts = time.time() if received_at is None else float(received_at)
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO capacity_rosters (
+                       slot_id, roster_epoch, roster_digest, roster_json,
+                       signature, received_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (slot_id, roster_digest) DO UPDATE SET
+                       roster_epoch = excluded.roster_epoch,
+                       roster_json = excluded.roster_json,
+                       signature = excluded.signature,
+                       received_at = excluded.received_at""",
+                (
+                    str(slot_id),
+                    int(roster_epoch),
+                    str(roster_digest),
+                    str(roster_json),
+                    str(signature),
+                    ts,
+                ),
+            )
+            self._conn.execute(
+                "DELETE FROM capacity_rosters WHERE received_at < ?",
+                (ts - float(self.CAPACITY_ROSTER_RETENTION_SECONDS),),
+            )
+            self._conn.commit()
+
+    def get_capacity_roster(self, slot_id: str) -> Optional[dict]:
+        """Return the newest stored roster row for one endpoint slot."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM capacity_rosters
+                   WHERE slot_id = ?
+                   ORDER BY received_at DESC, roster_epoch DESC
+                   LIMIT 1""",
+                (str(slot_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_capacity_roster_missing(
+        self, slot_id: str, epoch_number: int
+    ) -> None:
+        """Mark one mesh slot's roster as unlearnable at this epoch.
+
+        first_missing_epoch is preserved across calls so the gate measures
+        the full refusal streak, not the latest observation.
+        """
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO capacity_roster_probes (
+                       slot_id, first_missing_epoch, last_missing_epoch
+                   ) VALUES (?, ?, ?)
+                   ON CONFLICT (slot_id) DO UPDATE SET
+                       first_missing_epoch = CASE
+                           WHEN capacity_roster_probes.first_missing_epoch <= 0
+                               THEN excluded.first_missing_epoch
+                           ELSE capacity_roster_probes.first_missing_epoch
+                       END,
+                       last_missing_epoch = excluded.last_missing_epoch""",
+                (str(slot_id), int(epoch_number), int(epoch_number)),
+            )
+            self._conn.commit()
+
+    def clear_capacity_roster_missing(self, slot_id: str) -> None:
+        """Forget a slot's refusal streak once a roster is learned."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM capacity_roster_probes WHERE slot_id = ?",
+                (str(slot_id),),
+            )
+            self._conn.commit()
+
+    def get_capacity_roster_missing(self, slot_id: str) -> Optional[dict]:
+        """Return the refusal-streak row for one slot, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM capacity_roster_probes WHERE slot_id = ?",
+                (str(slot_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_capacity_roster_for_selection(
+        self,
+        slot_id: str,
+        max_roster_epoch: int,
+    ) -> Optional[dict]:
+        """Newest roster old enough for the non-interactive selection domain.
+
+        Selection determinism requires both sides to group on a frozen
+        document, so only rosters with ``roster_epoch <= current_epoch - 1``
+        may feed selection; callers pass that bound as ``max_roster_epoch``.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM capacity_rosters
+                   WHERE slot_id = ? AND roster_epoch <= ?
+                   ORDER BY received_at DESC, roster_epoch DESC
+                   LIMIT 1""",
+                (str(slot_id), int(max_roster_epoch)),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def create_capacity_audit_window(
         self,
@@ -1761,14 +3425,15 @@ class ValidatorStateDB:
                         miner_hotkey_ss58, endpoint,
                         model_id, quant, max_context_len, gpu_name, gpu_count,
                         vram_gb, group_key, slot_id, lease_id, claimed_gpu_class,
-                        gpu_index, pass_count, workload_spec, deadline_s, transport_grace_s,
+                        gpu_index, roster_digest, pass_count, workload_spec,
+                        deadline_s, transport_grace_s,
                         payload_deadline_s, drain_until_ts, created_at, updated_at
                     ) VALUES (
                         ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?
                     )""",
                     (
                         audit_id,
@@ -1788,6 +3453,7 @@ class ValidatorStateDB:
                         str(slot["lease_id"]),
                         str(slot.get("claimed_gpu_class", "")),
                         int(slot.get("gpu_index", 0) or 0),
+                        str(slot.get("roster_digest", "") or ""),
                         int(slot.get("pass_count", 0) or 0),
                         json.dumps(
                             slot.get("workload_spec") or {},
@@ -2085,7 +3751,7 @@ class ValidatorStateDB:
         with self._lock:
             if return_slots:
                 rows = self._conn.execute(
-                    """SELECT s.audit_id, s.miner_address, s.model_index,
+                    """SELECT DISTINCT s.audit_id, s.miner_address, s.model_index,
                               s.endpoint, 'no_show' AS verdict,
                               COALESCE(s.failure_reason, 'missing_final_receipt') AS failure_reason
                        FROM capacity_audit_slots s
@@ -2125,7 +3791,7 @@ class ValidatorStateDB:
                 # extra workspace-retention or proof-construction time.
                 if return_slots:
                     rows = self._conn.execute(
-                        """SELECT s.audit_id, s.miner_address, s.model_index,
+                        """SELECT DISTINCT s.audit_id, s.miner_address, s.model_index,
                                   s.endpoint, 'hard_proof_miss' AS verdict,
                                   COALESCE(s.failure_reason, 'missing_proof_payload') AS failure_reason
                            FROM capacity_audit_slots s
@@ -2187,7 +3853,13 @@ class ValidatorStateDB:
             self._conn.commit()
         return expired_slots if return_slots else updated
 
-    def get_capacity_audit_slot(self, audit_id: str, address: str, model_index: int) -> Optional[dict]:
+    def get_capacity_audit_slot(
+        self,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        gpu_index: int = 0,
+    ) -> Optional[dict]:
         with self._lock:
             row = self._conn.execute(
                 """SELECT s.*, w.epoch_number, w.selection_block, w.audit_block,
@@ -2200,8 +3872,9 @@ class ValidatorStateDB:
                           w.proof_challenge_finalized_at
                    FROM capacity_audit_slots s
                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
-                   WHERE s.audit_id = ? AND s.miner_address = ? AND s.model_index = ?""",
-                (audit_id, address.lower(), int(model_index)),
+                   WHERE s.audit_id = ? AND s.miner_address = ?
+                     AND s.model_index = ? AND s.gpu_index = ?""",
+                (audit_id, address.lower(), int(model_index), int(gpu_index)),
             ).fetchone()
         return dict(row) if row is not None else None
 
@@ -2214,6 +3887,7 @@ class ValidatorStateDB:
         pass0_root: str,
         artifact: dict,
         received_at: Optional[float] = None,
+        gpu_index: int = 0,
     ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
         with self._lock:
@@ -2225,6 +3899,7 @@ class ValidatorStateDB:
                        verdict = CASE WHEN verdict = 'pending' THEN 'pass0_seen' ELSE verdict END,
                        updated_at = ?
                    WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND gpu_index = ?
                      AND EXISTS (
                        SELECT 1 FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
@@ -2238,6 +3913,7 @@ class ValidatorStateDB:
                     audit_id,
                     address.lower(),
                     int(model_index),
+                    int(gpu_index),
                 ),
             )
             self._conn.commit()
@@ -2258,6 +3934,7 @@ class ValidatorStateDB:
         probation_required: bool = False,
         final_observed_block: Optional[int] = None,
         received_at: Optional[float] = None,
+        gpu_index: int = 0,
     ) -> Tuple[Optional[dict], bool]:
         """Persist the first final receipt without letting retries retime it.
 
@@ -2309,6 +3986,7 @@ class ValidatorStateDB:
                        END,
                        updated_at = ?
                    WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND gpu_index = ?
                      AND EXISTS (
                        SELECT 1 FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
@@ -2333,14 +4011,16 @@ class ValidatorStateDB:
                     audit_id,
                     address.lower(),
                     int(model_index),
+                    int(gpu_index),
                     int(hard_override),
                 ),
             )
             row = self._conn.execute(
                 """SELECT *
                    FROM capacity_audit_slots
-                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
-                (audit_id, address.lower(), int(model_index)),
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND gpu_index = ?""",
+                (audit_id, address.lower(), int(model_index), int(gpu_index)),
             ).fetchone()
             self._conn.commit()
         return (dict(row) if row is not None else None, bool(cur.rowcount))
@@ -2378,6 +4058,7 @@ class ValidatorStateDB:
                         WHERE s.audit_id = h.audit_id
                           AND s.miner_address = h.miner_address
                           AND s.model_index = h.model_index
+                          AND s.gpu_index = h.gpu_index
                           AND s.verdict = 'timing_miss'
                           AND s.failure_reason = 'deadline_exceeded'
                           AND {on_time_final}
@@ -2419,6 +4100,7 @@ class ValidatorStateDB:
         proof_verify_ms: Optional[float] = None,
         probation_required: bool = False,
         received_at: Optional[float] = None,
+        gpu_index: int = 0,
     ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
         verify_ms = None if proof_verify_ms is None else max(0.0, float(proof_verify_ms))
@@ -2450,6 +4132,7 @@ class ValidatorStateDB:
                        END,
                        updated_at = ?
                    WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND gpu_index = ?
                      AND EXISTS (
                        SELECT 1 FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
@@ -2470,10 +4153,119 @@ class ValidatorStateDB:
                     audit_id,
                     address.lower(),
                     int(model_index),
+                    int(gpu_index),
                 ),
             )
             self._conn.commit()
         return (cur.rowcount or 0) == 1
+
+    def recently_scored_mesh_keys(self, min_epoch: int) -> set:
+        """(address, model_index) pairs of active entries scored since min_epoch.
+
+        Used to exempt still-serving registrations from the superseded-skip
+        in snapshot verification: a scoring entry is serving, whatever its
+        registration order.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT address, model_index FROM miner_entries
+                   WHERE is_active = 1 AND last_scored_epoch >= ?""",
+                (int(min_epoch),),
+            ).fetchall()
+        return {
+            (str(r["address"]).lower(), int(r["model_index"])) for r in rows
+        }
+
+    def record_validator_outage_interval(
+        self, start_ts: float, end_ts: float
+    ) -> None:
+        """Persist an observed validator liveness gap (stall or restart).
+
+        The close consults these to suppress miner penalties for epochs the
+        validator itself marred: a wedged or restarted validator must never
+        cost miners probation, because its own dead canaries are
+        indistinguishable from miner failures at scoring time.
+        """
+        if not (end_ts > start_ts > 0):
+            return
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS validator_outage_intervals (
+                    start_ts REAL NOT NULL,
+                    end_ts REAL NOT NULL,
+                    recorded_at REAL NOT NULL
+                )"""
+            )
+            self._conn.execute(
+                "INSERT INTO validator_outage_intervals "
+                "(start_ts, end_ts, recorded_at) VALUES (?, ?, ?)",
+                (float(start_ts), float(end_ts), now),
+            )
+            self._conn.execute(
+                "DELETE FROM validator_outage_intervals WHERE end_ts < ?",
+                (now - 7 * 86400,),
+            )
+            self._conn.commit()
+
+    def validator_outage_overlap_seconds(
+        self, window_start: float, window_end: float
+    ) -> float:
+        """Total recorded validator-outage seconds inside a wall-clock window."""
+        if window_end <= window_start:
+            return 0.0
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT start_ts, end_ts FROM validator_outage_intervals "
+                    "WHERE end_ts > ? AND start_ts < ?",
+                    (float(window_start), float(window_end)),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return 0.0
+        total = 0.0
+        for row in rows:
+            s = max(float(row["start_ts"]), float(window_start))
+            e = min(float(row["end_ts"]), float(window_end))
+            if e > s:
+                total += e - s
+        return total
+
+    def find_validator_outage_no_show_audits(
+        self,
+        outage_start: float,
+        outage_end: float,
+    ) -> Dict[int, List[str]]:
+        """Audit windows blaming miners for receipts due during a validator outage.
+
+        A slot's receipt-acceptance window is
+        [audit_start_observed_at, audit_start_observed_at + deadline_s +
+        transport_grace_s]. If the validator itself was down for any part of
+        that window, a no_show/missing_final_receipt verdict says nothing
+        about the miner - its publishes were refused at the door. Returns
+        {epoch_number: [audit_id, ...]} for exactly those windows, skipping
+        ones already neutralized as validator incidents.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT DISTINCT s.audit_id, w.epoch_number
+                   FROM capacity_audit_slots s
+                   JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                   WHERE s.verdict = 'no_show'
+                     AND COALESCE(s.failure_reason, '') = 'missing_final_receipt'
+                     AND w.status != 'validator_incident'
+                     AND w.audit_start_observed_at IS NOT NULL
+                     AND w.audit_start_observed_at < ?
+                     AND w.audit_start_observed_at + s.deadline_s + s.transport_grace_s > ?
+                   ORDER BY w.epoch_number, s.audit_id""",
+                (float(outage_end), float(outage_start)),
+            ).fetchall()
+        grouped: Dict[int, List[str]] = {}
+        for row in rows:
+            grouped.setdefault(int(row["epoch_number"]), []).append(
+                str(row["audit_id"])
+            )
+        return grouped
 
     def reconcile_capacity_audit_incident(
         self,
@@ -2785,7 +4577,10 @@ class ValidatorStateDB:
                      AND probation_required != 0""",
                 (ts, ts, audit_id, address, int(model_index)),
             )
-            if (cur.rowcount or 0) != 1:
+            # Marks every ordinal row of the audit group in one statement, so
+            # a mesh audit with several failing GPUs still applies exactly one
+            # probation event.
+            if (cur.rowcount or 0) < 1:
                 self._conn.rollback()
                 return None
             self._conn.commit()
@@ -2823,6 +4618,7 @@ class ValidatorStateDB:
         address: str,
         model_index: int,
         received_at: Optional[float] = None,
+        gpu_index: int = 0,
     ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
         with self._lock:
@@ -2835,6 +4631,7 @@ class ValidatorStateDB:
                        END,
                        updated_at = ?
                    WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND gpu_index = ?
                      AND EXISTS (
                        SELECT 1 FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
@@ -2846,6 +4643,7 @@ class ValidatorStateDB:
                     audit_id,
                     address.lower(),
                     int(model_index),
+                    int(gpu_index),
                 ),
             )
             self._conn.commit()
@@ -2858,8 +4656,14 @@ class ValidatorStateDB:
         address: str,
         model_index: int,
         released_at: Optional[float] = None,
+        gpu_index: int = 0,
     ) -> int:
-        """Release a selected endpoint from proxy drain after audit evidence is complete."""
+        """Release one audit opening from proxy drain after its evidence is complete.
+
+        Keyed per gpu_index on purpose: a mesh slot's drain only ends once
+        every ordinal's row has been released, so one finished GPU cannot
+        un-drain the endpoint while sibling openings are still proving.
+        """
         ts = time.time() if released_at is None else float(released_at)
         with self._lock:
             cur = self._conn.execute(
@@ -2868,7 +4672,8 @@ class ValidatorStateDB:
                            WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
                        END,
                        updated_at = ?
-                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND gpu_index = ?""",
                 (
                     ts,
                     ts,
@@ -2876,6 +4681,7 @@ class ValidatorStateDB:
                     audit_id,
                     address.lower(),
                     int(model_index),
+                    int(gpu_index),
                 ),
             )
             self._conn.commit()
@@ -2919,6 +4725,21 @@ class ValidatorStateDB:
             self._conn.commit()
         return cur.rowcount or 0
 
+    # Worst-of severity ranks for one audit's ordinal rows. A mesh audit fans
+    # out to N per-GPU rows under one audit_id; strike counting collapses each
+    # (audit_id, address, model_index) group to its single worst sub-verdict
+    # so per-ordinal fan-out can never multiply strikes.
+    _CAPACITY_FAILURE_SEVERITY_SQL = """CASE s.verdict
+        WHEN 'hard_proof_miss' THEN 4
+        WHEN 'timing_miss' THEN 3
+        WHEN 'no_show' THEN 2
+        ELSE 0 END"""
+    _CAPACITY_FAILURE_SEVERITY_RANKS = {
+        "hard_proof_miss": 4,
+        "timing_miss": 3,
+        "no_show": 2,
+    }
+
     def recent_capacity_failures(
         self,
         address: str,
@@ -2928,9 +4749,17 @@ class ValidatorStateDB:
         verdicts: Tuple[str, ...] = ("timing_miss", "hard_proof_miss", "no_show"),
         require_chain_confirmed: bool = False,
         require_consequence_eligible: bool = False,
-        before_epoch: Optional[int] = None,
     ) -> int:
-        placeholders = ",".join("?" for _ in verdicts)
+        wanted_ranks = sorted(
+            {
+                self._CAPACITY_FAILURE_SEVERITY_RANKS[v]
+                for v in verdicts
+                if v in self._CAPACITY_FAILURE_SEVERITY_RANKS
+            }
+        )
+        if not wanted_ranks:
+            return 0
+        rank_placeholders = ",".join("?" for _ in wanted_ranks)
         confirmation_clause = ""
         if require_chain_confirmed:
             confirmation_clause = (
@@ -2948,27 +4777,29 @@ class ValidatorStateDB:
         eligibility_clause = (
             " AND s.probation_required != 0" if require_consequence_eligible else ""
         )
-        before_clause = " AND w.epoch_number < ?" if before_epoch is not None else ""
         with self._lock:
             identity_clause, identity_params = self._capacity_address_identity_filter_locked(
                 address
             )
             row = self._conn.execute(
                 f"""SELECT COUNT(*) AS n
-                    FROM capacity_audit_slots s
-                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
-                    WHERE s.miner_address = ?
-                      AND s.model_index = ?
-                      AND w.epoch_number >= ?
-                      {before_clause}
-                      AND s.verdict IN ({placeholders})
-                      AND {identity_clause}
-                      {eligibility_clause}
-                      {confirmation_clause}""",
+                    FROM (
+                      SELECT MAX({self._CAPACITY_FAILURE_SEVERITY_SQL}) AS worst
+                      FROM capacity_audit_slots s
+                      JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                      WHERE s.miner_address = ?
+                        AND s.model_index = ?
+                        AND w.epoch_number >= ?
+                        AND s.verdict IN ('timing_miss', 'hard_proof_miss', 'no_show')
+                        AND {identity_clause}
+                        {eligibility_clause}
+                        {confirmation_clause}
+                      GROUP BY s.audit_id
+                    )
+                    WHERE worst IN ({rank_placeholders})""",
                 (
                     address.lower(), int(model_index), int(since_epoch),
-                    *((int(before_epoch),) if before_epoch is not None else ()),
-                    *verdicts, *identity_params,
+                    *identity_params, *wanted_ranks,
                 ),
             ).fetchone()
         return int(row["n"] if row is not None else 0)
@@ -3003,8 +4834,10 @@ class ValidatorStateDB:
             identity_clause, identity_params = self._capacity_address_identity_filter_locked(
                 address
             )
+            # Any ordinal's invalid proof makes the audit count once; invalid
+            # is the top severity so no sibling verdict can mask it.
             row = self._conn.execute(
-                f"""SELECT COUNT(*) AS n
+                f"""SELECT COUNT(DISTINCT s.audit_id) AS n
                     FROM capacity_audit_slots s
                     JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
                     WHERE s.miner_address = ?
@@ -3040,7 +4873,16 @@ class ValidatorStateDB:
         verdicts: Tuple[str, ...] = ("timing_miss", "hard_proof_miss", "no_show"),
         require_chain_confirmed: bool = False,
     ) -> int:
-        placeholders = ",".join("?" for _ in verdicts)
+        wanted_ranks = sorted(
+            {
+                self._CAPACITY_FAILURE_SEVERITY_RANKS[v]
+                for v in verdicts
+                if v in self._CAPACITY_FAILURE_SEVERITY_RANKS
+            }
+        )
+        if not wanted_ranks:
+            return 0
+        rank_placeholders = ",".join("?" for _ in wanted_ranks)
         confirmation_clause = ""
         if require_chain_confirmed:
             confirmation_clause = (
@@ -3059,13 +4901,18 @@ class ValidatorStateDB:
             identity_clause, identity_params = self._capacity_uid_identity_filter_locked(uid)
             row = self._conn.execute(
                 f"""SELECT COUNT(*) AS n
-                    FROM capacity_audit_slots s
-                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
-                    WHERE w.epoch_number >= ?
-                      AND s.verdict IN ({placeholders})
-                      AND ({identity_clause})
-                      {confirmation_clause}""",
-                (int(since_epoch), *verdicts, *identity_params),
+                    FROM (
+                      SELECT MAX({self._CAPACITY_FAILURE_SEVERITY_SQL}) AS worst
+                      FROM capacity_audit_slots s
+                      JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                      WHERE w.epoch_number >= ?
+                        AND s.verdict IN ('timing_miss', 'hard_proof_miss', 'no_show')
+                        AND ({identity_clause})
+                        {confirmation_clause}
+                      GROUP BY s.audit_id, s.miner_address, s.model_index
+                    )
+                    WHERE worst IN ({rank_placeholders})""",
+                (int(since_epoch), *identity_params, *wanted_ranks),
             ).fetchone()
         return int(row["n"] if row is not None else 0)
 
@@ -3076,7 +4923,6 @@ class ValidatorStateDB:
         since_epoch: int,
         require_chain_confirmed: bool = False,
         require_consequence_eligible: bool = False,
-        soft_failures_before_epoch: Optional[int] = None,
     ) -> Dict[Tuple[str, int], dict]:
         """Return finalized failure counts grouped by the registered endpoint slot."""
         confirmation_clause = ""
@@ -3096,61 +4942,52 @@ class ValidatorStateDB:
         eligibility_clause = (
             " AND s.probation_required != 0" if require_consequence_eligible else ""
         )
-        soft_before = (
-            int(soft_failures_before_epoch)
-            if soft_failures_before_epoch is not None
-            else None
-        )
-        no_show_epoch_clause = (
-            " AND w.epoch_number < ?" if soft_before is not None else ""
-        )
-        timing_epoch_clause = (
-            " AND w.epoch_number < ?" if soft_before is not None else ""
-        )
         with self._lock:
             identity_clause, identity_params = self._capacity_uid_identity_filter_locked(uid)
+            # Inner query: one row per audit with its worst-of severity across
+            # the ordinal fan-out; outer query: per-slot failure totals. An
+            # audit whose worst is timing_miss counts as timing even when a
+            # sibling ordinal no-showed (timing_miss outranks no_show).
             rows = self._conn.execute(
                 f"""SELECT
-                        s.miner_address,
-                        s.model_index,
-                        SUM(CASE
-                            WHEN s.verdict = 'hard_proof_miss'
-                             AND (
-                               s.failure_reason = 'pass0_root_mismatch'
-                               OR (
-                                 s.proof_status = 'invalid_payload'
-                                 AND s.failure_reason NOT IN (
-                                   'unsupported_proof_payload_format',
-                                   'unsupported_combined_format',
-                                   'unsupported_combined_workload'
+                        miner_address,
+                        model_index,
+                        SUM(invalid_flag) AS invalid_proof_failures,
+                        SUM(CASE WHEN worst IN (4, 2) THEN 1 ELSE 0 END)
+                            AS hard_failures,
+                        SUM(CASE WHEN worst = 3 THEN 1 ELSE 0 END)
+                            AS timing_failures
+                    FROM (
+                      SELECT
+                          s.miner_address,
+                          s.model_index,
+                          MAX({self._CAPACITY_FAILURE_SEVERITY_SQL}) AS worst,
+                          MAX(CASE
+                              WHEN s.verdict = 'hard_proof_miss'
+                               AND (
+                                 s.failure_reason = 'pass0_root_mismatch'
+                                 OR (
+                                   s.proof_status = 'invalid_payload'
+                                   AND s.failure_reason NOT IN (
+                                     'unsupported_proof_payload_format',
+                                     'unsupported_combined_format',
+                                     'unsupported_combined_workload'
+                                   )
                                  )
                                )
-                             )
-                            THEN 1 ELSE 0 END
-                        ) AS invalid_proof_failures,
-                        SUM(CASE
-                            WHEN s.verdict = 'hard_proof_miss'
-                              OR (s.verdict = 'no_show'{no_show_epoch_clause})
-                            THEN 1 ELSE 0 END
-                        ) AS hard_failures,
-                        SUM(CASE
-                            WHEN s.verdict = 'timing_miss'{timing_epoch_clause}
-                            THEN 1 ELSE 0 END
-                        ) AS timing_failures
-                    FROM capacity_audit_slots s
-                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
-                    WHERE w.epoch_number >= ?
-                      AND ({identity_clause})
-                      AND s.verdict IN ('hard_proof_miss', 'no_show', 'timing_miss')
-                      {eligibility_clause}
-                      {confirmation_clause}
-                    GROUP BY s.miner_address, s.model_index""",
-                (
-                    *((soft_before,) if soft_before is not None else ()),
-                    *((soft_before,) if soft_before is not None else ()),
-                    int(since_epoch),
-                    *identity_params,
-                ),
+                              THEN 1 ELSE 0 END
+                          ) AS invalid_flag
+                      FROM capacity_audit_slots s
+                      JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                      WHERE w.epoch_number >= ?
+                        AND ({identity_clause})
+                        AND s.verdict IN ('hard_proof_miss', 'no_show', 'timing_miss')
+                        {eligibility_clause}
+                        {confirmation_clause}
+                      GROUP BY s.miner_address, s.model_index, s.audit_id
+                    )
+                    GROUP BY miner_address, model_index""",
+                (int(since_epoch), *identity_params),
             ).fetchall()
         return {
             (str(row["miner_address"]).lower(), int(row["model_index"])): {
@@ -3237,7 +5074,6 @@ class ValidatorStateDB:
                            ELSE timing_status
                        END,
                        failure_reason = ?,
-                       probation_required = 0,
                        drain_until_ts = CASE
                            WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
                        END,
@@ -3256,36 +5092,16 @@ class ValidatorStateDB:
                     int(model_index),
                 ),
             )
-            self._conn.execute(
-                """UPDATE capacity_audit_history
-                   SET verdict = 'timing_excused',
-                       timing_status = CASE
-                           WHEN timing_status IN ('miss', 'missing_final') THEN 'excused'
-                           ELSE timing_status
-                       END,
-                       failure_reason = ?,
-                       probation_required = 0,
-                       slot_updated_at = ?
-                   WHERE audit_id = ?
-                     AND miner_address = ?
-                     AND model_index = ?
-                     AND verdict IN ('timing_miss', 'no_show')""",
-                (
-                    reason,
-                    ts,
-                    audit_id,
-                    address.lower(),
-                    int(model_index),
-                ),
-            )
             self._conn.commit()
         return cur.rowcount or 0
 
     def get_capacity_drains(self, now: Optional[float] = None) -> List[AuditDrain]:
         ts = time.time() if now is None else float(now)
         with self._lock:
+            # DISTINCT collapses per-ordinal mesh rows sharing one endpoint
+            # drain; the endpoint stays drained while ANY ordinal row is.
             rows = self._conn.execute(
-                """SELECT audit_id, miner_address, model_index, endpoint, drain_until_ts
+                """SELECT DISTINCT audit_id, miner_address, model_index, endpoint, drain_until_ts
                    FROM capacity_audit_slots
                    WHERE drain_until_ts > ?
                      AND verdict IN ('pending', 'pass0_seen', 'timing_pass')""",
@@ -3526,6 +5342,8 @@ class ValidatorStateDB:
         capacity_audit_gate_enforced: Optional[bool] = None,
         capacity_audit_gate_suppression_reason: str = "",
         uid_network_state: Optional[Dict[int, dict]] = None,
+        mesh_excluded: Optional[Dict[Tuple[str, int], str]] = None,
+        mesh_pinned: Optional[set] = None,
         window_hours: Tuple[int, ...] = (24, 48),
         epoch_seconds: int = 72 * 60,
     ) -> Dict[str, Any]:
@@ -3559,6 +5377,18 @@ class ValidatorStateDB:
         network_by_uid = {
             int(uid): dict(values or {})
             for uid, values in (uid_network_state or {}).items()
+        }
+        # Mesh (Sleipnir) health inputs from the validator's epoch state:
+        # snapshot-verify failures (entry excluded from the epoch) and the
+        # set of entries whose serving snapshot is pinned right now. Error
+        # strings are already operator-facing one-liners; cap length so the
+        # public payload stays bounded.
+        mesh_excluded_map = {
+            (str(k[0]).lower(), int(k[1])): str(v or "")[:160]
+            for k, v in (mesh_excluded or {}).items()
+        }
+        mesh_pinned_keys = {
+            (str(k[0]).lower(), int(k[1])) for k in (mesh_pinned or set())
         }
 
         with self._lock:
@@ -3744,6 +5574,51 @@ class ValidatorStateDB:
             filtered_entries.append(row)
         entry_rows = filtered_entries
 
+        # Newest registration per (uid, model_id). Registrations append
+        # monotonically (a deploy to a new endpoint creates a HIGHER index),
+        # so for the same model under the same UID every lower index is
+        # SUPERSEDED - a stable fact, deliberately independent of the
+        # oscillating is_active flag (chain discovery re-activates dead
+        # orphans every epoch until snapshot-verify excludes them again,
+        #). Superseded entries must never carry
+        # "re-register" advice or active-looking mesh hints.
+        latest_index_by_model: Dict[Tuple[int, str], int] = {}
+        serving_index_by_model: Dict[Tuple[int, str], int] = {}
+        for row in entry_rows:
+            # MESH (gguf) lane only: append-supersedes is a property of the
+            # mesh deploy protocol. The vLLM lane legitimately serves ONE
+            # model on SEVERAL concurrent registrations - never supersession.
+            if not str(row.get("quant") or "").startswith("gguf"):
+                continue
+            model_id_val = str(row.get("model_id") or "").strip()
+            uid_val = row.get("bittensor_uid")
+            if not model_id_val or uid_val is None:
+                continue
+            row_idx = int(row.get("model_index") or -1)
+            map_key = (int(uid_val), model_id_val)
+            if row_idx > latest_index_by_model.get(map_key, -1):
+                latest_index_by_model[map_key] = row_idx
+            # A registration that is demonstrably SERVING (pinned this epoch,
+            # or active and recently scored) outranks a merely-newer index:
+            # a failed replacement attempt must not dethrone the working
+            # registration it failed to replace.
+            row_addr = str(row.get("address") or "").lower()
+            row_pinned = (row_addr, row_idx) in mesh_pinned_keys
+            row_scored = (
+                row.get("last_scored_epoch") is not None
+                and int(row.get("last_scored_epoch") or 0) >= cur_epoch - 2
+            )
+            if int(row.get("is_active") or 0) and (row_pinned or row_scored):
+                if row_idx > serving_index_by_model.get(map_key, -1):
+                    serving_index_by_model[map_key] = row_idx
+        # Intended registration per (uid, model): the newest SERVING one;
+        # only when nothing in the group serves does the newest index win
+        # (a migration in progress or a fully dead model).
+        intended_index_by_model: Dict[Tuple[int, str], int] = {
+            key: serving_index_by_model.get(key, latest)
+            for key, latest in latest_index_by_model.items()
+        }
+
         repeat_window = max(
             1,
             int(getattr(capacity_audit_cfg, "repeat_window_epochs", 20) or 20),
@@ -3779,6 +5654,7 @@ class ValidatorStateDB:
                 gate_rows = [
                     dict(row) for row in self._conn.execute(
                     f"""SELECT
+                            s.audit_id,
                             COALESCE(s.miner_uid, e.bittensor_uid) AS miner_uid,
                             LOWER(s.miner_address) AS miner_address,
                             s.miner_hotkey_ss58,
@@ -3800,7 +5676,31 @@ class ValidatorStateDB:
                         ORDER BY w.epoch_number ASC""",
                     (gate_since_epoch,),
                 ).fetchall()]
+            # Collapse per-ordinal mesh rows to one worst-of row per audit so
+            # the public diagnostics mirror the score gate's strike counting.
+            worst_by_audit: Dict[tuple, tuple[int, dict]] = {}
             for row in gate_rows:
+                dedupe_key = (
+                    str(row.get("audit_id") or ""),
+                    str(row.get("miner_address") or ""),
+                    int(row.get("model_index") or 0),
+                )
+                current = worst_by_audit.get(dedupe_key)
+                rank = self._CAPACITY_FAILURE_SEVERITY_RANKS.get(
+                    str(row.get("verdict") or ""), 0
+                ) + (
+                    # Invalid proof evidence outranks every plain verdict.
+                    10
+                    if _debug_capacity_audit_invalid_failure(
+                        str(row.get("verdict") or ""),
+                        row.get("proof_status"),
+                        row.get("failure_reason"),
+                    )
+                    else 0
+                )
+                if current is None or rank > current[0]:
+                    worst_by_audit[dedupe_key] = (rank, row)
+            for _rank, row in worst_by_audit.values():
                 key = event_key(row)
                 if key is None:
                     continue
@@ -4140,20 +6040,32 @@ class ValidatorStateDB:
                 audit_seen.add(dedupe)
                 uids.add(key[0])
                 item = audits.setdefault(key, empty_audit())
+                # Audit rows carry model_id; keep the first non-empty one so
+                # entries whose miner_entries row was filtered (dead orphans
+                # outside the ownership window) still resolve their model
+                # identity for display and supersession.
+                if row.get("model_id") and not item.get("model_id"):
+                    item["model_id"] = str(row.get("model_id"))
                 verdict = str(row.get("verdict") or "pending")
                 item["total"] += 1
                 if verdict in item:
                     item[verdict] += 1
                 else:
                     item["pending"] += 1
-                raw_reason = row.get("failure_reason") or ""
-                reason = (
-                    _debug_public_reason(raw_reason, "capacity_audit_failed")
-                    if raw_reason else ""
-                )
-                if reason:
-                    reasons = item["failure_reasons"]
-                    reasons[reason] = int(reasons.get(reason, 0)) + 1
+                # Failure reasons only from rows whose verdict IS a failure:
+                # excused rows (receipt-overlap or validator-incident) keep a
+                # descriptive failure_reason string, and counting them here
+                # painted healthy executors with "capacity_audit_failed"
+                # hints.
+                if verdict in {"timing_miss", "hard_proof_miss", "no_show"}:
+                    raw_reason = row.get("failure_reason") or ""
+                    reason = (
+                        _debug_public_reason(raw_reason, "capacity_audit_failed")
+                        if raw_reason else ""
+                    )
+                    if reason:
+                        reasons = item["failure_reasons"]
+                        reasons[reason] = int(reasons.get(reason, 0)) + 1
                 if verdict in {"timing_miss", "hard_proof_miss", "no_show"}:
                     epoch_i = int(row.get("epoch_number") or 0)
                     item["recent_failures"].append({
@@ -4292,6 +6204,71 @@ class ValidatorStateDB:
                             "on_probation",
                             "One or more entries are on probation and need clean passes to recover.",
                         )
+                    mesh_key = (addr, idx)
+                    is_mesh_entry = bool(
+                        str((db_entry or {}).get("quant") or "").startswith("gguf")
+                    )
+                    _model_id_val = (
+                        str((db_entry or {}).get("model_id") or "").strip()
+                        or str((audit_data or {}).get("model_id") or "").strip()
+                    )
+                    _latest_idx = (
+                        intended_index_by_model.get((uid, _model_id_val))
+                        if _model_id_val else None
+                    )
+                    mesh_excluded_error = mesh_excluded_map.get(mesh_key, "")
+                    mesh_pinned_now = mesh_key in mesh_pinned_keys
+                    # A SERVING entry is never superseded, whatever its index:
+                    # the same model legitimately scales across several
+                    # concurrent registrations (multiple pools/workers under
+                    # one UID). Supersession only ever labels entries that
+                    # are NOT serving while a newer serving (or, if none
+                    # serves, newer registered) sibling exists.
+                    entry_serving = mesh_pinned_now or (
+                        is_active
+                        and score_data.get("last_scored_epoch") is not None
+                        and int(score_data.get("last_scored_epoch") or 0)
+                        >= cur_epoch - 2
+                    )
+                    is_superseded = (
+                        _latest_idx is not None
+                        and _latest_idx > idx
+                        and not entry_serving
+                    )
+                    is_stalled_replacement = (
+                        _latest_idx is not None
+                        and _latest_idx < idx
+                        and not entry_serving
+                    )
+                    if is_superseded:
+                        entry_hint_codes.append("superseded_by_active_entry")
+                    if is_stalled_replacement:
+                        entry_hint_codes.append("replacement_not_serving")
+                        add_hint(
+                            hints,
+                            "replacement_not_serving",
+                            "A newer registration exists for a model whose older registration is still the one serving.",
+                        )
+                    if mesh_excluded_error and not is_superseded:
+                        entry_hint_codes.append("mesh_snapshot_excluded")
+                        add_hint(
+                            hints,
+                            "mesh_snapshot_excluded",
+                            "The validator could not verify this mesh's serving snapshot this epoch; the entry is excluded until the pin succeeds.",
+                        )
+                    elif (
+                        is_mesh_entry
+                        and is_active
+                        and not mesh_pinned_now
+                        and not is_superseded
+                        and not is_stalled_replacement
+                    ):
+                        entry_hint_codes.append("mesh_not_pinned")
+                        add_hint(
+                            hints,
+                            "mesh_not_pinned",
+                            "This mesh entry has no pinned verification snapshot for the current epoch yet, so it is not being routed.",
+                        )
                     if is_active and int(db_entry.get("scored_epochs") or 0) == 0:
                         entry_hint_codes.append("new_entry_not_scored")
                         add_hint(
@@ -4328,7 +6305,11 @@ class ValidatorStateDB:
                             "receipt_delivery_failed",
                             "A successful canary result could not be delivered to the miner's receipt endpoint.",
                         )
-                    if gate_data["hard_failures"] or gate_data["timing_failures"] or gate_data["invalid_proof_failures"]:
+                    if (
+                        gate_data["hard_failures"]
+                        or gate_data["timing_failures"]
+                        or gate_data["invalid_proof_failures"]
+                    ) and not is_superseded:
                         entry_hint_codes.append("capacity_audit_failures")
                         add_hint(
                             hints,
@@ -4344,7 +6325,21 @@ class ValidatorStateDB:
                         )
                     if model_gate_reason:
                         add_step(entry_next_steps, model_gate_reason)
-                    if not is_active:
+                    if is_superseded:
+                        add_step(
+                            entry_next_steps,
+                            f"Superseded by the newer registration at model "
+                            f"index {_latest_idx}; the stale lease expires "
+                            f"on its own - no action needed.",
+                        )
+                    elif is_stalled_replacement:
+                        add_step(
+                            entry_next_steps,
+                            f"This newer registration is not serving while "
+                            f"model index {_latest_idx} still is; bring this "
+                            f"endpoint up or let its lease lapse.",
+                        )
+                    elif not is_active:
                         add_step(
                             entry_next_steps,
                             "This executor is not active in the cached validator state; start or re-register the intended endpoint.",
@@ -4381,19 +6376,23 @@ class ValidatorStateDB:
                             entry_next_steps,
                             "Check the miner receipt-ingest route and validator authorization; inference itself succeeded.",
                         )
-                    for failure_reason in sorted(
-                        (audit_data.get("failure_reasons") or {}).keys()
-                    ):
-                        add_step(
-                            entry_next_steps,
-                            _debug_capacity_audit_next_step(failure_reason),
-                        )
+                    if not is_superseded:
+                        # A superseded corpse's audit history is data, not a
+                        # to-do list: action steps belong to the serving
+                        # registration only.
+                        for failure_reason in sorted(
+                            (audit_data.get("failure_reasons") or {}).keys()
+                        ):
+                            add_step(
+                                entry_next_steps,
+                                _debug_capacity_audit_next_step(failure_reason),
+                            )
                     if is_probation:
                         add_step(
                             entry_next_steps,
                             f"Keep this executor clean for {probation_remaining} more probation pass(es).",
                         )
-                    if gate_status.get("active"):
+                    if gate_status.get("active") and not is_superseded:
                         clear_epoch = gate_status.get("next_possible_clear_epoch")
                         suffix = (
                             f" Earliest clear if clean: epoch {clear_epoch}."
@@ -4408,7 +6407,7 @@ class ValidatorStateDB:
                         gate_data["hard_failures"]
                         or gate_data["timing_failures"]
                         or gate_data["invalid_proof_failures"]
-                    ):
+                    ) and not is_superseded:
                         add_step(
                             entry_next_steps,
                             "Recent audit failures are present but below the active gate threshold; keep this executor clean.",
@@ -4418,7 +6417,7 @@ class ValidatorStateDB:
                         "address": addr,
                         "model_index": idx,
                         "endpoint": db_entry.get("endpoint") if db_entry else "",
-                        "model_id": db_entry.get("model_id") if db_entry else "",
+                        "model_id": _model_id_val,
                         "quant": db_entry.get("quant") if db_entry else "",
                         "gpu_name": db_entry.get("gpu_name") if db_entry else "",
                         "gpu_count": int(db_entry.get("gpu_count") or 0) if db_entry else 0,
@@ -4442,6 +6441,10 @@ class ValidatorStateDB:
                             "consecutive_passes": probation_consecutive,
                             "required_passes": probation_required,
                             "passes_remaining_if_clean": probation_remaining,
+                            "source": (
+                                str(db_entry.get("probation_source") or "")
+                                if db_entry else ""
+                            ),
                         },
                         "canary": canary_data,
                         "receipts": receipt_data,
@@ -4451,8 +6454,29 @@ class ValidatorStateDB:
                             "gate_counts": gate_data,
                             "gate_status": gate_status,
                         },
-                        "issue_codes": entry_hint_codes,
-                        "next_steps": entry_next_steps,
+                        "mesh": {
+                            "is_mesh": is_mesh_entry,
+                            "snapshot_pinned": mesh_pinned_now,
+                            "snapshot_error": mesh_excluded_error,
+                        },
+                        "issue_codes": (
+                            # INVARIANT BY CONSTRUCTION: a superseded corpse
+                            # carries exactly one code and exactly one step.
+                            # Its history (probation dict, gate counts, score)
+                            # stays visible as DATA below, but no to-do or
+                            # alarm code may ever leak onto it - whatever
+                            # future step/hint sections get added above.
+                            ["superseded_by_active_entry"]
+                            if is_superseded else entry_hint_codes
+                        ),
+                        "next_steps": (
+                            [
+                                f"Superseded by the newer registration at "
+                                f"model index {_latest_idx}; the stale lease "
+                                f"expires on its own - no action needed."
+                            ]
+                            if is_superseded else entry_next_steps
+                        ),
                     })
 
                 if inactive_recent_entries:
@@ -4595,6 +6619,8 @@ class ValidatorStateDB:
                     "blacklisted",
                     "uid_audit_gate_active",
                     "model_gate_active",
+                    "mesh_snapshot_excluded",
+                    "mesh_not_pinned",
                     "stale_uid_identity",
                     "reverse_proxy_timeout",
                     "first_token_timeout",
@@ -4718,6 +6744,7 @@ class ValidatorStateDB:
         """
         entries = self.get_active_entries()
         all_entries = self._get_all_entries()
+        latest_score_samples = self._get_latest_score_samples()
         uids = self.get_all_uids()
         probation = self.get_probation_addresses()
         audit_drains = self.get_capacity_drains()
@@ -4729,12 +6756,57 @@ class ValidatorStateDB:
         # Active entries with ema_score=0 (just registered, not yet scored)
         # get a small positive value so the proxy still routes to them.
         miner_scores: Dict[str, Dict[str, float]] = {}
+        miner_ema_scores: Dict[str, Dict[str, float]] = {}
+        miner_score_metadata: Dict[str, Dict[str, Dict[str, Any]]] = {}
         for e in all_entries:
             addr = e["address"]
             idx_str = str(e["model_index"])
             if addr not in miner_scores:
                 miner_scores[addr] = {}
-            score = e["ema_score"]
+                miner_ema_scores[addr] = {}
+                miner_score_metadata[addr] = {}
+            raw_ema = float(e["ema_score"])
+            miner_ema_scores[addr][idx_str] = raw_ema
+            last_scored_epoch = e.get("last_scored_epoch")
+            miner_score_metadata[addr][idx_str] = {
+                "scored_epochs": max(0, int(e.get("scored_epochs") or 0)),
+                "last_scored_epoch": (
+                    max(0, int(last_scored_epoch))
+                    if last_scored_epoch is not None
+                    else None
+                ),
+            }
+            sample = latest_score_samples.get((addr, int(e["model_index"])))
+            if (
+                sample is not None
+                and last_scored_epoch is not None
+                and int(sample["score_epoch"]) == int(last_scored_epoch)
+            ):
+                metadata = miner_score_metadata[addr][idx_str]
+                metadata.update(
+                    {
+                        "score_epoch": int(sample["score_epoch"]),
+                        "latest_completed_ema": float(sample["ema_score"]),
+                        "ema_scope": "coordinator_model_slot",
+                        "ema_carries_across_topology": True,
+                    }
+                )
+                if sample.get("mesh_id") is not None:
+                    metadata["latest_mesh_sample"] = {
+                        "chain_id": int(sample["chain_id"]),
+                        "netuid": int(sample["netuid"]),
+                        "coordinator_address": addr,
+                        "model_index": int(e["model_index"]),
+                        "model_id": str(sample["model_id"]),
+                        "mesh_id": str(sample["mesh_id"]),
+                        "verification_snapshot_hash": str(
+                            sample["snapshot_hash"]
+                        ),
+                        "snapshot_generation": int(
+                            sample["snapshot_generation"]
+                        ),
+                    }
+            score = raw_ema
             if not e.get("is_active"):
                 score = 0.0
             elif score == 0:
@@ -4812,6 +6884,8 @@ class ValidatorStateDB:
             epoch_number=epoch,
             epoch_start_block=start_block,
             miner_scores=miner_scores,
+            miner_ema_scores=miner_ema_scores,
+            miner_score_metadata=miner_score_metadata,
             miner_tps=miner_tps,
             miner_ttft_ms=miner_ttft_ms,
             probation_miners=probation,
@@ -4981,6 +7055,91 @@ class ValidatorStateDB:
         with self._lock:
             cursor = self._conn.execute(
                 "DELETE FROM local_service_receipts WHERE epoch_number < ?",
+                (max(0, int(minimum_epoch)),),
+            )
+            self._conn.commit()
+            return max(0, int(cursor.rowcount or 0))
+
+    def record_planned_canary_obligations(
+        self,
+        epoch_number: int,
+        rows: List[dict],
+    ) -> None:
+        """Journal one plan's canary obligations for an epoch.
+
+        Idempotent per (epoch, obligation_id); successive plans of the same
+        epoch (mid-epoch restart re-plan) accumulate rather than replace, so
+        the epoch close can validate receipts against every plan this
+        validator actually dispatched from.
+        """
+
+        epoch_number = int(epoch_number)
+        if epoch_number < 0:
+            raise ValueError("planned canary obligation epoch is invalid")
+        encoded: List[tuple] = []
+        for row in rows:
+            obligation_id = str(row["obligation_id"]).lower()
+            if len(obligation_id) != 32:
+                raise ValueError("planned canary obligation id is malformed")
+            bytes.fromhex(obligation_id)
+            kind = str(row["kind"])
+            if kind not in ("low", "full"):
+                raise ValueError("planned canary obligation kind is invalid")
+            encoded.append(
+                (
+                    epoch_number,
+                    obligation_id,
+                    str(row["miner_address"]).lower(),
+                    int(row["model_index"]),
+                    kind,
+                    int(row["target_prompt_tokens"]),
+                    time.time(),
+                )
+            )
+        if not encoded:
+            return
+        with self._lock:
+            self._conn.executemany(
+                """INSERT OR IGNORE INTO planned_canary_obligations (
+                    epoch_number, obligation_id, miner_address,
+                    model_index, kind, target_prompt_tokens, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                encoded,
+            )
+            self._conn.commit()
+
+    def get_planned_canary_obligations(
+        self,
+        epoch_number: int,
+    ) -> List[dict]:
+        """Return every journaled canary obligation for one epoch."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT obligation_id, miner_address, model_index,
+                          kind, target_prompt_tokens
+                   FROM planned_canary_obligations
+                   WHERE epoch_number = ?
+                   ORDER BY created_at ASC, obligation_id ASC""",
+                (int(epoch_number),),
+            ).fetchall()
+        return [
+            {
+                "obligation_id": str(row["obligation_id"]),
+                "miner_address": str(row["miner_address"]),
+                "model_index": int(row["model_index"]),
+                "kind": str(row["kind"]),
+                "target_prompt_tokens": int(row["target_prompt_tokens"]),
+            }
+            for row in rows
+        ]
+
+    def gc_planned_canary_obligations(self, minimum_epoch: int) -> int:
+        """Delete journaled obligations older than the retained epoch floor."""
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM planned_canary_obligations WHERE epoch_number < ?",
                 (max(0, int(minimum_epoch)),),
             )
             self._conn.commit()

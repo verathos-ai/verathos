@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from neurons.runtime import is_mesh_quant
 from verallm.proof_v3.canary_policy import (
     CANARY_HARD_DECODE_ANCHORS_V3,
     CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
@@ -14,9 +15,9 @@ from verallm.proof_v3.canary_policy import (
     DEFAULT_CANARY_CANDIDATE_TARGET_PER_EPOCH_V3,
     DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3,
     DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3,
+    LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
     DEFAULT_CANARY_REPEAT_PREFIX_MIN_TOKENS_V3,
     DEFAULT_CANARY_REPEAT_PREFIX_TARGET_BPS_V3,
-    LEGACY_CANARY_OWNER_CONTEXT_SIZING_ABI_V3,
     MIN_CANARY_HARD_DECODE_ANCHOR_BPS_V3,
     MIN_CANARY_HARD_DECODE_TAIL_BPS_V3,
     canary_prompt_token_tolerance_v3,
@@ -295,6 +296,13 @@ class CanaryTest:
     temperature: float
     verify_proof: bool
     verify_tee: bool = False
+    # GGUF-mesh runtime: execution is routed through the mesh verification
+    # lane (receipts + light/hard audits) instead of the vLLM proof path.
+    # Scheduling is identical to every other endpoint; only transport and
+    # verification differ.  The hard demand for a mesh canary is derived
+    # from ``verify_proof`` at dispatch time.
+    verify_mesh: bool = False
+    mesh_audit_tier: str = ""
     enable_thinking: bool = False
     presence_penalty: Optional[float] = 0.0
     top_k: Optional[int] = 0
@@ -453,7 +461,13 @@ def _log_uniform_prompt_bands_v3(
     minimum: int,
     maximum: int,
 ) -> tuple[tuple[int, int], ...]:
-    """Partition a prompt range into contiguous doubling bands."""
+    """Partition [minimum, maximum] into doubling bands from the minimum.
+
+    Mesh-lane full-context sizing draws a band uniformly, so equal band
+    probability with doubling widths makes SMALL prompts the common case
+    while every size up to the advertised maximum stays reachable - the
+    decode-side twin of ``_log_uniform_decode_bands_v3``.
+    """
 
     low = int(minimum)
     high = int(maximum)
@@ -465,11 +479,65 @@ def _log_uniform_prompt_bands_v3(
         upper = min(high, 2 * lower - 1)
         bands.append((lower, upper))
         lower = upper + 1
+    # Merge a trailing singleton into the previous band (same rationale
+    # as the decode bands: no high-cost singleton band).
     if len(bands) > 1 and bands[-1][0] == bands[-1][1]:
         previous = bands[-2]
         bands[-2] = (previous[0], bands[-1][1])
         bands.pop()
     return tuple(bands)
+
+
+def _mesh_full_prompt_target_v3(
+    seed: bytes,
+    *,
+    minimum: int,
+    maximum: int,
+    max_draw_bps: int,
+) -> int:
+    """Min-heavy full-context prompt size for MESH miners.
+
+    llama.cpp prefill is minutes-long at advertised-maximum sizes and
+    monopolizes the mesh, so unlike vLLM the mesh lane
+    must not exercise the maximum every epoch. The signed Bernoulli tail
+    keeps the exact maximum always POSSIBLE - capacity cannot be faked
+    down - while the log-uniform bands make small draws the common case.
+    Seed-deterministic: every validator draws the same size.
+    """
+
+    low = int(minimum)
+    high = int(maximum)
+    if low <= 0 or high < low:
+        raise ValueError("mesh full-prompt range is invalid")
+    if _seed_int(seed, b"mesh_full_prompt_max_draw", 10_000) < int(
+        max_draw_bps
+    ):
+        return high
+    bands = _log_uniform_prompt_bands_v3(low, high)
+    # GEOMETRIC band weighting, not uniform: uniform gave the widest
+    # (largest) band the same probability as the smallest, so a 264k
+    # advert drew a 200k+ multi-minute prefill roughly every third full
+    # canary. Halving each band's weight relative to the previous keeps
+    # every size reachable (and the exact maximum through the signed
+    # tail above) while the MEDIAN draw lands in the smallest bands.
+    # Integer thresholds keep the draw seed-deterministic across
+    # validators exactly like the uniform pick it replaces.
+    weights = [2 ** (len(bands) - 1 - i) for i in range(len(bands))]
+    total = sum(weights)
+    pick = _seed_int(seed, b"mesh_full_prompt_band", total)
+    cumulative = 0
+    band_index = len(bands) - 1
+    for i, weight in enumerate(weights):
+        cumulative += weight
+        if pick < cumulative:
+            band_index = i
+            break
+    lower, upper = bands[band_index]
+    return lower + _seed_int(
+        seed,
+        b"mesh_full_prompt_offset",
+        upper - lower + 1,
+    )
 
 
 def _owner_full_prompt_target_v3(
@@ -526,6 +594,15 @@ def _owner_full_prompt_target_v3(
         seed,
         offset_domain,
         upper - lower + 1,
+    )
+
+def _miner_runs_mesh(miner) -> bool:
+    """THE mesh-lane predicate: scheduling and verification routing must
+    agree on it, so both call this one helper (a divergence would size a
+    canary for one lane and verify it in the other)."""
+
+    return bool(getattr(miner, "mesh_enabled", False)) or is_mesh_quant(
+        str(getattr(miner, "quant", "") or "")
     )
 
 
@@ -925,6 +1002,18 @@ class CanaryScheduler:
     )
     hard_candidate_bps: int = DEFAULT_CANARY_CANDIDATE_HARD_BPS_V3
     advertised_context_target_bps: int = 9_000
+    # Mesh lane only (vLLM full-context sizing is untouched): min-heavy
+    # full-context draws between a floor and the advertised context, plus
+    # the signed Bernoulli exact-maximum tail. See
+    # _mesh_full_prompt_target_v3 for why the mesh cannot exercise the
+    # maximum every epoch.
+    # 5% of the advertised context (was 10%): with geometric band
+    # weighting the floor anchors the smallest, most-likely band, so a
+    # lower floor directly lowers the median full-canary cost; the
+    # low-context clamp in _mesh_full_prompt_floor still keeps every
+    # full draw above the small-canary band.
+    mesh_full_min_prompt_bps: int = 500
+    mesh_full_max_draw_bps: int = 500
     owner_full_min_prompt_bps: int = (
         DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
     )
@@ -992,6 +1081,24 @@ class CanaryScheduler:
         # Preserve a substantial request-specific suffix even under a custom
         # signed policy and tokenizer tolerance.
         return min(target, max(1, minimum // 2))
+
+    def _mesh_full_prompt_floor(self, max_target: int) -> int:
+        """Smallest full-context size the mesh lane may draw.
+
+        Scales with the claim (mesh_full_min_prompt_bps of the maximum)
+        but always clears the low-context band, so a full-context draw
+        can never be confused with - or be cheaper than - a low canary.
+        """
+
+        return min(
+            int(max_target),
+            max(
+                int(self.low_context_max_tokens) + 1,
+                int(max_target)
+                * int(self.mesh_full_min_prompt_bps)
+                // 10_000,
+            ),
+        )
 
     def _safe_context_target(
         self,
@@ -1198,8 +1305,29 @@ class CanaryScheduler:
                     context_limit,
                     decode_reserve_tokens=decode_cap,
                 )
+                miner_is_mesh = _miner_runs_mesh(miner)
                 sampling_enabled = int(self.owner_full_max_draw_bps) < 10_000
-                if sampling_enabled:
+                advertised_target = advertised_max
+                full_repeat_basis = marked_full_max
+                if miner_is_mesh:
+                    # Mesh lane: min-heavy draw between the mesh floor and
+                    # the advertised context with GEOMETRIC band weighting
+                    # (llama.cpp prefill is minutes-long at advertised
+                    # maxima). Exact maximum stays
+                    # reachable through the signed Bernoulli tail.
+                    advertised_target = _mesh_full_prompt_target_v3(
+                        seed,
+                        minimum=self._mesh_full_prompt_floor(advertised_max),
+                        maximum=advertised_max,
+                        max_draw_bps=self.mesh_full_max_draw_bps,
+                    )
+                    # The shared repeat prefix must fit the SMALLEST size
+                    # any full-context draw can produce.
+                    full_repeat_basis = min(
+                        self._mesh_full_prompt_floor(marked_full_max),
+                        self._mesh_full_prompt_floor(advertised_max),
+                    )
+                elif sampling_enabled:
                     advertised_target = _owner_full_prompt_target_v3(
                         seed,
                         minimum=self._owner_full_prompt_floor(advertised_max),
@@ -1211,9 +1339,6 @@ class CanaryScheduler:
                         self._owner_full_prompt_floor(marked_full_max),
                         self._owner_full_prompt_floor(advertised_max),
                     )
-                else:
-                    advertised_target = advertised_max
-                    full_repeat_basis = marked_full_max
                 full_repeat_target = self._repeat_prefix_target(
                     full_repeat_basis
                 )
@@ -1343,7 +1468,17 @@ class CanaryScheduler:
                         context_limit,
                         decode_reserve_tokens=max_new,
                     )
-                    if sampling_enabled:
+                    if miner_is_mesh:
+                        # Every marked candidate draws independently (its
+                        # own seed); the advertised light above and each
+                        # candidate can therefore land on different sizes.
+                        target = _mesh_full_prompt_target_v3(
+                            seed,
+                            minimum=self._mesh_full_prompt_floor(target),
+                            maximum=target,
+                            max_draw_bps=self.mesh_full_max_draw_bps,
+                        )
+                    elif sampling_enabled:
                         target = _owner_full_prompt_target_v3(
                             seed,
                             minimum=self._owner_full_prompt_floor(target),
@@ -1468,6 +1603,23 @@ class CanaryScheduler:
                         )
                     )
                     test_index += 1
+        # Mark tests whose endpoint runs the GGUF-mesh runtime.  This does
+        # not alter scheduling in any way; it only routes the execution of
+        # these obligations through the mesh verification lane.
+        mesh_keys = {
+            (str(miner.address).lower(), int(miner.model_index))
+            for miner in miners
+            # Same predicate the SIZING used above: a divergence would
+            # size a canary for one lane and verify it in the other.
+            if _miner_runs_mesh(miner)
+        }
+        if mesh_keys:
+            for test in self.tests:
+                if (
+                    str(test.miner_address).lower(),
+                    int(test.model_index),
+                ) in mesh_keys:
+                    test.verify_mesh = True
         self.tests.sort(key=lambda item: (item.target_block, item.miner_address))
         return self.tests
 

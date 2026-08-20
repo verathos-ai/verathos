@@ -33,6 +33,24 @@ _TOKENIZER_GROUPS: tuple[tuple[str, ...], ...] = (
 )
 
 
+def resolve_tokenizer_source(model_id_or_path: str) -> str:
+    """Map a model id to the repo its tokenizer artifacts actually live in.
+
+    Mesh model ids are registry ids, not HF repos, and their GGUF repos
+    embed the tokenizer in the model file with no tokenizer.json, so a
+    verbatim lookup 404s (observed: the validator's tokenizer drift
+    check marked every mesh model drifted). vLLM ids and local paths pass
+    through unchanged.
+    """
+
+    try:
+        from verallm.registry.models import mesh_tokenizer_source
+
+        return mesh_tokenizer_source(model_id_or_path) or model_id_or_path
+    except Exception:
+        return model_id_or_path
+
+
 def compute_tokenizer_hash(model_id_or_path: str) -> bytes:
     """Compute a deterministic 32-byte hash of a model's tokenizer files.
 
@@ -59,7 +77,7 @@ def compute_tokenizer_hash(model_id_or_path: str) -> bytes:
         Exception: anything else (network failure, parse error) — fail
             closed so the caller knows there's a problem.
     """
-    src = _resolve_tokenizer_dir(model_id_or_path)
+    src = _resolve_tokenizer_dir(resolve_tokenizer_source(model_id_or_path))
 
     tokenizer_json = src / "tokenizer.json"
     tokenizer_config = src / "tokenizer_config.json"

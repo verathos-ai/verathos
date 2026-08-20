@@ -1285,7 +1285,7 @@ PY
         $PYTHON -m pip install --no-build-isolation --no-cache-dir "gptqmodel>=0.9,<6.0" 2>&1 | tail -10 || {
             echo "  WARNING: gptqmodel install failed — GPTQ models will not be available."
             echo "  (Non-fatal; AWQ/fp16/fp8 models still work. Retry manually if needed:"
-            echo "   VERATHOS_INSTALL_GPTQMODEL=1 bash scripts/public_overlay/setup_miner.sh)"
+            echo "   VERATHOS_INSTALL_GPTQMODEL=1 bash scripts/setup_miner.sh)"
         }
         # Restore deps that gptqmodel upgraded beyond vLLM's constraints.
         # gptqmodel works fine at runtime with these pinned versions.
@@ -1364,8 +1364,8 @@ except Exception as e:
     # verify with "Python version mismatch" even though the wheel install
     # is fine.  Wipe ALL source-tree .so AND .so.torch* alternates here —
     # the wheel install in site-packages is the authoritative source.
-    # Public deploys won't have these (gitignored + excluded by
-    # sync_to_public.sh), but private-repo rsyncs can carry them along.
+    # Release checkouts don't ship these, but manual rsyncs of a dev tree
+    # can carry stray copies along.
     if [ -d "${REPO_DIR}/zkllm/cuda" ]; then
         find "${REPO_DIR}/zkllm/cuda" -maxdepth 1 \( \
             -name "zkllm_native.cpython-*.so" -o \
