@@ -5672,6 +5672,7 @@ class ValidatorNeuron:
         address: str,
         model_index: int,
         uid: int,
+        cause: str = "for_cause",
     ) -> None:
         close_epoch = int(
             self._epoch_close_value(
@@ -5695,8 +5696,12 @@ class ValidatorNeuron:
             ):
                 endpoint = str(getattr(miner, "endpoint", "") or "")
                 break
-        tracker.enter_probation(key, close_epoch, endpoint=endpoint)
-        self._db.enter_probation(address, model_index, close_epoch, uid=int(uid))
+        tracker.enter_probation(
+            key, close_epoch, endpoint=endpoint, cause=cause
+        )
+        self._db.enter_probation(
+            address, model_index, close_epoch, uid=int(uid), cause=cause
+        )
         self._write_shared_state()
 
     def _apply_capacity_audit_score_gate(
@@ -5731,10 +5736,26 @@ class ValidatorNeuron:
                 return False
             targets = [(int(model_index), entry)]
             if ensure_probation:
+                # Every capacity-audit consequence is for_cause, the
+                # timing and no-show lanes included. The audit's sybil
+                # defense is an elimination sieve over repeated windows:
+                # random beacon-driven cohorts eventually stress
+                # co-hosted slots SIMULTANEOUSLY, the shared hardware
+                # cannot serve every calibrated workload at once, the
+                # miss accumulates to the gate, and probation PARKS the
+                # slot out of the process while later windows sift the
+                # survivors — window by window the set converges to the
+                # slots with genuinely dedicated capacity. Probation is
+                # the sieve's removal step, not a penalty duration, so
+                # NOTHING outside the audit's own rules may lift it: not
+                # re-registration, not a deploy-gate pass, not an
+                # availability reclassification. Any such bypass
+                # reinserts eliminated sybils and unwinds the sieve.
                 self._ensure_capacity_audit_entry_probation(
                     address,
                     int(model_index),
                     int(uid),
+                    cause="for_cause",
                 )
         for entry_model_index, entry in targets:
             if entry.ema_score != 0.0:
@@ -6072,6 +6093,7 @@ class ValidatorNeuron:
                     key,
                     self._current_epoch,
                     endpoint=endpoint,
+                    cause="for_cause",
                 )
                 self.scorer.halve_ema(address, model_index)
             bt.logging.info(
@@ -9103,11 +9125,18 @@ class ValidatorNeuron:
             return
         for entry in entries:
             entered = entry.get("probation_entered_epoch")
-            if entered is None:
-                continue
             key = self._miner_model_key(
                 str(entry.get("address", "")), int(entry.get("model_index", 0)),
             )
+            if entered is None:
+                # The database cleared this row (availability-only cause,
+                # registration changed). Follow it — but ONLY for
+                # availability tracker rows; a for_cause tracker row is
+                # never dropped by reconciliation.
+                clear = getattr(tracker, "clear_availability_probation", None)
+                if callable(clear) and tracker.is_on_probation(key):
+                    clear(key)
+                continue
             if tracker.is_on_probation(key):
                 continue
             reconcile(
@@ -13589,13 +13618,18 @@ class ValidatorNeuron:
                 and outcome.proof_failures > 0
                 and outcome.proof_failure_penalty_required
             )
+            _entry_cause = (
+                "for_cause" if had_proof_failure else "availability"
+            )
             had_proof_failure = had_proof_failure or obligation_failure
             if had_proof_failure and not suppress_probation:
                 # Enter or reset probation (mid-epoch may have already entered)
                 self._probation_tracker.enter_probation(
-                    key, epoch_number, endpoint=getattr(miner, 'endpoint', ''))
+                    key, epoch_number, endpoint=getattr(miner, 'endpoint', ''),
+                    cause=_entry_cause)
                 self._db.enter_probation(
                     miner.address, miner.model_index, epoch_number,
+                    cause=_entry_cause,
                     uid=uid if uid is not None else -1,
                     hotkey_ss58=getattr(miner, "hotkey_ss58", "") or "",
                 )
@@ -15533,9 +15567,11 @@ class ValidatorNeuron:
         except Exception:
             pass
         if not self._probation_tracker.is_on_probation(key):
-            self._probation_tracker.enter_probation(key, close_epoch, endpoint=endpoint)
+            self._probation_tracker.enter_probation(
+                key, close_epoch, endpoint=endpoint, cause="for_cause")
             self._db.enter_probation(
                 miner_address, model_index, close_epoch,
+                cause="for_cause",
                 uid=_uid, hotkey_ss58=_ss58,
             )
         else:

@@ -1132,6 +1132,12 @@ class ProbationState:
     required_passes: int = 3  # must pass N consecutive epochs to exit
     escalation_epochs: int = 5  # report offline after N epochs on probation
     endpoint: str = ""  # endpoint URL when probation started (for migration checks)
+    # Why probation entered. "availability" = missed obligations only (a
+    # dead or unreachable box, zero dishonesty evidence); "for_cause" =
+    # any proof, integrity, or evasion failure. A fresh registration may
+    # clear availability probation; for_cause always serves the full
+    # consecutive-pass exit. Unknown/legacy state reads as for_cause.
+    cause: str = "for_cause"
 
 
 class ProbationTracker:
@@ -1165,7 +1171,7 @@ class ProbationTracker:
         self._load()
 
     def enter_probation(self, key: Tuple[str, int], epoch: int,
-                        endpoint: str = "") -> None:
+                        endpoint: str = "", cause: str = "for_cause") -> None:
         """Put a miner-model entry on probation (or reset if already on)."""
         with self._lock:
             if key in self._probation:
@@ -1173,6 +1179,11 @@ class ProbationTracker:
                 self._probation[key].consecutive_passes = 0
                 if endpoint:
                     self._probation[key].endpoint = endpoint
+                if cause == "for_cause":
+                    # Severity only ratchets up: an availability entry that
+                    # later fails a proof becomes for_cause; it never
+                    # downgrades back.
+                    self._probation[key].cause = "for_cause"
                 bt.logging.info(f"Probation RESET for {key[0][:10]} model_index={key[1]} (new failure during probation)")
             else:
                 self._probation[key] = ProbationState(
@@ -1180,6 +1191,7 @@ class ProbationTracker:
                     required_passes=self.required_passes,
                     escalation_epochs=self.escalation_epochs,
                     endpoint=endpoint,
+                    cause=cause if cause in ("availability", "for_cause") else "for_cause",
                 )
                 bt.logging.info(f"Probation ENTERED for {key[0][:10]} model_index={key[1]} at epoch {epoch} endpoint={endpoint} (must pass {self.required_passes} consecutive epochs to exit)")
             self._save()
@@ -1247,6 +1259,24 @@ class ProbationTracker:
                 self._probation[key].consecutive_passes = 0
                 bt.logging.info(f"Probation pass counter RESET for {key[0][:10]} model_index={key[1]} (proof failure)")
                 self._save()
+
+    def clear_availability_probation(self, key: Tuple[str, int]) -> bool:
+        """Drop a probation row whose cause is availability-only.
+
+        Used when the authoritative database cleared the row after a
+        changed registration. For_cause rows are never dropped here.
+        """
+        with self._lock:
+            state = self._probation.get(key)
+            if state is None or state.cause != "availability":
+                return False
+            del self._probation[key]
+            self._save()
+            bt.logging.info(
+                f"Probation dropped for {key[0][:10]} model_index={key[1]}: "
+                f"database cleared an availability-only record"
+            )
+            return True
 
     def is_on_probation(self, key: Tuple[str, int]) -> bool:
         """Check if a miner-model entry is on probation."""
@@ -1374,6 +1404,7 @@ class ProbationTracker:
                     "required_passes": state.required_passes,
                     "escalation_epochs": state.escalation_epochs,
                     "endpoint": state.endpoint,
+                    "cause": state.cause,
                 })
             tmp_path = self._state_path + ".tmp"
             try:
@@ -1401,6 +1432,7 @@ class ProbationTracker:
                         required_passes=entry.get("required_passes", self.required_passes),
                         escalation_epochs=entry.get("escalation_epochs", self.escalation_epochs),
                         endpoint=entry.get("endpoint", ""),
+                        cause=str(entry.get("cause") or "for_cause"),
                     )
                 if self._probation:
                     bt.logging.info(f"Loaded {len(self._probation)} probation entries from {self._state_path}")

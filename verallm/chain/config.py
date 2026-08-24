@@ -293,3 +293,28 @@ class ChainConfig:
             data = json.load(f)
         data.update(overrides)
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+MAINNET_CHAIN_ID = 964
+
+
+def validate_registration_endpoint_scheme(endpoint: str, chain_id: object) -> None:
+    """Refuse plain-http registration endpoints on mainnet.
+
+    The public mainnet proxy only routes https endpoints, so an http
+    registration produces a miner the validators score but no user can
+    ever reach — an invisible-to-traffic state the operator cannot
+    diagnose from their side. Refusing at registration keeps that state
+    unrepresentable. Test networks keep accepting http: their fleets run
+    inside trusted rigs and endpoint TLS adds nothing to the proofs.
+    """
+    try:
+        is_mainnet = int(chain_id) == MAINNET_CHAIN_ID
+    except (TypeError, ValueError):
+        is_mainnet = False
+    if is_mainnet and not str(endpoint or "").strip().lower().startswith("https://"):
+        raise ValueError(
+            "mainnet registration requires an https:// endpoint "
+            f"(got {endpoint!r}): front the miner with TLS "
+            "(scripts/setup_https.sh) and register the https URL"
+        )

@@ -785,6 +785,12 @@ class MeshCapacityAuditWorker:
                 error[:300],
             )
             return False
+        # Ingest reachability probe. A worker that can run every audit but
+        # cannot DELIVER the evidence is scored as a no-show and ends up
+        # on probation with nothing in its own logs explaining why; probe
+        # the return path once at startup so a broken egress is loud
+        # before the first window, not after the first probation.
+        self._probe_ingest_reachability()
         # Roster already published at the top of start() (backend-agnostic);
         # republish here in case it changed between the preflight and now.
         self._publish_roster_file()
@@ -2036,6 +2042,33 @@ class MeshCapacityAuditWorker:
 
     # ── publishing ───────────────────────────────────────────────
 
+    def _probe_ingest_reachability(self) -> None:
+        """One HTTP roundtrip per validator ingest; WARN on each failure."""
+        import httpx
+
+        urls = self._validator_urls()
+        if not urls:
+            return
+        unreachable = []
+        for endpoint in urls:
+            try:
+                resp = httpx.get(
+                    f"{endpoint}/capacity/audit/v1/health", timeout=8.0
+                )
+                if resp.status_code >= 500:
+                    unreachable.append(f"{endpoint} (status {resp.status_code})")
+            except Exception as exc:
+                unreachable.append(f"{endpoint} ({type(exc).__name__})")
+        if unreachable:
+            logger.error(
+                "mesh capacity audit ingest UNREACHABLE from this worker: "
+                "%s — audit evidence cannot be delivered on this path and "
+                "the validator will record no-shows (leading to probation) "
+                "even though the audits run. Fix the network egress from "
+                "this box to the validator audit endpoints.",
+                "; ".join(unreachable),
+            )
+
     def _validator_urls(self) -> tuple[str, ...]:
         from neurons.capacity_audit_discovery import CapacityAuditEndpointResolver
 
@@ -2115,11 +2148,25 @@ class MeshCapacityAuditWorker:
                         f"{endpoint}{path}", json=artifact, timeout=5.0
                     )
                 except Exception as exc:
-                    logger.debug(
-                        "mesh capacity publish error: url=%s %s",
-                        endpoint,
-                        exc,
-                    )
+                    if attempt + 1 >= max(1, int(attempts)):
+                        # The last attempt for this endpoint failed at the
+                        # transport layer. This is the failure mode that
+                        # silently turns a diligent worker into a no-show,
+                        # so it must be visible at production log level.
+                        logger.warning(
+                            "mesh capacity publish undeliverable: url=%s "
+                            "attempts=%s %s: %s",
+                            endpoint,
+                            attempts,
+                            type(exc).__name__,
+                            exc,
+                        )
+                    else:
+                        logger.debug(
+                            "mesh capacity publish error: url=%s %s",
+                            endpoint,
+                            exc,
+                        )
                     resp = None
                 if resp is not None:
                     if resp.status_code < 300:
@@ -2149,6 +2196,21 @@ class MeshCapacityAuditWorker:
             thread_name_prefix="mesh-capacity-publish",
         ) as pool:
             delivered = sum(pool.map(deliver, urls))
+        if delivered == 0:
+            streak = int(getattr(self, "_publish_failure_streak", 0)) + 1
+            self._publish_failure_streak = streak
+            if streak >= 3:
+                logger.error(
+                    "mesh capacity audit evidence UNDELIVERABLE to every "
+                    "validator ingest (%s consecutive artifacts). The "
+                    "validator records these windows as no-shows and the "
+                    "slot WILL be probated even though the audits run. "
+                    "Check network egress from this box to the validator "
+                    "audit endpoints.",
+                    streak,
+                )
+        else:
+            self._publish_failure_streak = 0
         if (
             delivered == 0
             and unknown_slot_refusals

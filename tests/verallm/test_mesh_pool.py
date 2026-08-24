@@ -6781,3 +6781,123 @@ def test_first_batch_deadline_scales_with_model_bytes(monkeypatch):
     # the launch path.
     monkeypatch.setenv("VERATHOS_MESH_FIRST_BATCH_DEADLINE_S", "soon")
     assert pool_module._first_batch_deadline_s(120_000_000_000) == 2400.0
+
+
+def test_report_for_deleted_mesh_orders_teardown(tmp_path):
+    """A report whose mesh record no longer exists carries mesh_gone: the
+    worker's spawn serves something no pool state references, and without
+    the explicit teardown order it lingers unsupervised on the GPU."""
+
+    _state_dir, _tok, mgr, worker_body, mesh_key = (
+        _direct_manager_with_drive_command(tmp_path)
+    )
+    delivered = mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})[
+        "command"
+    ]
+    with mgr.lock:
+        del mgr.state["meshes"][mesh_key]
+        mgr._save()
+
+    response = mgr.handle_report(
+        {
+            **worker_body,
+            **_command_report(
+                delivered,
+                worker_id="w1",
+                event="drive_ready",
+                mesh_id="mesh-gone",
+                join_token="vtmesh_gone",
+                coordinator_endpoint="http://w1:9500",
+            ),
+        }
+    )
+    assert response["status"] == "stale"
+    assert response["mesh_gone"] is True
+
+
+def test_report_for_terminal_mesh_orders_teardown_not_resurrection(tmp_path):
+    """A drive that completes AFTER its mesh was failed (silent-driver reap)
+    or torn down must not resurrect the record. Observed live: the drive
+    finished into a serve holding ~20GB VRAM for a mesh the manager had
+    already failed. The worker is ordered to tear down instead, and the
+    record keeps its terminal status."""
+
+    _state_dir, _tok, mgr, worker_body, mesh_key = (
+        _direct_manager_with_drive_command(tmp_path)
+    )
+    delivered = mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})[
+        "command"
+    ]
+    report = {
+        **worker_body,
+        **_command_report(
+            delivered,
+            worker_id="w1",
+            event="drive_ready",
+            mesh_id="mesh-terminal-status",
+            join_token="vtmesh_terminal_status",
+            coordinator_endpoint="http://w1:9500",
+        ),
+    }
+
+    for terminal_status in ("error", "stopping", "stopped"):
+        with mgr.lock:
+            mgr.state["meshes"][mesh_key]["status"] = terminal_status
+            mgr._save()
+        response = mgr.handle_report(dict(report))
+        assert response["status"] == "stale", terminal_status
+        assert response["mesh_gone"] is True, terminal_status
+        assert (
+            mgr.state["meshes"][mesh_key]["status"] == terminal_status
+        ), "terminal mesh status must never be resurrected by a late report"
+
+
+def test_benign_stale_races_carry_no_teardown_order(tmp_path):
+    """Command-identity races (cross-worker report, superseded command)
+    return bare stale WITHOUT mesh_gone — tearing down a serve over a
+    duplicate-delivery race would kill healthy meshes."""
+
+    _state_dir, _tok, mgr, worker_body, mesh_key = (
+        _direct_manager_with_drive_command(tmp_path)
+    )
+    delivered = mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})[
+        "command"
+    ]
+    report = {
+        **worker_body,
+        **_command_report(
+            delivered,
+            worker_id="w1",
+            event="drive_ready",
+            mesh_id="mesh-benign-stale",
+            join_token="vtmesh_benign_stale",
+            coordinator_endpoint="http://w1:9500",
+        ),
+    }
+
+    mgr.handle_join(
+        {
+            **worker_body,
+            "worker_id": "w2",
+            "capability": {"gpu_name": "t", "vram_gb": 48},
+            "catalog": [{"model_id": "m1", "model_bytes": 1000}],
+            "endpoints": {
+                "rpc": "w2:50052",
+                "proof": "http://w2:9402",
+                "mesh": "http://w2:9500",
+            },
+        }
+    )
+    cross_worker = mgr.handle_report({**report, "worker_id": "w2"})
+    assert cross_worker["status"] == "stale"
+    assert "mesh_gone" not in cross_worker
+
+    with mgr.lock:
+        mgr._queue_worker_command(
+            mgr.state["workers"]["w1"],
+            {"action": "stop", "mesh_key": mesh_key},
+        )
+        mgr._save()
+    superseded = mgr.handle_report(report)
+    assert superseded["status"] == "stale"
+    assert "mesh_gone" not in superseded

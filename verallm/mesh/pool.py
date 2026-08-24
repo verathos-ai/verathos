@@ -800,6 +800,63 @@ def _first_batch_deadline_s(model_bytes: int = 0) -> float:
     return min(7200.0, max(600.0, int(model_bytes or 0) / 50e6))
 
 
+def _formation_silence_budget_s(model_bytes: int = 0) -> float:
+    """Driver-silence budget during formation, scaled to the model.
+
+    A driver loading a large GGUF can starve its own poll loop well past a
+    flat 120s floor even while the load is healthy, and a false reap here
+    does not stop the drive worker-side — it completes into a serve the
+    failed record no longer tracks. 50 MB/s is the same conservative load
+    rate the first-batch deadline uses; the cap keeps genuinely dead
+    drivers from wedging a launch for more than 15 minutes.
+    """
+
+    return min(
+        900.0,
+        max(120.0, 4 * WORKER_STALE_S, int(model_bytes or 0) / 50e6),
+    )
+
+
+def _release_fetch_memory(model_id: str) -> None:
+    """Return download-inflated heap to the OS after a model fetch.
+
+    The fetch and manifest phases stream multi-GB files through this
+    process, and glibc keeps the freed arenas mapped afterwards, so the
+    daemon's RSS can sit gigabytes above its real working set. The daemon
+    then enters the memory-heaviest phase of its life (the drive spawns
+    llama-server plus the proof sidecar), and on a cgroup-limited box the
+    OOM killer picks the fattest task — a daemon SIGKILLed mid-drive
+    leaves an untracked serve behind. Trim is a no-op outside glibc
+    (macOS workers), and every probe here is best-effort.
+    """
+
+    import gc
+
+    gc.collect()
+    trimmed = False
+    try:
+        import ctypes
+
+        trimmed = bool(ctypes.CDLL("libc.so.6").malloc_trim(0))
+    except Exception:
+        pass
+    rss_mb = -1
+    try:
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss_mb = int(line.split()[1]) // 1024
+                    break
+    except Exception:
+        pass
+    logger.info(
+        "fetch heap released for %s: malloc_trim=%s rss_now=%sMB",
+        model_id,
+        trimmed,
+        rss_mb if rss_mb >= 0 else "unknown",
+    )
+
+
 def _registration_view(state: Mapping[str, Any]) -> dict[str, Any]:
     """Registration fields for a status payload, single-slot compatible."""
 
@@ -4490,7 +4547,34 @@ class PoolManager:
 
             mesh = self.state["meshes"].get(mesh_key)
             if mesh is None and action != "stop":
-                return {"status": "stale", "command_id": command_id}
+                # mesh_gone tells the worker its spawn serves a record that
+                # no longer exists; the worker MUST tear that serve down. A
+                # bare "stale" (command-identity races below) must not — the
+                # two cases carry different obligations.
+                return {
+                    "status": "stale",
+                    "command_id": command_id,
+                    "mesh_gone": True,
+                }
+            if (
+                mesh is not None
+                and action in ("drive", "join")
+                and str(mesh.get("status", "") or "")
+                in ("error", "stopped", "stopping")
+            ):
+                # A drive/join completing AFTER its mesh was failed or torn
+                # down must not resurrect the record. Without this, a driver
+                # that finishes forming after the silent-driver reap keeps
+                # an unsupervised serve on the GPU that no pool state
+                # references: coordinator + llama hold the model's full
+                # VRAM for a mesh the manager already failed, and shadow
+                # the worker's ports against every later launch. Tell the
+                # worker to tear its spawn down instead.
+                return {
+                    "status": "stale",
+                    "command_id": command_id,
+                    "mesh_gone": True,
+                }
             terminal = True
             fail_message = ""
             response: dict[str, Any] = {"status": "ok"}
@@ -5051,14 +5135,28 @@ class PoolManager:
                 # 10+ minutes exactly this way). Generous threshold so a
                 # worker riding out a network blip is left alone; "serving"
                 # meshes are never reaped (driver_stale below flags those).
+                _mesh_model_bytes = int(
+                    (
+                        (self.state.get("model_registry") or {}).get(
+                            str(m.get("model_id", "") or ""), {}
+                        )
+                        or {}
+                    ).get("model_bytes", 0)
+                    or 0
+                )
+                _silent_budget_s = _formation_silence_budget_s(
+                    _mesh_model_bytes
+                )
                 if (
                     m.get("status") in ("driving", "joining", "fetching")
-                    and silent_s > max(120, 4 * WORKER_STALE_S)
+                    and silent_s > _silent_budget_s
                 ):
                     self._fail_mesh_locked(
                         m,
                         f"driver worker went silent for {silent_s}s during "
-                        "formation; restart its worker and relaunch",
+                        "formation (budget "
+                        f"{int(_silent_budget_s)}s); restart its worker and "
+                        "relaunch",
                     )
                     for member_id in m.get("members", []):
                         if member_id in workers:
@@ -10602,6 +10700,7 @@ class LocalMeshRunner:
         self.config.catalog.append(entry)
         if self.config.catalog_path:
             Path(self.config.catalog_path).write_text(json.dumps(self.config.catalog, indent=1))
+        _release_fetch_memory(model_id)
         return {"event": "fetched", "entry": entry}
 
     def stop(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -12128,6 +12227,31 @@ def pool_worker_loop(
     phase_continuation_started: set[str] = set()
     worker_command_state = {"active_id": ""}
 
+    def _log_termination_signal(signum: int, frame: Any) -> None:
+        # A daemon killed mid-command dies silently today, and the forensic
+        # cost of that silence is real: the manager only ever sees "went
+        # silent". Name the signal and the in-flight command before dying.
+        # (SIGKILL is uncatchable — cgroup OOM kills stay silent; this
+        # covers every orderly stop: pm2 stop/restart, operator kill.)
+        with command_runtime_lock:
+            active = worker_command_state["active_id"]
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = str(signum)
+        logger.warning(
+            "worker daemon received %s while %s; supervised serves survive "
+            "in their own sessions and the next daemon start reaps them",
+            signal_name,
+            f"executing command {active[:8]}" if active else "idle",
+        )
+        raise SystemExit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _log_termination_signal)
+    except ValueError:
+        pass  # not the main thread (tests drive the daemon in threads)
+
     def _accepted_drive_ready_phase(
         report: Mapping[str, Any],
         response: Mapping[str, Any] | None,
@@ -12138,6 +12262,52 @@ def pool_worker_loop(
             and str(response.get("command_phase", "") or "") == "drive_ready"
             and str(report.get("event", "") or "") == "drive_ready"
         )
+
+    def _mesh_gone_teardown(
+        report: Mapping[str, Any],
+        response: Mapping[str, Any] | None,
+    ) -> None:
+        """Tear down a local serve whose mesh the manager no longer tracks.
+
+        A ``mesh_gone`` report response means the record this command spawned
+        for was failed, stopped, or deleted manager-side while the command
+        was still running. Whatever the command left behind (coordinator +
+        llama on a driver, rpc stage on a member) is an unsupervised serve
+        holding GPU memory that no pool state references and no operator
+        command can reach; it also shadows the worker's ports against every
+        later launch. Reap it and idle the worker.
+        """
+        nonlocal status, active_mesh
+        if not (response and bool(response.get("mesh_gone"))):
+            return
+        event = str(report.get("event", "") or "")
+        if event == "stopped":
+            return  # a stop already tore everything down
+        mesh_key = str(report.get("mesh_key", "") or "")
+        command_id = str(report.get("command_id", "") or "")
+        logger.error(
+            "manager no longer tracks mesh %s (command %s, event %s): "
+            "tearing down the local serve so it cannot linger unsupervised "
+            "on the GPU",
+            mesh_key,
+            command_id[:8],
+            event,
+        )
+        try:
+            runner.stop({"command_id": command_id, "mesh_key": mesh_key})
+        except Exception as exc:
+            logger.error(
+                "mesh_gone teardown for %s failed: %s",
+                mesh_key,
+                str(exc)[:200],
+            )
+            return
+        with command_runtime_lock:
+            still_active = worker_command_state["active_id"] == command_id
+        if still_active:
+            status = "idle"
+            active_mesh = ""
+            warm_state["driver_serving"] = False
 
     def _remember_and_deliver_command_report(
         command_id: str,
@@ -12175,6 +12345,7 @@ def pool_worker_loop(
             and _accepted_drive_ready_phase(report_fields, response)
         ):
             _start_multibox_verifier(phase_command)
+        _mesh_gone_teardown(report_fields, response)
         return response
 
     def _retry_completed_command_report(
@@ -12205,6 +12376,7 @@ def pool_worker_loop(
                 and _accepted_drive_ready_phase(report_fields, response)
             ):
                 _start_multibox_verifier(phase_command)
+            _mesh_gone_teardown(report_fields, response)
 
         threading.Thread(target=_deliver, daemon=True).start()
 

@@ -310,3 +310,59 @@ def test_adoption_requires_same_model_and_index(monkeypatch, tmp_path):
         manager.state["mesh_registrations"]["qwen2.5-7b-q4-k-m"]["mesh_key"]
         == "m-1"
     )
+
+
+def test_lapse_warning_logs_once_per_state_not_per_tick(
+    monkeypatch, tmp_path, caplog
+):
+    """A permanently-dead mesh must not repeat the identical lapse warning
+    every renewer tick forever (a single retired model can bury the
+    manager log). One line per (mesh_key, status) transition; a recovery
+    re-arms the warning for the next lapse."""
+
+    import logging
+
+    registration_module._LAPSE_LOGGED.clear()
+    manager = _manager(tmp_path)
+    outcomes: list = []
+    _wire_renew(monkeypatch, outcomes)
+    manager.state["mesh_registrations"] = {
+        "qwen2.5-7b-q4-k-m": _registration(3600)
+    }
+
+    def _lapse_lines() -> int:
+        return sum(
+            1
+            for record in caplog.records
+            if "letting the lease lapse" in record.getMessage()
+        )
+
+    with caplog.at_level(logging.WARNING, logger="verallm.mesh.registration"):
+        # Three ticks against the same gone mesh: exactly one warning.
+        for _ in range(3):
+            renew_lease_if_due(
+                manager, chain_config=None, private_key=PRIVATE_KEY
+            )
+        assert _lapse_lines() == 1
+
+        # A DIFFERENT terminal state is a new fact: one more warning.
+        manager.state["meshes"]["m-1"] = {"status": "error"}
+        for _ in range(2):
+            renew_lease_if_due(
+                manager, chain_config=None, private_key=PRIVATE_KEY
+            )
+        assert _lapse_lines() == 2
+
+        # Recovery (mesh serving again) re-arms the warning...
+        manager.state["meshes"]["m-1"] = {"status": "serving"}
+        renew_lease_if_due(
+            manager, chain_config=None, private_key=PRIVATE_KEY
+        )
+        assert outcomes, "serving mesh inside the window must renew"
+
+        # ...so the next lapse logs again.
+        manager.state["meshes"]["m-1"] = {"status": "error"}
+        renew_lease_if_due(
+            manager, chain_config=None, private_key=PRIVATE_KEY
+        )
+        assert _lapse_lines() == 3

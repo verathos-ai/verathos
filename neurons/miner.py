@@ -2914,6 +2914,16 @@ def main():
 
     neuron.setup(private_key=args.private_key)
 
+    # ── Endpoint scheme posture ──
+    # Fail before any model load: an http endpoint on mainnet registers a
+    # miner the public proxy will never route.
+    from verallm.chain.config import validate_registration_endpoint_scheme
+    try:
+        validate_registration_endpoint_scheme(args.endpoint, chain_config.chain_id)
+    except ValueError as exc:
+        bt.logging.error(str(exc))
+        sys.exit(1)
+
     # ── Startup banner ──
     network = args.subtensor_network or ("testnet" if chain_config.chain_id == 945 else "mainnet")
     print_banner(

@@ -440,6 +440,13 @@ def registration_target_from_state(state: Mapping[str, Any]) -> RegistrationTarg
 LEASE_RENEW_WINDOW_S = 12 * 3600
 LEASE_RENEWER_INTERVAL_S = 15 * 60
 
+# One "letting the lease lapse" line per (model, mesh, status) transition:
+# a permanently-retired model would otherwise repeat the identical warning
+# every tick forever, burying the manager log's real signal. In-memory by
+# design — a manager restart re-logs each lapse once, which is the useful
+# reminder, not spam.
+_LAPSE_LOGGED: dict[str, str] = {}
+
 
 def renew_lease_if_due(
     manager,
@@ -505,12 +512,19 @@ def renew_lease_if_due(
                     mesh = dict(candidate)
                     break
             if not adopted_key:
-                logger.warning(
-                    "lease renewer: %s mesh %s is %r, letting the lease lapse",
-                    model_id,
-                    state.get("mesh_key"),
-                    mesh.get("status", "gone"),
+                lapse_fingerprint = (
+                    f"{state.get('mesh_key')}:{mesh.get('status', 'gone')}"
                 )
+                if _LAPSE_LOGGED.get(model_id) != lapse_fingerprint:
+                    _LAPSE_LOGGED[model_id] = lapse_fingerprint
+                    logger.warning(
+                        "lease renewer: %s mesh %s is %r, letting the lease "
+                        "lapse (repeats of this exact state are not "
+                        "re-logged)",
+                        model_id,
+                        state.get("mesh_key"),
+                        mesh.get("status", "gone"),
+                    )
                 continue
             logger.info(
                 "lease renewer: %s relaunched as mesh %s (stored key %s); "
@@ -524,6 +538,9 @@ def renew_lease_if_due(
                 if isinstance(stored, dict):
                     stored["mesh_key"] = adopted_key
                     manager._save()
+        # Reaching here means the model has a serving mesh again (directly
+        # or adopted): a future lapse is a NEW event worth logging.
+        _LAPSE_LOGGED.pop(model_id, None)
         if (
             int(state.get("expires_at", 0)) - current_time
             > LEASE_RENEW_WINDOW_S

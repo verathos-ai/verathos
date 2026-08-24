@@ -521,7 +521,36 @@ warm_hopper_gdn_kernel() {
     fi
 
     echo "  Warming the FlashInfer H100 GDN kernel..."
-    if ! timeout 600 env MAX_JOBS="${MAX_JOBS:-$(nproc)}" "$PYTHON" - <<'PY'
+    # The JIT builds ~67 sm_90a kernel units and each nvcc peaks near
+    # 10 GB of RAM, so an unbounded job count OOM-kills high-core boxes.
+    # RAM decides the parallelism; cores only cap it. MAX_JOBS in the
+    # environment wins outright.
+    local gdn_mem_gb gdn_jobs gdn_nvlib gdn_lib_path
+    gdn_mem_gb=$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo 2>/dev/null || echo 16)
+    gdn_jobs=$(( gdn_mem_gb / 12 ))
+    [ "$gdn_jobs" -lt 1 ] && gdn_jobs=1
+    [ "$gdn_jobs" -gt "$(nproc)" ] && gdn_jobs=$(nproc)
+    gdn_jobs="${MAX_JOBS:-$gdn_jobs}"
+    # The final link must see the SAME toolchain's runtime libraries the
+    # pip-shipped nvcc compiled against, or it dies on
+    # "cannot find -lcudart".
+    gdn_lib_path=""
+    for gdn_nvlib in "$VENV_DIR"/lib/python*/site-packages/nvidia/*/lib; do
+        [ -d "$gdn_nvlib" ] && gdn_lib_path="$gdn_nvlib:$gdn_lib_path"
+    done
+    # A killed build leaves a lock file that every later module load
+    # waits on forever. With no live build process the lock is garbage.
+    if ! pgrep -x ninja >/dev/null 2>&1 && ! pgrep -f "flashinfer" >/dev/null 2>&1; then
+        rm -f "$HOME"/.cache/flashinfer/*/*/cached_ops/tmp/*.lock 2>/dev/null || true
+    fi
+    # A cold cache legitimately needs tens of minutes at bounded
+    # parallelism; a warm cache loads in seconds. The timeout guards a
+    # hang, not the build.
+    if ! timeout "${VERATHOS_GDN_WARMUP_TIMEOUT_S:-2700}" env \
+        MAX_JOBS="$gdn_jobs" \
+        LIBRARY_PATH="${gdn_lib_path}${LIBRARY_PATH:-}" \
+        LD_LIBRARY_PATH="${gdn_lib_path}${LD_LIBRARY_PATH:-}" \
+        "$PYTHON" - <<'PY'
 import torch
 from flashinfer.gdn_prefill import get_gdn_prefill_module
 

@@ -1004,7 +1004,8 @@ class ValidatorStateDB:
 
         with self._lock:
             row = self._conn.execute(
-                "SELECT model_id, endpoint, quant, max_context_len FROM miner_entries "
+                "SELECT model_id, endpoint, quant, max_context_len, "
+                "probation_entered_epoch, probation_source FROM miner_entries "
                 "WHERE address = ? AND model_index = ?",
                 (address, model_index),
             ).fetchone()
@@ -1018,11 +1019,19 @@ class ValidatorStateDB:
                 # Only genuinely new slots inherit; a long-standing sibling
                 # entry is untouched, so an operator running several models is
                 # not punished across all of them for one bad slot.
+                # Availability-cause probation (a dead box, zero dishonesty
+                # evidence) dies with its slot: a fresh registration is the
+                # recovery, and the new slot faces normal canaries at once.
+                # For-cause probation inherits — re-registering must never
+                # reset a proof/integrity/evasion consequence. Legacy and
+                # unknown sources read as for_cause (fail closed).
                 inherited = self._conn.execute(
                     """SELECT MIN(probation_entered_epoch) AS entered
                        FROM miner_entries
                        WHERE address = ?
-                         AND probation_entered_epoch IS NOT NULL""",
+                         AND probation_entered_epoch IS NOT NULL
+                         AND (probation_source IS NULL
+                              OR probation_source NOT LIKE '%availability')""",
                     (address,),
                 ).fetchone()
                 inherited_epoch = (
@@ -1043,7 +1052,7 @@ class ValidatorStateDB:
                               ?, 0, 3, 5, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (address, model_index, model_id, endpoint, quant,
                      max_context_len, epoch, epoch, inherited_epoch,
-                     "inherited" if inherited_epoch is not None else None,
+                     "inherited_for_cause" if inherited_epoch is not None else None,
                      1 if tee_enabled else 0, tee_platform,
                      gpu_name, gpu_count, vram_gb, compute_capability, _gpu_uuids_json,
                      hotkey_ss58, coldkey_ss58, now, now),
@@ -1121,6 +1130,37 @@ class ValidatorStateDB:
                          _gpu_uuids_json, _gpu_uuids_json,
                          hotkey_ss58, coldkey_ss58, now, address, model_index),
                     )
+                    if (
+                        registration_changed
+                        and row["probation_entered_epoch"] is not None
+                        and str(row["probation_source"] or "").endswith(
+                            "availability"
+                        )
+                    ):
+                        # Availability-cause probation records missed
+                        # obligations only — a dead or unreachable box,
+                        # never dishonesty. A changed registration IS the
+                        # recovery, so routability returns immediately;
+                        # the very next canaries verify the new serve, and
+                        # the EMA damage from the outage stays in place.
+                        # For-cause probation never clears here: any
+                        # proof, integrity, or evasion consequence serves
+                        # its full consecutive-pass exit regardless of
+                        # re-registration.
+                        self._conn.execute(
+                            """UPDATE miner_entries SET
+                                probation_entered_epoch = NULL,
+                                probation_consecutive_passes = 0,
+                                probation_source = NULL,
+                                updated_at = ?
+                            WHERE address = ? AND model_index = ?""",
+                            (now, address, model_index),
+                        )
+                        bt.logging.info(
+                            f"Probation cleared for {address[:10]} "
+                            f"idx={model_index}: availability-only cause "
+                            f"and the registration changed"
+                        )
             self._conn.commit()
         return model_switched
 
@@ -2191,6 +2231,7 @@ class ValidatorStateDB:
         *,
         uid: int = -1,
         hotkey_ss58: str = "",
+        cause: str = "for_cause",
     ) -> None:
         """Put an entry on probation (or reset consecutive passes if already on).
 
@@ -2220,23 +2261,43 @@ class ValidatorStateDB:
             if row["probation_entered_epoch"] is not None:
                 # Already on probation — reset passes.  Validator-side
                 # operation against a misbehaving miner; INFO not WARN
-                # (the validator is doing its job).
-                self._conn.execute(
-                    """UPDATE miner_entries SET
-                        probation_consecutive_passes = 0, updated_at = ?
-                    WHERE address = ? AND model_index = ?""",
-                    (time.time(), address, model_index),
-                )
+                # (the validator is doing its job).  Severity only ratchets
+                # up: a for_cause failure on an availability probation
+                # upgrades the source; it never downgrades.
+                if cause == "for_cause":
+                    self._conn.execute(
+                        """UPDATE miner_entries SET
+                            probation_consecutive_passes = 0,
+                            probation_source = 'earned_for_cause',
+                            updated_at = ?
+                        WHERE address = ? AND model_index = ?""",
+                        (time.time(), address, model_index),
+                    )
+                else:
+                    self._conn.execute(
+                        """UPDATE miner_entries SET
+                            probation_consecutive_passes = 0, updated_at = ?
+                        WHERE address = ? AND model_index = ?""",
+                        (time.time(), address, model_index),
+                    )
                 bt.logging.info(f"Probation RESET for {who} idx={model_index} (new failure during probation)")
             else:
                 self._conn.execute(
                     """UPDATE miner_entries SET
                         probation_entered_epoch = ?,
                         probation_consecutive_passes = 0,
-                        probation_source = 'earned',
+                        probation_source = ?,
                         updated_at = ?
                     WHERE address = ? AND model_index = ?""",
-                    (epoch, time.time(), address, model_index),
+                    (
+                        epoch,
+                        "earned_availability"
+                        if cause == "availability"
+                        else "earned_for_cause",
+                        time.time(),
+                        address,
+                        model_index,
+                    ),
                 )
                 bt.logging.info(f"Probation ENTERED for {who} idx={model_index} at epoch {epoch}")
             self._conn.commit()

@@ -3631,6 +3631,12 @@ def cmd_deploy(args: argparse.Namespace) -> None:
                 chain_endpoint, subtensor_network or None
             ),
         )
+    # Endpoint scheme posture: refuse before the pipeline spends anything.
+    from verallm.chain.config import validate_registration_endpoint_scheme
+
+    validate_registration_endpoint_scheme(
+        args.endpoint, getattr(chain_config, "chain_id", None)
+    )
     call = _pool_client(args)
     _default_signer_from_pool(args, call)
     private_key, hotkey_seed, hotkey_ss58 = _deploy_credentials(args)
