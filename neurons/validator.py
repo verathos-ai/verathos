@@ -9129,16 +9129,30 @@ class ValidatorNeuron:
                 str(entry.get("address", "")), int(entry.get("model_index", 0)),
             )
             if entered is None:
-                # The database cleared this row (availability-only cause,
-                # registration changed). Follow it — but ONLY for
-                # availability tracker rows; a for_cause tracker row is
-                # never dropped by reconciliation.
-                clear = getattr(tracker, "clear_availability_probation", None)
-                if callable(clear) and tracker.is_on_probation(key):
-                    clear(key)
+                # The row EXISTS with probation cleared — an EXPLICIT
+                # database state (availability clear on re-registration),
+                # not an absence. The DB is the authority for explicit
+                # clears, so the tracker row drops REGARDLESS of its local
+                # cause label: a restart or legacy load can mislabel a
+                # tracker row for_cause, and gating this drop on the local
+                # label wedges the miner in a ghost probation with no DB
+                # row left to exit through. Fail-closed retention applies
+                # only to rows the DB does not mention at all (this loop
+                # never touches those). The capacity lane's own guard is
+                # its persisted window history, which re-gates a
+                # still-oversubscribed slot on the next windows no matter
+                # what happens here.
+                drop = getattr(tracker, "reconcile_not_on_probation", None)
+                if callable(drop) and tracker.is_on_probation(key):
+                    drop(key)
+                    bt.logging.info(
+                        f"Probation dropped for {key[0][:10]} idx={key[1]}: "
+                        "database shows an explicit clear"
+                    )
                 continue
             if tracker.is_on_probation(key):
                 continue
+            _db_source = str(entry.get("probation_source") or "")
             reconcile(
                 key,
                 entered_at_epoch=int(entered),
@@ -9146,6 +9160,14 @@ class ValidatorNeuron:
                     entry.get("probation_consecutive_passes", 0) or 0
                 ),
                 endpoint=str(entry.get("endpoint", "") or ""),
+                # earned_availability restores as availability; every other
+                # source (earned/inherited for_cause, legacy NULL) stays
+                # for_cause, fail-closed.
+                cause=(
+                    "availability"
+                    if _db_source.endswith("availability")
+                    else "for_cause"
+                ),
             )
             bt.logging.info(
                 f"Probation tracked for {key[0][:10]} idx={key[1]} "
@@ -9271,6 +9293,21 @@ class ValidatorNeuron:
                     bt.logging.warning(
                         f"Mesh snapshot verification failed for {miner.address[:10]} "
                         f"model_index={miner.model_index}: {exc} — excluding from epoch"
+                    )
+                    # An excluded slot cannot receive its planned canaries:
+                    # those obligations become unserviceable by the
+                    # validator's own decision, and counting them missing at
+                    # close turns a boundary pin race into probation for a
+                    # healthy mesh (a fresh registration can miss its first
+                    # pin fetch through no fault of its serving). Neutralize
+                    # the slot for this epoch — exclusion already costs the
+                    # miner its score, and a mesh that never presents a
+                    # valid snapshot earns zero forever, so neutrality here
+                    # is not an eligibility path.
+                    self._validator_canary_failures.add(
+                        self._miner_model_key(
+                            miner.address, miner.model_index
+                        )
                     )
                     # Exclusion must not be terminal for the epoch: record
                     # the slot so the periodic retry re-attempts the pin
@@ -13246,11 +13283,23 @@ class ValidatorNeuron:
             )
             if obligation_failure and not suppress_probation:
                 if key not in canary_penalized_keys:
+                    # Canary obligation misses alone are the availability
+                    # signature (dead box / canary dodge — the one class
+                    # that may clear on re-registration). Hard-audit
+                    # obligations left in the missing set carry a policy
+                    # penalty and belong to the for_cause lane: those
+                    # misses ARE audit evidence and must survive
+                    # re-registration.
                     self._on_proof_failure(
                         miner.address,
                         miner.model_index,
                         endpoint=getattr(miner, "endpoint", ""),
                         source_epoch=epoch_number,
+                        cause=(
+                            "for_cause"
+                            if hard_failure_penalty_required
+                            else "availability"
+                        ),
                     )
                     canary_penalized_keys.add(key)
                 bt.logging.info(
@@ -13618,8 +13667,13 @@ class ValidatorNeuron:
                 and outcome.proof_failures > 0
                 and outcome.proof_failure_penalty_required
             )
+            # Hard-audit misses carried into obligation_failure are
+            # for_cause evidence even when every proof passed; only a pure
+            # canary obligation miss classifies as availability.
             _entry_cause = (
-                "for_cause" if had_proof_failure else "availability"
+                "for_cause"
+                if (had_proof_failure or hard_failure_penalty_required)
+                else "availability"
             )
             had_proof_failure = had_proof_failure or obligation_failure
             if had_proof_failure and not suppress_probation:
@@ -15498,7 +15552,8 @@ class ValidatorNeuron:
                           source_epoch: Optional[int] = None,
                           epoch_close_number: Optional[int] = None,
                           epoch_close_event_kind: str = "",
-                          binding_violation: bool = False):
+                          binding_violation: bool = False,
+                          cause: str = "for_cause"):
         """Mid-epoch cutoff: immediately put miner on probation and notify proxy.
 
         Called as soon as a proof verification fails (not waiting for epoch close).
@@ -15566,17 +15621,33 @@ class ValidatorNeuron:
             _ss58 = self._get_miner_ss58(miner_address, "hotkey") or ""
         except Exception:
             pass
+        # ``cause`` classifies the ENTRY: proof/integrity/binding callers
+        # keep the for_cause default; the canary obligation-miss caller
+        # passes "availability" (dead-box signature). The label only
+        # ratchets up afterwards, so a mislabeled for_cause here would
+        # permanently disable the availability re-registration clear.
+        _probation_cause = (
+            "availability" if cause == "availability" else "for_cause"
+        )
         if not self._probation_tracker.is_on_probation(key):
             self._probation_tracker.enter_probation(
-                key, close_epoch, endpoint=endpoint, cause="for_cause")
+                key, close_epoch, endpoint=endpoint, cause=_probation_cause)
             self._db.enter_probation(
                 miner_address, model_index, close_epoch,
-                cause="for_cause",
+                cause=_probation_cause,
                 uid=_uid, hotkey_ss58=_ss58,
             )
         else:
             self._probation_tracker.record_failure(key)
             self._db.record_failure(miner_address, model_index)
+            if _probation_cause == "for_cause":
+                # A for_cause consequence during an availability probation
+                # upgrades the label (clocks untouched); the reverse never
+                # downgrades.
+                self._probation_tracker.ratchet_cause_for_cause(key)
+                self._db.ratchet_probation_source_for_cause(
+                    miner_address, model_index
+                )
 
         # Cut the score immediately — don't wait for epoch close
         if binding_violation:

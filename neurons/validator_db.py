@@ -2360,6 +2360,30 @@ class ValidatorStateDB:
             )
             self._conn.commit()
 
+    def ratchet_probation_source_for_cause(
+        self, address: str, model_index: int
+    ) -> None:
+        """Upgrade an active availability probation source to for_cause.
+
+        Up only, clocks untouched: a for_cause consequence during an
+        availability probation must disqualify the row from the
+        availability re-registration clear without restarting the
+        probation itself. No-op for rows already for_cause, cleared rows,
+        and legacy NULL sources (NULL already reads for_cause,
+        fail-closed).
+        """
+        address = address.lower()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE miner_entries SET
+                    probation_source = 'earned_for_cause', updated_at = ?
+                WHERE address = ? AND model_index = ?
+                  AND probation_entered_epoch IS NOT NULL
+                  AND probation_source LIKE '%availability'""",
+                (time.time(), address, model_index),
+            )
+            self._conn.commit()
+
     def apply_proxy_proof_failure_event(
         self,
         *,

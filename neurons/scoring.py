@@ -1203,8 +1203,16 @@ class ProbationTracker:
         entered_at_epoch: int,
         consecutive_passes: int,
         endpoint: str = "",
+        cause: str = "for_cause",
     ) -> None:
-        """Replace one local probation row with authoritative DB state."""
+        """Replace one local probation row with authoritative DB state.
+
+        ``cause`` must come from the DB row's probation_source so a
+        restart-reconstructed row keeps its true class: defaulting an
+        availability row to for_cause would permanently disable its
+        re-registration clear (the label only ratchets up afterwards).
+        Unknown/legacy sources stay for_cause, fail-closed.
+        """
 
         with self._lock:
             current = self._probation.get(key)
@@ -1220,6 +1228,9 @@ class ProbationTracker:
                     else self.escalation_epochs
                 ),
                 endpoint=endpoint or (current.endpoint if current else ""),
+                cause=(
+                    "availability" if cause == "availability" else "for_cause"
+                ),
             )
             self._save()
 
@@ -1259,6 +1270,27 @@ class ProbationTracker:
                 self._probation[key].consecutive_passes = 0
                 bt.logging.info(f"Probation pass counter RESET for {key[0][:10]} model_index={key[1]} (proof failure)")
                 self._save()
+
+    def ratchet_cause_for_cause(self, key: Tuple[str, int]) -> bool:
+        """Upgrade an active availability row to for_cause. Up only.
+
+        A for_cause consequence landing while an availability probation is
+        already active must upgrade the label without disturbing the
+        probation clocks — otherwise the availability re-registration
+        clear would later release a slot that earned a for_cause record.
+        Returns True when a row was upgraded.
+        """
+        with self._lock:
+            state = self._probation.get(key)
+            if state is None or state.cause != "availability":
+                return False
+            state.cause = "for_cause"
+            self._save()
+        bt.logging.info(
+            f"Probation cause RATCHETED to for_cause for {key[0][:10]} "
+            f"model_index={key[1]}"
+        )
+        return True
 
     def clear_availability_probation(self, key: Tuple[str, int]) -> bool:
         """Drop a probation row whose cause is availability-only.
