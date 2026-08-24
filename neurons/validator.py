@@ -9402,7 +9402,10 @@ class ValidatorNeuron:
         # the scheduler has produced the signed-policy plan.
         self._expected_receipts = {}
         self._expected_canary_obligations = {}
-        self._validator_canary_failures = set()
+        # Do not clear _validator_canary_failures here. Snapshot verification
+        # runs before planning and may already have marked an excluded slot as
+        # validator-neutral for this epoch. Clearing the set here would turn
+        # the validator's own exclusion into missing miner obligations.
         self._canary_penalized_keys = set()
         self._shared_hard_proof_verdicts = {}
         with self._shared_hard_prefetch_lock:
@@ -10040,6 +10043,9 @@ class ValidatorNeuron:
         # endpoint-free snapshot has been authenticated against fresh
         # MinerRegistry/metagraph identity and chain ModelSpec commitments.
         # vLLM entries pass through unchanged.
+        # Start the epoch's validator-neutral set immediately before pinning.
+        # The planner deliberately preserves any exclusions recorded below.
+        self._validator_canary_failures = set()
         self._epoch_miners = self._refresh_mesh_verification_snapshots(
             self._epoch_miners,
             epoch_number,

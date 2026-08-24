@@ -6908,6 +6908,7 @@ def _manager_with_registration_and_idle_worker(tmp_path):
         tmp_path, manager_endpoint="http://127.0.0.1:0", serving_mode="dev"
     )
     mgr = PoolManager(state_dir)
+    mgr.AUTO_RELAUNCH_DELAY_S = 0.01
     worker_body = {"pool_secret": tok.pool_secret}
     mgr.handle_join({**worker_body, "worker_id": "w1",
                      "capability": {"gpu_name": "t", "vram_gb": 48},
@@ -6917,7 +6918,7 @@ def _manager_with_registration_and_idle_worker(tmp_path):
     with mgr.lock:
         mgr.state.setdefault("mesh_registrations", {})["m1"] = {
             "model_id": "m1",
-            "model_index": 7,
+            "index": 7,
             "mesh_key": "m-dead",
             "endpoint": "https://mesh.example:9443",
             "quant": "gguf_mesh_q4_k_m",
@@ -6927,6 +6928,36 @@ def _manager_with_registration_and_idle_worker(tmp_path):
         }
         mgr._save()
     return mgr, worker_body
+
+
+def _add_idle_worker(mgr, worker_body, worker_id):
+    mgr.handle_join(
+        {
+            **worker_body,
+            "worker_id": worker_id,
+            "capability": {"gpu_name": "t", "vram_gb": 48},
+            "catalog": [{"model_id": "m1", "model_bytes": 1000}],
+            "endpoints": {
+                "rpc": f"{worker_id}:50052",
+                "proof": f"http://{worker_id}:9402",
+                "mesh": f"http://{worker_id}:9500",
+            },
+        }
+    )
+
+
+def _add_detached_error_mesh(mgr):
+    with mgr.lock:
+        mgr.state["meshes"]["m-dead"] = {
+            "mesh_key": "m-dead",
+            "model_id": "m1",
+            "model_index": 7,
+            "members": ["w1"],
+            "driver": "w1",
+            "status": "error",
+            "error": "worker runtime failed",
+        }
+        mgr._save()
 
 
 def _wait_for_live_mesh(mgr, model_id, timeout_s=5.0):
@@ -6956,6 +6987,59 @@ class TestAutoRelaunch:
         assert mesh is not None, "auto-relaunch must launch the dead model"
         assert mesh["driver"] == "w1"
 
+    def test_detached_error_tombstone_is_retired_before_relaunch(self, tmp_path):
+        """The real crash path leaves an error mesh record behind after its
+        workers detach. Auto-relaunch must retire that terminal record before
+        creating the replacement, or subnet index-conflict checks reject the
+        launch forever."""
+        mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
+        _add_detached_error_mesh(mgr)
+
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+
+        mesh = _wait_for_live_mesh(mgr, "m1")
+        assert mesh is not None
+        with mgr.lock:
+            assert "m-dead" not in mgr.state["meshes"]
+
+    def test_relaunch_uses_recommended_multi_worker_placement(self, tmp_path):
+        """An idle catalog-holding worker is only the recovery trigger. The
+        model may need several machines, so placement must still pass through
+        the manager's feasible-set recommender."""
+        mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
+        _add_idle_worker(mgr, worker_body, "w2")
+        calls = []
+
+        def recommend(model_id):
+            calls.append(model_id)
+            return ([{"workers": ["w1", "w2"], "driver": "w1"}], [])
+
+        mgr.recommend = recommend
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+
+        mesh = _wait_for_live_mesh(mgr, "m1")
+        assert mesh is not None
+        assert calls == ["m1"]
+        assert mesh["members"] == ["w1", "w2"]
+
+    def test_delayed_relaunch_cannot_override_operator_stop(self, tmp_path):
+        """Suspension may race the delayed relaunch thread. The launch must
+        re-check operator intent under the same lock that creates the mesh."""
+        mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
+        mgr.AUTO_RELAUNCH_DELAY_S = 0.2
+        _add_detached_error_mesh(mgr)
+        admin = {"management_secret": mgr.state["management_secret"]}
+
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+        mgr.handle_stop({**admin, "mesh_key": "m-dead"})
+        time.sleep(0.4)
+
+        assert _wait_for_live_mesh(mgr, "m1", timeout_s=0.3) is None
+        with mgr.lock:
+            assert mgr._registrations_locked()["m1"][
+                "suspended_by_operator"
+            ] is True
+
     def test_operator_stop_suspends_until_explicit_launch(self, tmp_path):
         mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
         mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
@@ -6982,7 +7066,7 @@ class TestAutoRelaunch:
         )
         mgr._auto_relaunch_last.clear()
         mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
-        assert _wait_for_live_mesh(mgr, "m1", timeout_s=2.0) is None, (
+        assert _wait_for_live_mesh(mgr, "m1", timeout_s=0.3) is None, (
             "operator stop must suspend auto-relaunch"
         )
         # An explicit launch re-arms the guard.
@@ -6999,15 +7083,15 @@ class TestAutoRelaunch:
         mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
         mgr._auto_relaunch_last = {"m1": time.monotonic()}
         mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
-        assert _wait_for_live_mesh(mgr, "m1", timeout_s=2.0) is None, (
+        assert _wait_for_live_mesh(mgr, "m1", timeout_s=0.3) is None, (
             "a recent attempt must gate the next one"
         )
 
     def test_unbound_registration_is_ignored(self, tmp_path):
         mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
         with mgr.lock:
-            mgr._registrations_locked()["m1"].pop("model_index")
+            mgr._registrations_locked()["m1"].pop("index")
         mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
-        assert _wait_for_live_mesh(mgr, "m1", timeout_s=2.0) is None, (
+        assert _wait_for_live_mesh(mgr, "m1", timeout_s=0.3) is None, (
             "auto-relaunch only guards chain-bound registrations"
         )

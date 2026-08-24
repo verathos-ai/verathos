@@ -4454,6 +4454,7 @@ class PoolManager:
     # launch), one attempt per model per cooldown window so a
     # crash-looping serve cannot be hammered.
     AUTO_RELAUNCH_COOLDOWN_S = 600.0
+    AUTO_RELAUNCH_DELAY_S = 1.0
 
     def _maybe_auto_relaunch_registered(self, worker_id: str) -> None:
         now = time.monotonic()
@@ -4471,14 +4472,23 @@ class PoolManager:
             }
             if not catalog_models:
                 return
-            live_models = {
-                str(m.get("model_id", "") or "")
-                for m in self.state["meshes"].values()
-                if str(m.get("status", "") or "")
-                in ("fetching", "driving", "joining", "serving", "stopping")
-            }
+            live_models = set()
+            for mesh_key, mesh in self.state["meshes"].items():
+                model_id = str(mesh.get("model_id", "") or "")
+                status = str(mesh.get("status", "") or "")
+                assigned = any(
+                    str((self.state["workers"].get(member_id) or {}).get(
+                        "mesh", ""
+                    ) or "") == mesh_key
+                    for member_id in (mesh.get("members") or [])
+                )
+                # A detached error/stopped record is a removable tombstone.
+                # Every other record, and every record whose workers are
+                # still assigned, blocks relaunch until teardown converges.
+                if status not in ("error", "stopped") or assigned:
+                    live_models.add(model_id)
             for model_id, registration in self._registrations_locked().items():
-                if registration.get("model_index") is None:
+                if registration.get("index") is None:
                     continue
                 if registration.get("suspended_by_operator"):
                     continue
@@ -4499,20 +4509,20 @@ class PoolManager:
         model_id = candidate_model
         logger.warning(
             "auto-relaunch: registered model %s has no live mesh; "
-            "relaunching on idle worker %s (its catalog holds the model)",
+            "relaunch triggered by idle worker %s (its catalog holds the "
+            "model); selecting a feasible worker set",
             model_id,
             worker_id,
         )
 
         def _relaunch() -> None:
-            time.sleep(1.0)
+            time.sleep(self.AUTO_RELAUNCH_DELAY_S)
             try:
                 self.handle_launch(
                     {
                         "management_secret": management_secret,
                         "model_id": model_id,
-                        "workers": [worker_id],
-                        "driver": worker_id,
+                        "_auto_relaunch": True,
                     }
                 )
             except Exception as exc:
@@ -5532,6 +5542,7 @@ class PoolManager:
 
     def handle_launch(self, body: dict[str, Any]) -> dict[str, Any]:
         self._auth_manage(body)
+        auto_relaunch = bool(body.get("_auto_relaunch"))
         if not self.serving_mode:
             raise ValueError(
                 "pool serving mode is unconfigured; recreate it explicitly as dev or subnet"
@@ -5657,6 +5668,37 @@ class PoolManager:
         if driver not in members:
             raise ValueError("driver must be one of the mesh workers")
         with self.lock:
+            if auto_relaunch:
+                registration = self._registrations_locked().get(model_id)
+                if not isinstance(registration, dict) or registration.get(
+                    "index"
+                ) is None:
+                    raise ValueError(
+                        "auto-relaunch requires a chain-bound registration"
+                    )
+                if registration.get("suspended_by_operator"):
+                    raise ValueError("auto-relaunch is suspended by operator")
+
+                terminal_meshes = []
+                for key, existing in self.state["meshes"].items():
+                    if str(existing.get("model_id", "") or "") != model_id:
+                        continue
+                    assigned = any(
+                        str((self.state["workers"].get(member_id) or {}).get(
+                            "mesh", ""
+                        ) or "") == key
+                        for member_id in (existing.get("members") or [])
+                    )
+                    status = str(existing.get("status", "") or "")
+                    if status not in ("error", "stopped") or assigned:
+                        raise ValueError(
+                            "auto-relaunch refused while another mesh record "
+                            "is live or still owns workers"
+                        )
+                    terminal_meshes.append(key)
+                for key in terminal_meshes:
+                    self.state["meshes"].pop(key, None)
+
             if self.serving_mode == POOL_SERVING_MODE_SUBNET and chain_bound:
                 model_index = int(model_registration["model_index"])
                 conflicting = [
@@ -5974,12 +6016,14 @@ class PoolManager:
                 ).get(model_id)
                 if isinstance(launched_registration, dict):
                     launched_registration["mesh_key"] = mesh_key
-            # An explicit launch lifts any operator suspension: the operator
-            # has re-stated that this model should serve, so auto-relaunch
-            # may guard it again.
-            _launch_registration = self._registrations_locked().get(model_id)
-            if isinstance(_launch_registration, dict):
-                _launch_registration.pop("suspended_by_operator", None)
+            if not auto_relaunch:
+                # An explicit launch lifts any operator suspension: the
+                # operator has re-stated that this model should serve, so
+                # auto-relaunch may guard it again. An automatic launch must
+                # never clear intent that raced its delayed attempt.
+                _launch_registration = self._registrations_locked().get(model_id)
+                if isinstance(_launch_registration, dict):
+                    _launch_registration.pop("suspended_by_operator", None)
             for wid in members:
                 self.state["workers"][wid]["status"] = "assigned"
                 self.state["workers"][wid]["mesh"] = mesh_key
