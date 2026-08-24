@@ -618,6 +618,41 @@ class EconomicChallengeV3:
             label=b"residual-cols/" + struct.pack("<I", layer_index),
         )
 
+    def moe_token_position_for(
+        self,
+        *,
+        layer_index: int,
+        minimum_position: int = 0,
+    ) -> int:
+        """Select one executed absolute row for bounded sparse-MoE replay.
+
+        ``minimum_position`` excludes rows served entirely from an
+        authenticated prefix cache.  The default preserves the original
+        no-cache selection ABI exactly.
+        """
+
+        if layer_index not in self.selected_layer_indices:
+            raise ProofV3Error("MoE layer was not selected")
+        if (
+            isinstance(minimum_position, bool)
+            or not isinstance(minimum_position, int)
+            or minimum_position < 0
+            or minimum_position >= self.sequence_token_count
+        ):
+            raise ProofV3Error("MoE minimum sequence position is malformed")
+        candidates = tuple(
+            position
+            for position in self.candidate_sequence_positions
+            if position >= minimum_position
+        )
+        if not candidates:
+            raise ProofV3Error("MoE executed candidate sequence pool is empty")
+        slot = _Sampler(
+            self.selection_seed,
+            b"moe-token/v1/" + struct.pack("<I", layer_index),
+        ).below(len(candidates))
+        return candidates[slot]
+
     def _lane_coherent_cells(
         self,
         *,

@@ -54,6 +54,12 @@ from verallm.proof_v3.lean_projection_fold import (
     LEAN_PROJECTION_FOLD_ABI_V3,
 )
 from verallm.proof_v3.gdn_runtime_semantics import GdnRuntimeSemanticsV3
+from verallm.proof_v3.moe_projection_inventory import (
+    MoeProjectionIdentityV3,
+    parse_moe_projection_name_v3,
+    validate_moe_projection_inventory_v3,
+)
+from verallm.proof_v3.moe_runtime_semantics import MoeRuntimeSemanticsV3
 from verallm.proof_v3.profile import ExecutionSecurityProfileV3
 from verallm.proof_v3.projection_manifest import (
     LM_HEAD_CATALOG_BINDING_V3,
@@ -123,6 +129,12 @@ _GDN_ENTRY_NAMES = frozenset(
         "post_norm",
     }
 )
+_FULL_ATTENTION_MOE_ENTRY_NAMES = _FULL_ATTENTION_ENTRY_NAMES - {
+    "down",
+    "gate_up",
+}
+_GDN_MOE_ENTRY_NAMES = _GDN_ENTRY_NAMES - {"down", "gate_up"}
+_MOE_ENTRY_PREFIX = re.compile(r"^l([0-9]+)\.moe\.")
 
 __all__ = [
     "ECONOMIC_PROFILE_ADAPTER_ID_V3",
@@ -390,9 +402,13 @@ def economic_profile_uses_canonical_gdn_input_v3(
 def _manifest_inventory(
     manifest: ProjectionManifestV3,
     layer_kinds: Sequence[str],
+    moe_runtime_semantics: MoeRuntimeSemanticsV3 | None = None,
+    *,
+    allow_unvalidated_moe: bool = False,
 ) -> tuple[
     dict[str, ProjectionManifestEntryV3],
     dict[int, dict[str, ProjectionManifestEntryV3]],
+    dict[MoeProjectionIdentityV3, ProjectionManifestEntryV3],
 ]:
     if not isinstance(manifest, ProjectionManifestV3):
         raise ProofV3Error("economic manifest has an unexpected type")
@@ -411,6 +427,7 @@ def _manifest_inventory(
         )
     by_name: dict[str, ProjectionManifestEntryV3] = {}
     by_layer: dict[int, dict[str, ProjectionManifestEntryV3]] = {}
+    moe_entry_names: set[str] = set()
     for entry in manifest.entries:
         if (
             not isinstance(entry, ProjectionManifestEntryV3)
@@ -430,6 +447,13 @@ def _manifest_inventory(
         ):
             raise ProofV3Error("economic manifest entry is malformed")
         by_name[entry.name] = entry
+        if _MOE_ENTRY_PREFIX.match(entry.name) is not None:
+            if parse_moe_projection_name_v3(entry.name) is None:
+                raise ProofV3Error(
+                    "economic manifest contains an unsupported MoE projection name"
+                )
+            moe_entry_names.add(entry.name)
+            continue
         match = _LAYER_ENTRY.fullmatch(entry.name)
         if match is not None:
             layer_index = int(match.group(1))
@@ -439,9 +463,10 @@ def _manifest_inventory(
                 raise ProofV3Error("economic manifest layer entry is duplicated")
             layer[suffix] = entry
 
-    global_names = set(by_name) - {
+    layer_entry_names = {
         entry.name for entries in by_layer.values() for entry in entries.values()
     }
+    global_names = set(by_name) - layer_entry_names - moe_entry_names
     if global_names != _GLOBAL_ENTRY_NAMES:
         raise ProofV3Error(
             "economic manifest global inventory is incomplete or unsupported"
@@ -455,22 +480,74 @@ def _manifest_inventory(
         raise ProofV3Error(
             "economic manifest layer inventory does not match the profile"
         )
+    if moe_runtime_semantics is not None:
+        moe_layers = frozenset(
+            item.layer_index for item in moe_runtime_semantics.layers
+        )
+    elif allow_unvalidated_moe:
+        moe_layers = frozenset(
+            int(match.group(1))
+            for name in moe_entry_names
+            if (match := _MOE_ENTRY_PREFIX.match(name)) is not None
+        )
+    else:
+        moe_layers = frozenset()
+    if any(layer_index >= len(kinds) for layer_index in moe_layers):
+        raise ProofV3Error("MoE runtime semantics reference an unknown layer")
+    if (
+        moe_runtime_semantics is None
+        and not allow_unvalidated_moe
+        and (moe_entry_names or manifest.moe_runtime_semantics_digest)
+    ):
+        raise ProofV3Error(
+            "economic manifest carries unauthenticated MoE inventory"
+        )
     for layer_index, kind in enumerate(kinds):
         actual = set(by_layer[layer_index])
+        uses_moe = layer_index in moe_layers
         if kind == "full_attention":
-            if actual not in (
-                _FULL_ATTENTION_ENTRY_NAMES,
-                _FULL_ATTENTION_ENTRY_NAMES | {"qkv_bias"},
-            ):
+            expected = (
+                _FULL_ATTENTION_MOE_ENTRY_NAMES
+                if uses_moe
+                else _FULL_ATTENTION_ENTRY_NAMES
+            )
+            if actual not in (expected, expected | {"qkv_bias"}):
                 raise ProofV3Error(
                     f"full-attention layer {layer_index} has an unsupported "
                     "manifest inventory"
                 )
-        elif actual != _GDN_ENTRY_NAMES:
+        elif actual != (
+            _GDN_MOE_ENTRY_NAMES if uses_moe else _GDN_ENTRY_NAMES
+        ):
             raise ProofV3Error(
                 f"GDN layer {layer_index} has an unsupported manifest inventory"
             )
-    return by_name, by_layer
+    if moe_runtime_semantics is None:
+        if allow_unvalidated_moe:
+            if bool(moe_entry_names) != bool(
+                manifest.moe_runtime_semantics_digest
+            ):
+                raise ProofV3Error(
+                    "economic manifest MoE inventory and semantics digest disagree"
+                )
+        moe_entries = {}
+    else:
+        if (
+            moe_runtime_semantics.digest()
+            != manifest.moe_runtime_semantics_digest
+        ):
+            raise ProofV3Error(
+                "MoE profile lacks exact authenticated runtime semantics"
+            )
+        moe_entries = validate_moe_projection_inventory_v3(
+            manifest=manifest,
+            semantics=moe_runtime_semantics,
+        )
+        if {entry.name for entry in moe_entries.values()} != moe_entry_names:
+            raise ProofV3Error(
+                "economic manifest contains unsupported MoE projection names"
+            )
+    return by_name, by_layer, moe_entries
 
 
 def infer_economic_manifest_layer_kinds_v3(
@@ -490,6 +567,12 @@ def infer_economic_manifest_layer_kinds_v3(
     for entry in manifest.entries:
         if not isinstance(entry, ProjectionManifestEntryV3):
             raise ProofV3Error("economic manifest entry is malformed")
+        if _MOE_ENTRY_PREFIX.match(entry.name) is not None:
+            if parse_moe_projection_name_v3(entry.name) is None:
+                raise ProofV3Error(
+                    "economic manifest contains an unsupported MoE projection name"
+                )
+            continue
         match = _LAYER_ENTRY.fullmatch(entry.name)
         if match is None:
             continue
@@ -509,16 +592,22 @@ def infer_economic_manifest_layer_kinds_v3(
         if actual in (
             _FULL_ATTENTION_ENTRY_NAMES,
             _FULL_ATTENTION_ENTRY_NAMES | {"qkv_bias"},
+            _FULL_ATTENTION_MOE_ENTRY_NAMES,
+            _FULL_ATTENTION_MOE_ENTRY_NAMES | {"qkv_bias"},
         ):
             kinds.append("full_attention")
-        elif actual == _GDN_ENTRY_NAMES:
+        elif actual in {_GDN_ENTRY_NAMES, _GDN_MOE_ENTRY_NAMES}:
             kinds.append("gdn")
         else:
             raise ProofV3Error(
                 f"layer {layer_index} has an unsupported manifest inventory"
             )
     result = tuple(kinds)
-    _manifest_inventory(manifest, result)
+    _manifest_inventory(
+        manifest,
+        result,
+        allow_unvalidated_moe=True,
+    )
     return result
 
 
@@ -686,6 +775,7 @@ def build_economic_execution_profile_v3(
     gdn_runtime_semantics: GdnRuntimeSemanticsV3 | None,
     tokenizer_binding_digest: bytes,
     runtime_encoding_id: str,
+    moe_runtime_semantics: MoeRuntimeSemanticsV3 | None = None,
     max_context_tokens: int | None = None,
     max_decode_tokens: int = 4_096,
     streaming: bool = True,
@@ -784,7 +874,11 @@ def build_economic_execution_profile_v3(
     if lean and not streaming:
         raise ProofV3Error("lean economic profiles require streaming selection")
     kinds = tuple(str(kind) for kind in layer_kinds)
-    by_name, by_layer = _manifest_inventory(manifest, kinds)
+    by_name, by_layer, moe_entries = _manifest_inventory(
+        manifest,
+        kinds,
+        moe_runtime_semantics,
+    )
     if (
         not isinstance(tokenizer_binding_digest, bytes)
         or len(tokenizer_binding_digest) != 32
@@ -820,6 +914,16 @@ def build_economic_execution_profile_v3(
 
     hidden = by_name["embed_tokens"].in_dim
     vocab = by_name["embed_tokens"].out_dim
+    moe_layers = frozenset(
+        item.layer_index for item in moe_runtime_semantics.layers
+    ) if moe_runtime_semantics is not None else frozenset()
+    if moe_runtime_semantics is not None and (
+        moe_runtime_semantics.hidden_size != hidden
+        or moe_runtime_semantics.runtime_encoding_id != runtime_encoding_id
+    ):
+        raise ProofV3Error(
+            "MoE runtime geometry or encoding disagrees with the execution profile"
+        )
     if (
         by_name["lm_head"].in_dim != hidden
         or by_name["lm_head"].out_dim != vocab
@@ -829,13 +933,17 @@ def build_economic_execution_profile_v3(
             "embedding, final norm and LM-head dimensions are inconsistent"
         )
     for layer_index, entries in by_layer.items():
-        if (
+        malformed = (
             entries["input_norm"].in_dim != hidden
             or entries["post_norm"].in_dim != hidden
-            or entries["gate_up"].in_dim != hidden
-            or entries["down"].out_dim != hidden
-            or entries["gate_up"].out_dim != 2 * entries["down"].in_dim
-        ):
+        )
+        if layer_index not in moe_layers:
+            malformed = malformed or (
+                entries["gate_up"].in_dim != hidden
+                or entries["down"].out_dim != hidden
+                or entries["gate_up"].out_dim != 2 * entries["down"].in_dim
+            )
+        if malformed:
             raise ProofV3Error(
                 f"layer {layer_index} dimensions are inconsistent"
             )
@@ -936,7 +1044,13 @@ def build_economic_execution_profile_v3(
             -1,
         ),
     ]
+    moe_entries_by_layer: dict[int, list[ProjectionManifestEntryV3]] = {}
+    for identity, entry in moe_entries.items():
+        moe_entries_by_layer.setdefault(identity.layer_index, []).append(entry)
     for layer_index, kind in enumerate(kinds):
+        complete_layer_entries = tuple(by_layer[layer_index].values()) + tuple(
+            moe_entries_by_layer.get(layer_index, ())
+        )
         layer_digest = _digest(
             b"LAYER_INVENTORY/",
             inventory_digest,
@@ -944,7 +1058,7 @@ def build_economic_execution_profile_v3(
             *(
                 _entry_bytes(entry)
                 for entry in sorted(
-                    by_layer[layer_index].values(),
+                    complete_layer_entries,
                     key=lambda item: item.name,
                 )
             ),
@@ -954,22 +1068,37 @@ def build_economic_execution_profile_v3(
             if kind == "full_attention"
             else gdn_runtime_semantics.digest()
         )
-        static_bindings.extend(
-            (
+        static_bindings.append(
+            StaticParameterBindingV3(
+                f"transition_params_l{layer_index}",
+                "attention" if kind == "full_attention" else "transition",
+                _digest(b"TRANSITION/", layer_digest, semantics_digest),
+                layer_index,
+            )
+        )
+        if layer_index in moe_layers:
+            assert moe_runtime_semantics is not None
+            static_bindings.append(
                 StaticParameterBindingV3(
-                    f"transition_params_l{layer_index}",
-                    "attention" if kind == "full_attention" else "transition",
-                    _digest(b"TRANSITION/", layer_digest, semantics_digest),
+                    f"moe_params_l{layer_index}",
+                    "moe",
+                    _digest(
+                        b"MOE/",
+                        layer_digest,
+                        moe_runtime_semantics.digest(),
+                    ),
                     layer_index,
-                ),
+                )
+            )
+        else:
+            static_bindings.append(
                 StaticParameterBindingV3(
                     f"bridge_params_l{layer_index}",
                     "bridge",
                     _digest(b"BRIDGE/", layer_digest),
                     layer_index,
-                ),
+                )
             )
-        )
     static_bindings = sorted(static_bindings, key=lambda item: item.binding_id)
 
     table_bindings: list[StaticTableBindingV3] = []
@@ -1173,6 +1302,35 @@ def build_economic_execution_profile_v3(
             transition_id = f"gdn_l{layer_index}"
             relation_id = "gdn"
             adapter_id = "gdn.v1"
+        if layer_index in moe_layers:
+            assert moe_runtime_semantics is not None
+            bridge_id = f"moe_l{layer_index}"
+            bridge_node = ExecutionRelationNodeV3(
+                bridge_id,
+                "moe",
+                moe_runtime_semantics.adapter_id,
+                (
+                    f"state_l{layer_index}",
+                    transition_tensor,
+                    *cache_tensor_ids,
+                ),
+                (state_out,),
+                "exact",
+                (f"moe_params_l{layer_index}",),
+                layer_index=layer_index,
+            )
+        else:
+            bridge_id = f"bridge_l{layer_index}"
+            bridge_node = ExecutionRelationNodeV3(
+                bridge_id,
+                "bridge",
+                "residual.bridge.v1",
+                (transition_tensor, *cache_tensor_ids),
+                (state_out,),
+                "exact",
+                (f"bridge_params_l{layer_index}",),
+                layer_index=layer_index,
+            )
         nodes.extend(
             (
                 ExecutionRelationNodeV3(
@@ -1195,23 +1353,14 @@ def build_economic_execution_profile_v3(
                     (f"transition_params_l{layer_index}",),
                     layer_index=layer_index,
                 ),
-                ExecutionRelationNodeV3(
-                    f"bridge_l{layer_index}",
-                    "bridge",
-                    "residual.bridge.v1",
-                    (transition_tensor, *cache_tensor_ids),
-                    (state_out,),
-                    "exact",
-                    (f"bridge_params_l{layer_index}",),
-                    layer_index=layer_index,
-                ),
+                bridge_node,
             )
         )
         layer_audits.append(
             LayerAuditPlanV3(
                 layer_index=layer_index,
                 transition_node_id=transition_id,
-                bridge_node_id=f"bridge_l{layer_index}",
+                bridge_node_id=bridge_id,
                 required_operation_references=(reference_by_layer[layer_index],),
                 attention_query_head_count=nh if kind == "full_attention" else 0,
                 attention_key_value_head_count=(
@@ -1479,6 +1628,7 @@ def validate_economic_execution_profile_v3(
     attention_runtime_semantics: AttentionRuntimeSemanticsV3 | None,
     gdn_runtime_semantics: GdnRuntimeSemanticsV3 | None,
     tokenizer_binding_digest: bytes | None,
+    moe_runtime_semantics: MoeRuntimeSemanticsV3 | None = None,
 ) -> None:
     """Rebuild and compare the complete signed economic profile."""
 
@@ -1503,6 +1653,7 @@ def validate_economic_execution_profile_v3(
             calibration_set=calibration_set,
             attention_runtime_semantics=attention_runtime_semantics,
             gdn_runtime_semantics=gdn_runtime_semantics,
+            moe_runtime_semantics=moe_runtime_semantics,
             tokenizer_binding_digest=tokenizer_binding_digest,
             runtime_encoding_id=next(iter(runtime_encodings)),
             max_context_tokens=profile.max_verified_context_tokens,

@@ -17,6 +17,9 @@ from verallm.crypto.merkle import MerkleTree, verify_merkle_path
 from zkllm.types import MerklePath
 
 TRACE_PROFILE_QWEN_HYBRID_DENSE_V1 = "qwen_hybrid_dense_trace_v1"
+TRACE_PROFILE_QWEN_HYBRID_SPARSE_MOE_SHELL_V1 = (
+    "qwen_hybrid_sparse_moe_shell_trace_v1"
+)
 TRACE_ATTENTION_FULL_AUDIT_ONLY = "full_attention_audit_only"
 TRACE_ATTENTION_FULL_TRANSITION_V1 = "full_attention_transition_v1"
 TRACE_ATTENTION_GDN_AUDIT_ONLY = "gdn_attention_audit_only"
@@ -1804,6 +1807,7 @@ __all__ = [
     "TRACE_ATTENTION_GDN_AUDIT_ONLY",
     "TRACE_ATTENTION_GDN_TRANSITION_V1",
     "TRACE_PROFILE_QWEN_HYBRID_DENSE_V1",
+    "TRACE_PROFILE_QWEN_HYBRID_SPARSE_MOE_SHELL_V1",
     "TokenExecutionTraceV2",
     "TokenTraceOpeningV2",
     "TraceTensorV2",

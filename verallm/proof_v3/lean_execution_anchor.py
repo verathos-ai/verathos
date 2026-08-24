@@ -25,12 +25,22 @@ from typing import Final
 
 from verallm.proof_v3.economic_challenge import EconomicChallengeV3
 from verallm.proof_v3.errors import ProofV3Error
+from verallm.proof_v3.moe_runtime_semantics import (
+    MoeRuntimeSemanticsV3,
+    moe_runtime_encoding_bytes_v3,
+)
 
 LEAN_EXECUTION_ANCHOR_ABI_V3: Final = (
     "execution_anchor.per_layer_kv.v5"
 )
 LEAN_EXECUTION_CHECKPOINT_STRIDE_V3: Final = 1
 LEAN_KV_PROJECTION_ROWS_PER_LAYER_V3: Final = 16
+LEAN_MOE_RUNTIME_STAGE_SUFFIXES_V3: Final = (
+    "moe_input",
+    "moe_router_logits",
+    "residual_after_attention",
+    "moe_aggregate_output",
+)
 
 _KV_ROW_DOMAIN: Final = (
     b"VERATHOS/PROOF_V3/LEAN_EXECUTION_ANCHOR/V2/KV_LAYER_ROWS/SHA256"
@@ -40,10 +50,13 @@ __all__ = [
     "LEAN_EXECUTION_ANCHOR_ABI_V3",
     "LEAN_EXECUTION_CHECKPOINT_STRIDE_V3",
     "LEAN_KV_PROJECTION_ROWS_PER_LAYER_V3",
+    "LEAN_MOE_RUNTIME_STAGE_SUFFIXES_V3",
     "derive_lean_kv_projection_rows_v3",
     "expected_lean_execution_anchor_inventory_v3",
     "expected_lean_execution_anchor_reveals_v3",
     "lean_execution_checkpoint_layers_v3",
+    "lean_hybrid_moe_retention_slot_bound_v3",
+    "lean_opaque_moe_retention_slot_bound_v3",
     "lean_bottom_sequence_positions_v3",
     "lean_projection_row_layouts_v3",
     "lean_qkv_projection_rows_v3",
@@ -110,6 +123,52 @@ def _positive_u32(value, name: str) -> int:
     return value
 
 
+def lean_opaque_moe_retention_slot_bound_v3(
+    *,
+    selected_layer_count: int,
+) -> int:
+    """Bound graph-static raw retention for any valid lean MoE challenge.
+
+    Each selected layer can expose the four MoE-local roots, every residual
+    checkpoint in its corridor, and the preceding corridor boundary. The
+    terminal residual is mandatory independently of the selected layers.
+    """
+
+    selected = _positive_u32(
+        selected_layer_count,
+        "lean selected-layer count",
+    )
+    return (
+        selected
+        * (
+            len(LEAN_MOE_RUNTIME_STAGE_SUFFIXES_V3)
+            + LEAN_EXECUTION_CHECKPOINT_STRIDE_V3
+            + 1
+        )
+        + 1
+    )
+
+
+def lean_hybrid_moe_retention_slot_bound_v3(
+    *,
+    selected_layer_count: int,
+) -> int:
+    """Bound sparse and K/V raw retention for a hybrid MoE replay.
+
+    The sparse bound covers every reachable MoE and residual stage. In the
+    worst valid selection every signed layer is a full-attention layer and adds
+    one independent ``attention_kv_output`` stage.
+    """
+
+    selected = _positive_u32(
+        selected_layer_count,
+        "lean selected-layer count",
+    )
+    return lean_opaque_moe_retention_slot_bound_v3(
+        selected_layer_count=selected,
+    ) + selected
+
+
 def lean_execution_checkpoint_layers_v3(
     layer_indices,
 ) -> tuple[int, ...]:
@@ -171,6 +230,7 @@ def expected_lean_execution_anchor_inventory_v3(
     projection_dims: Mapping[str, tuple[int, int]],
     attention_kv_widths: Mapping[int, int],
     gdn_runtime_semantics=None,
+    moe_runtime_semantics=None,
     context_token_count: int | None = None,
 ) -> tuple[tuple[str, int, int], ...]:
     """Return the exact signed lean pre-nonce stage inventory.
@@ -190,6 +250,23 @@ def expected_lean_execution_anchor_inventory_v3(
         raise ProofV3Error("lean K/V geometry is malformed")
 
     records: list[tuple[str, int, int]] = []
+    if moe_runtime_semantics is None:
+        moe_layers = frozenset()
+    elif not isinstance(moe_runtime_semantics, MoeRuntimeSemanticsV3):
+        raise ProofV3Error("lean MoE execution-anchor semantics are malformed")
+    else:
+        moe_layers = frozenset(
+            item.layer_index for item in moe_runtime_semantics.layers
+        )
+        if (
+            not moe_layers.issubset(
+                layer for layer, _kind in layers_and_kinds
+            )
+            or moe_runtime_semantics.hidden_size != hidden
+        ):
+            raise ProofV3Error(
+                "lean MoE execution-anchor geometry is inconsistent"
+            )
     checkpoints = set(lean_execution_checkpoint_layers_v3(
         layer for layer, _kind in layers_and_kinds
     ))
@@ -197,6 +274,30 @@ def expected_lean_execution_anchor_inventory_v3(
         if layer in checkpoints:
             records.append(
                 (f"l{layer}.residual_out", sequence, hidden * 2)
+            )
+        if layer in moe_layers:
+            records.extend(
+                (
+                    (f"l{layer}.moe_input", sequence, hidden * 2),
+                    (
+                        f"l{layer}.moe_router_logits",
+                        sequence,
+                        moe_runtime_semantics.num_experts
+                        * moe_runtime_encoding_bytes_v3(
+                            moe_runtime_semantics.router_encoding_id
+                        ),
+                    ),
+                    (
+                        f"l{layer}.residual_after_attention",
+                        sequence,
+                        hidden * 2,
+                    ),
+                    (
+                        f"l{layer}.moe_aggregate_output",
+                        sequence,
+                        hidden * 2,
+                    ),
+                )
             )
         if kind == "full_attention":
             dims = projection_dims.get(f"l{layer}.qkv")
@@ -662,6 +763,8 @@ def expected_lean_execution_anchor_reveals_v3(
     layer_kinds: Mapping[int, str],
     attention_rows_by_layer: Mapping[int, tuple[int, ...]] | None = None,
     gdn_runtime_semantics=None,
+    moe_runtime_semantics=None,
+    minimum_moe_position: int = 0,
     complete_gdn_projection_window: bool = False,
 ) -> tuple[tuple[str, tuple[int, ...]], ...]:
     """Return exact precommitted boundary rows needed by one hard audit.
@@ -689,6 +792,18 @@ def expected_lean_execution_anchor_reveals_v3(
         layer_indices=layers,
     )
     checkpoints = set(lean_execution_checkpoint_layers_v3(layers))
+    if moe_runtime_semantics is None:
+        moe_layers = frozenset()
+    elif not isinstance(moe_runtime_semantics, MoeRuntimeSemanticsV3):
+        raise ProofV3Error("lean MoE execution-anchor semantics are malformed")
+    else:
+        moe_layers = frozenset(
+            item.layer_index for item in moe_runtime_semantics.layers
+        )
+        if not moe_layers.issubset(layers):
+            raise ProofV3Error(
+                "lean MoE execution-anchor layers are inconsistent"
+            )
 
     sampled_positions = {
         int(challenge.candidate_sequence_positions[row])
@@ -720,6 +835,18 @@ def expected_lean_execution_anchor_reveals_v3(
             expected.setdefault(
                 f"l{previous}.residual_out", set()
             ).update(sampled_positions)
+        if layer in moe_layers:
+            moe_position = challenge.moe_token_position_for(
+                layer_index=layer,
+                minimum_position=minimum_moe_position,
+            )
+            for suffix in LEAN_MOE_RUNTIME_STAGE_SUFFIXES_V3:
+                expected.setdefault(f"l{layer}.{suffix}", set()).add(
+                    moe_position
+                )
+            expected.setdefault(f"l{layer}.residual_out", set()).add(
+                moe_position
+            )
     for layer in audited:
         if kinds[layer] == "gdn":
             semantics = (

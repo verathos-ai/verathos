@@ -102,7 +102,7 @@ def projection_anchor_from_replay_v3(
         replay_stage.leaf_hashes[offset : offset + 32]
         for offset in range(0, len(replay_stage.leaf_hashes), 32)
     )
-    tree = MerkleTree.from_leaf_hashes(leaf_hashes)
+    tree = MerkleTree.from_leaf_hashes(list(leaf_hashes))
     if tree.root != commitment.root:
         raise ProofV3Error(
             "selected-trace replay anchor root changed"
@@ -187,14 +187,14 @@ class _ReplayAnchorRegistryV3:
         tree = self._trees.get(commitment.stage_id)
         if tree is None:
             tree = MerkleTree.from_leaf_hashes(
-                tuple(
+                [
                     stage.leaf_hashes[offset : offset + 32]
                     for offset in range(
                         0,
                         len(stage.leaf_hashes),
                         32,
                     )
-                )
+                ]
             )
             if tree.root != commitment.root:
                 raise ProofV3Error(

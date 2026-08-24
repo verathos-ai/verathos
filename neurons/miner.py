@@ -72,6 +72,7 @@ PROOF_V3_EXECUTION_PROFILE_ENV = "VERATHOS_PROOF_V3_EXECUTION_PROFILE"
 PROOF_V3_CALIBRATION_SET_ENV = "VERATHOS_PROOF_V3_CALIBRATION_SET"
 PROOF_V3_ATTENTION_SEMANTICS_ENV = "VERATHOS_PROOF_V3_ATTENTION_SEMANTICS"
 PROOF_V3_GDN_SEMANTICS_ENV = "VERATHOS_PROOF_V3_GDN_SEMANTICS"
+PROOF_V3_MOE_SEMANTICS_ENV = "VERATHOS_PROOF_V3_MOE_SEMANTICS"
 PROOF_V3_LM_HEAD_CATALOG_ENV = "VERATHOS_PROOF_V3_LM_HEAD_CATALOG"
 PROOF_V3_PROJECTION_MANIFEST_ENV = "VERATHOS_PROOF_V3_PROJECTION_MANIFEST"
 PROOF_V3_PROJECTION_CATALOG_ENV = "VERATHOS_PROOF_V3_PROJECTION_CATALOG"
@@ -604,6 +605,7 @@ def _forward_proof_v3_artifacts(
     calibration_set: str | None,
     attention_semantics: str | None,
     gdn_semantics: str | None,
+    moe_semantics: str | None,
     lm_head_catalog: str | None,
     projection_manifest: str | None,
     projection_catalog: str | None,
@@ -619,6 +621,7 @@ def _forward_proof_v3_artifacts(
         ("--proof-v3-calibration-set", calibration_set),
         ("--proof-v3-attention-semantics", attention_semantics),
         ("--proof-v3-gdn-semantics", gdn_semantics),
+        ("--proof-v3-moe-semantics", moe_semantics),
         ("--proof-v3-lm-head-catalog", lm_head_catalog),
         ("--proof-v3-projection-manifest", projection_manifest),
         ("--proof-v3-projection-catalog", projection_catalog),
@@ -646,6 +649,7 @@ def _apply_proof_v3_release_descriptor(args, descriptor_path: str) -> None:
         "proof_v3_calibration_set": "calibration_set",
         "proof_v3_attention_semantics": "attention_runtime_semantics",
         "proof_v3_gdn_semantics": "gdn_runtime_semantics",
+        "proof_v3_moe_semantics": "moe_runtime_semantics",
         "proof_v3_lm_head_catalog": "lm_head_catalog",
         "proof_v3_projection_manifest": "projection_manifest",
         "proof_v3_projection_catalog": "projection_catalog",
@@ -2173,6 +2177,14 @@ def parse_args():
         ),
     )
     proof_v3_group.add_argument(
+        "--proof-v3-moe-semantics",
+        default=os.environ.get(PROOF_V3_MOE_SEMANTICS_ENV),
+        help=(
+            "Manifest-bound sparse-MoE runtime semantics when required "
+            f"(env: {PROOF_V3_MOE_SEMANTICS_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
         "--proof-v3-lm-head-catalog",
         default=os.environ.get(PROOF_V3_LM_HEAD_CATALOG_ENV),
         help=(
@@ -2828,6 +2840,7 @@ def main():
         calibration_set=args.proof_v3_calibration_set,
         attention_semantics=args.proof_v3_attention_semantics,
         gdn_semantics=args.proof_v3_gdn_semantics,
+        moe_semantics=args.proof_v3_moe_semantics,
         lm_head_catalog=args.proof_v3_lm_head_catalog,
         projection_manifest=args.proof_v3_projection_manifest,
         projection_catalog=args.proof_v3_projection_catalog,

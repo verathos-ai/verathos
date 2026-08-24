@@ -164,6 +164,9 @@ class ProjectionManifestV3:
     # Digest of the signed Qwen GDN recurrence/state-layout artifact.
     # Mandatory when the qualified execution profile contains GDN layers.
     gdn_runtime_semantics_digest: bytes = b""
+    # Digest of the signed sparse-MoE routing, dispatch, expert, shared-expert,
+    # aggregation and residual semantics. Mandatory for sparse-MoE profiles.
+    moe_runtime_semantics_digest: bytes = b""
     # SIGNED decoder/final RMSNorm ABI. Most model families use the stored
     # weight directly; Gemma/Qwen3.5-style layers apply ``1 + weight``.
     # Epsilon is encoded as the exact float64 bit pattern used at runtime.
@@ -236,6 +239,17 @@ class ProjectionManifestV3:
             self.rms_norm_semantics_id,
             self.rms_norm_epsilon_bits,
         )
+        for name, digest in (
+            ("attention runtime semantics", self.attn_runtime_semantics_digest),
+            ("GDN runtime semantics", self.gdn_runtime_semantics_digest),
+            ("MoE runtime semantics", self.moe_runtime_semantics_digest),
+        ):
+            if digest and (
+                not isinstance(digest, bytes)
+                or len(digest) != 32
+                or digest == bytes(32)
+            ):
+                raise ProofV3Error(f"{name} digest is malformed")
 
     def canonical_bytes(self) -> bytes:
         """Deterministic serialization (the signed + hashed payload)."""
@@ -334,6 +348,14 @@ class ProjectionManifestV3:
                         self.gdn_runtime_semantics_digest.hex()
                 }
                 if self.gdn_runtime_semantics_digest
+                else {}
+            ),
+            **(
+                {
+                    "moe_runtime_semantics_digest":
+                        self.moe_runtime_semantics_digest.hex()
+                }
+                if self.moe_runtime_semantics_digest
                 else {}
             ),
             **(
@@ -459,6 +481,9 @@ class ProjectionManifestV3:
             gdn_runtime_semantics_digest=bytes.fromhex(
                 obj.get("gdn_runtime_semantics_digest", "")
             ),
+            moe_runtime_semantics_digest=bytes.fromhex(
+                obj.get("moe_runtime_semantics_digest", "")
+            ),
             rms_norm_semantics_id=obj.get(
                 "rms_norm_semantics_id",
                 RMSNORM_WEIGHT_GAIN_V3,
@@ -512,7 +537,8 @@ def build_projection_manifest_v3(
     entries = []
     for name in sorted(weights):
         include_row_sq = (
-            name.rsplit(".", 1)[-1].lower() in row_norm_projections
+            ".moe." not in name.lower()
+            and name.rsplit(".", 1)[-1].lower() in row_norm_projections
         )
         if fast:
             # tensor-fast root path (byte-identical to the reference,

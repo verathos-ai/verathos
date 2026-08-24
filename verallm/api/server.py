@@ -598,9 +598,27 @@ def _register_proof_v3_economic_pool_capture(
     )
     registered_keys = set(economic_pool_keys).union(split_stages)
     if (0, "residual_in") not in registered_keys:
-        raise RuntimeError(
-            "proof-v3 initial economic-pool residual witness is unavailable"
+        response_stamp_records = tuple(
+            record
+            for wrapper in capture_wrappers
+            for inventory in (
+                getattr(
+                    type(wrapper),
+                    "proof_capture_response_stamp_buffer",
+                    None,
+                ),
+            )
+            if inventory is not None
+            for record in inventory(wrapper)
         )
+        if len(response_stamp_records) != 1:
+            raise RuntimeError(
+                "proof-v3 initial economic-pool residual witness is "
+                "unavailable"
+            )
+        response_stamp = response_stamp_records[0]
+        tracker.register_response_stamp_capture(response_stamp)
+        economic_pool_buffers.append(response_stamp[:3])
 
     tracker.register_economic_pool_buffers(tuple(economic_pool_buffers))
     tracker.register_split_economic_pool_stages(split_stages)
@@ -1252,6 +1270,17 @@ async def health():
         else None,
         "proof_protocol_versions": _advertised_proof_protocol_versions(),
     }
+    execution_profile = getattr(state.miner, "execution_profile", None)
+    if execution_profile is not None:
+        result["execution_profile"] = {
+            "adapter": execution_profile.adapter_id,
+            "revision": execution_profile.revision,
+            "architecture_fingerprint": (
+                execution_profile.architecture_fingerprint_sha256
+            ),
+            "modality": execution_profile.supported_modality,
+            "mtp_enabled": execution_profile.mtp_enabled,
+        }
     if state.gpu_name:
         result["hardware"] = {
             "gpu_name": state.gpu_name,
@@ -1854,6 +1883,17 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
         return d
 
     messages_dicts = [_msg_to_dict(m) for m in body.messages]
+    execution_profile = getattr(state.miner, "execution_profile", None)
+    if execution_profile is not None and execution_profile.text_only:
+        from verallm.service_profile import (
+            UnsupportedModalityError,
+            normalize_text_only_chat_messages,
+        )
+
+        try:
+            messages_dicts = normalize_text_only_chat_messages(messages_dicts)
+        except UnsupportedModalityError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
     # Compute prompt_hash from the canonical messages JSON for input integrity.
     # Stored as local var (not on state) to avoid race conditions between
     # concurrent requests — state._current_prompt_hash was shared/mutable.
@@ -4911,6 +4951,19 @@ def _proof_v3_execution_capture_requested(args) -> bool:
     )
 
 
+def _proof_v3_lean_root_suffixes(manifest) -> tuple[str, ...]:
+    """Return the exact graph-root stages required before the nonce."""
+
+    from verallm.proof_v3.lean_execution_anchor import (
+        LEAN_MOE_RUNTIME_STAGE_SUFFIXES_V3,
+    )
+
+    suffixes = ["attention_kv_output", "residual_out"]
+    if getattr(manifest, "moe_runtime_semantics_digest", b""):
+        suffixes.extend(LEAN_MOE_RUNTIME_STAGE_SUFFIXES_V3)
+    return tuple(suffixes)
+
+
 def _proof_execution_capture_modes(
     args,
     *,
@@ -5000,7 +5053,7 @@ def _prepare_proof_v3_graph_capture(args, *, expected_model_id: str):
     from pathlib import Path
 
     from verallm.proof_v3.capture_staging import (
-        recommended_dense_capture_staging_rows_v3,
+        recommended_capture_staging_rows_v3,
     )
     from verallm.proof_v3.economic_profile import (
         infer_economic_manifest_layer_kinds_v3,
@@ -5035,12 +5088,61 @@ def _prepare_proof_v3_graph_capture(args, *, expected_model_id: str):
             "proof-v3 graph-capture manifest does not match the model"
         )
 
+    moe_semantics_path = str(
+        getattr(args, "proof_v3_moe_semantics", None)
+        or os.environ.get("VERATHOS_PROOF_V3_MOE_SEMANTICS", "")
+    ).strip()
+    moe_semantics_digest = getattr(
+        manifest,
+        "moe_runtime_semantics_digest",
+        b"",
+    )
+    moe_router_encoding_id = None
+    moe_runtime_semantics = None
+    if moe_semantics_digest:
+        from verallm.proof_v3.moe_runtime_semantics import (
+            load_moe_runtime_semantics_v3,
+        )
+
+        if not moe_semantics_path:
+            raise RuntimeError(
+                "proof-v3 sparse-MoE graph capture requires its runtime "
+                "semantics artifact"
+            )
+        semantics_path = Path(moe_semantics_path)
+        try:
+            if (
+                semantics_path.stat().st_size
+                > MAX_PROOF_V3_MANIFEST_ARTIFACT_BYTES
+            ):
+                raise ProofV3Error(
+                    "proof-v3 MoE runtime semantics artifact is too large"
+                )
+            moe_runtime_semantics = load_moe_runtime_semantics_v3(
+                str(semantics_path)
+            )
+        except (OSError, ProofV3Error) as exc:
+            raise RuntimeError(
+                "proof-v3 MoE runtime semantics could not be loaded"
+            ) from exc
+        if moe_runtime_semantics.digest() != moe_semantics_digest:
+            raise RuntimeError(
+                "proof-v3 MoE runtime semantics do not match the manifest"
+            )
+        moe_router_encoding_id = moe_runtime_semantics.router_encoding_id
+    elif moe_semantics_path:
+        raise RuntimeError(
+            "proof-v3 graph-capture manifest does not bind the configured "
+            "MoE runtime semantics"
+        )
+
     profile_path = str(
         getattr(args, "proof_v3_execution_profile", None)
         or os.environ.get("VERATHOS_PROOF_V3_EXECUTION_PROFILE", "")
     ).strip()
     lean_capture = False
     prefix_cache_sharing = False
+    relation_spec = None
     if profile_path:
         from verallm.proof_v3.document import (
             load_signed_execution_profile_document_v3,
@@ -5089,7 +5191,46 @@ def _prepare_proof_v3_graph_capture(args, *, expected_model_id: str):
         for index, kind in enumerate(layer_kinds)
         if kind == "full_attention"
     )
-    staging_rows = recommended_dense_capture_staging_rows_v3(manifest)
+    staging_rows = recommended_capture_staging_rows_v3(
+        manifest,
+        moe_runtime_semantics=moe_runtime_semantics,
+    )
+    capture_adapter_id = None
+    capture_selected_layer_count = None
+    if lean_capture and moe_semantics_digest:
+        from verallm.miner.execution_profile import (
+            QWEN_HYBRID_MOE_ROOT_HISTORY_CAPTURE_V3,
+            qualified_vllm_execution_profile,
+        )
+
+        runtime_profile = qualified_vllm_execution_profile(
+            expected_model_id
+        )
+        if runtime_profile is not None:
+            capture_adapter_id = runtime_profile.proof_capture_adapter_id
+        if capture_adapter_id not in (
+            None,
+            QWEN_HYBRID_MOE_ROOT_HISTORY_CAPTURE_V3,
+        ):
+            raise RuntimeError(
+                "proof-v3 graph-capture adapter is unsupported"
+            )
+        if capture_adapter_id is not None:
+            raw_selected_layer_count = getattr(
+                getattr(relation_spec, "audit_policy", None),
+                "selected_layer_count",
+                None,
+            )
+            if (
+                isinstance(raw_selected_layer_count, bool)
+                or not isinstance(raw_selected_layer_count, int)
+                or raw_selected_layer_count <= 0
+            ):
+                raise RuntimeError(
+                    "qualified sparse graph capture requires its signed "
+                    "selected-layer bound"
+                )
+            capture_selected_layer_count = raw_selected_layer_count
     legacy_full_rows = str(
         os.environ.get("VERALLM_CAPTURE_FULL_ROWS", "")
     ).strip()
@@ -5107,16 +5248,28 @@ def _prepare_proof_v3_graph_capture(args, *, expected_model_id: str):
             LEAN_EXECUTION_CHECKPOINT_STRIDE_V3,
         )
 
-        expected_environment.update(
-            {
-                "VERALLM_CAPTURE_ROOT_SUFFIXES": (
-                    "attention_kv_output,residual_out"
-                ),
-                "VERALLM_CAPTURE_ROOT_CHECKPOINT_STRIDE": str(
-                    LEAN_EXECUTION_CHECKPOINT_STRIDE_V3
-                ),
-            }
-        )
+        if capture_adapter_id is not None:
+            expected_environment.update(
+                {
+                    "VERALLM_CAPTURE_ROOT_SUFFIXES": (
+                        "attention_kv_output,moe_aggregate_output,moe_input,"
+                        "moe_router_logits,residual_after_attention,"
+                        "residual_out"
+                    ),
+                    "VERALLM_CAPTURE_ROOT_CHECKPOINT_STRIDE": "1",
+                }
+            )
+        else:
+            expected_environment.update(
+                {
+                    "VERALLM_CAPTURE_ROOT_SUFFIXES": ",".join(
+                        _proof_v3_lean_root_suffixes(manifest)
+                    ),
+                    "VERALLM_CAPTURE_ROOT_CHECKPOINT_STRIDE": str(
+                        LEAN_EXECUTION_CHECKPOINT_STRIDE_V3
+                    ),
+                }
+            )
     else:
         for name in (
             "VERALLM_CAPTURE_ROOT_SUFFIXES",
@@ -5143,6 +5296,21 @@ def _prepare_proof_v3_graph_capture(args, *, expected_model_id: str):
     setattr(args, "_proof_v3_full_attention_layers", full_attention_layers)
     setattr(args, "_proof_v3_layer_kinds", layer_kinds)
     setattr(args, "_proof_v3_lean_capture", lean_capture)
+    setattr(
+        args,
+        "_proof_v3_capture_adapter_id",
+        capture_adapter_id,
+    )
+    setattr(
+        args,
+        "_proof_v3_capture_selected_layer_count",
+        capture_selected_layer_count,
+    )
+    setattr(
+        args,
+        "_proof_v3_moe_router_encoding_id",
+        moe_router_encoding_id,
+    )
     setattr(
         args,
         "_proof_v3_prefix_cache_sharing",
@@ -5300,6 +5468,7 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
     )
     from verallm.miner.economic_proof_v3_weights import (
         EconomicProofV3WeightStore,
+        economic_runtime_projection_names_v3,
         prepare_economic_proof_v3_weight_startup_v3,
         validate_compact_projection_catalog_runtime_v3,
     )
@@ -5308,9 +5477,6 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
     )
     from verallm.proof_v3.economic_release import (
         load_qualified_economic_proof_v3_release,
-    )
-    from verallm.proof_v3.economic_challenge import (
-        audited_projections_for_layer_kind_v3,
     )
     from verallm.proof_v3.native_reference_tree_accelerator import (
         install_fused_reference_acceleration,
@@ -5405,6 +5571,10 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
             str(getattr(args, "proof_v3_gdn_semantics", None) or "").strip()
             or None
         ),
+        moe_runtime_semantics_path=(
+            str(getattr(args, "proof_v3_moe_semantics", None) or "").strip()
+            or None
+        ),
         lm_head_catalog_path=lm_head_catalog_path,
         expected_model_id=model_spec.model_id,
         expected_authorities=authority.signers,
@@ -5447,15 +5617,15 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
             getattr(args, "proof_v3_weight_cache_dir", None) or None
         ),
         compact_selected_trace=compact_static_weights,
+        moe_weight_reader=getattr(miner, "_gptq_moe_reader", None),
     )
     base_started = time.perf_counter()
-    challenge_names = {
-        f"l{layer}.{manifest_suffix}"
-        for layer, kind in enumerate(layer_kinds)
-        for _x_suffix, _s_suffix, manifest_suffix in (
-            audited_projections_for_layer_kind_v3(kind)
+    challenge_names, catalog_challenge_names = (
+        economic_runtime_projection_names_v3(
+            manifest=release.manifest,
+            layer_kinds=layer_kinds,
         )
-    }
+    )
     (
         lm_head_compute_bytes,
         reclaimed_weight_cache_bytes,
@@ -5471,7 +5641,7 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
             validate_compact_projection_catalog_runtime_v3(
                 weight_store=weight_store,
                 projection_catalog=release.artifacts.lean_projection_catalog,
-                projection_names=challenge_names,
+                projection_names=catalog_challenge_names,
             )
         )
     base_seconds = time.perf_counter() - base_started
@@ -5882,6 +6052,21 @@ def startup(args):
         # residual, GDN, attention-reduction and terminal capture path above,
         # but must not place this Python v2 wrapper in its compiled model.
         proof_v2_full_attention_state_capture=full_attention_state_capture,
+        proof_v3_moe_router_encoding_id=getattr(
+            args,
+            "_proof_v3_moe_router_encoding_id",
+            None,
+        ),
+        proof_v3_capture_adapter_id=getattr(
+            args,
+            "_proof_v3_capture_adapter_id",
+            None,
+        ),
+        proof_v3_capture_selected_layer_count=getattr(
+            args,
+            "_proof_v3_capture_selected_layer_count",
+            None,
+        ),
         **vllm_kwargs,
     )
 
@@ -6125,7 +6310,7 @@ def startup(args):
             # NOTE: has_capture_buffers is populated LATER, so detect mode
             # directly from already-wrapped gate_proj modules here.
             _use_buffer = False
-            if not miner.is_moe and miner._use_cuda_graphs:
+            if miner._use_cuda_graphs:
                 from verallm.vllm_plugin.capture_linear import (
                     CaptureDecoderLayerWrapper,
                     CaptureLinearWrapper,
@@ -6135,9 +6320,19 @@ def startup(args):
                     mlp = miner._get_mlp(layer)
                     if mlp is None:
                         continue
+                    if (
+                        miner.is_moe
+                        and isinstance(mlp, CaptureLinearWrapper)
+                        and mlp._capture_input_suffix == "moe_input"
+                    ):
+                        _use_buffer = bool(mlp._use_buffer)
+                        break
                     gate = miner._get_gate_proj(mlp)
-                    if isinstance(gate, CaptureLinearWrapper):
-                        _use_buffer = bool(getattr(gate, "_use_buffer", False))
+                    if not miner.is_moe and isinstance(
+                        gate,
+                        CaptureLinearWrapper,
+                    ):
+                        _use_buffer = bool(gate._use_buffer)
                         break
             elif miner.is_moe and getattr(miner, "_moe_buffer_mode", False):
                 _use_buffer = True
@@ -6263,8 +6458,10 @@ def startup(args):
                         f"Batch mode: pre-warmed {n_prewarmed} router weights to CPU"
                     )
 
-            # Register buffer-mode capture layers for dense models.
-            if not miner.is_moe and not _skip_capture:
+            # Register every proof-bound projection/block wrapper. Sparse MoE
+            # layers share this inventory for their attention/GDN, router,
+            # aggregate and residual stages.
+            if not _skip_capture:
                 from verallm.vllm_plugin.capture_linear import (
                     CaptureDecoderLayerWrapper,
                     CaptureLinearWrapper,
@@ -6288,10 +6485,21 @@ def startup(args):
                 seen_wrappers = set()
                 for layer in layers:
                     for module in layer.modules():
+                        root_inventory = getattr(
+                            type(module),
+                            "proof_capture_root_buffers",
+                            None,
+                        )
                         if (
-                            isinstance(
-                                module,
-                                (CaptureLinearWrapper, CaptureDecoderLayerWrapper),
+                            (
+                                isinstance(
+                                    module,
+                                    (
+                                        CaptureLinearWrapper,
+                                        CaptureDecoderLayerWrapper,
+                                    ),
+                                )
+                                or root_inventory is not None
                             )
                             and id(module) not in reduction_wrapper_ids
                             and id(module) not in seen_wrappers
@@ -6317,6 +6525,22 @@ def startup(args):
                         for wrapper in capture_wrappers
                         if wrapper.proof_capture_root_buffers()
                     ]
+                    seen_root_wrapper_ids = {
+                        id(wrapper) for wrapper in root_wrappers
+                    }
+                    for wrappers in reduction_wrappers.values():
+                        for wrapper in (
+                            wrappers.get("qkv"),
+                            wrappers.get("o"),
+                        ):
+                            if (
+                                wrapper is not None
+                                and id(wrapper)
+                                not in seen_root_wrapper_ids
+                                and wrapper.proof_capture_root_buffers()
+                            ):
+                                seen_root_wrapper_ids.add(id(wrapper))
+                                root_wrappers.append(wrapper)
                     root_buffers = tuple(
                         item
                         for wrapper in root_wrappers
@@ -6324,7 +6548,11 @@ def startup(args):
                     )
                     split_root_row_aliases = tuple(
                         item
-                        for wrapper in root_wrappers
+                        # A qualified sparse QKV split wrapper owns the exact
+                        # whole-step source slice but deliberately does not
+                        # allocate a second root buffer. Retained-lane replay
+                        # still needs that authenticated split alias.
+                        for wrapper in capture_wrappers
                         if isinstance(wrapper, CaptureLinearWrapper)
                         for item in wrapper.proof_capture_split_row_aliases()
                     )
@@ -6332,6 +6560,50 @@ def startup(args):
                         tracker.register_execution_anchor_root_buffers(
                             root_buffers
                         )
+                        root_histories = tuple(
+                            item
+                            for wrapper in root_wrappers
+                            for history_source in (
+                                getattr(
+                                    wrapper,
+                                    "proof_capture_root_history",
+                                    None,
+                                ),
+                            )
+                            if history_source is not None
+                            for item in history_source()
+                        )
+                        if root_histories:
+                            if len(root_histories) != 1:
+                                raise RuntimeError(
+                                    "proof capture root history inventory "
+                                    "is ambiguous"
+                                )
+                            tracker.register_execution_anchor_root_history(
+                                *root_histories[0]
+                            )
+                        root_finalizers = tuple(
+                            item
+                            for wrapper in root_wrappers
+                            for finalizer_source in (
+                                getattr(
+                                    wrapper,
+                                    "proof_capture_root_finalizer",
+                                    None,
+                                ),
+                            )
+                            if finalizer_source is not None
+                            for item in finalizer_source()
+                        )
+                        if root_finalizers:
+                            if len(root_finalizers) != 1:
+                                raise RuntimeError(
+                                    "proof capture root finalizer inventory "
+                                    "is ambiguous"
+                                )
+                            tracker.register_execution_anchor_root_post_graph_finalizer(
+                                root_finalizers[0]
+                            )
                         root_staging_buffers = tuple(
                             (
                                 int(binding.stage_id.split(".", 1)[0][1:]),
@@ -6340,7 +6612,15 @@ def startup(args):
                                 binding.row_width,
                             )
                             for wrapper in root_wrappers
-                            for binding in wrapper._runtime_root_bindings()
+                            for binding_source in (
+                                getattr(
+                                    wrapper,
+                                    "_runtime_root_bindings",
+                                    None,
+                                ),
+                            )
+                            if binding_source is not None
+                            for binding in binding_source()
                             for staging in (
                                 getattr(
                                     binding.owner,
@@ -6355,7 +6635,15 @@ def startup(args):
                         root_retention_records = tuple(
                             item
                             for wrapper in root_wrappers
-                            for item in wrapper.proof_capture_root_retention()
+                            for retention_source in (
+                                getattr(
+                                    wrapper,
+                                    "proof_capture_root_retention",
+                                    None,
+                                ),
+                            )
+                            if retention_source is not None
+                            for item in retention_source()
                         )
                         tracker.register_execution_anchor_root_retention(
                             root_retention_records
@@ -6562,6 +6850,29 @@ def startup(args):
                         ),
                     )
 
+                    gdn_root_histories = tuple(
+                        item
+                        for layer in layers
+                        for module in layer.modules()
+                        for history_source in (
+                            getattr(
+                                module,
+                                "proof_capture_gdn_root_history",
+                                None,
+                            ),
+                        )
+                        if history_source is not None
+                        for item in history_source()
+                    )
+                    if gdn_root_histories:
+                        if len(gdn_root_histories) != 1:
+                            raise RuntimeError(
+                                "proof-v3 GDN root history inventory is "
+                                "ambiguous"
+                            )
+                        tracker.register_gdn_decode_checkpoint_root_history(
+                            *gdn_root_histories[0]
+                        )
                     gdn_modules = []
                     for layer_index, layer in enumerate(layers):
                         owner = layer
@@ -7210,6 +7521,11 @@ def parse_args():
         "--proof-v3-gdn-semantics",
         default=os.environ.get("VERATHOS_PROOF_V3_GDN_SEMANTICS") or None,
         help="Path to manifest-bound GDN runtime semantics when required",
+    )
+    parser.add_argument(
+        "--proof-v3-moe-semantics",
+        default=os.environ.get("VERATHOS_PROOF_V3_MOE_SEMANTICS") or None,
+        help="Path to manifest-bound sparse-MoE runtime semantics when required",
     )
     parser.add_argument(
         "--proof-v3-lm-head-catalog",

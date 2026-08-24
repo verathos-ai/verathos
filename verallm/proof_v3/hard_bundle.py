@@ -23,8 +23,10 @@ from verallm.proof_v3.economic_registry import (
     verify_economic_execution_proof_v3,
 )
 from verallm.proof_v3.economic_transport import (
+    MAX_ECONOMIC_MOE_TRANSPORT_BYTES,
     MAX_ECONOMIC_TRANSPORT_BYTES,
     decode_economic_proof_transport_v3,
+    economic_proof_transport_maximum_bytes_v3,
 )
 from verallm.proof_v3.errors import ProofV3Error, ProofV3VerificationError
 from verallm.proof_v3.payload import (
@@ -50,20 +52,23 @@ from verallm.proof_v3.verifier import (
 )
 
 HARD_BUNDLE_FORMAT_VERSION_V3 = 1
-MAX_HARD_BUNDLE_BYTES_V3 = 64 << 20
+MAX_DENSE_HARD_BUNDLE_BYTES_V3 = 64 << 20
+MAX_HARD_BUNDLE_BYTES_V3 = 128 << 20
 MAX_HARD_BUNDLE_TOKEN_IDS_V3 = 1 << 20
 HARD_BUNDLE_MEDIA_TYPE_V3 = (
     "application/vnd.verathos.proof-v3-hard-bundle+octet-stream"
 )
 
 _MAGIC = b"V3HB"
-_FLAGS = 0
+_FLAGS_DENSE = 0
+_FLAGS_SPARSE_MOE = 1
 _HEADER = struct.Struct("<4sHHIIIIIIII")
 _DIGEST_DOMAIN = b"VERATHOS/PROOF_V3/RETAINED_HARD_BUNDLE/V1/SHA256"
 
 __all__ = [
     "HARD_BUNDLE_FORMAT_VERSION_V3",
     "HARD_BUNDLE_MEDIA_TYPE_V3",
+    "MAX_DENSE_HARD_BUNDLE_BYTES_V3",
     "MAX_HARD_BUNDLE_BYTES_V3",
     "RetainedHardProofBundleV3",
     "runtime_policy_from_nonce_reveal_v3",
@@ -77,6 +82,26 @@ def _fixed32(value: bytes, name: str, *, nonzero: bool = False) -> bytes:
     if nonzero and value == bytes(32):
         raise ProofV3VerificationError(f"{name} must not be the zero digest")
     return value
+
+
+def _retained_proof_transport_maximum_v3(encoded: bytes) -> int:
+    """Select a bundle lane while preserving bounded failed-proof capture."""
+
+    try:
+        return economic_proof_transport_maximum_bytes_v3(
+            encoded,
+            allow_sparse_moe=True,
+        )
+    except ProofV3Error:
+        # Validators intentionally retain malformed rejected responses for
+        # deterministic replay. Preserve that diagnostic behavior only inside
+        # the legacy dense byte ceiling; the larger sparse lane always needs a
+        # valid, explicit transport header.
+        if isinstance(encoded, bytes) and 0 < len(encoded) <= (
+            MAX_ECONOMIC_TRANSPORT_BYTES
+        ):
+            return MAX_ECONOMIC_TRANSPORT_BYTES
+        raise
 
 
 def _token_ids(values, name: str, *, positive: bool) -> tuple[int, ...]:
@@ -214,11 +239,15 @@ class RetainedHardProofBundleV3:
             raise ProofV3VerificationError(
                 "retained hard bundle reveal has an unexpected type"
             )
-        if (
-            not isinstance(self.encoded_proof, bytes)
-            or not self.encoded_proof
-            or len(self.encoded_proof) > MAX_ECONOMIC_TRANSPORT_BYTES
-        ):
+        try:
+            proof_maximum = _retained_proof_transport_maximum_v3(
+                self.encoded_proof
+            )
+        except ProofV3Error as exc:
+            raise ProofV3VerificationError(
+                "retained hard bundle proof transport is malformed"
+            ) from exc
+        if not self.encoded_proof or len(self.encoded_proof) > proof_maximum:
             raise ProofV3VerificationError(
                 "retained hard bundle proof bytes are out of range"
             )
@@ -282,6 +311,16 @@ class RetainedHardProofBundleV3:
         )
 
     def canonical_bytes(self) -> bytes:
+        proof_maximum = _retained_proof_transport_maximum_v3(
+            self.encoded_proof
+        )
+        sparse_moe = proof_maximum == MAX_ECONOMIC_MOE_TRANSPORT_BYTES
+        flags = _FLAGS_SPARSE_MOE if sparse_moe else _FLAGS_DENSE
+        bundle_maximum = (
+            MAX_HARD_BUNDLE_BYTES_V3
+            if sparse_moe
+            else MAX_DENSE_HARD_BUNDLE_BYTES_V3
+        )
         precommit = self.precommit_context.canonical_bytes()
         envelope = self.envelope.canonical_bytes()
         reveal = self.nonce_reveal.canonical_bytes()
@@ -298,7 +337,7 @@ class RetainedHardProofBundleV3:
                 _HEADER.pack(
                     _MAGIC,
                     HARD_BUNDLE_FORMAT_VERSION_V3,
-                    _FLAGS,
+                    flags,
                     len(precommit),
                     len(envelope),
                     len(reveal),
@@ -318,7 +357,7 @@ class RetainedHardProofBundleV3:
                 self.encoded_proof,
             )
         )
-        if len(encoded) > MAX_HARD_BUNDLE_BYTES_V3:
+        if len(encoded) > bundle_maximum:
             raise ProofV3VerificationError(
                 "retained hard bundle exceeds its byte limit"
             )
@@ -358,10 +397,25 @@ class RetainedHardProofBundleV3:
         if (
             magic != _MAGIC
             or version != HARD_BUNDLE_FORMAT_VERSION_V3
-            or flags != _FLAGS
+            or flags not in {_FLAGS_DENSE, _FLAGS_SPARSE_MOE}
         ):
             raise ProofV3VerificationError(
                 "retained hard bundle header is unsupported"
+            )
+        sparse_moe = flags == _FLAGS_SPARSE_MOE
+        bundle_maximum = (
+            MAX_HARD_BUNDLE_BYTES_V3
+            if sparse_moe
+            else MAX_DENSE_HARD_BUNDLE_BYTES_V3
+        )
+        proof_maximum = (
+            MAX_ECONOMIC_MOE_TRANSPORT_BYTES
+            if sparse_moe
+            else MAX_ECONOMIC_TRANSPORT_BYTES
+        )
+        if len(encoded) > bundle_maximum:
+            raise ProofV3VerificationError(
+                "retained hard bundle byte length is out of range"
             )
         if (
             prompt_count == 0
@@ -370,7 +424,7 @@ class RetainedHardProofBundleV3:
             or output_count > MAX_HARD_BUNDLE_TOKEN_IDS_V3
             or text_len > MAX_OUTPUT_STREAM_BYTES_V3
             or not 0 < finish_len <= MAX_FINISH_REASON_BYTES_V3
-            or not 0 < proof_len <= MAX_ECONOMIC_TRANSPORT_BYTES
+            or not 0 < proof_len <= proof_maximum
             or not 0 < reveal_len <= MAX_NONCE_REVEAL_BYTES_V3
         ):
             raise ProofV3VerificationError(
@@ -414,6 +468,18 @@ class RetainedHardProofBundleV3:
                 "retained hard bundle finish reason is not UTF-8"
             ) from exc
         proof = take(proof_len)
+        try:
+            observed_proof_maximum = _retained_proof_transport_maximum_v3(
+                proof
+            )
+        except ProofV3Error as exc:
+            raise ProofV3VerificationError(
+                "retained hard bundle proof transport is malformed"
+            ) from exc
+        if observed_proof_maximum != proof_maximum:
+            raise ProofV3VerificationError(
+                "retained hard bundle sparse-MoE flag is inconsistent"
+            )
         if offset != len(encoded):
             raise ProofV3VerificationError(
                 "retained hard bundle has trailing bytes"
@@ -561,7 +627,20 @@ def verify_retained_hard_proof_bundle_v3(
         capability_requirement=require_economic_recompute_capability_v3,
     )
     try:
-        proof = decode_economic_proof_transport_v3(bundle.encoded_proof)
+        proof = decode_economic_proof_transport_v3(
+            bundle.encoded_proof,
+            allow_sparse_moe=bool(
+                getattr(
+                    getattr(
+                        qualified_profile.registration,
+                        "artifacts",
+                        None,
+                    ),
+                    "moe_runtime_semantics",
+                    None,
+                )
+            ),
+        )
     except ProofV3Error:
         raise
     except Exception as exc:

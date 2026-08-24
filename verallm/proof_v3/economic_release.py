@@ -36,6 +36,10 @@ from verallm.proof_v3.gdn_runtime_semantics import (
     GdnRuntimeSemanticsV3,
     load_gdn_runtime_semantics_v3,
 )
+from verallm.proof_v3.moe_runtime_semantics import (
+    MoeRuntimeSemanticsV3,
+    load_moe_runtime_semantics_v3,
+)
 from verallm.proof_v3.economic_lm_head_catalog_fold import (
     EconomicLmHeadCatalogArtifactV3,
 )
@@ -140,6 +144,7 @@ class EconomicProofV3RuntimeRelease:
     artifacts: EconomicVerifiedArtifactsV3
     profile: ExecutionSecurityProfileV3
     layer_kinds: tuple[str, ...]
+    moe_runtime_semantics: MoeRuntimeSemanticsV3 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +161,7 @@ def load_economic_proof_v3_runtime_release(
     calibration_set_path,
     attention_runtime_semantics_path,
     gdn_runtime_semantics_path=None,
+    moe_runtime_semantics_path=None,
     lm_head_catalog_path=None,
     expected_model_id: str,
     expected_authorities: Collection[str | bytes],
@@ -308,6 +314,19 @@ def load_economic_proof_v3_runtime_release(
             "signed manifest requires GDN runtime semantics"
         )
 
+    has_moe = bool(manifest.moe_runtime_semantics_digest)
+    if has_moe != bool(moe_runtime_semantics_path):
+        raise ProofV3VerificationError(
+            "MoE runtime semantics do not match the qualified manifest"
+        )
+    moe = (
+        load_moe_runtime_semantics_v3(str(moe_runtime_semantics_path))
+        if moe_runtime_semantics_path
+        else None
+    )
+    if moe is not None:
+        artifacts.authenticate_moe_runtime_semantics_v3(moe)
+
     artifacts.authenticate_tokenizer_binding_v3(tokenizer_binding_digest)
     profile = build_economic_execution_profile_v3(
         manifest=manifest,
@@ -315,6 +334,7 @@ def load_economic_proof_v3_runtime_release(
         calibration_set=calibration,
         attention_runtime_semantics=attention,
         gdn_runtime_semantics=gdn,
+        moe_runtime_semantics=moe,
         tokenizer_binding_digest=tokenizer_binding_digest,
         runtime_encoding_id=runtime_encoding_id,
         max_decode_tokens=max_decode_tokens,
@@ -352,6 +372,7 @@ def load_economic_proof_v3_runtime_release(
         calibration_set=calibration,
         attention_runtime_semantics=attention,
         gdn_runtime_semantics=gdn,
+        moe_runtime_semantics=moe,
         lm_head_catalog=lm_head_catalog,
         artifacts=artifacts,
         profile=profile,
@@ -366,6 +387,7 @@ def load_qualified_economic_proof_v3_release(
     calibration_set_path,
     attention_runtime_semantics_path,
     gdn_runtime_semantics_path=None,
+    moe_runtime_semantics_path=None,
     lm_head_catalog_path=None,
     expected_model_id: str,
     expected_authorities: Collection[str | bytes],
@@ -410,6 +432,7 @@ def load_qualified_economic_proof_v3_release(
         calibration_set_path=calibration_set_path,
         attention_runtime_semantics_path=attention_runtime_semantics_path,
         gdn_runtime_semantics_path=gdn_runtime_semantics_path,
+        moe_runtime_semantics_path=moe_runtime_semantics_path,
         lm_head_catalog_path=lm_head_catalog_path,
         expected_model_id=expected_model_id,
         expected_authorities=expected_authorities,

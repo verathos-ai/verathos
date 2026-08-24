@@ -21,6 +21,7 @@ from verallm.proof_v3.projection_manifest import (
 
 __all__ = [
     "EconomicVerifiedArtifactsV3",
+    "open_manifest_weight_range_v3",
     "open_manifest_weight_row_v3",
     "required_chunk_indices_v3",
 ]
@@ -89,7 +90,60 @@ def open_manifest_weight_row_v3(
         range_siblings=flat_range_sibling_digests_v3(
             tree._tree, required[0], required[-1]
         ),
-)
+    )
+
+
+def open_manifest_weight_range_v3(
+    *,
+    tree,
+    first_row: int,
+    row_count: int,
+    in_dim: int,
+    out_dim: int,
+    chunk_size: int,
+    weight_tensor=None,
+):
+    """Miner-side contiguous multi-row opening with one range multiproof."""
+
+    from verallm.proof_v3.economic_moe_wire import (
+        EconomicMoeWeightRangeRevealV3,
+    )
+
+    if (
+        isinstance(first_row, bool)
+        or not isinstance(first_row, int)
+        or isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or first_row < 0
+        or row_count <= 0
+        or first_row + row_count > out_dim
+        or in_dim <= 0
+        or out_dim <= 0
+        or chunk_size <= 0
+    ):
+        raise ProofV3Error("weight range geometry is malformed")
+    first_byte = first_row * in_dim
+    last_byte = (first_row + row_count) * in_dim - 1
+    required = tuple(
+        range(first_byte // chunk_size, last_byte // chunk_size + 1)
+    )
+    blob = bytearray()
+    for chunk_index in required:
+        _path, chunk_data = tree.get_proof(
+            chunk_index,
+            W_tensor=weight_tensor,
+        )
+        blob.extend(chunk_data)
+    return EconomicMoeWeightRangeRevealV3(
+        first_row=first_row,
+        row_count=row_count,
+        chunk_blob=bytes(blob),
+        range_siblings=flat_range_sibling_digests_v3(
+            tree._tree,
+            required[0],
+            required[-1],
+        ),
+    )
 
 
 def _require_projection_catalog_quantization_v3(
@@ -103,6 +157,9 @@ def _require_projection_catalog_quantization_v3(
     from verallm.proof_v3.lean_projection_fold import (
         lean_projection_operation_key_v3,
     )
+    from verallm.proof_v3.moe_projection_inventory import (
+        parse_moe_projection_name_v3,
+    )
 
     descriptor_by_key = {
         (
@@ -113,6 +170,11 @@ def _require_projection_catalog_quantization_v3(
         for descriptor in static_manifest.operations
     }
     for entry in projection_manifest.entries:
+        if parse_moe_projection_name_v3(entry.name) is not None:
+            # Sparse-MoE weights use their individually signed Merkle roots
+            # and post-commit range openings.  They deliberately do not
+            # occupy the dense full-output Pallas catalog.
+            continue
         if not entry.name.startswith("l") or "." not in entry.name:
             continue
         layer_text, projection = entry.name.split(".", 1)
@@ -207,6 +269,8 @@ class EconomicVerifiedArtifactsV3:
         self.attention_runtime_semantics = None
         # Digest-authenticated Qwen GDN recurrence/state-layout artifact.
         self.gdn_runtime_semantics = None
+        # Digest-authenticated sparse-MoE logical execution artifact.
+        self.moe_runtime_semantics = None
         # Miner-supplied opening of the audited layer's o_proj INPUT oracle
         # (l{layer}.attn_o_x) at the attention plan's sampled token
         # positions -- the runtime side of the output bridge.
@@ -288,6 +352,25 @@ class EconomicVerifiedArtifactsV3:
             )
         self.gdn_runtime_semantics = semantics
 
+    def authenticate_moe_runtime_semantics_v3(self, semantics) -> None:
+        from verallm.proof_v3.moe_runtime_semantics import (
+            MoeRuntimeSemanticsV3,
+        )
+
+        signed = self._manifest.moe_runtime_semantics_digest
+        if not signed:
+            raise ProofV3VerificationError(
+                "signed manifest pins no MoE runtime semantics"
+            )
+        if (
+            not isinstance(semantics, MoeRuntimeSemanticsV3)
+            or semantics.digest() != signed
+        ):
+            raise ProofV3VerificationError(
+                "MoE runtime semantics do not match the signed manifest"
+            )
+        self.moe_runtime_semantics = semantics
+
     def authenticate_tokenizer_binding_v3(self, tokenizer_digest: bytes) -> None:
         """Attach the validator-verified on-chain tokenizer digest."""
 
@@ -351,6 +434,9 @@ class EconomicVerifiedArtifactsV3:
             LeanProjectionCatalogV3,
             lean_projection_operation_key_v3,
         )
+        from verallm.proof_v3.moe_projection_inventory import (
+            parse_moe_projection_name_v3,
+        )
 
         if not isinstance(
             verified_v2_catalog_binding,
@@ -373,6 +459,8 @@ class EconomicVerifiedArtifactsV3:
             verified_v2_catalog_binding=verified_v2_catalog_binding,
         )
         for entry in self._manifest.entries:
+            if parse_moe_projection_name_v3(entry.name) is not None:
+                continue
             if not entry.name.startswith("l") or "." not in entry.name:
                 continue
             layer_text, projection = entry.name.split(".", 1)
@@ -582,3 +670,97 @@ class EconomicVerifiedArtifactsV3:
                 f"projection {name!r} authenticated chunks omit the row"
             )
         return tuple(row.tolist())
+
+    def verify_weight_range(self, *, name: str, reveal) -> bytes:
+        """Authenticate contiguous complete rows against one manifest root."""
+
+        from verallm.proof_v3.economic_moe_wire import (
+            EconomicMoeWeightRangeRevealV3,
+        )
+        from zkllm.crypto.merkle import hash_flat_chunk, hash_leaf, hash_node
+
+        if not isinstance(reveal, EconomicMoeWeightRangeRevealV3):
+            raise ProofV3VerificationError(
+                "weight range reveal has an unexpected type"
+            )
+        entry = self.entry(name)
+        if entry.orientation != "out_in":
+            raise ProofV3VerificationError(
+                f"projection {name!r} orientation {entry.orientation!r} is not "
+                "supported by the economic audit"
+            )
+        if reveal.first_row + reveal.row_count > entry.out_dim:
+            raise ProofV3VerificationError(
+                f"projection {name!r} row range exceeds the manifest out_dim"
+            )
+        chunk_size = self._manifest.chunk_size
+        first_byte = reveal.first_row * entry.in_dim
+        byte_count = reveal.row_count * entry.in_dim
+        last_byte = first_byte + byte_count - 1
+        required = tuple(
+            range(first_byte // chunk_size, last_byte // chunk_size + 1)
+        )
+        total_bytes = entry.in_dim * entry.out_dim
+        total_chunks = -(-total_bytes // chunk_size)
+        lengths = []
+        expected_blob_len = 0
+        for chunk_index in required:
+            start = chunk_index * chunk_size
+            length = min(chunk_size, total_bytes - start)
+            if length <= 0:
+                raise ProofV3VerificationError(
+                    f"projection {name!r} required chunk exceeds the tree"
+                )
+            lengths.append(length)
+            expected_blob_len += length
+        if len(reveal.chunk_blob) != expected_blob_len:
+            raise ProofV3VerificationError(
+                f"projection {name!r} chunk blob does not match the required range"
+            )
+        nodes = []
+        cursor = 0
+        for length in lengths:
+            chunk_bytes = reveal.chunk_blob[cursor : cursor + length]
+            cursor += length
+            nodes.append(hash_leaf(hash_flat_chunk(chunk_bytes)))
+        low, high = required[0], required[-1]
+        level_size = total_chunks
+        sibling_iter = iter(reveal.range_siblings)
+        try:
+            while level_size > 1:
+                if low % 2 == 1:
+                    nodes.insert(0, next(sibling_iter))
+                    low -= 1
+                if high % 2 == 0:
+                    if high == level_size - 1:
+                        nodes.append(nodes[-1])
+                    else:
+                        nodes.append(next(sibling_iter))
+                    high += 1
+                nodes = [
+                    hash_node(nodes[index], nodes[index + 1])
+                    for index in range(0, len(nodes), 2)
+                ]
+                low //= 2
+                high //= 2
+                level_size = (level_size + 1) // 2
+        except StopIteration as exc:
+            raise ProofV3VerificationError(
+                f"projection {name!r} range proof is missing siblings"
+            ) from exc
+        if (
+            next(sibling_iter, None) is not None
+            or len(nodes) != 1
+            or nodes[0] != entry.root
+        ):
+            raise ProofV3VerificationError(
+                f"projection {name!r} row range did not reconstruct the "
+                "signed manifest root"
+            )
+        blob_start = required[0] * chunk_size
+        offset = first_byte - blob_start
+        if offset < 0 or offset + byte_count > len(reveal.chunk_blob):
+            raise ProofV3VerificationError(
+                f"projection {name!r} authenticated chunks omit the row range"
+            )
+        return reveal.chunk_blob[offset : offset + byte_count]

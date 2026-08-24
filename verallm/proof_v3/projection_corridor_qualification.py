@@ -51,6 +51,20 @@ _MLP_ACTIVATION_NEGATIVE_CASES_V3 = frozenset(
         "saturated_mlp_activation_substitute",
     )
 )
+_MOE_RUNTIME_NEGATIVE_CASES_V3 = frozenset(
+    (
+        "moe_aggregate_output_mutation",
+        "moe_expert_down_mutation",
+        "moe_expert_gate_up_mutation",
+        "moe_padding_substitution",
+        "moe_postcommit_capacity_substitution",
+        "moe_residual_output_mutation",
+        "moe_router_output_mutation",
+        "moe_routing_weight_mutation",
+        "moe_selected_expert_substitution",
+        "moe_shared_expert_mutation",
+    )
+)
 _EVIDENCE_CLASSES_V3 = frozenset(
     (
         "real_model_wire",
@@ -78,6 +92,10 @@ _CASE_EVIDENCE_CLASSES_V3 = {
     **{
         case_id: frozenset(("qualified_relation_fixture",))
         for case_id in _MLP_ACTIVATION_NEGATIVE_CASES_V3
+    },
+    **{
+        case_id: frozenset(("qualified_relation_fixture",))
+        for case_id in _MOE_RUNTIME_NEGATIVE_CASES_V3
     },
 }
 
@@ -134,6 +152,23 @@ def projection_corridor_manifest_layers_v3(
             "projection-corridor manifest layer inventory is not contiguous"
         )
     return ordered
+
+
+def projection_corridor_dense_mlp_layers_v3(
+    manifest_entry_names: Iterable[str],
+) -> tuple[int, ...]:
+    """Return layers whose activation coverage uses the dense-MLP relation."""
+
+    names = tuple(str(name) for name in manifest_entry_names)
+    layers = projection_corridor_manifest_layers_v3(names)
+    moe_layers = {
+        int(name.split(".", 1)[0][1:])
+        for name in names
+        if ".moe." in name
+        and name.split(".", 1)[0].startswith("l")
+        and name.split(".", 1)[0][1:].isdigit()
+    }
+    return tuple(layer for layer in layers if layer not in moe_layers)
 
 
 def _canonical_positive_counts(
@@ -315,7 +350,9 @@ def validate_projection_corridor_honest_coverage_v3(
         raise ProofV3Error(
             "projection-corridor coverage minimum is too weak"
         )
-    layers = projection_corridor_manifest_layers_v3(manifest_entry_names)
+    entry_names = tuple(str(name) for name in manifest_entry_names)
+    layers = projection_corridor_manifest_layers_v3(entry_names)
+    dense_mlp_layers = projection_corridor_dense_mlp_layers_v3(entry_names)
     calibration_counts = _canonical_layer_counts(
         value["calibration_layer_counts"],
         name="calibration layer counts",
@@ -372,7 +409,7 @@ def validate_projection_corridor_honest_coverage_v3(
                 "projection-corridor MLP activation coverage is malformed"
             )
         mlp_coverage[layer] = item
-    if tuple(mlp_coverage) != layers:
+    if tuple(mlp_coverage) != dense_mlp_layers:
         raise ProofV3Error(
             "projection-corridor MLP activation layer coverage is incomplete"
         )
@@ -614,6 +651,8 @@ def required_projection_corridor_negative_cases_v3(
         for name in names
     ):
         required.update(_MLP_ACTIVATION_NEGATIVE_CASES_V3)
+    if any(".moe." in name for name in names):
+        required.update(_MOE_RUNTIME_NEGATIVE_CASES_V3)
     return tuple(sorted(required))
 
 

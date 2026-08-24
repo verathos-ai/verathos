@@ -124,6 +124,9 @@ _MLP_ACTIVATION_QUALIFICATION_REPORT = None
 # at most one quantized bin here. Prefix-cache replay crosses independently
 # scheduled prefill geometries and uses its own signed cell-plus-row corridor.
 _REPLAY_CAPTURE_MAX_LSB_DELTA_V3 = 1
+_RUNTIME_CELL_BOUNDED_MOE_INPUT_MODEL_IDS_V3 = frozenset(
+    {"Qwen/Qwen3.6-35B-A3B-FP8"}
+)
 
 
 def _execution_anchor_row_for_absolute_position_v3(
@@ -999,6 +1002,96 @@ def _rmsnorm_corridor_check(
     )
 
 
+def _quantized_rmsnorm_row_corridor_check(
+    *,
+    source_row,
+    source_scale: float,
+    target_row,
+    target_scale: float,
+    norm_row,
+    norm_scale: float,
+    norm_gain_offset: float,
+    columns,
+    epsilon: float,
+    what: str,
+    kind: str,
+    failure: str,
+) -> None:
+    """Verify selected RMSNorm cells without treating rails as finite bins."""
+
+    saturated_source_intervals = {}
+    direct_saturated_outputs = {}
+    if any(value in (-128, 127) for value in source_row):
+        (
+            denominator_interval,
+            saturated_source_intervals,
+            direct_saturated_outputs,
+        ) = _rmsnorm_saturation_aware_interval(
+            source_row=source_row,
+            source_scale=source_scale,
+            target_row=target_row,
+            target_scale=target_scale,
+            norm_row=norm_row,
+            norm_scale=norm_scale,
+            norm_gain_offset=norm_gain_offset,
+            epsilon=epsilon,
+        )
+    else:
+        denominator_interval = _rmsnorm_denominator_interval(
+            source_row=source_row,
+            source_scale=source_scale,
+            epsilon=epsilon,
+        )
+    for column in columns:
+        target_value = target_row[column]
+        check_kwargs = dict(
+            target_value=target_value,
+            target_scale=target_scale,
+            norm_weight=norm_row[column],
+            norm_scale=norm_scale,
+            norm_gain_offset=norm_gain_offset,
+            column=column,
+            epsilon=epsilon,
+            what=what,
+            kind=kind,
+            failure=failure,
+        )
+        if column in direct_saturated_outputs:
+            lower, upper = direct_saturated_outputs[column]
+            delta, target_quant, target_center = (
+                _quantized_target_interval_delta(
+                    expected_lower=lower,
+                    expected_upper=upper,
+                    target_value=target_value,
+                    target_scale=target_scale,
+                )
+            )
+            _fixed_quantization_corridor_check(
+                delta=delta,
+                quant=target_quant,
+                relative=_REL_COEFF
+                * max(abs(lower), abs(upper), abs(target_center)),
+                what=what,
+                kind=kind,
+                failure=failure,
+            )
+            continue
+        if (
+            column in saturated_source_intervals
+            and target_value in (-128, 127)
+        ):
+            continue
+        _rmsnorm_corridor_check(
+            source_row=source_row,
+            source_scale=source_scale,
+            denominator_interval=denominator_interval,
+            selected_source_interval=(
+                saturated_source_intervals.get(column)
+            ),
+            **check_kwargs,
+        )
+
+
 def _rmsnorm_exact_source_corridor_check(
     *,
     target_value: int,
@@ -1064,6 +1157,129 @@ def _rmsnorm_exact_source_corridor_check(
         kind=kind,
         failure=failure,
     )
+
+
+def _verify_moe_input_rmsnorm_v3(
+    *,
+    source_row_bytes: bytes,
+    target_row_bytes: bytes,
+    encoding_id: str,
+    norm_weight_row,
+    norm_weight_scale: float,
+    norm_gain_offset: float,
+    epsilon: float,
+    atol_q24: int,
+    layer_index: int,
+    runtime_cell_bounded_source: bool = False,
+) -> None:
+    """Bind the authenticated post-attention row to the MoE router input."""
+
+    from verallm.proof_v3.economic_execution_anchor import _decode_row_v3
+
+    import numpy as np
+
+    source = np.asarray(
+        _decode_row_v3(source_row_bytes, encoding_id),
+        dtype=np.float64,
+    )
+    target = np.asarray(
+        _decode_row_v3(target_row_bytes, encoding_id),
+        dtype=np.float64,
+    )
+    weights = np.asarray(tuple(norm_weight_row), dtype=np.float64)
+    if (
+        source.ndim != 1
+        or target.shape != source.shape
+        or weights.shape != source.shape
+        or not bool(np.isfinite(source).all())
+        or not bool(np.isfinite(target).all())
+        or not math.isfinite(norm_weight_scale)
+        or norm_weight_scale <= 0.0
+        or not math.isfinite(norm_gain_offset)
+        or not math.isfinite(epsilon)
+        or epsilon <= 0.0
+        or isinstance(atol_q24, bool)
+        or not isinstance(atol_q24, int)
+        or atol_q24 < 0
+        or not isinstance(runtime_cell_bounded_source, bool)
+    ):
+        raise _fail("MoE post-attention RMSNorm geometry is malformed")
+    gains = weights * norm_weight_scale + norm_gain_offset
+    gain_lower = gains - 0.5 * norm_weight_scale
+    gain_upper = gains + 0.5 * norm_weight_scale
+    from verallm.proof_v3 import economic_moe_verifier
+
+    try:
+        if runtime_cell_bounded_source:
+            source_lower, source_upper = (
+                economic_moe_verifier._runtime_precision_cell_bounds_v3(
+                    source,
+                    encoding_id=encoding_id,
+                )
+            )
+            source_minimum_magnitude = np.where(
+                (source_lower <= 0.0) & (source_upper >= 0.0),
+                0.0,
+                np.minimum(np.abs(source_lower), np.abs(source_upper)),
+            )
+            source_maximum_magnitude = np.maximum(
+                np.abs(source_lower),
+                np.abs(source_upper),
+            )
+            denominator_lower = math.sqrt(
+                float(np.square(source_minimum_magnitude).mean()) + epsilon
+            )
+            denominator_upper = math.sqrt(
+                float(np.square(source_maximum_magnitude).mean()) + epsilon
+            )
+            numerator_candidates = np.stack(
+                (
+                    source_lower * gain_lower,
+                    source_lower * gain_upper,
+                    source_upper * gain_lower,
+                    source_upper * gain_upper,
+                )
+            )
+            numerator_lower = np.min(numerator_candidates, axis=0)
+            numerator_upper = np.max(numerator_candidates, axis=0)
+            output_candidates = np.stack(
+                (
+                    numerator_lower / denominator_lower,
+                    numerator_lower / denominator_upper,
+                    numerator_upper / denominator_lower,
+                    numerator_upper / denominator_upper,
+                )
+            )
+            expected_lower = np.min(output_candidates, axis=0)
+            expected_upper = np.max(output_candidates, axis=0)
+        else:
+            denominator = math.sqrt(float(np.square(source).mean()) + epsilon)
+            expected_a = source * gain_lower / denominator
+            expected_b = source * gain_upper / denominator
+            expected_lower = np.minimum(expected_a, expected_b)
+            expected_upper = np.maximum(expected_a, expected_b)
+        delta = economic_moe_verifier._runtime_precision_interval_delta_v3(
+            target,
+            expected_lower,
+            expected_upper,
+            encoding_id=encoding_id,
+        )
+    except ProofV3VerificationError as exc:
+        raise _fail(
+            "MoE post-attention RMSNorm produced malformed runtime values"
+        ) from exc
+    tolerance = atol_q24 / float(1 << 24)
+    if economic_moe_verifier._record_moe_runtime_qualification_v3(
+        layer_index=layer_index,
+        relation_id="moe_input",
+        delta=delta,
+    ):
+        return
+    if not bool((delta <= tolerance).all()):
+        raise _fail(
+            f"MoE layer {layer_index} router input is detached from the "
+            "authenticated post-attention RMSNorm"
+        )
 
 
 def _silu(value: float) -> float:
@@ -2570,9 +2786,49 @@ def verify_economic_recompute_v3(
                 "GDN runtime semantics are not authenticated by the signed "
                 "manifest"
             )
+    moe_runtime_semantics = getattr(
+        artifacts, "moe_runtime_semantics", None
+    )
+    if moe_runtime_semantics is None:
+        moe_layers = frozenset()
+    else:
+        from verallm.proof_v3.moe_runtime_semantics import (
+            MoeRuntimeSemanticsV3,
+        )
+
+        signed_moe_semantics = getattr(
+            artifacts.manifest,
+            "moe_runtime_semantics_digest",
+            b"",
+        )
+        if (
+            not isinstance(moe_runtime_semantics, MoeRuntimeSemanticsV3)
+            or not signed_moe_semantics
+            or moe_runtime_semantics.digest() != signed_moe_semantics
+        ):
+            raise _fail(
+                "MoE runtime semantics are not authenticated by the signed "
+                "manifest"
+            )
+        moe_layers = frozenset(
+            item.layer_index for item in moe_runtime_semantics.layers
+        )
+        if not moe_layers.issubset(layer_universe):
+            raise _fail("MoE runtime semantics reference an unknown layer")
+        if selected_trace_profile:
+            raise _fail(
+                "sparse MoE is supported only by the compact-v9 replay path"
+            )
     global_layer_index = layer_universe[-1] + 1
     embed_hidden_dim, _embed_vocab_dim = artifacts.dims("embed_tokens")
     _lm_hidden_dim, lm_vocab_dim = artifacts.dims("lm_head")
+    if (
+        moe_runtime_semantics is not None
+        and moe_runtime_semantics.hidden_size != embed_hidden_dim
+    ):
+        raise _fail(
+            "MoE runtime semantics hidden width disagrees with the signed model"
+        )
     if compact_terminal:
         logits_block_cols, logits_block_count = lm_vocab_dim, 0
     else:
@@ -2586,6 +2842,13 @@ def verify_economic_recompute_v3(
     selected_inventory_layers = tuple(
         sorted(challenge.selected_layer_indices)
     )
+    selected_moe_layers = tuple(
+        layer for layer in selected_inventory_layers if layer in moe_layers
+    )
+    if bool(proof.moe_wire) != bool(selected_moe_layers):
+        raise _fail(
+            "MoE wire presence does not match the selected sparse layers"
+        )
     _prefix_cache_lanes = ()
     prefix_cache_gdn_windows = ()
     prefix_cache_projection_heads = ()
@@ -2767,6 +3030,24 @@ def verify_economic_recompute_v3(
             raise _fail(str(exc)) from exc
     prefix_cache_lane_map = dict(_prefix_cache_lanes)
     _profile_mark("prefix-cache-structure")
+    authenticated_moe_weights = ()
+    if selected_moe_layers:
+        try:
+            from verallm.proof_v3.economic_moe_verifier import (
+                authenticate_economic_moe_openings_v3,
+            )
+
+            authenticated_moe_weights = (
+                authenticate_economic_moe_openings_v3(
+                    wire=proof.moe_wire,
+                    artifacts=artifacts,
+                    semantics=moe_runtime_semantics,
+                    challenge=challenge,
+                    minimum_token_position=prefix_cached_tokens,
+                )
+            )
+        except (ProofV3Error, ProofV3VerificationError) as exc:
+            raise _fail(f"MoE opening authentication failed: {exc}") from exc
     expected_inventory = expected_economic_inventory_v3(
         layer_indices=layer_universe,
         layer_kinds=layer_kinds,
@@ -2775,6 +3056,7 @@ def verify_economic_recompute_v3(
         selected_layer_indices=(
             selected_inventory_layers if streaming_inventory else None
         ),
+        moe_layer_indices=tuple(sorted(moe_layers)),
     )
     wire_inventory = tuple(
         (oracle.oracle_id, oracle.phase, oracle.layer_index, oracle.operation)
@@ -2815,31 +3097,38 @@ def verify_economic_recompute_v3(
                 )
         if streaming_inventory and layer not in selected_inventory_layers:
             continue
-        gu_in, gu_out = artifacts.dims(f"l{layer}.gate_up")
-        dn_in, dn_out = artifacts.dims(f"l{layer}.down")
         norm_in, norm_out = artifacts.dims(f"l{layer}.input_norm")
         post_in, post_out = artifacts.dims(f"l{layer}.post_norm")
         if (
-            gu_in != embed_hidden
-            or dn_out != embed_hidden
-            or norm_in != embed_hidden
+            norm_in != embed_hidden
             or post_in != embed_hidden
             or norm_out != 1
             or post_out != 1
-            or gu_out != 2 * dn_in
         ):
             raise _fail(
                 f"layer {layer} signed projection dimensions are inconsistent"
             )
-        common_checks = (
-            (f"l{layer}.gate_up_x", layer_rows, gu_in),
-            (f"l{layer}.gate_up_s", layer_rows, gu_out),
-            (f"l{layer}.gate_up_y", layer_rows, gu_out),
-            (f"l{layer}.down_x", layer_rows, dn_in),
-            (f"l{layer}.down_s", layer_rows, dn_out),
-            (f"l{layer}.down_y", layer_rows, dn_out),
-            (f"l{layer}.mid_residual", layer_rows, embed_hidden),
-        )
+        common_checks = ((f"l{layer}.mid_residual", layer_rows, embed_hidden),)
+        if layer not in moe_layers:
+            gu_in, gu_out = artifacts.dims(f"l{layer}.gate_up")
+            dn_in, dn_out = artifacts.dims(f"l{layer}.down")
+            if (
+                gu_in != embed_hidden
+                or dn_out != embed_hidden
+                or gu_out != 2 * dn_in
+            ):
+                raise _fail(
+                    f"layer {layer} signed dense MLP dimensions are "
+                    "inconsistent"
+                )
+            common_checks = (
+                (f"l{layer}.gate_up_x", layer_rows, gu_in),
+                (f"l{layer}.gate_up_s", layer_rows, gu_out),
+                (f"l{layer}.gate_up_y", layer_rows, gu_out),
+                (f"l{layer}.down_x", layer_rows, dn_in),
+                (f"l{layer}.down_s", layer_rows, dn_out),
+                (f"l{layer}.down_y", layer_rows, dn_out),
+            ) + common_checks
         if layer_kinds[layer] == "full_attention":
             qkv_in, qkv_out = artifacts.dims(f"l{layer}.qkv")
             o_in, o_out = artifacts.dims(f"l{layer}.o")
@@ -2975,6 +3264,7 @@ def verify_economic_recompute_v3(
     lean_tokens_by_layer = {}
     lean_positions_by_layer = {}
     kv_positions_by_layer = {}
+    absolute_moe_rows: dict[str, dict[int, bytes]] = {}
     if challenge.selection_abi_id == ECONOMIC_SELECTION_ABI_V3:
         if (
             proof.execution_anchors
@@ -3000,7 +3290,9 @@ def verify_economic_recompute_v3(
                 ("qkv", "o")
                 if layer_kinds[layer] == "full_attention"
                 else ("gdn_qkvz", "gdn_ba", "gdn_o")
-            ) + ("gate_up", "down")
+            )
+            if layer not in moe_layers:
+                names += ("gate_up", "down")
             for name in names:
                 projection_dims[f"l{layer}.{name}"] = artifacts.dims(
                     f"l{layer}.{name}"
@@ -3034,6 +3326,9 @@ def verify_economic_recompute_v3(
                 gdn_runtime_semantics=getattr(
                     artifacts, "gdn_runtime_semantics", None
                 ),
+                moe_runtime_semantics=getattr(
+                    artifacts, "moe_runtime_semantics", None
+                ),
                 context_token_count=challenge.context_token_count,
             )
             expected_anchor_reveals = (
@@ -3052,6 +3347,10 @@ def verify_economic_recompute_v3(
                     gdn_runtime_semantics=getattr(
                         artifacts, "gdn_runtime_semantics", None
                     ),
+                    moe_runtime_semantics=getattr(
+                        artifacts, "moe_runtime_semantics", None
+                    ),
+                    minimum_moe_position=prefix_cached_tokens,
                     complete_gdn_projection_window=selected_trace_profile,
                 )
             )
@@ -3285,6 +3584,13 @@ def verify_economic_recompute_v3(
                 )
             )
         anchor_encoding = economic_execution_anchor_encoding_v3(profile)
+        if (
+            moe_runtime_semantics is not None
+            and moe_runtime_semantics.runtime_encoding_id != anchor_encoding
+        ):
+            raise _fail(
+                "MoE runtime encoding disagrees with the signed anchor profile"
+            )
         if not lean:
             anchor_binding = derive_economic_execution_anchor_oracle_binding_v3(
                 opened_rows=anchor_rows,
@@ -3299,6 +3605,7 @@ def verify_economic_recompute_v3(
                 attention_runtime_semantics=getattr(
                     artifacts, "attention_runtime_semantics", None
                 ),
+                moe_layer_indices=tuple(sorted(moe_layers)),
             )
         if not lean and any(
             layer_kinds[layer] == "gdn"
@@ -3344,6 +3651,45 @@ def verify_economic_recompute_v3(
                 "streaming anchor lanes do not match the nonce-selected "
                 "GDN coordinates"
             )
+
+        if authenticated_moe_weights:
+            for authenticated in authenticated_moe_weights:
+                layer = authenticated.layer_index
+                position = authenticated.token_position
+                anchor_position = position - prefix_cached_tokens
+                if anchor_position < 0:
+                    raise _fail(
+                        "MoE replay row precedes the authenticated cache suffix"
+                    )
+                for suffix in (
+                    "moe_input",
+                    "moe_router_logits",
+                    "residual_after_attention",
+                    "moe_aggregate_output",
+                    "residual_out",
+                ):
+                    stage_id = f"l{layer}.{suffix}"
+                    try:
+                        row = anchor_rows[stage_id][anchor_position]
+                    except KeyError as exc:
+                        raise _fail(
+                            f"MoE runtime anchor {stage_id!r} is missing its "
+                            "validator-selected row"
+                        ) from exc
+                    absolute_moe_rows.setdefault(stage_id, {})[position] = row
+            try:
+                from verallm.proof_v3.economic_moe_verifier import (
+                    verify_economic_moe_numeric_replay_v3,
+                )
+
+                verify_economic_moe_numeric_replay_v3(
+                    authenticated_layers=authenticated_moe_weights,
+                    artifacts=artifacts,
+                    semantics=moe_runtime_semantics,
+                    runtime_rows=absolute_moe_rows,
+                )
+            except ProofV3VerificationError as exc:
+                raise _fail(f"MoE numeric replay failed: {exc}") from exc
     else:
         raise _fail("economic selection ABI is not supported")
 
@@ -3416,6 +3762,9 @@ def verify_economic_recompute_v3(
 
     # ---- (5) architecture-specific projection audits ---------------------
     selected_layers = tuple(sorted(challenge.selected_layer_indices))
+    dense_selected_layers = tuple(
+        layer for layer in selected_layers if layer not in moe_layers
+    )
     from verallm.proof_v3.economic_profile import (
         economic_profile_uses_canonical_gdn_input_v3,
         economic_profile_uses_exact_mlp_activation_v3,
@@ -3432,6 +3781,10 @@ def verify_economic_recompute_v3(
         for layer in selected_layers
         for (x_suffix, s_suffix, manifest_suffix) in (
             audited_projections_for_layer_kind_v3(layer_kinds[layer])
+        )
+        if not (
+            layer in moe_layers
+            and manifest_suffix in {"gate_up", "down"}
         )
     )
     if len(proof.projections) != len(expected_reveal_keys):
@@ -4372,10 +4725,10 @@ def verify_economic_recompute_v3(
         for reveal in proof.mlp_activation_reveals
     }
     if exact_mlp_activation:
-        if tuple(sorted(mlp_activation_reveals)) != selected_layers:
+        if tuple(sorted(mlp_activation_reveals)) != dense_selected_layers:
             raise _fail(
                 "lean MLP activation reveals do not cover exactly the "
-                "selected layers"
+                "selected dense layers"
             )
     elif mlp_activation_reveals:
         raise _fail(
@@ -4507,8 +4860,394 @@ def verify_economic_recompute_v3(
                         }
                     )
 
+    def _verify_sparse_full_attention_coupling_v3(coupling) -> None:
+        """Verify the attention half of a sparse-MoE decoder layer."""
+
+        layer = coupling.layer_index
+        layer_tokens = projection_tokens_by_layer[layer]
+        if (
+            coupling.down_y_oracle_index != coupling.mid_oracle_index
+            or coupling.gate_up_y_oracle_index != coupling.mid_oracle_index
+            or coupling.down_y_opening != coupling.mid_opening
+            or coupling.gate_up_y_opening != coupling.mid_opening
+            or coupling.qkv_s_kv_opening != coupling.mid_opening
+            or coupling.qkv_kv_weight_rows
+        ):
+            raise _fail(
+                f"sparse-MoE attention coupling l{layer} has noncanonical "
+                "dense placeholders"
+            )
+        expected_oracles = {
+            "attn_o_y": (
+                coupling.attn_o_y_oracle_index,
+                f"l{layer}.attn_o_y",
+            ),
+            "mid": (coupling.mid_oracle_index, f"l{layer}.mid_residual"),
+            "k": (coupling.k_oracle_index, f"l{layer}.k_cache"),
+            "v": (coupling.v_oracle_index, f"l{layer}.v_cache"),
+        }
+        oracles = {}
+        for key, (index, expected_id) in expected_oracles.items():
+            oracle = proof.oracles[index]
+            if oracle.oracle_id != expected_id:
+                raise _fail(
+                    "sparse-MoE attention coupling references the wrong oracle"
+                )
+            oracles[key] = oracle
+
+        revealed_bias = dict(coupling.bias_rows)
+        biases: dict[str, tuple[tuple[int, ...], float]] = {}
+        for projection_index, suffix in ((0, "o"), (3, "qkv")):
+            name = f"l{layer}.{suffix}_bias"
+            if not artifacts.has_entry(name):
+                continue
+            reveal = revealed_bias.pop(projection_index, None)
+            if reveal is None:
+                raise _fail(
+                    f"sparse-MoE attention coupling l{layer} is missing "
+                    f"the signed {suffix} bias"
+                )
+            biases[suffix] = (
+                artifacts.verify_weight_row(name=name, reveal=reveal),
+                artifacts.scale_for(name),
+            )
+        if revealed_bias:
+            raise _fail(
+                f"sparse-MoE attention coupling l{layer} has an unsupported "
+                "bias reveal"
+            )
+
+        def _sparse_bias_at(
+            suffix: str,
+            output: int,
+        ) -> tuple[float, float]:
+            entry = biases.get(suffix)
+            if entry is None:
+                return 0.0, 0.0
+            values, scale = entry
+            if output >= len(values):
+                raise _fail(
+                    f"sparse-MoE attention {suffix} bias is too narrow"
+                )
+            return values[output] * scale, 0.5 * scale
+
+        residual_cols = challenge.residual_cols_for(
+            layer_index=layer,
+            hidden_dim=embed_hidden,
+        )
+        o_x_rows, o_surrogate, o_weights, o_x_scale, o_w_scale, o_outs = (
+            opened_projections[(layer, "o")]
+        )
+        o_cells = tuple(
+            (token, column)
+            for token in layer_tokens
+            for column in sorted(set(o_outs) | set(residual_cols))
+        )
+        o_values = _opened_cells(
+            oracle=oracles["attn_o_y"],
+            base_binding=base_binding,
+            cells=o_cells,
+            opening=coupling.attn_o_y_opening,
+            what=f"sparse-MoE attention l{layer} o output",
+            expect_mode=2,
+        )
+        mid_rows = _opened_rows(
+            oracle=oracles["mid"],
+            base_binding=base_binding,
+            rows=layer_tokens,
+            opening=coupling.mid_opening,
+            require_int8=True,
+            what=f"sparse-MoE attention l{layer} mid residual",
+            expect_mode=2,
+        )
+        o_scale = bits_to_scale_v3(oracles["attn_o_y"].scale_bits)
+        o_x_sq = {
+            token: sum(value * value for value in o_x_rows[token])
+            for token in layer_tokens
+        }
+        o_w_sq = {
+            output: _projection_weight_row_sq(
+                layer=layer,
+                suffix="o",
+                out=output,
+                weight_rows=o_weights,
+            )
+            for output in o_outs
+        }
+        for token in layer_tokens:
+            for output in o_outs:
+                bias_value, bias_quant = _sparse_bias_at("o", output)
+                _corridor_check(
+                    surrogate_value=_projection_surrogate_value(
+                        o_surrogate,
+                        token,
+                        output,
+                    ),
+                    captured_value=o_values[(token, output)],
+                    x_row=o_x_rows[token],
+                    w_row=o_weights.get(output, ()),
+                    x_scale=o_x_scale,
+                    w_scale=o_w_scale,
+                    y_scale=o_scale,
+                    what=f"sparse-MoE attention l{layer}.o Y corridor",
+                    bias_value=bias_value,
+                    bias_quant=bias_quant,
+                    stats=corridor_stats,
+                    kind="y_o",
+                    x_sq=o_x_sq[token],
+                    w_sq=o_w_sq[output],
+                    sigma_cap=corridor_sigma,
+                )
+
+        qkv_x_rows, qkv_surrogate, qkv_weights, qkv_x_scale, qkv_w_scale, _ = (
+            opened_projections[(layer, "qkv")]
+        )
+        kv_dim = oracles["k"].col_count
+        qkv_width = oracle_by_id[f"l{layer}.qkv_s"].col_count
+        q_width = qkv_width - 2 * kv_dim
+        kv_cols = challenge.kv_cols_for(
+            layer_index=layer,
+            kv_dim=kv_dim,
+        )
+        kv_cells = tuple(
+            (token, column)
+            for token in layer_tokens
+            for column in kv_cols
+        )
+        k_values = _opened_cells(
+            oracle=oracles["k"],
+            base_binding=base_binding,
+            cells=kv_cells,
+            opening=coupling.k_opening,
+            what=f"sparse-MoE attention l{layer} K cache",
+            expect_mode=1,
+        )
+        v_values = _opened_cells(
+            oracle=oracles["v"],
+            base_binding=base_binding,
+            cells=kv_cells,
+            opening=coupling.v_opening,
+            what=f"sparse-MoE attention l{layer} V cache",
+            expect_mode=1,
+        )
+        qkv_x_sq = {
+            token: sum(value * value for value in qkv_x_rows[token])
+            for token in layer_tokens
+        }
+        runtime_outputs = tuple(
+            sorted(
+                {q_width + column for column in kv_cols}
+                | {q_width + kv_dim + column for column in kv_cols}
+                | set(attention_query_output_columns_by_layer.get(layer, ()))
+            )
+        )
+        qkv_w_sq = {
+            output: _projection_weight_row_sq(
+                layer=layer,
+                suffix="qkv",
+                out=output,
+                weight_rows=qkv_weights,
+            )
+            for output in runtime_outputs
+        }
+        k_scale = bits_to_scale_v3(oracles["k"].scale_bits)
+        v_scale = bits_to_scale_v3(oracles["v"].scale_bits)
+        for token in layer_tokens:
+            for column in kv_cols:
+                for tag, output, captured, scale in (
+                    (
+                        "K",
+                        q_width + column,
+                        k_values[(token, column)],
+                        k_scale,
+                    ),
+                    (
+                        "V",
+                        q_width + kv_dim + column,
+                        v_values[(token, column)],
+                        v_scale,
+                    ),
+                ):
+                    try:
+                        surrogate_value = _projection_surrogate_value(
+                            qkv_surrogate,
+                            token,
+                            output,
+                        )
+                    except KeyError as exc:
+                        raise _fail(
+                            f"sparse-MoE attention l{layer} omits a "
+                            f"validator-selected {tag} projection cell"
+                        ) from exc
+                    bias_value, bias_quant = _sparse_bias_at("qkv", output)
+                    _corridor_check(
+                        surrogate_value=surrogate_value,
+                        captured_value=captured,
+                        x_row=qkv_x_rows[token],
+                        w_row=qkv_weights.get(output, ()),
+                        x_scale=qkv_x_scale,
+                        w_scale=qkv_w_scale,
+                        y_scale=scale,
+                        what=f"sparse-MoE attention l{layer} {tag} corridor",
+                        bias_value=bias_value,
+                        bias_quant=bias_quant,
+                        stats=corridor_stats,
+                        kind=f"{tag.lower()}_cache",
+                        x_sq=qkv_x_sq[token],
+                        w_sq=qkv_w_sq[output],
+                        sigma_cap=corridor_sigma,
+                    )
+
+        plan = attention_plans_by_layer.get(layer)
+        query_outputs = attention_query_output_columns_by_layer.get(layer, ())
+        if plan is None or not query_outputs:
+            raise _fail(
+                f"sparse-MoE attention l{layer} has no nonce-selected query plan"
+            )
+        from verallm.proof_v3.attention_anchor_binding import (
+            decode_runtime_values_v3,
+        )
+
+        token_for_position = {
+            position: token
+            for token, position in lean_positions_by_layer[layer].items()
+        }
+        relative_step = 2.0 ** (-7 if anchor_encoding == "bf16.v1" else -10)
+        for position in plan.row_positions:
+            try:
+                token = token_for_position[int(position)]
+                raw_values = decode_runtime_values_v3(
+                    attention_query_rows[(layer, int(position))],
+                    anchor_encoding,
+                )
+            except KeyError as exc:
+                raise _fail(
+                    f"sparse-MoE attention l{layer} query row is detached"
+                ) from exc
+            if len(raw_values) != qkv_width:
+                raise _fail(
+                    f"sparse-MoE attention l{layer} query width is malformed"
+                )
+            for output in query_outputs:
+                bias_value, bias_quant = _sparse_bias_at("qkv", output)
+                _corridor_check(
+                    surrogate_value=_projection_surrogate_value(
+                        qkv_surrogate,
+                        token,
+                        output,
+                    ),
+                    captured_value=float(raw_values[output]),
+                    x_row=qkv_x_rows[token],
+                    w_row=qkv_weights.get(output, ()),
+                    x_scale=qkv_x_scale,
+                    w_scale=qkv_w_scale,
+                    y_scale=1.0,
+                    what=f"sparse-MoE attention l{layer} query corridor",
+                    bias_value=bias_value,
+                    bias_quant=bias_quant,
+                    stats=corridor_stats,
+                    kind="q_gate_runtime",
+                    x_sq=qkv_x_sq[token],
+                    w_sq=qkv_w_sq[output],
+                    sigma_cap=corridor_sigma,
+                    output_quant_floor=max(
+                        abs(float(raw_values[output])) * relative_step,
+                        2.0 ** -24,
+                    ),
+                    captured_is_quantized=False,
+                )
+
+        residual_in, _residual_out = opened_boundaries[layer]
+        residual_in_scale = bits_to_scale_v3(
+            oracle_by_id[f"l{layer}.residual_in"].scale_bits
+        )
+        mid_scale = bits_to_scale_v3(oracles["mid"].scale_bits)
+        for token in layer_tokens:
+            for column in residual_cols:
+                _quantized_sum_corridor_check(
+                    output_i8=mid_rows[token][column],
+                    output_scale=mid_scale,
+                    left_i8=residual_in[token][column],
+                    left_scale=residual_in_scale,
+                    right_i8=o_values[(token, column)],
+                    right_scale=o_scale,
+                    what=(
+                        f"sparse-MoE attention l{layer} residual composition"
+                    ),
+                    kind="attention_residual",
+                    failure=(
+                        f"sparse-MoE attention l{layer} residual composition "
+                        "is broken"
+                    ),
+                )
+
+        input_norm_row = artifacts.verify_weight_row(
+            name=f"l{layer}.input_norm",
+            reveal=coupling.input_norm_row,
+        )
+        input_norm_scale = artifacts.scale_for(f"l{layer}.input_norm")
+        qkv_target_scale = bits_to_scale_v3(
+            oracle_by_id[f"l{layer}.qkv_x"].scale_bits
+        )
+        for token in layer_tokens:
+            _quantized_rmsnorm_row_corridor_check(
+                source_row=residual_in[token],
+                source_scale=residual_in_scale,
+                target_row=qkv_x_rows[token],
+                target_scale=qkv_target_scale,
+                norm_row=input_norm_row,
+                norm_scale=input_norm_scale,
+                norm_gain_offset=norm_gain_offset,
+                columns=challenge.norm_cols_for(
+                    layer_index=layer,
+                    hidden_dim=embed_hidden,
+                    which="input",
+                ),
+                epsilon=rmsnorm_epsilon,
+                what=f"sparse-MoE attention l{layer} input RMSNorm",
+                kind="rmsnorm_input",
+                failure=(
+                    f"sparse-MoE attention l{layer} input RMSNorm is "
+                    "outside its corridor"
+                ),
+            )
+
+        post_norm_row = artifacts.verify_weight_row(
+            name=f"l{layer}.post_norm",
+            reveal=coupling.post_norm_row,
+        )
+        authenticated = next(
+            item
+            for item in authenticated_moe_weights
+            if item.layer_index == layer
+        )
+        token_position = authenticated.token_position
+        signed_moe_layer = moe_runtime_semantics.layer_for(layer)
+        _verify_moe_input_rmsnorm_v3(
+            source_row_bytes=absolute_moe_rows[
+                f"l{layer}.residual_after_attention"
+            ][token_position],
+            target_row_bytes=absolute_moe_rows[f"l{layer}.moe_input"][
+                token_position
+            ],
+            encoding_id=anchor_encoding,
+            norm_weight_row=post_norm_row,
+            norm_weight_scale=artifacts.scale_for(f"l{layer}.post_norm"),
+            norm_gain_offset=norm_gain_offset,
+            epsilon=rmsnorm_epsilon,
+            atol_q24=signed_moe_layer.moe_input_atol_q24,
+            layer_index=layer,
+            runtime_cell_bounded_source=(
+                artifacts.manifest.model_id
+                in _RUNTIME_CELL_BOUNDED_MOE_INPUT_MODEL_IDS_V3
+            ),
+        )
+
     for coupling in proof.couplings:
         layer = coupling.layer_index
+        if layer in moe_layers:
+            _verify_sparse_full_attention_coupling_v3(coupling)
+            continue
         layer_tokens = projection_tokens_by_layer[layer]
         oracle_ids = {
             "attn_o_y": (coupling.attn_o_y_oracle_index, f"l{layer}.attn_o_y"),
@@ -5710,6 +6449,430 @@ def verify_economic_recompute_v3(
                             **check_kwargs,
                         )
 
+    lean_gdn_runtime_rows = {}
+
+    def _verify_sparse_gdn_coupling_v3(coupling) -> None:
+        """Verify the GDN half of a sparse-MoE decoder layer."""
+
+        layer = coupling.layer_index
+        layer_tokens = projection_tokens_by_layer[layer]
+        if (
+            coupling.down_y_oracle_index != coupling.mid_oracle_index
+            or coupling.gate_up_y_oracle_index != coupling.mid_oracle_index
+            or coupling.down_y_opening != coupling.mid_opening
+            or coupling.gate_up_y_opening != coupling.mid_opening
+        ):
+            raise _fail(
+                f"sparse-MoE GDN coupling l{layer} has noncanonical dense "
+                "placeholders"
+            )
+        if not coupling.runtime_rows and challenge.decode_token_count != 1:
+            raise _fail(
+                f"sparse-MoE GDN coupling l{layer} has no runtime replay rows"
+            )
+        lean_gdn_runtime_rows[layer] = tuple(coupling.runtime_rows)
+        token_for_position = {
+            position: token
+            for token, position in lean_positions_by_layer[layer].items()
+        }
+        if tuple(int(row[0]) for row in coupling.norm_source_rows) != tuple(
+            sorted(token_for_position)
+        ):
+            raise _fail(
+                f"sparse-MoE GDN coupling l{layer} norm rows are incomplete"
+            )
+        from verallm.proof_v3.economic_execution_anchor import (
+            _decode_row_v3,
+            quantize_execution_anchor_row_v3,
+        )
+
+        norm_sources = {}
+        for position, input_raw, post_raw in coupling.norm_source_rows:
+            input_values = _decode_row_v3(input_raw, anchor_encoding)
+            post_values = _decode_row_v3(post_raw, anchor_encoding)
+            if len(input_values) != embed_hidden or len(post_values) != embed_hidden:
+                raise _fail(
+                    f"sparse-MoE GDN coupling l{layer} norm width is malformed"
+                )
+            norm_sources[token_for_position[position]] = (
+                input_values,
+                post_values,
+                input_raw,
+                post_raw,
+            )
+
+        expected_oracles = {
+            "qkvz_y": (
+                coupling.qkvz_y_oracle_index,
+                f"l{layer}.gdn_qkvz_y",
+            ),
+            "ba_y": (coupling.ba_y_oracle_index, f"l{layer}.gdn_ba_y"),
+            "gdn_o_y": (
+                coupling.gdn_o_y_oracle_index,
+                f"l{layer}.gdn_o_y",
+            ),
+            "mid": (coupling.mid_oracle_index, f"l{layer}.mid_residual"),
+        }
+        oracles = {}
+        for key, (index, expected_id) in expected_oracles.items():
+            oracle = proof.oracles[index]
+            if oracle.oracle_id != expected_id:
+                raise _fail("sparse-MoE GDN coupling references the wrong oracle")
+            oracles[key] = oracle
+
+        revealed_bias = dict(coupling.bias_rows)
+        biases: dict[str, tuple[tuple[int, ...], float]] = {}
+        for projection_index, suffix in (
+            (2, "gdn_ba"),
+            (3, "gdn_o"),
+            (4, "gdn_qkvz"),
+        ):
+            name = f"l{layer}.{suffix}_bias"
+            if not artifacts.has_entry(name):
+                continue
+            reveal = revealed_bias.pop(projection_index, None)
+            if reveal is None:
+                raise _fail(
+                    f"sparse-MoE GDN coupling l{layer} is missing the "
+                    f"signed {suffix} bias"
+                )
+            biases[suffix] = (
+                artifacts.verify_weight_row(name=name, reveal=reveal),
+                artifacts.scale_for(name),
+            )
+        if revealed_bias:
+            raise _fail(
+                f"sparse-MoE GDN coupling l{layer} has an unsupported bias"
+            )
+
+        def _sparse_gdn_bias_at(
+            suffix: str,
+            output: int,
+        ) -> tuple[float, float]:
+            entry = biases.get(suffix)
+            if entry is None:
+                return 0.0, 0.0
+            values, scale = entry
+            if output >= len(values):
+                raise _fail(f"sparse-MoE GDN {suffix} bias is too narrow")
+            return values[output] * scale, 0.5 * scale
+
+        opened_y = {}
+        for key, opening in (
+            ("qkvz_y", coupling.qkvz_y_opening),
+            ("ba_y", coupling.ba_y_opening),
+            ("mid", coupling.mid_opening),
+        ):
+            opened_y[key] = _opened_rows(
+                oracle=oracles[key],
+                base_binding=base_binding,
+                rows=layer_tokens,
+                opening=opening,
+                require_int8=True,
+                what=f"sparse-MoE GDN coupling l{layer} {key}",
+                expect_mode=2,
+            )
+        residual_cols = challenge.residual_cols_for(
+            layer_index=layer,
+            hidden_dim=embed_hidden,
+        )
+        gdn_o_outs = opened_projections[(layer, "gdn_o")][5]
+        gdn_o_cells = tuple(
+            (token, column)
+            for token in layer_tokens
+            for column in sorted(set(gdn_o_outs) | set(residual_cols))
+        )
+        opened_y["gdn_o_y"] = _opened_cells(
+            oracle=oracles["gdn_o_y"],
+            base_binding=base_binding,
+            cells=gdn_o_cells,
+            opening=coupling.gdn_o_y_opening,
+            what=f"sparse-MoE GDN coupling l{layer} output",
+            expect_mode=2,
+        )
+
+        qkvz_scale = bits_to_scale_v3(oracles["qkvz_y"].scale_bits)
+        ba_scale = bits_to_scale_v3(oracles["ba_y"].scale_bits)
+        gdn_o_x_rows = opened_projections[(layer, "gdn_o")][0]
+        gdn_o_x_scale = opened_projections[(layer, "gdn_o")][3]
+        qkvz_columns = gdn_projection_output_columns_by_key[
+            (layer, "gdn_qkvz")
+        ]
+        ba_columns = gdn_projection_output_columns_by_key[(layer, "gdn_ba")]
+        gdn_o_columns = gdn_recurrence_input_columns_by_layer[layer]
+        for position, qkvz_raw, ba_raw, output_raw in coupling.runtime_rows:
+            token = token_for_position.get(int(position))
+            if token is None:
+                continue
+            expected_rows = (
+                (
+                    "qkvz_y",
+                    qkvz_columns,
+                    quantize_execution_anchor_row_v3(
+                        row_bytes=qkvz_raw,
+                        scale=qkvz_scale,
+                        encoding_id=anchor_encoding,
+                    ),
+                ),
+                (
+                    "ba_y",
+                    ba_columns,
+                    quantize_execution_anchor_row_v3(
+                        row_bytes=ba_raw,
+                        scale=ba_scale,
+                        encoding_id=anchor_encoding,
+                    ),
+                ),
+            )
+            for key, columns, expected in expected_rows:
+                if len(expected) != len(columns):
+                    raise _fail(
+                        f"sparse-MoE GDN coupling l{layer} runtime geometry "
+                        "is malformed"
+                    )
+                for column, value in zip(columns, expected, strict=True):
+                    if not _replay_capture_cell_matches_v3(
+                        opened_y[key][token][column],
+                        value,
+                    ):
+                        raise _fail(
+                            f"sparse-MoE GDN coupling l{layer} runtime output "
+                            "is detached from its projection"
+                        )
+            output_expected = quantize_execution_anchor_row_v3(
+                row_bytes=output_raw,
+                scale=gdn_o_x_scale,
+                encoding_id=anchor_encoding,
+            )
+            if len(output_expected) != len(gdn_o_columns):
+                raise _fail(
+                    f"sparse-MoE GDN coupling l{layer} recurrent output "
+                    "geometry is malformed"
+                )
+            for column, value in zip(
+                gdn_o_columns,
+                output_expected,
+                strict=True,
+            ):
+                if not _replay_capture_cell_matches_v3(
+                    gdn_o_x_rows[token][column],
+                    value,
+                ):
+                    raise _fail(
+                        f"sparse-MoE GDN coupling l{layer} recurrent output "
+                        "is detached from its output projection"
+                    )
+
+        qkvz_inputs = opened_projections[(layer, "gdn_qkvz")][0]
+        ba_inputs = opened_projections[(layer, "gdn_ba")][0]
+        if any(
+            qkvz_inputs[token] != ba_inputs[token] for token in layer_tokens
+        ):
+            raise _fail(
+                f"sparse-MoE GDN coupling l{layer} parallel inputs disagree"
+            )
+
+        if canonical_gdn_projection_inputs:
+            from verallm.proof_v3.gdn_projection_input import (
+                canonical_gdn_projection_inputs_v3,
+            )
+
+            input_norm_row = artifacts.verify_weight_row(
+                name=f"l{layer}.input_norm",
+                reveal=coupling.input_norm_row,
+            )
+            input_norm_scale = artifacts.scale_for(f"l{layer}.input_norm")
+            scale_bits, canonical_scale, canonical_rows = (
+                canonical_gdn_projection_inputs_v3(
+                    source_rows_by_token={
+                        token: norm_sources[token][0]
+                        for token in layer_tokens
+                    },
+                    norm_row=input_norm_row,
+                    norm_scale=input_norm_scale,
+                    norm_gain_offset=norm_gain_offset,
+                    epsilon=rmsnorm_epsilon,
+                )
+            )
+            for projection in ("gdn_qkvz", "gdn_ba"):
+                projection_rows = opened_projections[(layer, projection)]
+                if oracle_by_id[f"l{layer}.{projection}_x"].scale_bits != scale_bits:
+                    raise _fail(
+                        f"sparse-MoE GDN coupling l{layer} {projection} "
+                        "input scale is detached"
+                    )
+                if any(
+                    tuple(projection_rows[0][token]) != canonical_rows[token]
+                    for token in layer_tokens
+                ):
+                    raise _fail(
+                        f"sparse-MoE GDN coupling l{layer} {projection} input "
+                        "is detached from its RMSNorm source"
+                    )
+                opened_projections[(layer, projection)] = (
+                    projection_rows[0],
+                    projection_rows[1],
+                    projection_rows[2],
+                    canonical_scale,
+                    projection_rows[4],
+                    projection_rows[5],
+                )
+        else:
+            input_norm_row = artifacts.verify_weight_row(
+                name=f"l{layer}.input_norm",
+                reveal=coupling.input_norm_row,
+            )
+            input_norm_scale = artifacts.scale_for(f"l{layer}.input_norm")
+
+        for suffix, row_key in (
+            ("gdn_qkvz", "qkvz_y"),
+            ("gdn_ba", "ba_y"),
+            ("gdn_o", "gdn_o_y"),
+        ):
+            x_rows, surrogate, weights, x_scale, w_scale, outs = (
+                opened_projections[(layer, suffix)]
+            )
+            y_scale = bits_to_scale_v3(oracles[row_key].scale_bits)
+            x_sq = {
+                token: sum(value * value for value in x_rows[token])
+                for token in layer_tokens
+            }
+            w_sq = {
+                output: _projection_weight_row_sq(
+                    layer=layer,
+                    suffix=suffix,
+                    out=output,
+                    weight_rows=weights,
+                )
+                for output in outs
+            }
+            for token in layer_tokens:
+                for output in outs:
+                    bias_value, bias_quant = _sparse_gdn_bias_at(suffix, output)
+                    captured = (
+                        opened_y[row_key][(token, output)]
+                        if row_key == "gdn_o_y"
+                        else opened_y[row_key][token][output]
+                    )
+                    _corridor_check(
+                        surrogate_value=_projection_surrogate_value(
+                            surrogate,
+                            token,
+                            output,
+                        ),
+                        captured_value=captured,
+                        x_row=x_rows[token],
+                        w_row=weights.get(output, ()),
+                        x_scale=x_scale,
+                        w_scale=w_scale,
+                        y_scale=y_scale,
+                        what=f"sparse-MoE GDN l{layer}.{suffix} Y corridor",
+                        bias_value=bias_value,
+                        bias_quant=bias_quant,
+                        stats=corridor_stats,
+                        kind=f"y_{suffix}",
+                        x_sq=x_sq[token],
+                        w_sq=w_sq[output],
+                        sigma_cap=corridor_sigma,
+                    )
+
+        residual_in, _residual_out = opened_boundaries[layer]
+        residual_in_scale = bits_to_scale_v3(
+            oracle_by_id[f"l{layer}.residual_in"].scale_bits
+        )
+        mid_scale = bits_to_scale_v3(oracles["mid"].scale_bits)
+        gdn_o_scale = bits_to_scale_v3(oracles["gdn_o_y"].scale_bits)
+        for token in layer_tokens:
+            input_values, post_values, input_raw, post_raw = norm_sources[token]
+            if not _replay_capture_row_matches_v3(
+                tuple(residual_in[token]),
+                quantize_execution_anchor_row_v3(
+                    row_bytes=input_raw,
+                    scale=residual_in_scale,
+                    encoding_id=anchor_encoding,
+                ),
+            ) or not _replay_capture_row_matches_v3(
+                tuple(opened_y["mid"][token]),
+                quantize_execution_anchor_row_v3(
+                    row_bytes=post_raw,
+                    scale=mid_scale,
+                    encoding_id=anchor_encoding,
+                ),
+            ):
+                raise _fail(
+                    f"sparse-MoE GDN coupling l{layer} norm source is detached"
+                )
+            for column in residual_cols:
+                _quantized_sum_corridor_check(
+                    output_i8=opened_y["mid"][token][column],
+                    output_scale=mid_scale,
+                    left_i8=residual_in[token][column],
+                    left_scale=residual_in_scale,
+                    right_i8=opened_y["gdn_o_y"][(token, column)],
+                    right_scale=gdn_o_scale,
+                    what=f"sparse-MoE GDN l{layer} residual composition",
+                    kind="gdn_attention_residual",
+                    failure=(
+                        f"sparse-MoE GDN l{layer} residual composition is broken"
+                    ),
+                )
+            for projection in ("gdn_qkvz", "gdn_ba"):
+                target_rows = opened_projections[(layer, projection)][0]
+                target_scale = opened_projections[(layer, projection)][3]
+                for column in challenge.norm_cols_for(
+                    layer_index=layer,
+                    hidden_dim=embed_hidden,
+                    which="input",
+                ):
+                    _rmsnorm_exact_source_corridor_check(
+                        target_value=target_rows[token][column],
+                        target_scale=target_scale,
+                        source_values=input_values,
+                        norm_weight=input_norm_row[column],
+                        norm_scale=input_norm_scale,
+                        norm_gain_offset=norm_gain_offset,
+                        column=column,
+                        epsilon=rmsnorm_epsilon,
+                        what=f"sparse-MoE GDN l{layer} input RMSNorm",
+                        kind="gdn_rmsnorm_input",
+                        failure=(
+                            f"sparse-MoE GDN l{layer} input RMSNorm is outside "
+                            "its corridor"
+                        ),
+                    )
+
+        post_norm_row = artifacts.verify_weight_row(
+            name=f"l{layer}.post_norm",
+            reveal=coupling.post_norm_row,
+        )
+        authenticated = next(
+            item
+            for item in authenticated_moe_weights
+            if item.layer_index == layer
+        )
+        token_position = authenticated.token_position
+        _verify_moe_input_rmsnorm_v3(
+            source_row_bytes=absolute_moe_rows[
+                f"l{layer}.residual_after_attention"
+            ][token_position],
+            target_row_bytes=absolute_moe_rows[f"l{layer}.moe_input"][
+                token_position
+            ],
+            encoding_id=anchor_encoding,
+            norm_weight_row=post_norm_row,
+            norm_weight_scale=artifacts.scale_for(f"l{layer}.post_norm"),
+            norm_gain_offset=norm_gain_offset,
+            epsilon=rmsnorm_epsilon,
+            atol_q24=(
+                moe_runtime_semantics.layer_for(layer).moe_input_atol_q24
+            ),
+            layer_index=layer,
+            runtime_cell_bounded_source=(
+                artifacts.manifest.model_id
+                in _RUNTIME_CELL_BOUNDED_MOE_INPUT_MODEL_IDS_V3
+            ),
+        )
+
     if (
         tuple(c.layer_index for c in proof.gdn_couplings)
         != selected_gdn_layers
@@ -5718,9 +6881,11 @@ def verify_economic_recompute_v3(
             "GDN coupling reveals do not cover exactly the selected GDN "
             "layers"
         )
-    lean_gdn_runtime_rows = {}
     for coupling in proof.gdn_couplings:
         layer = coupling.layer_index
+        if layer in moe_layers:
+            _verify_sparse_gdn_coupling_v3(coupling)
+            continue
         layer_tokens = projection_tokens_by_layer[layer]
         norm_source_rows_by_token = {}
         if lean:

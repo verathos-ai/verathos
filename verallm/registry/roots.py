@@ -12,6 +12,7 @@ Because the computation is deterministic (same model + same quantization
 import hashlib
 import logging
 import time
+from pathlib import Path
 
 import torch
 
@@ -71,6 +72,59 @@ def _unwrap_capture_weight_module(module):
     return module
 
 
+def _resolve_quantized_moe_reader(
+    model_name: str,
+    *,
+    existing_reader=None,
+    checkpoint_source: str | None = None,
+):
+    """Resolve expert bytes without escaping a pinned checkpoint boundary."""
+
+    if existing_reader is not None:
+        logger.info(
+            "Registry: using the loaded miner's snapshot-bound MoE reader"
+        )
+        return existing_reader
+
+    try:
+        from verallm.miner.vllm_utils import (
+            _create_awq_moe_reader,
+            _create_fp8_moe_reader,
+            _create_gptq_moe_reader,
+            _create_mxfp4_moe_reader,
+            _detect_awq_moe_experts,
+            _detect_fp8_moe_experts,
+            _detect_gptq_moe_experts,
+            _detect_mxfp4_moe_experts,
+        )
+    except ImportError:
+        return None
+
+    reader_source = checkpoint_source or model_name
+    candidates = (
+        (
+            "MXFP4",
+            _detect_mxfp4_moe_experts,
+            _create_mxfp4_moe_reader,
+        ),
+        ("AWQ", _detect_awq_moe_experts, _create_awq_moe_reader),
+        ("GPTQ", _detect_gptq_moe_experts, _create_gptq_moe_reader),
+        ("FP8", _detect_fp8_moe_experts, _create_fp8_moe_reader),
+    )
+    for label, detector, factory in candidates:
+        if not detector(reader_source):
+            continue
+        reader = factory(reader_source)
+        if reader is not None:
+            logger.info(
+                "Registry: %s MoE detected — using checkpoint reader for "
+                "expert roots",
+                label,
+            )
+        return reader
+    return None
+
+
 def _compute_lm_head_root_cpu(lm_head_mod, hidden_size: int, chunk_size: int) -> bytes:
     """Compute lm_head weight root: unpack on CPU, hash on GPU via chunked transfer.
 
@@ -119,6 +173,46 @@ def _compute_lm_head_root_cpu(lm_head_mod, hidden_size: int, chunk_size: int) ->
     raise RuntimeError("No extraction method available for lm_head on CPU")
 
 
+def _compute_embedding_weight_root(
+    weight: torch.Tensor,
+    *,
+    chunk_size: int,
+    canonical_projection_v3: bool,
+) -> bytes:
+    """Compute an embedding root without changing legacy model identities.
+
+    Existing registrations use the original float32 expression below.  The
+    qualified Qwen sparse runtime also authenticates the embedding through
+    proof-v3, whose table-wide int8 surrogate deliberately performs its scale
+    arithmetic in float64.  Keep legacy models byte-for-byte stable while the
+    new sparse ModelSpec uses the same canonical surrogate as its signed v3
+    manifest and serving verifier.
+    """
+
+    if (
+        not isinstance(weight, torch.Tensor)
+        or weight.ndim != 2
+        or not weight.numel()
+    ):
+        raise ValueError("embedding weight is malformed")
+    if canonical_projection_v3:
+        from verallm.miner.proof_v3_projection_audit import (
+            projection_weight_surrogate_v3,
+        )
+
+        int8_weight, _scale = projection_weight_surrogate_v3(weight)
+    else:
+        float_weight = weight.detach().to(device="cpu", dtype=torch.float32)
+        absmax = float_weight.abs().max().clamp(min=1e-8)
+        int8_weight = (
+            (float_weight / absmax * 127)
+            .round()
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
+    return compute_flat_weight_root(int8_weight, chunk_size)
+
+
 def compute_model_identity_commitment(model) -> bytes:
     """Commit to the canonical parameter namespace and disk shapes.
 
@@ -152,7 +246,107 @@ def compute_model_identity_commitment(model) -> bytes:
     return hashlib.sha256(b"".join(commitment_data)).digest()
 
 
-def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelSpec:
+def compute_checkpoint_model_identity_commitment(reader) -> bytes:
+    """Commit a checkpoint's canonical tensor namespace and disk shapes.
+
+    Qualified sparse runtimes can expose different live module ownership and
+    parameter names across vLLM stacks. Their immutable safetensor index is
+    the architecture-independent namespace authority.
+    """
+
+    import struct
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    cache_dir = Path(getattr(reader, "_cache_dir", "")).expanduser().resolve()
+    weight_map = getattr(reader, "_weight_map", None)
+    if not cache_dir.is_dir() or not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("checkpoint identity reader metadata is unavailable")
+    names = tuple(sorted(weight_map))
+    if (
+        len(names) != len(set(names))
+        or any(not isinstance(name, str) or not name for name in names)
+        or any(not isinstance(weight_map[name], str) or not weight_map[name] for name in names)
+    ):
+        raise ValueError("checkpoint identity tensor map is malformed")
+    by_file: dict[str, list[str]] = {}
+    for name in names:
+        try:
+            encoded_name = name.encode("utf-8", "strict")
+        except UnicodeEncodeError as exc:
+            raise ValueError("checkpoint identity tensor name is malformed") from exc
+        if not encoded_name or len(encoded_name) >= 1 << 32 or "\x00" in name:
+            raise ValueError("checkpoint identity tensor name is malformed")
+        by_file.setdefault(weight_map[name], []).append(name)
+
+    domain = b"VERATHOS/MODEL_IDENTITY/CHECKPOINT_NAMESPACE_SHAPES/V1"
+    hasher = hashlib.sha256()
+    hasher.update(domain)
+    hasher.update(struct.pack("<Q", len(names)))
+    records: dict[str, bytes] = {}
+    repository_dir = (
+        cache_dir.parent.parent
+        if cache_dir.parent.name == "snapshots"
+        else cache_dir
+    ).resolve()
+    for filename, file_names in sorted(by_file.items()):
+        relative = Path(filename)
+        path = cache_dir / relative
+        resolved = path.resolve()
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not resolved.is_relative_to(repository_dir)
+            or not resolved.is_file()
+        ):
+            raise ValueError("checkpoint identity shard path is malformed")
+        try:
+            with safe_open(str(resolved), framework="pt", device="cpu") as handle:
+                available = frozenset(handle.keys())
+                for name in file_names:
+                    if name not in available:
+                        raise ValueError(
+                            "checkpoint identity tensor is absent from its shard"
+                        )
+                    shape = tuple(int(value) for value in handle.get_slice(name).get_shape())
+                    if (
+                        len(shape) >= 1 << 16
+                        or any(value < 0 or value >= 1 << 63 for value in shape)
+                    ):
+                        raise ValueError(
+                            "checkpoint identity tensor shape is malformed"
+                        )
+                    name_bytes = name.encode("utf-8")
+                    records[name] = b"".join(
+                        (
+                            struct.pack("<I", len(name_bytes)),
+                            name_bytes,
+                            struct.pack("<H", len(shape)),
+                            b"".join(
+                                struct.pack("<Q", value) for value in shape
+                            ),
+                        )
+                    )
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("checkpoint identity shard is unreadable") from exc
+    if set(records) != set(names):
+        raise ValueError("checkpoint identity tensor inventory is incomplete")
+    for name in names:
+        record = records[name]
+        hasher.update(struct.pack("<I", len(record)))
+        hasher.update(record)
+    return hasher.digest()
+
+
+def compute_model_roots(
+    model,
+    model_name: str,
+    chunk_size: int = 128,
+    *,
+    moe_weight_reader=None,
+    moe_checkpoint_source: str | None = None,
+) -> ModelSpec:
     """
     Compute weight Merkle roots for a model and return a ModelSpec.
 
@@ -163,6 +357,12 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
         model: Pre-loaded HuggingFace or vLLM-extracted model
         model_name: Model identifier string
         chunk_size: FlatWeightMerkle chunk size (elements per leaf)
+        moe_weight_reader: Snapshot-bound expert reader created by the loaded
+            miner. When present, this is authoritative for quantized MoE roots.
+        moe_checkpoint_source: Exact checkpoint path or repository identity to
+            use if a quantized MoE reader must be created here. Static-root
+            tooling that loads a pinned local snapshot must pass that snapshot
+            instead of allowing a second lookup of the registered model name.
     """
     model_config = model.config
     text_config = get_text_config(model)
@@ -182,7 +382,28 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
                 num_layers, hidden_size, intermediate_size)
     logger.info("Registry: Detected quantization: %s (%s)", quant_mode, mode_desc)
 
-    model_commitment = compute_model_identity_commitment(model)
+    from verallm.miner.execution_profile import (
+        QWEN36_35B_A3B_FP8_MODEL_ID,
+        QWEN36_35B_A3B_FP8_REVISION,
+    )
+
+    if model_name == QWEN36_35B_A3B_FP8_MODEL_ID:
+        reader_snapshot = Path(
+            getattr(moe_weight_reader, "_cache_dir", "")
+        ).resolve()
+        if (
+            moe_weight_reader is None
+            or reader_snapshot.name != QWEN36_35B_A3B_FP8_REVISION
+        ):
+            raise ValueError(
+                "qualified Qwen sparse model identity lacks its pinned "
+                "checkpoint reader"
+            )
+        model_commitment = compute_checkpoint_model_identity_commitment(
+            moe_weight_reader
+        )
+    else:
+        model_commitment = compute_model_identity_commitment(model)
 
     def _is_fused_awq_projection(layer) -> bool:
         if layer is None or not hasattr(layer, "qweight"):
@@ -308,32 +529,11 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
     # Quantized MoE: set up on-demand reader for per-expert weights from checkpoint.
     # AWQ, GPTQ, FP8, and MXFP4 all repack weights (Marlin format) making live
     # tensors unusable — the reader lazily loads original weights from checkpoint.
-    gptq_moe_reader = None
-    try:
-        from verallm.miner.vllm_utils import (
-            _detect_awq_moe_experts, _create_awq_moe_reader,
-            _detect_gptq_moe_experts, _create_gptq_moe_reader,
-            _detect_fp8_moe_experts, _create_fp8_moe_reader,
-            _detect_mxfp4_moe_experts, _create_mxfp4_moe_reader,
-        )
-        if _detect_mxfp4_moe_experts(model_name):
-            gptq_moe_reader = _create_mxfp4_moe_reader(model_name)
-            if gptq_moe_reader is not None:
-                logger.info("Registry: MXFP4 MoE detected — using checkpoint reader for expert roots")
-        elif _detect_awq_moe_experts(model_name):
-            gptq_moe_reader = _create_awq_moe_reader(model_name)
-            if gptq_moe_reader is not None:
-                logger.info("Registry: AWQ MoE detected — using checkpoint reader for expert roots")
-        elif _detect_gptq_moe_experts(model_name):
-            gptq_moe_reader = _create_gptq_moe_reader(model_name)
-            if gptq_moe_reader is not None:
-                logger.info("Registry: GPTQ MoE detected — using checkpoint reader for expert roots")
-        elif _detect_fp8_moe_experts(model_name):
-            gptq_moe_reader = _create_fp8_moe_reader(model_name)
-            if gptq_moe_reader is not None:
-                logger.info("Registry: FP8 MoE detected — using checkpoint reader for expert roots")
-    except ImportError:
-        pass
+    gptq_moe_reader = _resolve_quantized_moe_reader(
+        model_name,
+        existing_reader=moe_weight_reader,
+        checkpoint_source=moe_checkpoint_source,
+    )
 
     # Compute per-layer weight Merkle roots
     logger.info(
@@ -606,12 +806,14 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
     if embed_mod is not None and hasattr(embed_mod, 'weight'):
         import gc
         try:
-            W_emb = embed_mod.weight.data.cpu().float()
-            absmax = W_emb.abs().max().clamp(min=1e-8)
-            W_emb_int8 = (W_emb / absmax * 127).round().clamp(-128, 127).to(torch.int8)
-            del W_emb
+            embedding_root = _compute_embedding_weight_root(
+                embed_mod.weight.data,
+                chunk_size=chunk_size,
+                canonical_projection_v3=(
+                    model_name == QWEN36_35B_A3B_FP8_MODEL_ID
+                ),
+            )
             gc.collect()
-            embedding_root = compute_flat_weight_root(W_emb_int8, chunk_size)
             logger.info("Registry: embedding weight root: %s... (shape %s)",
                         embedding_root.hex()[:16], embed_mod.weight.shape)
         except Exception as e:

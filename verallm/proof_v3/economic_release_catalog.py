@@ -30,6 +30,7 @@ _REQUIRED = frozenset(
 _OPTIONAL = frozenset(
     {
         "gdn_runtime_semantics",
+        "moe_runtime_semantics",
         "lm_head_catalog",
         "projection_manifest",
         "projection_catalog",
@@ -198,6 +199,7 @@ def load_qualified_proof_v3_catalog(
             )
         root = source.parent
         gdn_name = value.get("gdn_runtime_semantics")
+        moe_name = value.get("moe_runtime_semantics")
         lm_head_catalog_name = value.get("lm_head_catalog")
         projection_manifest_name = value.get("projection_manifest")
         projection_catalog_name = value.get("projection_catalog")
@@ -280,6 +282,11 @@ def load_qualified_proof_v3_catalog(
             gdn_runtime_semantics_path=(
                 _relative_file(root, gdn_name, "GDN semantics")
                 if gdn_name is not None
+                else None
+            ),
+            moe_runtime_semantics_path=(
+                _relative_file(root, moe_name, "MoE semantics")
+                if moe_name is not None
                 else None
             ),
             lm_head_catalog_path=(

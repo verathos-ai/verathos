@@ -87,6 +87,14 @@ GDN_LAYER_OPERATIONS_V3 = (
     "residual_in",
     "residual_out",
 )
+DENSE_MLP_LAYER_OPERATIONS_V3 = (
+    "down_s",
+    "down_x",
+    "down_y",
+    "gate_up_s",
+    "gate_up_x",
+    "gate_up_y",
+)
 # Compatibility name for full-attention-only callers. Exact inventory
 # construction below is architecture-aware and never uses this alias.
 LAYER_OPERATIONS_V3 = FULL_ATTENTION_LAYER_OPERATIONS_V3
@@ -138,6 +146,7 @@ __all__ = [
     "LAYER_OPERATIONS_V3",
     "FULL_ATTENTION_LAYER_OPERATIONS_V3",
     "GDN_LAYER_OPERATIONS_V3",
+    "DENSE_MLP_LAYER_OPERATIONS_V3",
     "LOGITS_BLOCK_LEAVES_CAP_V3",
     "logits_block_geometry_v3",
     "logits_block_oracle_id_v3",
@@ -738,6 +747,7 @@ def expected_economic_inventory_v3(
     global_layer_index: int,
     logits_block_count: int = 1,
     selected_layer_indices=None,
+    moe_layer_indices=(),
 ) -> tuple[tuple[str, str, int, str], ...]:
     """The EXACT ordered ``(oracle_id, phase, layer, operation)`` inventory.
 
@@ -750,7 +760,10 @@ def expected_economic_inventory_v3(
     profiles pass zero because terminal work is selected post-nonce.
     Streaming mode additionally carries the bounded
     pre-nonce prompt-tail input used by the nonce-free response stamp.  The
-    adapter compares the wire inventory against this set exactly -- a
+    Sparse-MoE layers omit the six dense MLP projection oracles because their
+    signed router, selected-expert, shared-expert and capacity openings use
+    the dedicated bounded MoE wire.  The adapter compares the wire inventory
+    against this set exactly -- a
     missing, duplicated, reordered or extra oracle fails verification.
     """
 
@@ -783,17 +796,32 @@ def expected_economic_inventory_v3(
                 "inventory selected layers must be ordered within the "
                 "signed layer set"
             )
+    moe_layers = tuple(int(layer) for layer in moe_layer_indices)
+    if (
+        moe_layers != tuple(sorted(set(moe_layers)))
+        or any(layer not in kinds for layer in moe_layers)
+    ):
+        raise ProofV3Error(
+            "inventory MoE layers must be ordered within the signed layer set"
+        )
+    moe_set = frozenset(moe_layers)
+    dense_mlp = frozenset(DENSE_MLP_LAYER_OPERATIONS_V3)
     inventory: list[tuple[str, str, int, str]] = []
     for layer in layer_indices:
-        operations = (
-            ("residual_in", "residual_out")
-            if selected is not None and layer not in selected
-            else (
+        if selected is not None and layer not in selected:
+            operations = ("residual_in", "residual_out")
+        else:
+            operations = (
                 FULL_ATTENTION_LAYER_OPERATIONS_V3
                 if kinds[layer] == "full_attention"
                 else GDN_LAYER_OPERATIONS_V3
             )
-        )
+            if layer in moe_set:
+                operations = tuple(
+                    operation
+                    for operation in operations
+                    if operation not in dense_mlp
+                )
         for operation in operations:
             inventory.append(
                 (f"l{layer}.{operation}", "global", layer, operation)

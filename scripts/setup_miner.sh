@@ -52,6 +52,36 @@ resolve_miner_runtime_stack() {
     fi
 }
 
+resolve_flashinfer_build_jobs() {
+    local memory_gb="${1:-}"
+    local cpu_count="${2:-}"
+    local requested="${3:-}"
+
+    if ! [[ "$memory_gb" =~ ^[0-9]+$ ]] ||
+        ! [[ "$cpu_count" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: memory GiB must be non-negative and CPU count must be positive." >&2
+        return 2
+    fi
+    if [ -n "$requested" ] && ! [[ "$requested" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: VERATHOS_FLASHINFER_BUILD_JOBS must be a positive integer." >&2
+        return 2
+    fi
+
+    local jobs=4
+    if [ "$memory_gb" -ge 192 ]; then
+        jobs=16
+    elif [ "$memory_gb" -ge 96 ]; then
+        jobs=8
+    fi
+    if [ -n "$requested" ]; then
+        jobs="$requested"
+    fi
+    if [ "$jobs" -gt "$cpu_count" ]; then
+        jobs="$cpu_count"
+    fi
+    printf '%s\n' "$jobs"
+}
+
 # Deterministic diagnostic used by the installer regression suite. It runs no
 # setup actions and keeps the architecture policy executable in one place.
 if [ "${1:-}" = "--resolve-runtime-selection" ]; then
@@ -60,6 +90,15 @@ if [ "${1:-}" = "--resolve-runtime-selection" ]; then
         exit 2
     fi
     resolve_miner_runtime_stack "$2" "$3"
+    exit $?
+fi
+
+if [ "${1:-}" = "--resolve-flashinfer-build-jobs" ]; then
+    if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+        echo "Usage: $0 --resolve-flashinfer-build-jobs <memory-gib> <cpus> [override]" >&2
+        exit 2
+    fi
+    resolve_flashinfer_build_jobs "$2" "$3" "${4:-}"
     exit $?
 fi
 
@@ -251,9 +290,9 @@ fi
 
 # ── vLLM version policy & known issues ──────────────────────────────────────
 # The default install selects a qualified architecture/runtime pair below:
-# Ampere uses vLLM 0.19.1 + torch 2.10/cu128; Ada and older-driver Hopper use
-# vLLM 0.20.2 + torch 2.11/cu128; CUDA-13-capable Hopper/Blackwell uses vLLM
-# 0.20.2 + torch 2.11/cu130. Do not mix torch and vLLM across those pairs.
+# Ampere and pre-CUDA-13 sm_89+ hosts use vLLM 0.19.1 + torch 2.10/cu128;
+# CUDA-13-capable sm_89+ hosts use vLLM 0.20.2 + torch 2.11/cu130. Do not mix
+# torch and vLLM across those pairs.
 #
 # KNOWN ISSUE: A small number of sm_89 operators (RTX 4090 / L4 / L40S
 # / RTX 6000 Ada) hit `cudaErrorIllegalAddress` during model load
@@ -524,8 +563,21 @@ warm_hopper_gdn_kernel() {
         return 0
     fi
 
-    echo "  Warming the FlashInfer H100 GDN kernel..."
-    if ! timeout 600 env MAX_JOBS="${MAX_JOBS:-$(nproc)}" "$PYTHON" - <<'PY'
+    # Each sm_90a nvcc process can consume several GiB while FlashInfer builds
+    # the 67 GDN variants.  Using every visible CPU can OOM even a generously
+    # sized GPU container, so derive a conservative width from its cgroup-aware
+    # memory limit.  Keep a dedicated override for operators with measured
+    # capacity; an unrelated inherited MAX_JOBS must not bypass this guard.
+    local MEM_GB
+    MEM_GB=$(detect_memory_gb)
+    local GDN_JOBS
+    if ! GDN_JOBS=$(resolve_flashinfer_build_jobs \
+        "${MEM_GB:-0}" "$(nproc)" "${VERATHOS_FLASHINFER_BUILD_JOBS:-}"); then
+        return 1
+    fi
+
+    echo "  Warming the FlashInfer H100 GDN kernel (MAX_JOBS=$GDN_JOBS, ${MEM_GB:-unknown}GB RAM)..."
+    if ! timeout 1200 env MAX_JOBS="$GDN_JOBS" "$PYTHON" - <<'PY'
 import torch
 from flashinfer.gdn_prefill import get_gdn_prefill_module
 
@@ -1106,9 +1158,8 @@ if [ "$SKIP_INSTALL" = false ]; then
     #
     # Net selection:
     #  - sm < 89 (Ampere): vLLM 0.19.1 + torch 2.10.0 + cu128
-    #  - sm 90 or sm >= 120 with driver >= 580: vLLM 0.20.2 + torch
-    #    2.11.0 + cu130
-    #  - sm >= 89 otherwise: vLLM 0.20.2 + torch 2.11.0 + cu128
+    #  - sm >= 89 with driver >= 580: vLLM 0.20.2 + torch 2.11.0 + cu130
+    #  - sm >= 89 otherwise: vLLM 0.19.1 + torch 2.10.0 + cu128
     if [ "$VLLM_RUNTIME_STACK" = "ampere-cu128" ] ||
         [ "$VLLM_RUNTIME_STACK" = "legacy-cu128" ]; then
         VLLM_SOURCE_TAG="v0.19.1"
@@ -1417,10 +1468,14 @@ assert hasattr(zkllm_native, 'cuda_blake3_merkle_leaves'), 'Missing cuda_blake3_
 assert hasattr(zkllm_native, 'cuda_blake3_activation_row_roots'), 'Missing proof-v3 activation row reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_runtime_row_roots_retain_into'), 'Missing proof-v3 retained-runtime activation reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_runtime_staged_row_roots_into'), 'Missing proof-v3 staged row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_staged_row_roots_lanes_into'), 'Missing mixed-lane proof-v3 staged row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_staged_row_roots_lanes_history_into'), 'Missing persistent mixed-lane proof-v3 staged row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_tensor_row_roots_lanes_into'), 'Missing proof-v3 runtime tensor reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_activation_update_peaks'), 'Missing proof-v3 activation frontier reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_activation_update_peaks_heterogeneous'), 'Missing proof-v3 heterogeneous frontier reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_runtime_row_roots_into'), 'Missing proof-v3 graph row reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_prehashed_update_peaks'), 'Missing proof-v3 prehashed frontier reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_prehashed_update_peaks_inplace'), 'Missing in-place proof-v3 frontier reducer'
 assert hasattr(zkllm_native, 'cuda_blake3_prehashed_update_peaks_ranges'), 'Missing proof-v3 sparse range reducer'
 for name in (
     'combine_registered_catalog_u31_batch',

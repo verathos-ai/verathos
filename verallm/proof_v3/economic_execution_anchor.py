@@ -912,6 +912,7 @@ def derive_economic_execution_anchor_oracle_binding_v3(
     embedding_scale: float,
     encoding_id: str,
     attention_runtime_semantics=None,
+    moe_layer_indices=(),
 ) -> EconomicExecutionAnchorOracleBindingV3:
     """Interpret raw anchors and derive every selected transition oracle row.
 
@@ -929,6 +930,7 @@ def derive_economic_execution_anchor_oracle_binding_v3(
     layers_and_kinds = _layer_kinds(layer_indices, layer_kinds)
     layers = tuple(layer for layer, _kind in layers_and_kinds)
     kinds = dict(layers_and_kinds)
+    moe_layers = tuple(int(layer) for layer in moe_layer_indices)
     if (
         not isinstance(opened_rows, Mapping)
         or (
@@ -944,6 +946,8 @@ def derive_economic_execution_anchor_oracle_binding_v3(
         or not isinstance(embedding_scale, (int, float))
         or embedding_scale <= 0
         or encoding_id not in {"fp16.v1", "bf16.v1"}
+        or moe_layers != tuple(sorted(set(moe_layers)))
+        or any(layer not in layers for layer in moe_layers)
     ):
         raise ProofV3VerificationError(
             "execution anchor oracle-binding inputs are malformed"
@@ -1265,20 +1269,27 @@ def derive_economic_execution_anchor_oracle_binding_v3(
             scale=residual_scale,
         )
 
+    moe_layer_set = frozenset(moe_layers)
     for layer in challenge.selected_layer_indices:
-        for stage_suffix, oracle_suffix in (
-            ("mlp_gate_up_input", "gate_up_x"),
-            ("mlp_down_input", "down_x"),
-            ("residual_after_attention", "mid_residual"),
-        ):
+        input_stages = [("residual_after_attention", "mid_residual")]
+        output_stages = []
+        if layer not in moe_layer_set:
+            input_stages[:0] = [
+                ("mlp_gate_up_input", "gate_up_x"),
+                ("mlp_down_input", "down_x"),
+            ]
+            output_stages.extend(
+                (
+                    ("mlp_gate_up_output", "gate_up_y"),
+                    ("mlp_down_output", "down_y"),
+                )
+            )
+        for stage_suffix, oracle_suffix in input_stages:
             _bind(
                 stage_id=f"l{layer}.{stage_suffix}",
                 oracle_id=f"l{layer}.{oracle_suffix}",
             )
-        for stage_suffix, oracle_suffix in (
-            ("mlp_gate_up_output", "gate_up_y"),
-            ("mlp_down_output", "down_y"),
-        ):
+        for stage_suffix, oracle_suffix in output_stages:
             _bind_cells(
                 stage_id=f"l{layer}.{stage_suffix}",
                 oracle_id=f"l{layer}.{oracle_suffix}",
@@ -1372,6 +1383,7 @@ def derive_economic_execution_anchor_quantized_v3(
     embedding_scale: float,
     encoding_id: str,
     attention_runtime_semantics=None,
+    moe_layer_indices=(),
 ) -> EconomicExecutionAnchorOracleBindingV3:
     """Miner/verifier-shared canonical post-nonce raw-row quantization."""
 
@@ -1386,4 +1398,5 @@ def derive_economic_execution_anchor_quantized_v3(
         embedding_scale=embedding_scale,
         encoding_id=encoding_id,
         attention_runtime_semantics=attention_runtime_semantics,
+        moe_layer_indices=moe_layer_indices,
     )

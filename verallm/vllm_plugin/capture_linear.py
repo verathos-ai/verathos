@@ -67,6 +67,7 @@ class _RuntimeRootBinding:
     root_attribute: str
     staging_attribute: str
     dtype: torch.dtype
+    history_attribute: str | None = None
 
 
 def dense_execution_projection_specs(
@@ -222,7 +223,9 @@ class CaptureLinearWrapper(nn.Module):
                  output_root_suffix: str | None = None,
                  output_root_slice: tuple[int, int] | None = None,
                  row_indices: torch.Tensor | None = None,
-                 root_stage_suffixes: frozenset[str] | None = None):
+                 root_stage_suffixes: frozenset[str] | None = None,
+                 required_output_dtype: torch.dtype | None = None,
+                 diagnostic_expose_root_tensors: bool = False):
         super().__init__()
         # NOTE: self.original is assigned at the END of __init__.  With it
         # set early, nn.Module.register_buffer's hasattr() probe would fall
@@ -233,6 +236,11 @@ class CaptureLinearWrapper(nn.Module):
         self._layer_idx = layer_idx
         self._use_buffer = use_buffer
         self._use_triton_copy = use_triton_copy
+        self._diagnostic_expose_root_tensors = bool(
+            diagnostic_expose_root_tensors
+        )
+        self._capture_live_input = None
+        self._capture_live_output = None
         if not isinstance(input_kind, int) or not isinstance(output_kind, int):
             raise TypeError("capture tensor kinds must be integers")
         for value, name in (
@@ -283,6 +291,13 @@ class CaptureLinearWrapper(nn.Module):
             output_root_slice[1] - output_root_slice[0]
         )
         self._capture_dtype = dtype
+        if (
+            required_output_dtype is not None
+            and required_output_dtype
+            not in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            raise ValueError("required capture output dtype is unsupported")
+        self._capture_required_output_dtype = required_output_dtype
         self.register_buffer(
             "_capture_row_indices",
             row_indices,
@@ -360,6 +375,11 @@ class CaptureLinearWrapper(nn.Module):
                 else None,
                 persistent=False,
             )
+        for name in (
+            "_capture_input_root_history_buf",
+            "_capture_output_root_history_buf",
+        ):
+            self.register_buffer(name, None, persistent=False)
         self.register_buffer(
             "_capture_input_root_stage_buf",
             None,
@@ -490,6 +510,25 @@ class CaptureLinearWrapper(nn.Module):
             return getattr(self.original, name)
 
     def forward(self, x):
+        if self._diagnostic_expose_root_tensors:
+            if self._capture_input_root_buf is not None:
+                self._capture_live_input = x
+            y = self.original(x)
+            y_tensor = y[0] if isinstance(y, tuple) else y
+            if not isinstance(y_tensor, torch.Tensor):
+                raise TypeError("captured linear output is not a tensor")
+            if (
+                self._capture_required_output_dtype is not None
+                and y_tensor.dtype != self._capture_required_output_dtype
+            ):
+                raise RuntimeError(
+                    "captured operation output dtype does not match the "
+                    "signed runtime contract"
+                )
+            if self._capture_output_root_buf is not None:
+                root_start, root_stop = self._capture_output_root_slice
+                self._capture_live_output = y_tensor[:, root_start:root_stop]
+            return y
         capture_x = self._canonical_capture_value(
             x,
             (
@@ -517,6 +556,14 @@ class CaptureLinearWrapper(nn.Module):
         y_tensor = y[0] if isinstance(y, tuple) else y
         if not isinstance(y_tensor, torch.Tensor):
             raise TypeError("captured linear output is not a tensor")
+        if (
+            self._capture_required_output_dtype is not None
+            and y_tensor.dtype != self._capture_required_output_dtype
+        ):
+            raise RuntimeError(
+                "captured operation output dtype does not match the signed "
+                "runtime contract"
+            )
         capture_y = self._canonical_capture_value(
             y_tensor,
             (
@@ -547,18 +594,24 @@ class CaptureLinearWrapper(nn.Module):
             (
                 self._layer_idx,
                 suffix,
-                buffer,
+                (
+                    history_buffer
+                    if history_buffer is not None
+                    else buffer
+                ),
                 dimension * self._capture_buf_element_size(),
             )
-            for suffix, buffer, dimension in (
+            for suffix, buffer, history_buffer, dimension in (
                 (
                     self._capture_input_suffix,
                     self._capture_input_root_buf,
+                    self._capture_input_root_history_buf,
                     self._capture_input_dim,
                 ),
                 (
                     self._capture_output_root_suffix,
                     self._capture_output_root_buf,
+                    self._capture_output_root_history_buf,
                     self._capture_output_root_dim,
                 ),
             )
@@ -575,24 +628,28 @@ class CaptureLinearWrapper(nn.Module):
                 root_attribute=root_attribute,
                 staging_attribute=staging_attribute,
                 dtype=self._capture_dtype,
+                history_attribute=history_attribute,
             )
             for (
                 suffix,
                 dimension,
                 root_attribute,
                 staging_attribute,
+                history_attribute,
             ) in (
                 (
                     self._capture_input_suffix,
                     self._capture_input_dim,
                     "_capture_input_root_buf",
                     "_capture_input_root_stage_buf",
+                    "_capture_input_root_history_buf",
                 ),
                 (
                     self._capture_output_root_suffix,
                     self._capture_output_root_dim,
                     "_capture_output_root_buf",
                     "_capture_output_root_stage_buf",
+                    "_capture_output_root_history_buf",
                 ),
             )
             if getattr(self, root_attribute) is not None
@@ -679,8 +736,7 @@ class CaptureLinearWrapper(nn.Module):
             else output_buffer
         )
         if (
-            self._capture_output_root_buf is None
-            or source is None
+            source is None
             or source.ndim != 2
             or int(source.shape[1]) < root_stop
             or self._capture_output_root_suffix
@@ -718,6 +774,8 @@ class CaptureDecoderLayerWrapper(nn.Module):
         root_stage_suffixes: frozenset[str] | None = None,
         response_stamp_max_tokens: int = 0,
         response_stamp_row_indices: torch.Tensor | None = None,
+        response_stamp_only: bool = False,
+        diagnostic_expose_root_tensors: bool = False,
     ):
         super().__init__()
         self.original = original
@@ -726,6 +784,23 @@ class CaptureDecoderLayerWrapper(nn.Module):
         self._use_triton_copy = use_triton_copy
         self._capture_hidden_dim = int(hidden_dim)
         self._capture_dtype = dtype
+        self._response_stamp_only = bool(response_stamp_only)
+        self._diagnostic_expose_root_tensors = bool(
+            diagnostic_expose_root_tensors
+        )
+        if self._response_stamp_only and (
+            layer_idx != 0
+            or response_stamp_max_tokens <= 0
+            or response_stamp_row_indices is None
+            or use_buffer is False
+        ):
+            raise ValueError(
+                "response-stamp-only capture requires a buffered layer-zero "
+                "arena"
+            )
+        self._capture_live_residual_after_attention = None
+        self._capture_live_residual_out_hidden = None
+        self._capture_live_residual_out_residual = None
         self.register_buffer(
             "_capture_row_indices",
             row_indices,
@@ -737,7 +812,11 @@ class CaptureDecoderLayerWrapper(nn.Module):
             persistent=False,
         )
         capture_device = None
-        if (max_tokens > 0 or root_max_tokens > 0) and hidden_dim > 0:
+        if (
+            max_tokens > 0
+            or root_max_tokens > 0
+            or response_stamp_max_tokens > 0
+        ) and hidden_dim > 0:
             capture_device = next(original.parameters()).device
         buffer_device = None
         if (
@@ -972,7 +1051,7 @@ class CaptureDecoderLayerWrapper(nn.Module):
     def proof_capture_split_stages(self):
         """Return residual stages emitted through capture_at_split()."""
 
-        if self._use_buffer:
+        if self._use_buffer or self._response_stamp_only:
             return ()
         return (
             (self._layer_idx, "residual_in"),
@@ -1064,6 +1143,50 @@ class CaptureDecoderLayerWrapper(nn.Module):
 
     def forward(self, *args, **kwargs):
         hidden_states, residual = self._locate_hidden_residual(args, kwargs)
+        if self._response_stamp_only:
+            if not isinstance(hidden_states, torch.Tensor):
+                raise TypeError(
+                    "response-stamp decoder layer has no hidden-state tensor"
+                )
+            residual_in = (
+                hidden_states
+                if residual is None
+                else hidden_states + residual
+            )
+            self._capture_response_stamp(
+                self._canonical_capture_value(
+                    residual_in,
+                    self._capture_response_stamp_buf,
+                )
+            )
+            return self.original(*args, **kwargs)
+        if self._diagnostic_expose_root_tensors:
+            result = self.original(*args, **kwargs)
+            if not isinstance(result, tuple) or len(result) < 2:
+                raise TypeError(
+                    "captured decoder layer must return hidden and residual"
+                )
+            hidden_out, residual_after_attention = result[:2]
+            if not isinstance(hidden_out, torch.Tensor) or not isinstance(
+                residual_after_attention,
+                torch.Tensor,
+            ):
+                raise TypeError(
+                    "captured decoder layer returned non-tensor state"
+                )
+            if self._capture_residual_after_attention_root_buf is not None:
+                self._capture_live_residual_after_attention = (
+                    residual_after_attention
+                )
+            if self._capture_residual_out_root_buf is not None:
+                # Keep both already-computed result tensors live. The signed
+                # residual-out sum is deliberately deferred until after graph
+                # replay so this diagnostic adds no CUDA kernel to the model.
+                self._capture_live_residual_out_hidden = hidden_out
+                self._capture_live_residual_out_residual = (
+                    residual_after_attention
+                )
+            return result
         residual_in = (
             hidden_states
             if residual is None
@@ -1121,35 +1244,7 @@ class CaptureDecoderLayerWrapper(nn.Module):
             self._capture_residual_out_root_buf,
             self._capture_residual_out_root_stage_buf,
         )
-        if self._capture_response_stamp_buf is not None:
-            indices = self._capture_response_stamp_row_indices
-            if indices is None:
-                raise RuntimeError(
-                    "response-stamp capture indices are unavailable"
-                )
-            if capture_residual_in.is_cuda:
-                torch.ops.verallm.buffer_gather_rows(
-                    self._capture_response_stamp_buf,
-                    capture_residual_in,
-                    indices,
-                )
-            else:
-                valid = (indices >= 0) & (
-                    indices < capture_residual_in.shape[0]
-                )
-                if bool(valid.any()):
-                    positions = torch.nonzero(
-                        valid,
-                        as_tuple=False,
-                    ).flatten()
-                    self._capture_response_stamp_buf.index_copy_(
-                        0,
-                        positions,
-                        capture_residual_in.index_select(
-                            0,
-                            indices.index_select(0, positions),
-                        ),
-                    )
+        self._capture_response_stamp(capture_residual_in)
         if self._capture_root_batch_destination is not None:
             torch.ops.verallm.activation_staged_row_roots(
                 self._capture_root_batch_destination,
@@ -1174,6 +1269,33 @@ class CaptureDecoderLayerWrapper(nn.Module):
             self._capture_residual_out_buf,
         )
         return result
+
+    def _capture_response_stamp(self, residual_in: torch.Tensor) -> None:
+        if self._capture_response_stamp_buf is None:
+            return
+        indices = self._capture_response_stamp_row_indices
+        if indices is None:
+            raise RuntimeError(
+                "response-stamp capture indices are unavailable"
+            )
+        if residual_in.is_cuda:
+            torch.ops.verallm.buffer_gather_rows(
+                self._capture_response_stamp_buf,
+                residual_in,
+                indices,
+            )
+            return
+        valid = (indices >= 0) & (indices < residual_in.shape[0])
+        if bool(valid.any()):
+            positions = torch.nonzero(valid, as_tuple=False).flatten()
+            self._capture_response_stamp_buf.index_copy_(
+                0,
+                positions,
+                residual_in.index_select(
+                    0,
+                    indices.index_select(0, positions),
+                ),
+            )
 
 
 def enable_batched_runtime_root_capture_v3(
@@ -1226,6 +1348,33 @@ def enable_batched_runtime_root_capture_v3(
     if not bindings:
         return 0
 
+    # A signed sparse-MoE profile may use a router dtype different from the
+    # surrounding execution trace. The native staged reducer owns one typed
+    # rectangular arena, so only stages in the decoder's runtime dtype can
+    # share it. Mixed-dtype stages retain their already-installed direct graph
+    # reducer and exact root buffers.
+    finalizers = tuple(
+        module
+        for module in model.modules()
+        if isinstance(module, CaptureDecoderLayerWrapper)
+    )
+    if not finalizers:
+        raise RuntimeError("runtime root batch lacks a decoder finalizer")
+    finalizer = max(finalizers, key=lambda item: item._layer_idx)
+    runtime_dtype = finalizer._capture_dtype
+    direct_bindings = tuple(
+        item for item in bindings if item.dtype != runtime_dtype
+    )
+    bindings = tuple(
+        item for item in bindings if item.dtype == runtime_dtype
+    )
+    if not bindings:
+        logger.info(
+            "Kept %d mixed-dtype runtime root stage(s) on direct reducers",
+            len(direct_bindings),
+        )
+        return 0
+
     root_tensors = tuple(
         getattr(item.owner, item.root_attribute)
         for item in bindings
@@ -1258,15 +1407,6 @@ def enable_batched_runtime_root_capture_v3(
         for item, root in zip(bindings, root_tensors)
     ):
         raise RuntimeError("runtime root stage geometry is inconsistent")
-
-    finalizers = tuple(
-        module
-        for module in model.modules()
-        if isinstance(module, CaptureDecoderLayerWrapper)
-    )
-    if not finalizers:
-        raise RuntimeError("runtime root batch lacks a decoder finalizer")
-    finalizer = max(finalizers, key=lambda item: item._layer_idx)
 
     from zkllm.cuda import zkllm_native
 
@@ -1376,6 +1516,11 @@ def enable_batched_runtime_root_capture_v3(
         len(bindings),
         max_decode_rows,
     )
+    if direct_bindings:
+        logger.info(
+            "Kept %d mixed-dtype runtime root stage(s) on direct reducers",
+            len(direct_bindings),
+        )
     if retention_bindings:
         logger.info(
             "Bounded post-nonce root retention installed for %d stage(s) "

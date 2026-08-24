@@ -20,6 +20,7 @@ from verallm.proof_v2.layout import (
     MLP_GATE_UP_OPERATION_ID,
 )
 from verallm.proof_v3.errors import ProofV3Error
+from verallm.moe.detection import is_moe_layer
 from verallm.vllm_plugin.capture_linear import (
     dense_execution_projection_specs,
 )
@@ -127,14 +128,17 @@ def qualify_runtime_layer_kinds_v3(
                 "operations"
             )
         actual = frozenset(operation_ids)
-        required = _COMMON_OPERATIONS | _ARCHITECTURE_OPERATIONS[protocol_kind]
+        sparse_moe = is_moe_layer(layer)
+        common = frozenset() if sparse_moe else _COMMON_OPERATIONS
+        required = common | _ARCHITECTURE_OPERATIONS[protocol_kind]
         forbidden = (
             all_architecture_operations
             - _ARCHITECTURE_OPERATIONS[protocol_kind]
         )
         missing = required - actual
         extra_architecture = actual & forbidden
-        if missing or extra_architecture:
+        mixed_dense_sparse = sparse_moe and bool(actual & _COMMON_OPERATIONS)
+        if missing or extra_architecture or mixed_dense_sparse:
             raise ProofV3Error(
                 f"runtime layer {layer_index} does not match declared "
                 f"{declared_kind} projection inventory"

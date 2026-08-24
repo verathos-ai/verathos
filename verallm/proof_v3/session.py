@@ -828,6 +828,25 @@ class ProofV3ChallengeSession:
         return self._hard_proof_arrival_budget_ns
 
     @property
+    def maximum_hard_proof_transport_bytes(self) -> int:
+        """Return the adapter-authenticated hard-proof transport ceiling."""
+
+        from verallm.proof_v3.economic_transport import (
+            MAX_ECONOMIC_MOE_TRANSPORT_BYTES,
+            MAX_ECONOMIC_TRANSPORT_BYTES,
+        )
+
+        return (
+            MAX_ECONOMIC_MOE_TRANSPORT_BYTES
+            if getattr(
+                getattr(self._registration, "artifacts", None),
+                "moe_runtime_semantics",
+                None,
+            ) is not None
+            else MAX_ECONOMIC_TRANSPORT_BYTES
+        )
+
+    @property
     def verified_capture_chain_digest(self) -> bytes | None:
         """Return the authenticated economic capture chain after verification."""
 
@@ -1186,7 +1205,16 @@ class ProofV3ChallengeSession:
                         "economic proof verification requires validator-owned "
                         "request and output context"
                     )
-                proof = decode_economic_proof_transport_v3(encoded_proof)
+                proof = decode_economic_proof_transport_v3(
+                    encoded_proof,
+                    allow_sparse_moe=bool(
+                        getattr(
+                            getattr(self._registration, "artifacts", None),
+                            "moe_runtime_semantics",
+                            None,
+                        )
+                    ),
+                )
                 result = verify_economic_execution_proof_v3(
                     profile=self._profile,
                     envelope=envelope,

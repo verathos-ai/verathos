@@ -162,6 +162,11 @@ class ModelEntry:
     # Verification status
     verified_inference: bool = False    # True = passes full VeraLLM verification
 
+    # Service modalities admitted by this exact registry identity.  Empty
+    # retains the legacy, unbound behavior; a non-empty tuple is enforced by
+    # service boundaries before inference.
+    service_modalities: tuple[str, ...] = ()
+
     # Training support (None = inference only)
     training: TrainingConfig | None = None
 
@@ -1839,7 +1844,7 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
 
     ModelEntry(
         id="qwen3.6-35b-a3b",
-        name="Qwen3.6-35B-A3B",
+        name="Qwen3.6-35B-A3B AWQ",
         base_model="Qwen/Qwen3.6-35B-A3B",
         architecture="moe",
         categories=(ModelCategory.GENERAL, ModelCategory.CODING, ModelCategory.MULTIMODAL),
@@ -1861,12 +1866,6 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
                 notes="AWQ INT4 — full native 256K context on 48 GB (compact MoE); "
                       "needs VLLM_USE_FLASHINFER_MOE_FP16=1",
             ),
-            TierConfig(
-                VRAMTier.GB_80,
-                "Qwen/Qwen3.6-35B-A3B-FP8",
-                (QuantOption("fp8", 262144),),
-                notes="Official pre-quantized FP8 — full native 256K context",
-            ),
         ),
         total_params_b=35.0, active_params_b=3.0, num_experts=256,
         native_context_len=262144,
@@ -1876,6 +1875,32 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
         notes="Multimodal (text + image + video); GDN hybrid attention; "
               "256 experts (8 routed + 1 shared); successor to Qwen3.5-35B-A3B; "
               "requires vLLM >= 0.19.0",
+    ),
+
+    ModelEntry(
+        id="qwen3.6-35b-a3b-fp8",
+        name="Qwen3.6-35B-A3B FP8 (Text)",
+        base_model="Qwen/Qwen3.6-35B-A3B",
+        architecture="moe",
+        categories=(ModelCategory.GENERAL, ModelCategory.CODING),
+        tier_configs=(
+            TierConfig(
+                VRAMTier.GB_80,
+                "Qwen/Qwen3.6-35B-A3B-FP8",
+                (QuantOption("fp8", 262144),),
+                notes="Official pre-quantized FP8 — qualified text-only lane",
+            ),
+        ),
+        total_params_b=35.0, active_params_b=3.0, num_experts=256,
+        native_context_len=262144,
+        generation_quality=1.10,
+        moe_dense_equivalent=24.0,
+        verified_inference=True,
+        service_modalities=("text",),
+        family="qwen3.6", provider="Qwen",
+        notes="Official FP8 checkpoint; text-only service profile; GDN hybrid "
+              "attention; 256 experts (8 routed + 1 shared); requires vLLM "
+              ">= 0.19.0",
     ),
 
     ModelEntry(

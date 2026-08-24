@@ -155,6 +155,7 @@ class QualifiedEconomicAdapterV3:
                 self.artifacts.attention_runtime_semantics
             ),
             gdn_runtime_semantics=self.artifacts.gdn_runtime_semantics,
+            moe_runtime_semantics=self.artifacts.moe_runtime_semantics,
             tokenizer_binding_digest=(
                 self.artifacts.tokenizer_binding_digest
             ),

@@ -26,6 +26,7 @@ from verallm.proof_v2.trace import (
     TRACE_ATTENTION_GDN_AUDIT_ONLY,
     TRACE_ATTENTION_GDN_TRANSITION_V1,
     TRACE_PROFILE_QWEN_HYBRID_DENSE_V1,
+    TRACE_PROFILE_QWEN_HYBRID_SPARSE_MOE_SHELL_V1,
 )
 from verallm.proof_v2.transition import (
     FULL_ATTENTION_TRANSITION_PROFILE_V1,
@@ -335,23 +336,37 @@ def validate_qwen_hybrid_execution_manifest_profile(
     """Validate the exact authority-signed Qwen hybrid execution shell.
 
     Attention/GDN internal transition checks are selected by the signed
-    per-layer profile.  Every surrounding linear operation and both MLP
-    projections are mandatory; unknown or additional operations fail closed.
-    Dimensions that are not present in the on-chain ``ModelSpec`` remain
-    authority-signed in their operation descriptors and are checked against
-    the concrete runtime modules by the miner loader.
+    per-layer profile. Dense manifests require both MLP projections. Sparse
+    manifests require the same attention shell but deliberately exclude MLP
+    operations because routed/shared matrices use individually signed Merkle
+    openings in proof v3. Unknown or additional operations fail closed.
     """
 
     if not isinstance(manifest, StaticWeightCommitmentManifest):
         raise ProofV2LayoutError("manifest has an unexpected type")
-    if manifest.execution_profile != TRACE_PROFILE_QWEN_HYBRID_DENSE_V1:
+    if manifest.execution_profile == TRACE_PROFILE_QWEN_HYBRID_DENSE_V1:
+        sparse_moe_shell = False
+    elif (
+        manifest.execution_profile
+        == TRACE_PROFILE_QWEN_HYBRID_SPARSE_MOE_SHELL_V1
+    ):
+        sparse_moe_shell = True
+    else:
         raise ProofV2LayoutError(
             "proof v2 manifest is missing the supported causal execution profile"
         )
     spec = manifest.model_spec
-    if spec.num_experts != 0 or spec.expert_w_num_cols != 0:
+    if sparse_moe_shell and (
+        spec.num_experts < 2 or spec.expert_w_num_cols <= 0
+    ):
         raise ProofV2LayoutError(
-            "Qwen hybrid execution proof currently supports dense models only"
+            "sparse-MoE shell requires exact expert ModelSpec geometry"
+        )
+    if not sparse_moe_shell and (
+        spec.num_experts != 0 or spec.expert_w_num_cols != 0
+    ):
+        raise ProofV2LayoutError(
+            "dense Qwen hybrid execution profile rejects expert geometry"
         )
     if spec.activation != "silu" or spec.norm_type != "rmsnorm":
         raise ProofV2LayoutError(
@@ -408,7 +423,7 @@ def validate_qwen_hybrid_execution_manifest_profile(
             raise ProofV2LayoutError("execution operation layer is out of range")
         if descriptor.expert_id is not None:
             raise ProofV2LayoutError(
-                "dense execution operations must not specify an expert"
+                "Qwen shell execution operations must not specify an expert"
             )
         by_id = layer_descriptors[descriptor.layer]
         if descriptor.operation_id in by_id:
@@ -498,11 +513,15 @@ def validate_qwen_hybrid_execution_manifest_profile(
             raise ProofV2LayoutError(
                 "audit-only attention profiles cannot carry transition parameters"
             )
-        expected_ids = _EXECUTION_OPERATION_IDS.get(layer_profile.attention_profile)
+        expected_ids = _EXECUTION_OPERATION_IDS.get(
+            layer_profile.attention_profile
+        )
         if expected_ids is None:
             raise ProofV2LayoutError(
                 "execution manifest contains an unsupported attention profile"
             )
+        if sparse_moe_shell:
+            expected_ids = expected_ids - _COMMON_EXECUTION_OPERATION_IDS
         actual = layer_descriptors[layer_profile.layer]
         if frozenset(actual) != expected_ids:
             raise ProofV2LayoutError(
@@ -586,7 +605,14 @@ def validate_qwen_hybrid_execution_manifest_profile(
 
     operations = registered_operations_from_manifest(manifest)
     expected_count = sum(
-        len(_EXECUTION_OPERATION_IDS[item.attention_profile])
+        len(
+            _EXECUTION_OPERATION_IDS[item.attention_profile]
+            - (
+                _COMMON_EXECUTION_OPERATION_IDS
+                if sparse_moe_shell
+                else frozenset()
+            )
+        )
         for item in manifest.layer_execution
     )
     if len(operations) != expected_count:

@@ -71,6 +71,7 @@ _STATIC_BINDING_KINDS = frozenset(
         "embedding",
         "final_norm",
         "model_boundary",
+        "moe",
         "rope",
         "sampler",
         "transition",
@@ -85,15 +86,17 @@ _RELATION_ADAPTERS = {
     "full_attention": frozenset({"full_attention.v1"}),
     "gdn": frozenset({"gdn.v1"}),
     "bridge": frozenset({"residual.bridge.v1"}),
+    "moe": frozenset({"fused_moe.qwen3_5.v1"}),
     "final_norm": frozenset({"final_norm.v1"}),
     "sampler": frozenset({"canonical.sampler.v1"}),
 }
-_LAYER_RELATIONS = frozenset({"full_attention", "gdn", "bridge"})
+_LAYER_RELATIONS = frozenset({"full_attention", "gdn", "bridge", "moe"})
 _NODE_BINDING_KINDS = {
     "embedding": frozenset({"embedding", "model_boundary"}),
     "full_attention": frozenset({"attention", "rope", "transition"}),
     "gdn": frozenset({"bridge", "transition"}),
     "bridge": frozenset({"bridge"}),
+    "moe": frozenset({"moe"}),
     "final_norm": frozenset({"final_norm", "model_boundary"}),
     "sampler": frozenset({"sampler"}),
 }
@@ -398,7 +401,13 @@ class StaticParameterBindingV3:
             raise ProofV3Error("static binding_kind is not supported")
         _fixed32(self.binding_digest, "binding_digest", nonzero=True)
         layer = _i32(self.layer_index, "binding layer_index", minimum=-1)
-        if self.binding_kind in {"attention", "bridge", "rope", "transition"}:
+        if self.binding_kind in {
+            "attention",
+            "bridge",
+            "moe",
+            "rope",
+            "transition",
+        }:
             if layer < 0:
                 raise ProofV3Error("layer transition bindings require a layer index")
         elif layer != -1:
@@ -1547,7 +1556,7 @@ class ExecutionRelationSpecV3:
                     )
                 transition_nodes_by_layer[node.layer_index] = node.relation_id
                 transition_node_ids_by_layer[node.layer_index] = node.node_id
-            if node.relation_id == "bridge":
+            if node.relation_id in {"bridge", "moe"}:
                 family = cache_by_layer.get(node.layer_index)
                 if family is None:
                     raise ProofV3Error("bridge layer has no signed cache family")
@@ -1557,6 +1566,24 @@ class ExecutionRelationSpecV3:
                     )
                 if node.layer_index in bridge_node_ids_by_layer:
                     raise ProofV3Error("each layer may have only one bridge relation")
+                if node.relation_id == "moe":
+                    runtime_inputs = tuple(
+                        tensor_id
+                        for tensor_id in node.input_tensor_ids
+                        if tensors[tensor_id].commitment_role == "runtime_state"
+                        and sequence_dimension_id in tensors[tensor_id].shape
+                    )
+                    runtime_outputs = tuple(
+                        tensor_id
+                        for tensor_id in node.output_tensor_ids
+                        if tensors[tensor_id].commitment_role == "runtime_state"
+                        and sequence_dimension_id in tensors[tensor_id].shape
+                    )
+                    if len(runtime_inputs) != 2 or len(runtime_outputs) != 1:
+                        raise ProofV3Error(
+                            "MoE relations require the layer residual, transition "
+                            "output and one resulting runtime state"
+                        )
                 bridge_node_ids_by_layer[node.layer_index] = node.node_id
             available.update(outputs)
         if self.final_token_tensor_id not in self.nodes[-1].output_tensor_ids:

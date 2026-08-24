@@ -20,16 +20,21 @@ from verallm.proof_v3.economic_wire import (
 from verallm.proof_v3.errors import ProofV3Error
 
 ECONOMIC_TRANSPORT_VERSION = 2
-# Bounded operational envelope for one hard-audit response.  This is a
-# transport/resource limit, not a cryptographic parameter.  The measured
-# signed-policy 27B hybrid proof is about 25 MiB at 162 decoded tokens after
-# compact GDN suffix encoding.  The 32 MiB bound covers the policy's bounded
-# 192-token low-context range without changing audit coverage.
+# Bounded operational envelopes for one hard-audit response. These are
+# transport/resource limits, not cryptographic parameters. Dense proofs retain
+# the established 32 MiB boundary byte-for-byte. Sparse-MoE proofs carry a
+# distinct authenticated transport flag because complete selected gate/up
+# matrices are intentionally incompressible at production Qwen3.6 geometry.
+# Their 96 MiB boundary remains below the canonical 128 MiB wire limit while
+# covering the measured 65.25 MiB Qwen3.6-35B proof without reducing audit
+# coverage.
 MAX_ECONOMIC_TRANSPORT_BYTES = 32 << 20
+MAX_ECONOMIC_MOE_TRANSPORT_BYTES = 96 << 20
 
 _MAGIC = b"V3EZ"
 _CODEC_ZSTD = 2
-_FLAGS = 0
+_FLAGS_DENSE = 0
+_FLAGS_SPARSE_MOE = 1
 _HEADER = struct.Struct("<4sHBBII32s")
 _COMPRESSION_LEVEL = 9
 _COMPRESSION_WINDOW_LOG = 24
@@ -37,9 +42,42 @@ _COMPRESSION_WINDOW_LOG = 24
 __all__ = [
     "ECONOMIC_TRANSPORT_VERSION",
     "MAX_ECONOMIC_TRANSPORT_BYTES",
+    "MAX_ECONOMIC_MOE_TRANSPORT_BYTES",
     "encode_economic_proof_transport_v3",
     "decode_economic_proof_transport_v3",
+    "economic_proof_transport_maximum_bytes_v3",
 ]
+
+
+def economic_proof_transport_maximum_bytes_v3(
+    encoded: bytes,
+    *,
+    allow_sparse_moe: bool = False,
+) -> int:
+    """Return the canonical bound selected by an encoded transport header."""
+
+    if not isinstance(allow_sparse_moe, bool):
+        raise ProofV3Error("sparse-MoE transport permission must be boolean")
+    if not isinstance(encoded, bytes) or len(encoded) < _HEADER.size:
+        raise ProofV3Error("economic proof transport is malformed")
+    try:
+        magic, version, codec, flags, _raw, _compressed, _digest = (
+            _HEADER.unpack_from(encoded)
+        )
+    except struct.error as exc:
+        raise ProofV3Error("economic proof transport header is malformed") from exc
+    if (
+        magic != _MAGIC
+        or version != ECONOMIC_TRANSPORT_VERSION
+        or codec != _CODEC_ZSTD
+        or flags not in {_FLAGS_DENSE, _FLAGS_SPARSE_MOE}
+    ):
+        raise ProofV3Error("economic proof transport header is not supported")
+    if flags == _FLAGS_SPARSE_MOE:
+        if not allow_sparse_moe:
+            raise ProofV3Error("sparse-MoE proof transport is not permitted")
+        return MAX_ECONOMIC_MOE_TRANSPORT_BYTES
+    return MAX_ECONOMIC_TRANSPORT_BYTES
 
 
 def encode_economic_proof_transport_v3(
@@ -51,19 +89,25 @@ def encode_economic_proof_transport_v3(
         raise ProofV3Error("economic transport proof has an unexpected type")
     raw = proof.canonical_bytes()
     compressed = _compress_canonical_proof_v3(raw)
+    flags = _FLAGS_SPARSE_MOE if proof.moe_wire else _FLAGS_DENSE
+    maximum = (
+        MAX_ECONOMIC_MOE_TRANSPORT_BYTES
+        if flags == _FLAGS_SPARSE_MOE
+        else MAX_ECONOMIC_TRANSPORT_BYTES
+    )
     encoded = _HEADER.pack(
         _MAGIC,
         ECONOMIC_TRANSPORT_VERSION,
         _CODEC_ZSTD,
-        _FLAGS,
+        flags,
         len(raw),
         len(compressed),
         hashlib.sha256(raw).digest(),
     ) + compressed
-    if len(encoded) > MAX_ECONOMIC_TRANSPORT_BYTES:
+    if len(encoded) > maximum:
         raise ProofV3Error(
             "compressed economic proof exceeds the transport byte limit "
-            f"({len(encoded)} > {MAX_ECONOMIC_TRANSPORT_BYTES})"
+            f"({len(encoded)} > {maximum})"
         )
     return encoded
 
@@ -120,13 +164,23 @@ def _compress_canonical_proof_v3(raw: bytes) -> bytes:
 
 def decode_economic_proof_transport_v3(
     encoded: bytes,
+    *,
+    allow_sparse_moe: bool = False,
 ) -> EconomicRecomputeProofV3:
     """Boundedly decompress and canonical-parse one network proof."""
 
-    if not isinstance(encoded, bytes) or len(encoded) < _HEADER.size:
+    if not isinstance(allow_sparse_moe, bool):
+        raise ProofV3Error("sparse-MoE transport permission must be boolean")
+    if (
+        not isinstance(encoded, bytes)
+        or len(encoded) < _HEADER.size
+        or len(encoded) > MAX_ECONOMIC_MOE_TRANSPORT_BYTES
+    ):
         raise ProofV3Error("economic proof transport is malformed")
-    if len(encoded) > MAX_ECONOMIC_TRANSPORT_BYTES:
-        raise ProofV3Error("economic proof transport exceeds the byte limit")
+    maximum = economic_proof_transport_maximum_bytes_v3(
+        encoded,
+        allow_sparse_moe=allow_sparse_moe,
+    )
     try:
         (
             magic,
@@ -143,9 +197,12 @@ def decode_economic_proof_transport_v3(
         magic != _MAGIC
         or version != ECONOMIC_TRANSPORT_VERSION
         or codec != _CODEC_ZSTD
-        or flags != _FLAGS
+        or flags not in {_FLAGS_DENSE, _FLAGS_SPARSE_MOE}
     ):
         raise ProofV3Error("economic proof transport header is not supported")
+    sparse_moe = flags == _FLAGS_SPARSE_MOE
+    if len(encoded) > maximum:
+        raise ProofV3Error("economic proof transport exceeds the byte limit")
     if not 0 < raw_length <= MAX_ECONOMIC_WIRE_BYTES:
         raise ProofV3Error("economic proof transport raw length is out of range")
     if compressed_length != len(encoded) - _HEADER.size:
@@ -174,4 +231,9 @@ def decode_economic_proof_transport_v3(
         )
     if hashlib.sha256(raw).digest() != raw_digest:
         raise ProofV3Error("economic proof transport digest does not match")
-    return EconomicRecomputeProofV3.from_canonical_bytes(raw)
+    proof = EconomicRecomputeProofV3.from_canonical_bytes(raw)
+    if bool(proof.moe_wire) != sparse_moe:
+        raise ProofV3Error(
+            "economic proof transport sparse-MoE flag is inconsistent"
+        )
+    return proof

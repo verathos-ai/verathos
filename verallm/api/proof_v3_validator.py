@@ -788,11 +788,28 @@ def _iter_sse_events(response) -> Iterator[tuple[str, Mapping[str, object]]]:
         yield item
 
 
-def _read_bounded_hard_proof(response) -> bytes:
+def _read_bounded_hard_proof(
+    response,
+    *,
+    maximum_bytes: int | None = None,
+) -> bytes:
     from verallm.proof_v3.economic_transport import (
+        MAX_ECONOMIC_MOE_TRANSPORT_BYTES,
         MAX_ECONOMIC_TRANSPORT_BYTES,
     )
 
+    maximum = (
+        MAX_ECONOMIC_TRANSPORT_BYTES
+        if maximum_bytes is None
+        else maximum_bytes
+    )
+    if maximum not in {
+        MAX_ECONOMIC_TRANSPORT_BYTES,
+        MAX_ECONOMIC_MOE_TRANSPORT_BYTES,
+    }:
+        raise ProofV3VerificationError(
+            "proof-v3 hard-proof transport bound is invalid"
+        )
     declared = response.headers.get("content-length")
     if declared is not None:
         try:
@@ -801,7 +818,7 @@ def _read_bounded_hard_proof(response) -> bytes:
             raise ProofV3VerificationError(
                 "proof-v3 response content length is malformed"
             ) from exc
-        if not 0 < declared_length <= MAX_ECONOMIC_TRANSPORT_BYTES:
+        if not 0 < declared_length <= maximum:
             raise ProofV3VerificationError(
                 "proof-v3 response content length is out of range"
             )
@@ -809,7 +826,7 @@ def _read_bounded_hard_proof(response) -> bytes:
     size = 0
     for chunk in response.iter_bytes():
         size += len(chunk)
-        if size > MAX_ECONOMIC_TRANSPORT_BYTES:
+        if size > maximum:
             raise ProofV3VerificationError(
                 "proof-v3 hard proof exceeds its transport limit"
             )
@@ -879,11 +896,28 @@ async def _iter_sse_events_async(
         yield item
 
 
-async def _read_bounded_hard_proof_async(response) -> bytes:
+async def _read_bounded_hard_proof_async(
+    response,
+    *,
+    maximum_bytes: int | None = None,
+) -> bytes:
     from verallm.proof_v3.economic_transport import (
+        MAX_ECONOMIC_MOE_TRANSPORT_BYTES,
         MAX_ECONOMIC_TRANSPORT_BYTES,
     )
 
+    maximum = (
+        MAX_ECONOMIC_TRANSPORT_BYTES
+        if maximum_bytes is None
+        else maximum_bytes
+    )
+    if maximum not in {
+        MAX_ECONOMIC_TRANSPORT_BYTES,
+        MAX_ECONOMIC_MOE_TRANSPORT_BYTES,
+    }:
+        raise ProofV3VerificationError(
+            "proof-v3 hard-proof transport bound is invalid"
+        )
     declared = response.headers.get("content-length")
     if declared is not None:
         try:
@@ -892,7 +926,7 @@ async def _read_bounded_hard_proof_async(response) -> bytes:
             raise ProofV3VerificationError(
                 "proof-v3 response content length is malformed"
             ) from exc
-        if not 0 < declared_length <= MAX_ECONOMIC_TRANSPORT_BYTES:
+        if not 0 < declared_length <= maximum:
             raise ProofV3VerificationError(
                 "proof-v3 response content length is out of range"
             )
@@ -900,7 +934,7 @@ async def _read_bounded_hard_proof_async(response) -> bytes:
     size = 0
     async for chunk in response.aiter_bytes():
         size += len(chunk)
-        if size > MAX_ECONOMIC_TRANSPORT_BYTES:
+        if size > maximum:
             raise ProofV3VerificationError(
                 "proof-v3 hard proof exceeds its transport limit"
             )
@@ -1104,7 +1138,14 @@ def finalize_proof_v3_exchange_sync(
                     raise ProofV3VerificationError(
                         "proof-v3 hard proof has an unexpected media type"
                     )
-                encoded_proof = _read_bounded_hard_proof(response)
+                encoded_proof = _read_bounded_hard_proof(
+                    response,
+                    maximum_bytes=getattr(
+                        getattr(exchange, "session", None),
+                        "maximum_hard_proof_transport_bytes",
+                        None,
+                    ),
+                )
                 received_ns = time.monotonic_ns()
             exchange.verify_hard_proof(
                 encoded_proof=encoded_proof,
@@ -1291,7 +1332,14 @@ async def run_proof_v3_exchange_async(
                     raise ProofV3VerificationError(
                         "proof-v3 hard proof has an unexpected media type"
                     )
-                encoded_proof = await _read_bounded_hard_proof_async(response)
+                encoded_proof = await _read_bounded_hard_proof_async(
+                    response,
+                    maximum_bytes=getattr(
+                        getattr(exchange, "session", None),
+                        "maximum_hard_proof_transport_bytes",
+                        None,
+                    ),
+                )
                 received_ns = time.monotonic_ns()
             exchange.verify_hard_proof(
                 encoded_proof=encoded_proof,

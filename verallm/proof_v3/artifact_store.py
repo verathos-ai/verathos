@@ -63,6 +63,7 @@ _ARTIFACT_MAXIMUMS = MappingProxyType(
         "calibration_set": MAX_QUALIFIED_ARTIFACT_BYTES_V3,
         "attention_runtime_semantics": MAX_QUALIFIED_ARTIFACT_BYTES_V3,
         "gdn_runtime_semantics": MAX_QUALIFIED_ARTIFACT_BYTES_V3,
+        "moe_runtime_semantics": MAX_QUALIFIED_ARTIFACT_BYTES_V3,
         "lm_head_catalog": MAX_LM_HEAD_CATALOG_ARTIFACT_BYTES_V3,
         "projection_manifest": MAX_QUALIFIED_ARTIFACT_BYTES_V3,
         "projection_catalog": MAX_PALLAS_CATALOG_BYTES_V3,

@@ -596,6 +596,8 @@ def build_economic_recompute_proof_v3(
     gdn_prefix_positions_by_layer=None,
     selected_projection_rows=None,
     prefix_cache=None,
+    moe_runtime_semantics=None,
+    moe_wire: bytes = b"",
 ) -> EconomicRecomputeProofV3:
     """Open the validator-derived coordinates and assemble the wire proof.
 
@@ -634,6 +636,20 @@ def build_economic_recompute_proof_v3(
         )
     for kind in layer_kinds.values():
         audited_projections_for_layer_kind_v3(kind)
+    if moe_runtime_semantics is None:
+        moe_layers = frozenset()
+    else:
+        from verallm.proof_v3.moe_runtime_semantics import (
+            MoeRuntimeSemanticsV3,
+        )
+
+        if not isinstance(moe_runtime_semantics, MoeRuntimeSemanticsV3):
+            raise ProofV3Error("economic prover MoE semantics are malformed")
+        moe_layers = frozenset(
+            item.layer_index for item in moe_runtime_semantics.layers
+        )
+        if not moe_layers.issubset(layer_universe):
+            raise ProofV3Error("economic prover MoE layer is unknown")
 
     def _tree(name: str):
         if name not in weight_trees:
@@ -701,12 +717,46 @@ def build_economic_recompute_proof_v3(
         )
         and not complete_projection
     )
+    selected_moe_layers = tuple(
+        layer
+        for layer in sorted(challenge.selected_layer_indices)
+        if layer in moe_layers
+    )
+    if selected_moe_layers:
+        if not lean_mode or not economic_selection_is_compact_v3(
+            challenge.selection_abi_id
+        ):
+            raise ProofV3Error(
+                "sparse MoE requires the compact-v9 lean proof path"
+            )
+        try:
+            from verallm.proof_v3.economic_moe_wire import (
+                decode_economic_moe_wire_v3,
+            )
+
+            parsed_moe = decode_economic_moe_wire_v3(moe_wire)
+        except ProofV3Error as exc:
+            raise ProofV3Error("economic prover MoE wire is malformed") from exc
+        if (
+            parsed_moe.semantics_digest != moe_runtime_semantics.digest()
+            or tuple(item.layer_index for item in parsed_moe.layers)
+            != selected_moe_layers
+        ):
+            raise ProofV3Error(
+                "economic prover MoE wire does not cover the selected layers"
+            )
+    elif moe_wire:
+        raise ProofV3Error("economic prover carries an unsolicited MoE wire")
     if selected_projection_rows_supplied:
         expected_projection_names = {
             f"l{layer}.{manifest_suffix}"
             for layer in challenge.selected_layer_indices
             for _x_suffix, _s_suffix, manifest_suffix in (
                 audited_projections_for_layer_kind_v3(layer_kinds[layer])
+            )
+            if not (
+                layer in moe_layers
+                and manifest_suffix in {"gate_up", "down"}
             )
         }
         if set(selected_projection_rows) != expected_projection_names:
@@ -864,7 +914,11 @@ def build_economic_recompute_proof_v3(
         }
         if require_exact_mlp_activation:
             expected_mlp_layers = tuple(
-                sorted(int(layer) for layer in challenge.selected_layer_indices)
+                sorted(
+                    int(layer)
+                    for layer in challenge.selected_layer_indices
+                    if layer not in moe_layers
+                )
             )
             if tuple(sorted(mlp_activation_rows_by_layer)) != expected_mlp_layers:
                 raise ProofV3Error(
@@ -901,6 +955,13 @@ def build_economic_recompute_proof_v3(
         )
         projection_specs = audited_projections_for_layer_kind_v3(
             layer_kinds[layer]
+        )
+        projection_specs = tuple(
+            spec
+            for spec in projection_specs
+            if not (
+                layer in moe_layers and spec[2] in {"gate_up", "down"}
+            )
         )
         for x_suffix, s_suffix, manifest_suffix in projection_specs:
             x_oracle = oracle_set.get(f"l{layer}.{x_suffix}")
@@ -1124,7 +1185,153 @@ def build_economic_recompute_proof_v3(
                 )
             )
 
-        # -- common MLP, residual and norm coupling material ----------------
+        # -- sparse-MoE architecture coupling material ----------------------
+        if layer in moe_layers:
+            mid = oracle_set.get(f"l{layer}.mid_residual")
+            residual_cols = challenge.residual_cols_for(
+                layer_index=layer,
+                hidden_dim=mid.commitment.col_count,
+            )
+            _indices, mid_opening = mid.open_rows(tokens, value_mode=2)
+            bias_rows = []
+            for projection_index, (_x, _s, suffix) in enumerate(
+                audited_projections_for_layer_kind_v3(layer_kinds[layer])
+            ):
+                if suffix in {"gate_up", "down"}:
+                    continue
+                bias_name = f"l{layer}.{suffix}_bias"
+                if bias_name in weight_trees:
+                    bias_rows.append(
+                        (projection_index, _weight_row(bias_name, 0))
+                    )
+            input_norm_row = _weight_row(f"l{layer}.input_norm", 0)
+            post_norm_row = _weight_row(f"l{layer}.post_norm", 0)
+            mid_index = oracle_set.index_of(f"l{layer}.mid_residual")
+            if layer_kinds[layer] == "full_attention":
+                attn_o_y = oracle_set.get(f"l{layer}.attn_o_y")
+                k_oracle = oracle_set.get(f"l{layer}.k_cache")
+                v_oracle = oracle_set.get(f"l{layer}.v_cache")
+                o_outs = challenge.out_cells_for(
+                    layer_index=layer,
+                    out_dim=attn_o_y.commitment.col_count,
+                    projection="o",
+                )
+                attn_o_cells = tuple(
+                    (token, column)
+                    for token in tokens
+                    for column in sorted(set(o_outs) | set(residual_cols))
+                )
+                _indices, attn_o_y_opening = attn_o_y.open_cells(
+                    attn_o_cells,
+                    value_mode=2,
+                )
+                kv_cols = challenge.kv_cols_for(
+                    layer_index=layer,
+                    kv_dim=k_oracle.commitment.col_count,
+                )
+                kv_cells = tuple(
+                    (token, column)
+                    for token in tokens
+                    for column in kv_cols
+                )
+                _indices, k_opening = k_oracle.open_cells(
+                    kv_cells,
+                    value_mode=1,
+                )
+                _indices, v_opening = v_oracle.open_cells(
+                    kv_cells,
+                    value_mode=1,
+                )
+                couplings.append(
+                    EconomicLayerCouplingRevealV3(
+                        layer_index=layer,
+                        attn_o_y_oracle_index=oracle_set.index_of(
+                            f"l{layer}.attn_o_y"
+                        ),
+                        attn_o_y_opening=attn_o_y_opening,
+                        down_y_oracle_index=mid_index,
+                        down_y_opening=mid_opening,
+                        mid_oracle_index=mid_index,
+                        mid_opening=mid_opening,
+                        gate_up_y_oracle_index=mid_index,
+                        gate_up_y_opening=mid_opening,
+                        k_oracle_index=oracle_set.index_of(
+                            f"l{layer}.k_cache"
+                        ),
+                        k_opening=k_opening,
+                        v_oracle_index=oracle_set.index_of(
+                            f"l{layer}.v_cache"
+                        ),
+                        v_opening=v_opening,
+                        qkv_s_kv_opening=mid_opening,
+                        qkv_kv_weight_rows=(),
+                        input_norm_row=input_norm_row,
+                        post_norm_row=post_norm_row,
+                        bias_rows=tuple(bias_rows),
+                    )
+                )
+            else:
+                qkvz_y = oracle_set.get(f"l{layer}.gdn_qkvz_y")
+                ba_y = oracle_set.get(f"l{layer}.gdn_ba_y")
+                gdn_o_y = oracle_set.get(f"l{layer}.gdn_o_y")
+                _indices, qkvz_y_opening = qkvz_y.open_rows(
+                    tokens,
+                    value_mode=2,
+                )
+                _indices, ba_y_opening = ba_y.open_rows(
+                    tokens,
+                    value_mode=2,
+                )
+                gdn_o_outs = challenge.out_cells_for(
+                    layer_index=layer,
+                    out_dim=gdn_o_y.commitment.col_count,
+                    projection="gdn_o",
+                )
+                gdn_o_cells = tuple(
+                    (token, column)
+                    for token in tokens
+                    for column in sorted(
+                        set(gdn_o_outs) | set(residual_cols)
+                    )
+                )
+                _indices, gdn_o_y_opening = gdn_o_y.open_cells(
+                    gdn_o_cells,
+                    value_mode=2,
+                )
+                gdn_couplings.append(
+                    EconomicGdnLayerCouplingRevealV3(
+                        layer_index=layer,
+                        qkvz_y_oracle_index=oracle_set.index_of(
+                            f"l{layer}.gdn_qkvz_y"
+                        ),
+                        qkvz_y_opening=qkvz_y_opening,
+                        ba_y_oracle_index=oracle_set.index_of(
+                            f"l{layer}.gdn_ba_y"
+                        ),
+                        ba_y_opening=ba_y_opening,
+                        gdn_o_y_oracle_index=oracle_set.index_of(
+                            f"l{layer}.gdn_o_y"
+                        ),
+                        gdn_o_y_opening=gdn_o_y_opening,
+                        down_y_oracle_index=mid_index,
+                        down_y_opening=mid_opening,
+                        mid_oracle_index=mid_index,
+                        mid_opening=mid_opening,
+                        gate_up_y_oracle_index=mid_index,
+                        gate_up_y_opening=mid_opening,
+                        input_norm_row=input_norm_row,
+                        post_norm_row=post_norm_row,
+                        bias_rows=tuple(bias_rows),
+                        runtime_rows=gdn_runtime_rows_by_layer.get(layer, ()),
+                        norm_source_rows=gdn_norm_source_rows_by_layer.get(
+                            layer,
+                            (),
+                        ),
+                    )
+                )
+            continue
+
+        # -- common dense MLP, residual and norm coupling material ----------
         down_y = oracle_set.get(f"l{layer}.down_y")
         mid = oracle_set.get(f"l{layer}.mid_residual")
         gate_up_y = oracle_set.get(f"l{layer}.gate_up_y")
@@ -1788,6 +1995,7 @@ def build_economic_recompute_proof_v3(
         lean_projection_batch_wire=lean_projection_batch_wire,
         succinct_projection_batch_wire=succinct_projection_batch_wire,
         prefix_cache=prefix_cache,
+        moe_wire=moe_wire,
     )
     if trace:
         import zlib

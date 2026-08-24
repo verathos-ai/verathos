@@ -65,6 +65,9 @@ from verallm.proof_v3.prefix_cache import (
     PrefixCacheStateRecordV3,
 )
 from zkllm.types import MerklePath
+# v21/v22: a bounded nested sparse-MoE section authenticates complete router,
+# selected expert/shared-path, sampled down-row and route-independent capacity
+# openings. v22 is the prefix-cache counterpart.
 # v19/v20: lean compact proofs carry exact bounded replay cells for the
 # nonce-selected fused SwiGLU relation. v20 is the prefix-cache counterpart.
 # v17: checkpointed GDN couplings carry exact bounded replay source rows for
@@ -100,6 +103,8 @@ ECONOMIC_WIRE_FORMAT_VERSION = 17
 ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION = 18
 ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION = 19
 ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION = 20
+ECONOMIC_MOE_WIRE_FORMAT_VERSION = 21
+ECONOMIC_MOE_PREFIX_CACHE_WIRE_FORMAT_VERSION = 22
 _WIRE_MAGIC = b"V3EW"
 
 VALUE_MODE_EXTERNAL = 0
@@ -178,6 +183,8 @@ __all__ = [
     "ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION",
     "ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION",
     "ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION",
+    "ECONOMIC_MOE_WIRE_FORMAT_VERSION",
+    "ECONOMIC_MOE_PREFIX_CACHE_WIRE_FORMAT_VERSION",
     "MAX_ECONOMIC_WIRE_BYTES",
     "MAX_SELECTED_TRACE_WIRE_BYTES_V3",
     "MAX_REVEALED_LOGITS_V3",
@@ -2543,6 +2550,7 @@ class EconomicRecomputeProofV3:
     lean_projection_batch_wire: bytes = b""
     succinct_projection_batch_wire: bytes = b""
     selected_trace_wire: bytes = b""
+    moe_wire: bytes = b""
     chain: EconomicChainRevealV3 | None = None
     final: EconomicFinalRevealV3 | None = None
     attention: EconomicAttentionRequestSectionV3 | None = None
@@ -2791,6 +2799,18 @@ class EconomicRecomputeProofV3:
                     "selected trace and legacy recompute sections are "
                     "mutually exclusive"
                 )
+        moe_wire = self.moe_wire
+        if not isinstance(moe_wire, bytes):
+            raise ProofV3Error("MoE wire must be canonical bytes")
+        if moe_wire:
+            from verallm.proof_v3.economic_moe_wire import (
+                MAX_ECONOMIC_MOE_WIRE_BYTES_V3,
+                decode_economic_moe_wire_v3,
+            )
+
+            if len(moe_wire) > MAX_ECONOMIC_MOE_WIRE_BYTES_V3:
+                raise ProofV3Error("MoE wire exceeds the protocol bound")
+            decode_economic_moe_wire_v3(moe_wire)
         if self.chain is not None:
             if not isinstance(self.chain, EconomicChainRevealV3):
                 raise ProofV3Error("chain reveal has an unexpected type")
@@ -2845,6 +2865,7 @@ class EconomicRecomputeProofV3:
             "selected_trace_wire",
             selected_trace_wire,
         )
+        object.__setattr__(self, "moe_wire", moe_wire)
 
     def oracle_inventory_digest(self) -> bytes:
         return economic_oracle_inventory_digest_v3(self.oracles)
@@ -2858,7 +2879,13 @@ class EconomicRecomputeProofV3:
 
     def canonical_bytes(self) -> bytes:
         writer = _Writer()
-        if self.mlp_activation_reveals:
+        if self.moe_wire:
+            version = (
+                ECONOMIC_MOE_PREFIX_CACHE_WIRE_FORMAT_VERSION
+                if self.prefix_cache is not None
+                else ECONOMIC_MOE_WIRE_FORMAT_VERSION
+            )
+        elif self.mlp_activation_reveals:
             version = (
                 ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION
                 if self.prefix_cache is not None
@@ -2909,7 +2936,11 @@ class EconomicRecomputeProofV3:
         writer.pack("<I", len(self.gdn_couplings))
         for coupling in self.gdn_couplings:
             coupling.encode(writer)
-        if self.mlp_activation_reveals:
+        if self.moe_wire:
+            writer.pack("<I", len(self.mlp_activation_reveals))
+            for reveal in self.mlp_activation_reveals:
+                reveal.encode(writer)
+        elif self.mlp_activation_reveals:
             writer.pack("<I", len(self.mlp_activation_reveals))
             for reveal in self.mlp_activation_reveals:
                 reveal.encode(writer)
@@ -2936,6 +2967,16 @@ class EconomicRecomputeProofV3:
                 "selected trace wire",
                 MAX_SELECTED_TRACE_WIRE_BYTES_V3,
             )
+        if self.moe_wire:
+            from verallm.proof_v3.economic_moe_wire import (
+                MAX_ECONOMIC_MOE_WIRE_BYTES_V3,
+            )
+
+            writer.vbytes(
+                self.moe_wire,
+                "MoE wire",
+                MAX_ECONOMIC_MOE_WIRE_BYTES_V3,
+            )
         writer.pack("<B", 1 if self.chain is not None else 0)
         if self.chain is not None:
             self.chain.encode(writer)
@@ -2961,6 +3002,8 @@ class EconomicRecomputeProofV3:
             ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION,
             ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION,
             ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+            ECONOMIC_MOE_WIRE_FORMAT_VERSION,
+            ECONOMIC_MOE_PREFIX_CACHE_WIRE_FORMAT_VERSION,
         }:
             raise ProofV3Error("economic recompute proof header is not supported")
         commitment_envelope_digest = reader.read(32)
@@ -3030,10 +3073,17 @@ class EconomicRecomputeProofV3:
         if version in {
             ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION,
             ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+            ECONOMIC_MOE_WIRE_FORMAT_VERSION,
+            ECONOMIC_MOE_PREFIX_CACHE_WIRE_FORMAT_VERSION,
         }:
             mlp_activation_count = reader.count(
                 "MLP activation reveals",
                 MAX_COUPLING_REVEALS,
+                allow_zero=version
+                in {
+                    ECONOMIC_MOE_WIRE_FORMAT_VERSION,
+                    ECONOMIC_MOE_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+                },
             )
             mlp_activation_reveals = tuple(
                 EconomicMlpActivationRevealV3.decode(reader)
@@ -3078,6 +3128,19 @@ class EconomicRecomputeProofV3:
             if selected_trace_flag
             else b""
         )
+        moe_wire = b""
+        if version in {
+            ECONOMIC_MOE_WIRE_FORMAT_VERSION,
+            ECONOMIC_MOE_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+        }:
+            from verallm.proof_v3.economic_moe_wire import (
+                MAX_ECONOMIC_MOE_WIRE_BYTES_V3,
+            )
+
+            moe_wire = reader.vbytes(
+                "MoE wire",
+                MAX_ECONOMIC_MOE_WIRE_BYTES_V3,
+            )
         chain_flag = reader.unpack("<B")[0]
         if chain_flag not in (0, 1):
             raise ProofV3Error("economic chain flag is not canonical")
@@ -3098,6 +3161,7 @@ class EconomicRecomputeProofV3:
             if version in {
                 ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION,
                 ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+                ECONOMIC_MOE_PREFIX_CACHE_WIRE_FORMAT_VERSION,
             }
             else None
         )
@@ -3118,6 +3182,7 @@ class EconomicRecomputeProofV3:
             lean_projection_batch_wire=lean_projection_batch_wire,
             succinct_projection_batch_wire=succinct_projection_batch_wire,
             selected_trace_wire=selected_trace_wire,
+            moe_wire=moe_wire,
             attention=attention,
             chain=chain,
             final=final,

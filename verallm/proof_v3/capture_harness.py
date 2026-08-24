@@ -181,14 +181,20 @@ class CaptureMiner:
 
 
 def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
-                        max_model_len: int = 2048, max_num_seqs: int = 8,
+                        max_model_len: int | None = 2048,
+                        max_num_seqs: int | None = 8,
                         reduction_layers=None,
                         max_num_batched_tokens: int | None = None,
                         execution_anchor_stage_suffixes=None,
                         execution_anchor_checkpoint_stride: int = 1,
+                        proof_v3_moe_router_encoding_id: str | None = None,
+                        proof_v3_capture_adapter_id: str | None = None,
+                        proof_v3_capture_selected_layer_count: int | None = None,
                         enable_prefix_caching: bool = False,
+                        async_scheduling: bool | None = None,
                         enable_finished_cache_retention: bool = False,
                         quant: str = "fp16",
+                        revision: str | None = None,
                         ) -> CaptureMiner:
     import torch
 
@@ -244,6 +250,12 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
         vocab_size=0, activation="silu", norm_type="rmsnorm", attention_type="gqa")
 
     extra = {}
+    if max_model_len is not None:
+        extra["max_model_len"] = int(max_model_len)
+    if max_num_seqs is not None:
+        extra["max_num_seqs"] = int(max_num_seqs)
+    if revision is not None:
+        extra["revision"] = revision
     if max_num_batched_tokens is not None:
         extra["max_num_batched_tokens"] = int(max_num_batched_tokens)
     if enable_prefix_caching:
@@ -260,6 +272,8 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
         # incomplete request; disabling prefix caching is the production
         # configuration for audit-tracked serving.
         extra["enable_prefix_caching"] = False
+    if async_scheduling is not None:
+        extra["async_scheduling"] = bool(async_scheduling)
     if enable_prefix_caching or enable_finished_cache_retention:
         extra["scheduler_cls"] = (
             "verallm.miner.proof_cache_scheduler.ProofCacheScheduler"
@@ -267,7 +281,15 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
     miner = VllmMiner(model_path, temp_spec, None)
     miner.setup_vllm(quant=str(quant), gpu_memory_utilization=gpu_mem,
                      proof_v2_full_trace_capture=True,
-                     max_model_len=max_model_len, max_num_seqs=max_num_seqs,
+                     proof_v3_moe_router_encoding_id=(
+                         proof_v3_moe_router_encoding_id
+                     ),
+                     proof_v3_capture_adapter_id=(
+                         proof_v3_capture_adapter_id
+                     ),
+                     proof_v3_capture_selected_layer_count=(
+                         proof_v3_capture_selected_layer_count
+                     ),
                      **extra)
     if not miner._use_cuda_graphs:
         raise RuntimeError("CUDA graphs not active - eager is not a production claim")
@@ -292,8 +314,11 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
                        is_moe_layer_fn=lambda _: False, wrap_lm_head=not use_buffer)
     set_active_tracker(tr)
     bufs, seen = [], set()
+    response_stamp_records = []
     split_economic_keys = set()
     root_wrappers, seen_root_wrappers = [], set()
+    split_alias_wrappers, seen_split_alias_wrappers = [], set()
+    runtime_root_only_keys = set()
     for L in layers:
         for m in L.modules():
             split_stage_source = getattr(
@@ -303,17 +328,33 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
             )
             if split_stage_source is not None:
                 split_economic_keys.update(split_stage_source())
+            runtime_root_only_source = getattr(
+                m,
+                "proof_capture_runtime_root_only_stages",
+                None,
+            )
+            if runtime_root_only_source is not None:
+                runtime_root_only_keys.update(runtime_root_only_source())
+            root_buffer_source = getattr(
+                m,
+                "proof_capture_root_buffers",
+                None,
+            )
             if (
-                isinstance(
-                    m,
-                    (CaptureLinearWrapper, CaptureDecoderLayerWrapper),
-                )
-                and id(m) not in reduction_wrapper_ids
+                root_buffer_source is not None
                 and id(m) not in seen_root_wrappers
-                and m.proof_capture_root_buffers()
+                and root_buffer_source()
             ):
                 seen_root_wrappers.add(id(m))
                 root_wrappers.append(m)
+            if (
+                isinstance(m, CaptureLinearWrapper)
+                and id(m) not in reduction_wrapper_ids
+                and id(m) not in seen_split_alias_wrappers
+                and m.proof_capture_split_row_aliases()
+            ):
+                seen_split_alias_wrappers.add(id(m))
+                split_alias_wrappers.append(m)
             has_raw_capture = (
                 (
                     isinstance(m, CaptureLinearWrapper)
@@ -334,7 +375,21 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
             ):
                 seen.add(id(m))
                 bufs.append(m)
+            response_stamp_source = getattr(
+                type(m),
+                "proof_capture_response_stamp_buffer",
+                None,
+            )
+            if response_stamp_source is not None:
+                response_stamp_records.extend(response_stamp_source(m))
     tr.register_capture_buffers(bufs)
+    if response_stamp_records:
+        if len(response_stamp_records) != 1:
+            raise RuntimeError(
+                "proof capture response-stamp inventory is ambiguous"
+            )
+        if tr._response_stamp_buffer is None:
+            tr.register_response_stamp_capture(response_stamp_records[0])
     root_buffers = [
         item
         for wrapper in root_wrappers
@@ -349,12 +404,45 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
     ]
     split_root_row_aliases = [
         item
-        for wrapper in root_wrappers
-        if isinstance(wrapper, CaptureLinearWrapper)
+        # Qualified sparse QKV capture exposes its exact whole-step K/V alias
+        # without allocating a duplicate root buffer.
+        for wrapper in split_alias_wrappers
         for item in wrapper.proof_capture_split_row_aliases()
     ]
     if root_buffers:
         tr.register_execution_anchor_root_buffers(root_buffers)
+        root_histories = tuple(
+            item
+            for wrapper in root_wrappers
+            for history_source in (
+                getattr(wrapper, "proof_capture_root_history", None),
+            )
+            if history_source is not None
+            for item in history_source()
+        )
+        if root_histories:
+            if len(root_histories) != 1:
+                raise RuntimeError(
+                    "proof capture root history inventory is ambiguous"
+                )
+            tr.register_execution_anchor_root_history(*root_histories[0])
+        root_finalizers = tuple(
+            item
+            for wrapper in root_wrappers
+            for finalizer_source in (
+                getattr(wrapper, "proof_capture_root_finalizer", None),
+            )
+            if finalizer_source is not None
+            for item in finalizer_source()
+        )
+        if root_finalizers:
+            if len(root_finalizers) != 1:
+                raise RuntimeError(
+                    "proof capture root finalizer inventory is ambiguous"
+                )
+            tr.register_execution_anchor_root_post_graph_finalizer(
+                root_finalizers[0]
+            )
         root_staging_buffers = [
             (
                 int(binding.stage_id.split(".", 1)[0][1:]),
@@ -363,7 +451,11 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
                 binding.row_width,
             )
             for wrapper in root_wrappers
-            for binding in wrapper._runtime_root_bindings()
+            for binding_source in (
+                getattr(wrapper, "_runtime_root_bindings", None),
+            )
+            if binding_source is not None
+            for binding in binding_source()
             for staging in (
                 getattr(
                     binding.owner,
@@ -383,11 +475,33 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
             tuple(
                 item
                 for wrapper in root_wrappers
-                for item in wrapper.proof_capture_root_retention()
+                for retention_source in (
+                    getattr(wrapper, "proof_capture_root_retention", None),
+                )
+                if retention_source is not None
+                for item in retention_source()
             )
         )
         tr.register_split_execution_anchor_aliases(
             split_root_row_aliases
+        )
+    gdn_root_histories = tuple(
+        item
+        for layer in layers
+        for module in layer.modules()
+        for history_source in (
+            getattr(module, "proof_capture_gdn_root_history", None),
+        )
+        if history_source is not None
+        for item in history_source()
+    )
+    if gdn_root_histories:
+        if len(gdn_root_histories) != 1:
+            raise RuntimeError(
+                "proof capture GDN root history inventory is ambiguous"
+            )
+        tr.register_gdn_decode_checkpoint_root_history(
+            *gdn_root_histories[0]
         )
     gdn_modules = []
     for layer_index, layer in enumerate(layers):
@@ -504,6 +618,11 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
             root_row_aliases,
             required_root_row_aliases=reduction_root_row_aliases,
         )
+        if response_stamp_records and not any(
+            (int(layer), str(suffix)) == (0, "residual_in")
+            for layer, suffix, _buffer in economic_buffers
+        ):
+            economic_buffers += (response_stamp_records[0][:3],)
         root_keys = {
             (int(layer), str(suffix))
             for layer, suffix, _buffer, _width in root_buffers
@@ -523,6 +642,7 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
                 - raw_keys
                 - staging_keys
                 - split_economic_keys
+                - runtime_root_only_keys
             )
         )
         if missing_raw:
