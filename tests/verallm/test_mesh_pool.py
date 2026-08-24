@@ -6901,3 +6901,113 @@ def test_benign_stale_races_carry_no_teardown_order(tmp_path):
     superseded = mgr.handle_report(report)
     assert superseded["status"] == "stale"
     assert "mesh_gone" not in superseded
+
+
+def _manager_with_registration_and_idle_worker(tmp_path):
+    state_dir, tok = create_pool_state(
+        tmp_path, manager_endpoint="http://127.0.0.1:0", serving_mode="dev"
+    )
+    mgr = PoolManager(state_dir)
+    worker_body = {"pool_secret": tok.pool_secret}
+    mgr.handle_join({**worker_body, "worker_id": "w1",
+                     "capability": {"gpu_name": "t", "vram_gb": 48},
+                     "catalog": [{"model_id": "m1", "model_bytes": 1000}],
+                     "endpoints": {"rpc": "w1:50052", "proof": "http://w1:9402",
+                                   "mesh": "http://w1:9500"}})
+    with mgr.lock:
+        mgr.state.setdefault("mesh_registrations", {})["m1"] = {
+            "model_id": "m1",
+            "model_index": 7,
+            "mesh_key": "m-dead",
+            "endpoint": "https://mesh.example:9443",
+            "quant": "gguf_mesh_q4_k_m",
+            "max_context_len": 8192,
+            "model_spec_ref": "aa" * 32,
+            "expires_at": int(time.time()) + 86_400,
+        }
+        mgr._save()
+    return mgr, worker_body
+
+
+def _wait_for_live_mesh(mgr, model_id, timeout_s=5.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with mgr.lock:
+            live = [
+                m for m in mgr.state["meshes"].values()
+                if m.get("model_id") == model_id
+                and m.get("status") in ("fetching", "driving")
+            ]
+        if live:
+            return live[0]
+        time.sleep(0.1)
+    return None
+
+
+class TestAutoRelaunch:
+    """A registered model whose mesh died relaunches by itself when an
+    idle worker holding the model heartbeats in. Operator stops suspend
+    it; an explicit launch re-arms it; a cooldown bounds crash loops."""
+
+    def test_idle_worker_triggers_relaunch(self, tmp_path):
+        mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+        mesh = _wait_for_live_mesh(mgr, "m1")
+        assert mesh is not None, "auto-relaunch must launch the dead model"
+        assert mesh["driver"] == "w1"
+
+    def test_operator_stop_suspends_until_explicit_launch(self, tmp_path):
+        mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+        mesh = _wait_for_live_mesh(mgr, "m1")
+        assert mesh is not None
+        admin = {"management_secret": mgr.state["management_secret"]}
+        mgr.handle_stop({**admin, "mesh_key": mesh["mesh_key"]})
+        with mgr.lock:
+            assert mgr._registrations_locked()["m1"][
+                "suspended_by_operator"
+            ] is True
+        # Cooldown reset so ONLY the suspension can block the relaunch.
+        mgr._auto_relaunch_last.clear()
+        # Complete the stop so the worker idles again.
+        stop_cmd = mgr.handle_heartbeat(
+            {**worker_body, "worker_id": "w1"}
+        )["command"]
+        assert stop_cmd["action"] == "stop"
+        mgr.handle_report(
+            {
+                **worker_body,
+                **_command_report(stop_cmd, worker_id="w1", event="stopped"),
+            }
+        )
+        mgr._auto_relaunch_last.clear()
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+        assert _wait_for_live_mesh(mgr, "m1", timeout_s=2.0) is None, (
+            "operator stop must suspend auto-relaunch"
+        )
+        # An explicit launch re-arms the guard.
+        launched = mgr.handle_launch(
+            {**admin, "model_id": "m1", "workers": ["w1"], "driver": "w1"}
+        )
+        with mgr.lock:
+            assert "suspended_by_operator" not in mgr._registrations_locked()[
+                "m1"
+            ]
+        assert launched["driver"] == "w1"
+
+    def test_cooldown_bounds_crash_loops(self, tmp_path):
+        mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
+        mgr._auto_relaunch_last = {"m1": time.monotonic()}
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+        assert _wait_for_live_mesh(mgr, "m1", timeout_s=2.0) is None, (
+            "a recent attempt must gate the next one"
+        )
+
+    def test_unbound_registration_is_ignored(self, tmp_path):
+        mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
+        with mgr.lock:
+            mgr._registrations_locked()["m1"].pop("model_index")
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+        assert _wait_for_live_mesh(mgr, "m1", timeout_s=2.0) is None, (
+            "auto-relaunch only guards chain-bound registrations"
+        )

@@ -4431,6 +4431,7 @@ class PoolManager:
         # NOT persisting them keeps the beat off the disk-write path (the state
         # file write under the lock was serializing all workers' heartbeats).
         # Chat is delivered by the long-poll (/v1/pool/chat-poll), not here.
+        self._maybe_auto_relaunch_registered(worker_id)
         return {
             "status": "ok",
             "command": command,
@@ -4442,6 +4443,88 @@ class PoolManager:
                 else {}
             ),
         }
+
+    # Registered models must SERVE: a mesh that dies (worker crash, killed
+    # serve, host reboot) leaves an on-chain registration with nothing
+    # behind it, and until now the recovery was a manual relaunch. When an
+    # idle worker that already holds the model's files heartbeats in, the
+    # manager relaunches the mesh itself. Guards: chain-bound
+    # registrations only, never while any record for the model is still
+    # live, never after an operator stop (until the next explicit
+    # launch), one attempt per model per cooldown window so a
+    # crash-looping serve cannot be hammered.
+    AUTO_RELAUNCH_COOLDOWN_S = 600.0
+
+    def _maybe_auto_relaunch_registered(self, worker_id: str) -> None:
+        now = time.monotonic()
+        last_map = getattr(self, "_auto_relaunch_last", None)
+        if last_map is None:
+            last_map = self._auto_relaunch_last = {}
+        candidate_model = ""
+        with self.lock:
+            worker = self.state["workers"].get(worker_id)
+            if worker is None or worker.get("status") != "idle":
+                return
+            catalog_models = {
+                str(item.get("model_id", "") or "")
+                for item in (worker.get("catalog") or [])
+            }
+            if not catalog_models:
+                return
+            live_models = {
+                str(m.get("model_id", "") or "")
+                for m in self.state["meshes"].values()
+                if str(m.get("status", "") or "")
+                in ("fetching", "driving", "joining", "serving", "stopping")
+            }
+            for model_id, registration in self._registrations_locked().items():
+                if registration.get("model_index") is None:
+                    continue
+                if registration.get("suspended_by_operator"):
+                    continue
+                if model_id in live_models:
+                    continue
+                if model_id not in catalog_models:
+                    continue
+                if now - last_map.get(model_id, 0.0) < (
+                    self.AUTO_RELAUNCH_COOLDOWN_S
+                ):
+                    continue
+                last_map[model_id] = now
+                candidate_model = model_id
+                break
+            if not candidate_model:
+                return
+            management_secret = str(self.state["management_secret"])
+        model_id = candidate_model
+        logger.warning(
+            "auto-relaunch: registered model %s has no live mesh; "
+            "relaunching on idle worker %s (its catalog holds the model)",
+            model_id,
+            worker_id,
+        )
+
+        def _relaunch() -> None:
+            time.sleep(1.0)
+            try:
+                self.handle_launch(
+                    {
+                        "management_secret": management_secret,
+                        "model_id": model_id,
+                        "workers": [worker_id],
+                        "driver": worker_id,
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    "auto-relaunch of %s on %s failed (next attempt after "
+                    "cooldown): %s",
+                    model_id,
+                    worker_id,
+                    str(exc)[:200],
+                )
+
+        threading.Thread(target=_relaunch, daemon=True).start()
 
     def handle_report(self, body: dict[str, Any]) -> dict[str, Any]:
         worker_id, _proof_key = self._auth_worker(body, action="report")
@@ -5891,6 +5974,12 @@ class PoolManager:
                 ).get(model_id)
                 if isinstance(launched_registration, dict):
                     launched_registration["mesh_key"] = mesh_key
+            # An explicit launch lifts any operator suspension: the operator
+            # has re-stated that this model should serve, so auto-relaunch
+            # may guard it again.
+            _launch_registration = self._registrations_locked().get(model_id)
+            if isinstance(_launch_registration, dict):
+                _launch_registration.pop("suspended_by_operator", None)
             for wid in members:
                 self.state["workers"][wid]["status"] = "assigned"
                 self.state["workers"][wid]["mesh"] = mesh_key
@@ -6588,6 +6677,14 @@ class PoolManager:
             mesh = self.state["meshes"].get(mesh_key)
             if mesh is None:
                 raise ValueError("unknown mesh")
+            # An operator stop is intent, not an outage: suspend the
+            # model's auto-relaunch until the next explicit launch, or the
+            # manager would immediately resurrect what the operator just
+            # tore down.
+            model_id = str(mesh.get("model_id", "") or "")
+            registration = self._registrations_locked().get(model_id)
+            if isinstance(registration, dict):
+                registration["suspended_by_operator"] = True
             # Keep a stopping tombstone until every worker confirms process
             # shutdown. This prevents a visually convenient early removal from
             # making GPUs reusable while old backends still own their ports.
