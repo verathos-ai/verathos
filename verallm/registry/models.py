@@ -2922,9 +2922,9 @@ MESH_MODELS: tuple[MeshModelEntry, ...] = (
             MeshQuantVariant(
                 mesh_model_id="qwen3.8-27b-q4-k-m",
                 gguf_scheme="q4_k_m",
-                hf_files=("Qwen3.8-27B-Q4_K_M.gguf",),
-                model_bytes=17_106_775_008,
-                tensor_manifest_root="e6e3acc074c906b9a9aaeb6480fe0abc7e4f62f5805243e9a4f0a1dfc3ac91e2",
+                hf_files=("Qwen3.8-27B-UD-Q4_K_M.gguf",),
+                model_bytes=16_464_440_224,
+                tensor_manifest_root="de3d2acd111777f93044ca384eb09e89a4118115494a5cd6f0f734b2d2d80359",
             ),
             MeshQuantVariant(
                 mesh_model_id="qwen3.8-27b-q4-k-xl",
