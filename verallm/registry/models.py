@@ -2805,6 +2805,12 @@ class MeshQuantVariant:
     hf_files: tuple[str, ...]
     model_bytes: int
     hf_repo: str = ""  # override only when this quant lives in another repo
+    # Layer count override (0 = inherit the entry's). Quants of one family
+    # can be cut from different base builds with different layer counts,
+    # and the chain-bound launch refuses a mesh whose local GGUF layer
+    # count differs from the registered spec, so the catalogue must carry
+    # the per-file truth.
+    layers: int = 0
     # Owner-built tensor-manifest root (hex). When set, a driver fetching
     # this model DOWNLOADS the manifest from the gleipnir store instead of
     # rebuilding it locally — a rebuild on any miner is always a bug
@@ -2924,6 +2930,9 @@ MESH_MODELS: tuple[MeshModelEntry, ...] = (
                 gguf_scheme="q4_k_m",
                 hf_files=("Qwen3.8-27B-UD-Q4_K_M.gguf",),
                 model_bytes=16_464_440_224,
+                # The dynamic-quant build is cut from a 64-layer base while
+                # the family's other quants keep 65.
+                layers=64,
                 tensor_manifest_root="de3d2acd111777f93044ca384eb09e89a4118115494a5cd6f0f734b2d2d80359",
             ),
             MeshQuantVariant(
@@ -3245,7 +3254,7 @@ def mesh_model_source(
         variant.hf_repo or entry.hf_repo,
         variant.hf_files,
         variant.model_bytes,
-        entry.layers,
+        variant.layers or entry.layers,
     )
 
 
