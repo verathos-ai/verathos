@@ -949,10 +949,15 @@ def _shipped_model_fetch_spec(
         "model_bytes": int(model_bytes or 0),
     }
     if manifest_root:
-        from verallm.mesh.manifest_store import default_store_urls_for_chain
+        from verallm.mesh.manifest_store import (
+            all_default_store_urls,
+            default_store_urls_for_chain,
+        )
 
         spec["model_tensor_manifest_root"] = manifest_root
-        store_urls = default_store_urls_for_chain(chain_id)
+        # A pool without a chain binding still needs the owner's stores:
+        # the root is content-addressed, so the union is safe to query.
+        store_urls = default_store_urls_for_chain(chain_id) or all_default_store_urls()
         if store_urls:
             spec["manifest_urls"] = list(store_urls)
     return spec
@@ -8365,6 +8370,93 @@ class PoolWorkerConfig:
         return entry
 
 
+def _acquire_owner_manifest(
+    *,
+    model_id: str,
+    spec: Mapping[str, Any],
+    dest_dir: Path,
+    progress: Any | None = None,
+) -> str:
+    """The ONLY sources of a tensor manifest on a fetching box.
+
+    Manifests are owner-built; a fetching box downloads one from the
+    store or accepts an owner-built file pre-staged next to the model,
+    and NEVER builds one itself - a rebuild here is always a broken
+    distribution path, dev pools included. Every acquired manifest is
+    verified: a registered root must match, and all later proofs bind
+    to it, so both sources carry identical trust.
+    """
+
+    from verallm.mesh.gguf_manifest import (
+        load_gguf_tensor_manifest,
+        save_gguf_tensor_manifest,
+    )
+    from verallm.mesh.manifest_store import (
+        MeshManifestStoreError,
+        configured_mesh_manifest_base_urls,
+        fetch_mesh_tensor_manifest,
+    )
+
+    registered_root = str(
+        spec.get("model_tensor_manifest_root", "") or ""
+    ).lower()
+    store_error: MeshManifestStoreError | None = None
+    if registered_root:
+        base_urls = configured_mesh_manifest_base_urls(
+            spec.get("manifest_urls") or ()
+        )
+        if base_urls:
+            if progress is not None:
+                progress("fetching manifest")
+            try:
+                fetched = fetch_mesh_tensor_manifest(
+                    model_id,
+                    expected_tensor_manifest_root=registered_root,
+                    base_urls=base_urls,
+                )
+                return str(
+                    save_gguf_tensor_manifest(
+                        load_gguf_tensor_manifest(fetched),
+                        dest_dir / "tensor-manifest.json",
+                    )
+                )
+            except MeshManifestStoreError as exc:
+                store_error = exc
+                logger.warning(
+                    "manifest store fetch failed for %s (%s); checking for "
+                    "a pre-staged owner manifest",
+                    model_id,
+                    exc,
+                )
+    staged = dest_dir / "tensor-manifest.json"
+    if staged.is_file():
+        staged_manifest = load_gguf_tensor_manifest(str(staged))
+        staged_root = str(
+            staged_manifest.get("tensor_manifest_root", "") or ""
+        ).lower()
+        if registered_root and staged_root != registered_root:
+            raise ValueError(
+                f"pre-staged tensor manifest for {model_id} has root "
+                f"{staged_root[:16]}..., registered root is "
+                f"{registered_root[:16]}...; refusing it"
+            )
+        return str(staged)
+    if store_error is not None:
+        raise ValueError(
+            f"manifest store fetch failed for {model_id}: {store_error}; "
+            "no pre-staged owner-built tensor-manifest.json is available. "
+            "A fetching box never rebuilds a manifest - fix the store path "
+            "or pre-stage the manifest next to the model"
+        ) from store_error
+    raise ValueError(
+        f"no owner-built tensor manifest available for {model_id}: the "
+        "store fetch is unconfigured and nothing is pre-staged. A "
+        "fetching box never builds manifests - publish the manifest to "
+        "the store or pre-stage the owner-built tensor-manifest.json "
+        "next to the model"
+    )
+
+
 class LocalMeshRunner:
     """Executes drive/join/stop commands by spawning the validated serve CLIs."""
 
@@ -10694,11 +10786,11 @@ class LocalMeshRunner:
         """Download a model this worker lacks, so it can DRIVE a mesh for it.
 
         Members never need this (they join file-lessly); only a driver reads
-        the GGUF. Downloads from the registry-advertised HF repo, then builds
-        the tensor manifest locally — the manifest is deterministic over the
-        GGUF bytes, so every honest fetch of the same files commits to the
-        same Merkle root as everyone else's copy. Progress lands in the
-        worker's heartbeat status string ("fetching 42%") for the dashboard.
+        the GGUF. Downloads from the registry-advertised HF repo, then
+        acquires the OWNER-BUILT tensor manifest (store download, or a file
+        pre-staged next to the model) — a fetching box never builds one.
+        Progress lands in the worker's heartbeat status string
+        ("fetching 42%") for the dashboard.
         """
         self.enter_command(str(command.get("command_id", "") or ""))
         spec = dict(command.get("spec") or {})
@@ -10710,7 +10802,6 @@ class LocalMeshRunner:
         from huggingface_hub import hf_hub_download
 
         from verallm.mesh.gguf_manifest import (
-            build_gguf_tensor_manifest,
             load_gguf_tensor_manifest,
             save_gguf_tensor_manifest,
         )
@@ -10758,73 +10849,12 @@ class LocalMeshRunner:
         finally:
             done_evt.set()
         model_path = dest_dir / files[0]
-        manifest_path = None
-        registered_root = str(
-            spec.get("model_tensor_manifest_root", "") or ""
+        manifest_path = _acquire_owner_manifest(
+            model_id=model_id,
+            spec=spec,
+            dest_dir=dest_dir,
+            progress=progress,
         )
-        if registered_root:
-            # GLEIPNIR-style distribution: skip the local rebuild (minutes
-            # for a 7B, over an hour for the largest models) whenever a
-            # configured store serves a manifest matching the model's
-            # REGISTERED root. A wrong download can only fail that check.
-            from verallm.mesh.manifest_store import (
-                MeshManifestStoreError,
-                configured_mesh_manifest_base_urls,
-                fetch_mesh_tensor_manifest,
-            )
-
-            base_urls = configured_mesh_manifest_base_urls(
-                spec.get("manifest_urls") or ()
-            )
-            if base_urls:
-                if progress is not None:
-                    progress("fetching manifest")
-                try:
-                    fetched = fetch_mesh_tensor_manifest(
-                        model_id,
-                        expected_tensor_manifest_root=registered_root,
-                        base_urls=base_urls,
-                    )
-                    manifest_path = str(
-                        save_gguf_tensor_manifest(
-                            load_gguf_tensor_manifest(fetched),
-                            dest_dir / "tensor-manifest.json",
-                        )
-                    )
-                except MeshManifestStoreError as exc:
-                    if bool(spec.get("require_published_manifest")):
-                        # Subnet launch: manifests are owner-built and
-                        # published; a local rebuild on a miner box is
-                        # ALWAYS a broken fetch path. Fail loudly so the
-                        # gap is fixed at the store, never papered over
-                        # with hours of rebuild.
-                        raise ValueError(
-                            f"manifest store fetch failed for {model_id}: "
-                            f"{exc}; refusing the local manifest rebuild "
-                            "on a subnet mesh - fix the store path"
-                        ) from exc
-                    # Dev pools: the local build is a correct fallback; the
-                    # store only ever saves time. But say WHY it engaged:
-                    # Log why the fallback engaged so a broken store fetch
-                    # is not mistaken for an expected local rebuild.
-                    logger.warning(
-                        "manifest store fetch failed (%s); rebuilding the "
-                        "tensor manifest locally - minutes to an hour "
-                        "depending on model size",
-                        exc,
-                    )
-                    manifest_path = None
-        if manifest_path is None:
-            if bool(spec.get("require_published_manifest")):
-                raise ValueError(
-                    f"no published tensor manifest available for {model_id} "
-                    "(missing root or store URLs in the fetch spec); refusing "
-                    "the local manifest rebuild on a subnet mesh"
-                )
-            if progress is not None:
-                progress("verifying")  # manifest build hashes every tensor
-            manifest = build_gguf_tensor_manifest(model_path)
-            manifest_path = save_gguf_tensor_manifest(manifest, dest_dir / "tensor-manifest.json")
         entry = {
             "model_id": model_id,
             "llama_model": str(model_path),

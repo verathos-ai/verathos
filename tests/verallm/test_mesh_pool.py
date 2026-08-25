@@ -6349,6 +6349,7 @@ def test_shipped_fetch_spec_carries_manifest_root_and_store_urls():
     silently rebuilt the manifest locally — always a broken fetch path and
     potentially a hard wedge when the native hasher cannot complete."""
 
+    from verallm.mesh.manifest_store import all_default_store_urls
     from verallm.mesh.pool import _shipped_model_fetch_spec
 
     spec = _shipped_model_fetch_spec("qwen3.5-9b-q4-k-xl", chain_id=945)
@@ -6356,11 +6357,12 @@ def test_shipped_fetch_spec_carries_manifest_root_and_store_urls():
     assert spec["model_tensor_manifest_root"], "catalogue root must ship"
     assert spec["manifest_urls"] == ["https://verathos.ai/gleipnir/testnet"]
 
-    # No chain binding (dev pool): root still ships, URLs come from env only.
+    # No chain binding (dev pool): root and the safe union of content-addressed
+    # owner stores still ship, so the fetching box never rebuilds locally.
     dev = _shipped_model_fetch_spec("qwen3.5-9b-q4-k-xl", chain_id=None)
     assert dev is not None
     assert dev["model_tensor_manifest_root"]
-    assert "manifest_urls" not in dev
+    assert dev["manifest_urls"] == list(all_default_store_urls())
 
     assert _shipped_model_fetch_spec("no-such-model", chain_id=945) is None
 

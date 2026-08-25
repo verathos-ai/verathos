@@ -55,6 +55,24 @@ def default_store_urls_for_chain(chain_id: int | None) -> tuple[str, ...]:
     if chain_id is None:
         return ()
     return GLEIPNIR_STORE_URLS_BY_CHAIN.get(int(chain_id), ())
+
+
+def all_default_store_urls() -> tuple[str, ...]:
+    """Union of every known store, for pools with no chain binding.
+
+    Manifests are content-addressed by their tensor-manifest root, so
+    querying a store that does not carry the model is harmless: the index
+    lookup misses or the root check rejects, and the next base URL is
+    tried. This keeps owner-published manifests reachable from dev pools,
+    where no chain id exists to pick a single store.
+    """
+
+    urls: list[str] = []
+    for chain_urls in GLEIPNIR_STORE_URLS_BY_CHAIN.values():
+        for url in chain_urls:
+            if url not in urls:
+                urls.append(url)
+    return tuple(urls)
 MESH_MANIFEST_CACHE_DIR_ENV = "VERATHOS_MESH_MANIFEST_CACHE_DIR"
 MAX_MESH_MANIFEST_INDEX_BYTES = 8 << 20
 MAX_MESH_MANIFEST_BYTES = 64 << 20
