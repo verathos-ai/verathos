@@ -546,6 +546,55 @@ def _file_sha256(path: Path) -> str:
 # float GEMM result is bit-exact, not approximate.
 _PROOF_I8_F32_TILE_K = 1024
 
+# Safety margin kept free on the device beyond the GEMM working set: the
+# proof process is rarely alone on a GPU (an inference server usually holds
+# most of the card), and allocator fragmentation makes a byte-exact fit
+# unreliable.
+_PROOF_GEMM_CUDA_MARGIN_BYTES = 512 * (1 << 20)
+
+
+def _proof_i8_gemm_transient_bytes(rows: int, k: int, n: int) -> int:
+    """Peak device bytes the k-tiled i8 GEMM needs at once."""
+
+    chunk_rows = min(rows, max(1, (1 << 30) // max(1, n * 12)))
+    tile = min(k, _PROOF_I8_F32_TILE_K)
+    operands_i8 = rows * k + k * n
+    acc_i64 = chunk_rows * n * 8
+    part_f32 = chunk_rows * n * 4
+    tile_casts_f32 = (chunk_rows * tile + tile * n) * 4
+    return operands_i8 + acc_i64 + part_f32 + tile_casts_f32
+
+
+def _proof_gemm_pick_device(rows: int, k: int, n: int) -> "torch.device":
+    """Device for the proof GEMM: honor the override, else CUDA only when the
+    working set fits in currently free VRAM.
+
+    The GEMM shares the GPU with whatever else the box runs (typically the
+    serving backend); requesting more than the free headroom does not just
+    fail this path, it can starve the cohabitant's own allocations. Checking
+    up front keeps the exact CPU route as the pressure valve instead of a
+    device-wide OOM.
+    """
+
+    forced = os.environ.get("VERATHOS_PROOF_GEMM_DEVICE", "").strip()
+    if forced:
+        return torch.device(forced)
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info()
+    except Exception:
+        return torch.device("cuda")
+    needed = _proof_i8_gemm_transient_bytes(rows, k, n) + _PROOF_GEMM_CUDA_MARGIN_BYTES
+    if free_bytes < needed:
+        logger.info(
+            "proof GEMM working set %.1f MiB exceeds free VRAM %.1f MiB; using CPU",
+            needed / (1 << 20),
+            free_bytes / (1 << 20),
+        )
+        return torch.device("cpu")
+    return torch.device("cuda")
+
 
 def _proof_i8_matmul_i64_torch(x: np.ndarray, w: np.ndarray) -> np.ndarray | None:
     """Exact int8 GEMM via k-tiled float32 torch matmul with int64 accumulation.
@@ -564,13 +613,7 @@ def _proof_i8_matmul_i64_torch(x: np.ndarray, w: np.ndarray) -> np.ndarray | Non
     rows, k = int(x.shape[0]), int(x.shape[1])
     n = int(w.shape[1])
     try:
-        forced = os.environ.get("VERATHOS_PROOF_GEMM_DEVICE", "").strip()
-        if forced:
-            device = torch.device(forced)
-        elif torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
+        device = _proof_gemm_pick_device(rows, k, n)
         xt = torch.from_numpy(np.ascontiguousarray(x)).to(device)
         wt = torch.from_numpy(np.ascontiguousarray(w)).to(device)
         # Cap the per-chunk f32 partial (n*4 bytes/row) plus i64 accumulator
