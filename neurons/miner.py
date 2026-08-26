@@ -101,6 +101,62 @@ _NGINX_READ_TIMEOUT_VALUE_PATTERN = re.compile(
 )
 _MANAGED_NGINX_TIMEOUT_GRACE_SECONDS = 60
 _MANAGED_NGINX_FALLBACK_READ_TIMEOUT_SECONDS = 960
+_BITTENSOR_MAINNET_EVM_CHAIN_ID = 964
+_MAINNET_ENDPOINT_REMEDIATION = (
+    "Mainnet miners must register a publicly routable HTTPS endpoint. "
+    "Configure TLS with scripts/setup_https.sh and restart with "
+    "--endpoint https://<public-host>:<port>."
+)
+
+
+def _registered_endpoint_policy_result(
+    endpoint: str,
+    *,
+    netuid: int,
+    chain_id: int | None,
+) -> tuple[str, str]:
+    """Return ``(severity, message)`` for the endpoint being registered.
+
+    The local vLLM listener may remain HTTP behind nginx. This policy applies
+    only to the public ``--endpoint`` value written to MinerRegistry.
+    """
+
+    try:
+        resolved_chain_id = int(chain_id) if chain_id is not None else None
+    except (TypeError, ValueError):
+        resolved_chain_id = None
+    try:
+        resolved_netuid = int(netuid)
+    except (TypeError, ValueError):
+        resolved_netuid = 0
+    is_mainnet = (
+        resolved_chain_id == _BITTENSOR_MAINNET_EVM_CHAIN_ID
+        or (
+            resolved_chain_id in (None, 0)
+            and resolved_netuid == 96
+        )
+    )
+
+    from neurons.miner_pool import _is_safe_endpoint
+
+    if is_mainnet:
+        if not _is_safe_endpoint(str(endpoint or ""), allow_private=False):
+            return "error", _MAINNET_ENDPOINT_REMEDIATION
+        return "", ""
+    if not _is_safe_endpoint(str(endpoint or ""), allow_private=True):
+        return (
+            "warning",
+            "The supplied endpoint is malformed and may not be discoverable. "
+            "Testnet/local HTTP is permitted, but the endpoint must include "
+            "an http:// or https:// scheme and hostname.",
+        )
+    if str(endpoint or "").lower().startswith("http://"):
+        return (
+            "warning",
+            "HTTP endpoint accepted for testnet/local use. Mainnet requires a "
+            "publicly routable HTTPS endpoint.",
+        )
+    return "", ""
 
 
 def _managed_nginx_read_timeout_seconds(config: NeuronConfig) -> int:
@@ -1622,6 +1678,14 @@ class MinerNeuron:
         """
         from web3 import Web3
 
+        severity, endpoint_issue = _registered_endpoint_policy_result(
+            endpoint,
+            netuid=getattr(self.config, "netuid", 0),
+            chain_id=getattr(self.config, "chain_id", None),
+        )
+        if severity == "error":
+            raise RuntimeError(endpoint_issue)
+
         for attempt in range(1, max_retries + 1):
             try:
                 # Step 1: Reconcile EVM -> UID before accepting an existing
@@ -2630,6 +2694,19 @@ def main():
     for k in ChainConfig.__dataclass_fields__:
         if getattr(chain_config, k) != ChainConfig.__dataclass_fields__[k].default:
             setattr(config, k, getattr(chain_config, k))
+
+    # Fail before model loading, CUDA compilation, server launch, or chain
+    # mutation when the public registration can never be routed on mainnet.
+    endpoint_severity, endpoint_issue = _registered_endpoint_policy_result(
+        args.endpoint,
+        netuid=config.netuid,
+        chain_id=chain_config.chain_id,
+    )
+    if endpoint_severity == "error":
+        bt.logging.error(endpoint_issue)
+        sys.exit(1)
+    if endpoint_severity == "warning":
+        bt.logging.warning(endpoint_issue)
 
     # Set Substrate network from CLI args
     if explicit_chain_endpoint:

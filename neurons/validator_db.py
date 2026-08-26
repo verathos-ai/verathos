@@ -3920,6 +3920,7 @@ class ValidatorStateDB:
         stale_addresses: Optional[set[str]] = None,
         blacklisted_addresses: Optional[set[str]] = None,
         model_gate_reasons: Optional[Dict[Tuple[str, int], str]] = None,
+        endpoint_gate_reasons: Optional[Dict[Tuple[str, int], str]] = None,
         capacity_audit_gate_enforced: Optional[bool] = None,
         capacity_audit_gate_suppression_reason: str = "",
         uid_network_state: Optional[Dict[int, dict]] = None,
@@ -3951,6 +3952,11 @@ class ValidatorStateDB:
         model_gates = {
             (str(key[0]).lower(), int(key[1])): str(reason or "")
             for key, reason in (model_gate_reasons or {}).items()
+            if reason
+        }
+        endpoint_gates = {
+            (str(key[0]).lower(), int(key[1])): str(reason or "")
+            for key, reason in (endpoint_gate_reasons or {}).items()
             if reason
         }
         network_by_uid = {
@@ -4651,9 +4657,14 @@ class ValidatorStateDB:
                         if is_probation else 0
                     )
                     raw_ema = float(db_entry.get("ema_score") or 0.0) if db_entry else 0.0
-                    display_score = 0.0 if not is_active else (raw_ema if raw_ema > 0 else 0.01)
                     is_blacklisted = addr in blacklisted
                     model_gate_reason = model_gates.get((addr, idx), "")
+                    endpoint_gate_reason = endpoint_gates.get((addr, idx), "")
+                    display_score = (
+                        0.0
+                        if not is_active or endpoint_gate_reason
+                        else (raw_ema if raw_ema > 0 else 0.01)
+                    )
                     best_score = max(best_score, display_score)
                     if score_data.get("last_scored_epoch") is not None:
                         latest_scored_epoch = max(
@@ -4675,6 +4686,13 @@ class ValidatorStateDB:
                             hints,
                             "model_gate_active",
                             "This executor does not satisfy the current capacity model/GPU gate.",
+                        )
+                    if endpoint_gate_reason:
+                        entry_hint_codes.append("https_required")
+                        add_hint(
+                            hints,
+                            "https_required",
+                            "This executor's registered endpoint is not eligible on mainnet because public HTTPS is required.",
                         )
                     if addr in stale:
                         entry_hint_codes.append("stale_uid_identity")
@@ -4742,6 +4760,8 @@ class ValidatorStateDB:
                         )
                     if model_gate_reason:
                         add_step(entry_next_steps, model_gate_reason)
+                    if endpoint_gate_reason:
+                        add_step(entry_next_steps, endpoint_gate_reason)
                     if not is_active:
                         add_step(
                             entry_next_steps,
@@ -4827,6 +4847,10 @@ class ValidatorStateDB:
                         "model_gate": {
                             "active": bool(model_gate_reason),
                             "reason": model_gate_reason,
+                        },
+                        "endpoint_gate": {
+                            "active": bool(endpoint_gate_reason),
+                            "reason": endpoint_gate_reason,
                         },
                         "first_seen_epoch": db_entry.get("first_seen_epoch") if db_entry else None,
                         "last_seen_epoch": db_entry.get("last_seen_epoch") if db_entry else None,
@@ -4993,6 +5017,7 @@ class ValidatorStateDB:
                     "blacklisted",
                     "uid_audit_gate_active",
                     "model_gate_active",
+                    "https_required",
                     "stale_uid_identity",
                     "reverse_proxy_timeout",
                     "first_token_timeout",

@@ -160,6 +160,56 @@ from verallm.registry import get_model, MODELS_BY_ID
 logger = logging.getLogger(__name__)
 _PROOF_V2_ARTIFACT_REFRESH_SECONDS = 3600.0
 _PROOF_V3_ARTIFACT_REFRESH_SECONDS = 3600.0
+_BITTENSOR_MAINNET_EVM_CHAIN_ID = 964
+_HTTPS_MAINNET_REMEDIATION = (
+    "HTTPS is required on mainnet. Configure TLS with scripts/setup_https.sh "
+    "and re-register this endpoint using https://."
+)
+_PUBLIC_HTTPS_MAINNET_REMEDIATION = (
+    "Register a publicly routable HTTPS endpoint on mainnet."
+)
+
+
+def _mainnet_endpoint_eligibility_reason(
+    endpoint: str,
+    *,
+    netuid: int,
+    chain_id: int | None = None,
+) -> str:
+    """Return a deterministic mainnet endpoint gate reason, if any.
+
+    Testnet and local networks retain HTTP support. Mainnet mirrors the
+    production proxy's existing SSRF/TLS admission policy so an endpoint that
+    cannot receive organic traffic cannot retain a validator score.
+    """
+
+    try:
+        resolved_netuid = int(netuid)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        resolved_chain_id = int(chain_id) if chain_id is not None else None
+    except (TypeError, ValueError):
+        resolved_chain_id = None
+    if resolved_netuid != 96:
+        return ""
+    if resolved_chain_id not in (None, 0, _BITTENSOR_MAINNET_EVM_CHAIN_ID):
+        return ""
+
+    try:
+        parsed = urlparse(str(endpoint or ""))
+    except Exception:
+        return _PUBLIC_HTTPS_MAINNET_REMEDIATION
+    if parsed.scheme.lower() != "https":
+        return _HTTPS_MAINNET_REMEDIATION
+
+    # Reuse the already-shipped proxy policy rather than maintaining a second
+    # list of blocked mainnet networks in the scoring path.
+    from neurons.miner_pool import _is_safe_endpoint
+
+    if not _is_safe_endpoint(str(endpoint or ""), allow_private=False):
+        return _PUBLIC_HTTPS_MAINNET_REMEDIATION
+    return ""
 
 
 class _ProofV3ValidatorConfigurationError(RuntimeError):
@@ -917,6 +967,12 @@ class ValidatorNeuron:
         self._canary_accounting_lock = threading.Lock()
         self._epoch_miners: List[ActiveMiner] = []
         self._epoch_miners_discovery_valid: bool = False
+        # Registered mainnet endpoints that fail the proxy's public HTTPS
+        # admission policy are retained for diagnostics but never scheduled or
+        # scored. This is eligibility, not probation: fixing the registration
+        # restores the retained EMA without an audit-recovery cycle.
+        self._endpoint_policy_gate_reasons: Dict[Tuple[str, int], str] = {}
+        self._endpoint_policy_excluded_miners: Tuple[ActiveMiner, ...] = ()
         # {(lowercase miner_address, model_index): expected_receipt_count}
         self._expected_receipts: Dict[Tuple[str, int], int] = {}
         # Exact signed obligation IDs planned for each miner/model this epoch.
@@ -5485,6 +5541,12 @@ class ValidatorNeuron:
             _current_epoch=int(epoch_number),
             _epoch_start_block=int(self._epoch_start_block),
             _epoch_miners=tuple(self._epoch_miners),
+            _endpoint_policy_gate_reasons=dict(
+                getattr(self, "_endpoint_policy_gate_reasons", {}) or {}
+            ),
+            _endpoint_policy_excluded_miners=tuple(
+                getattr(self, "_endpoint_policy_excluded_miners", ()) or ()
+            ),
             _expected_receipts=dict(self._expected_receipts),
             _expected_canary_obligations=expected_obligations,
             _hard_canary_obligation_ids=set(self._hard_canary_obligation_ids),
@@ -5787,16 +5849,24 @@ class ValidatorNeuron:
             for address, model_indices in self._db.get_probation_addresses().items()
             for model_index in model_indices
         }
+        endpoint_policy_entries = {
+            (str(address).lower(), int(model_index))
+            for address, model_index in self._epoch_close_value(
+                "_endpoint_policy_gate_reasons",
+                getattr(self, "_endpoint_policy_gate_reasons", {}) or {},
+            )
+        }
+        excluded_entries = probation_entries | endpoint_policy_entries
         if model_bucket_mode:
             weights, model_unallocated = self.scorer.get_model_bucket_weights(
                 model_budgets,
                 model_groups=getattr(self, "_last_model_emission_groups", {}),
                 group_budgets=getattr(self, "_last_model_group_budgets", {}),
-                excluded_entries=probation_entries,
+                excluded_entries=excluded_entries,
             )
         else:
             weights = self.scorer.get_weights(
-                excluded_entries=probation_entries,
+                excluded_entries=excluded_entries,
             )
 
         if not weights and not (model_bucket_mode and model_unallocated > 0):
@@ -7760,6 +7830,76 @@ class ValidatorNeuron:
             gpu_uuids=list(getattr(entry, "gpu_uuids", ()) or ()),
         )
 
+    def _apply_mainnet_endpoint_policy(
+        self,
+        miners: Sequence[ActiveMiner],
+        *,
+        epoch_number: int,
+        preserve_existing: bool = False,
+    ) -> list[ActiveMiner]:
+        """Persist and remove endpoints the production proxy cannot route.
+
+        Invalid registrations remain in the validator DB for public diagnosis,
+        but are inactive for shared-state routing. Their EMA is deliberately
+        retained and excluded at weight construction rather than destroyed.
+        """
+
+        eligible_miners: list[ActiveMiner] = []
+        endpoint_policy_excluded: list[ActiveMiner] = (
+            list(getattr(self, "_endpoint_policy_excluded_miners", ()) or ())
+            if preserve_existing else []
+        )
+        endpoint_policy_reasons: Dict[Tuple[str, int], str] = (
+            dict(getattr(self, "_endpoint_policy_gate_reasons", {}) or {})
+            if preserve_existing else {}
+        )
+        existing_excluded_keys = {
+            self._miner_model_key(miner.address, miner.model_index)
+            for miner in endpoint_policy_excluded
+        }
+        for miner in miners:
+            reason = _mainnet_endpoint_eligibility_reason(
+                getattr(miner, "endpoint", ""),
+                netuid=getattr(self.config, "netuid", 0),
+                chain_id=getattr(self.config, "chain_id", None),
+            )
+            if not reason:
+                eligible_miners.append(miner)
+                continue
+            key = self._miner_model_key(miner.address, miner.model_index)
+            endpoint_policy_reasons[key] = reason
+            if key not in existing_excluded_keys:
+                endpoint_policy_excluded.append(miner)
+                existing_excluded_keys.add(key)
+            self._db.upsert_entry(
+                address=miner.address,
+                model_index=miner.model_index,
+                model_id=miner.model_id,
+                endpoint=miner.endpoint,
+                quant=miner.quant,
+                max_context_len=miner.max_context_len,
+                epoch=epoch_number,
+                hotkey_ss58=getattr(miner, "hotkey_ss58", ""),
+                coldkey_ss58=getattr(miner, "coldkey_ss58", ""),
+            )
+            miner_uid = getattr(miner, "bittensor_uid", None)
+            if miner_uid is not None:
+                self._db.set_uid(miner.address, int(miner_uid))
+            self._db.mark_entry_inactive(miner.address, miner.model_index)
+            bt.logging.info(
+                f"Endpoint policy gate: {miner.address[:10]} "
+                f"model_index={miner.model_index} endpoint={miner.endpoint} — {reason}"
+            )
+        self._endpoint_policy_gate_reasons = endpoint_policy_reasons
+        self._endpoint_policy_excluded_miners = tuple(endpoint_policy_excluded)
+        if endpoint_policy_excluded:
+            entry_word = "entry" if len(endpoint_policy_excluded) == 1 else "entries"
+            bt.logging.info(
+                f"Endpoint policy: excluded {len(endpoint_policy_excluded)} "
+                f"mainnet miner {entry_word} before probing and scheduling"
+            )
+        return eligible_miners
+
     def _do_epoch_setup(self, epoch_start_block: int, epoch_number: int):
         """Heavy epoch setup — runs on a background executor thread."""
         t0 = time.monotonic()
@@ -7834,6 +7974,16 @@ class ValidatorNeuron:
                 self._epoch_miners,
                 epoch_number=epoch_number,
             )
+        )
+
+        # Apply the same public-endpoint policy used by the production proxy
+        # before TCP probes, identity challenges, canaries or capacity audits.
+        # The URL is on-chain registry data, so the decision requires no miner
+        # response and cannot be bypassed through /health metadata.
+        self._epoch_miners = self._apply_mainnet_endpoint_policy(
+            self._epoch_miners,
+            epoch_number=epoch_number,
+            preserve_existing=used_fallback,
         )
 
         # ── Fast TCP pre-filter: skip dead endpoints entirely ─────────
@@ -13462,6 +13612,10 @@ class ValidatorNeuron:
                         )
                         continue
                     self._db.set_uid(miner.address, uid_val)
+                    # Preserve the authoritative lookup across the subsequent
+                    # discovery-policy upsert. A first-seen ineligible entry
+                    # does not yet have a DB row for set_uid() to update.
+                    miner.bittensor_uid = uid_val
                     # Update cache
                     self._ss58_cache[miner.address.lower()] = {
                         "hotkey_ss58": miner.hotkey_ss58,
@@ -13674,7 +13828,22 @@ class ValidatorNeuron:
 
         entries: list[VerdictSnapshotEntryV1] = []
         omitted_identity_count = 0
-        for miner in self._epoch_close_value("_epoch_miners", ()):
+        snapshot_miners = list(self._epoch_close_value("_epoch_miners", ()))
+        seen_snapshot_keys = {
+            self._miner_model_key(miner.address, miner.model_index)
+            for miner in snapshot_miners
+        }
+        for miner in self._epoch_close_value(
+            "_endpoint_policy_excluded_miners", ()
+        ):
+            key = self._miner_model_key(miner.address, miner.model_index)
+            if key not in seen_snapshot_keys:
+                snapshot_miners.append(miner)
+                seen_snapshot_keys.add(key)
+        endpoint_policy_reasons = dict(
+            self._epoch_close_value("_endpoint_policy_gate_reasons", {}) or {}
+        )
+        for miner in snapshot_miners:
             key = self._miner_model_key(
                 miner.address,
                 miner.model_index,
@@ -13722,7 +13891,8 @@ class ValidatorNeuron:
                 omitted_identity_count += 1
                 continue
             capacity_gated = bool(
-                self._capacity_audit_score_gate_reason(
+                key in endpoint_policy_reasons
+                or self._capacity_audit_score_gate_reason(
                     miner.address,
                     miner.model_index,
                     epoch_number,
@@ -13834,6 +14004,9 @@ class ValidatorNeuron:
                         model_gate_reasons[
                             (str(miner.address).lower(), int(miner.model_index))
                         ] = reason
+                endpoint_gate_reasons = dict(
+                    getattr(self, "_endpoint_policy_gate_reasons", {}) or {}
+                )
                 network_state = ValidatorNeuron._miner_debug_network_snapshot(self)
                 snapshot = self._db.build_miner_debug_snapshots(
                     current_epoch=epoch,
@@ -13841,6 +14014,7 @@ class ValidatorNeuron:
                     stale_addresses=stale_addresses,
                     blacklisted_addresses=blacklist,
                     model_gate_reasons=model_gate_reasons,
+                    endpoint_gate_reasons=endpoint_gate_reasons,
                     capacity_audit_gate_enforced=enforcement_enabled,
                     capacity_audit_gate_suppression_reason=suppression_reason,
                     uid_network_state=network_state,
@@ -15426,6 +15600,10 @@ def main():
         )
         neuron._epoch_miners_discovery_valid = True
         neuron._enrich_miners_from_metagraph(neuron._epoch_miners)
+        neuron._epoch_miners = neuron._apply_mainnet_endpoint_policy(
+            neuron._epoch_miners,
+            epoch_number=0,
+        )
         # Fetch hardware metadata from miners at startup (best-effort).
         neuron._refresh_miner_hardware_batch(
             neuron._epoch_miners,
