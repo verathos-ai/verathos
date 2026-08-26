@@ -210,16 +210,24 @@ def _mainnet_endpoint_eligibility_reason(
     return ""
 
 
-def _score_retention_discovered_keys(
+def _epoch_seen_score_keys(
     eligible_miners: Sequence[ActiveMiner],
     endpoint_policy_excluded_miners: Sequence[ActiveMiner],
 ) -> set[Tuple[str, int]]:
-    """Return entries whose retained EMA must survive epoch-close cleanup."""
+    """Return entries seen on chain, including policy-ineligible endpoints."""
 
     return {
         (str(miner.address).lower(), int(miner.model_index))
         for miner in (*eligible_miners, *endpoint_policy_excluded_miners)
     }
+
+
+def _decay_ineligible_endpoint_ema(ema_score: float, ema_alpha: float) -> float:
+    """Apply the ordinary zero-score EMA recurrence to an ineligible endpoint."""
+
+    alpha = min(1.0, max(0.0, float(ema_alpha)))
+    decayed = max(0.0, float(ema_score)) * (1.0 - alpha)
+    return 0.0 if decayed < 1e-6 else decayed
 
 
 class _ProofV3ValidatorConfigurationError(RuntimeError):
@@ -979,8 +987,8 @@ class ValidatorNeuron:
         self._epoch_miners_discovery_valid: bool = False
         # Registered mainnet endpoints that fail the proxy's public HTTPS
         # admission policy are retained for diagnostics but never scheduled or
-        # scored. This is eligibility, not probation: fixing the registration
-        # restores the retained EMA without an audit-recovery cycle.
+        # scored. This is eligibility, not probation: their EMA decays toward
+        # zero until the registration is fixed, without an audit-recovery cycle.
         self._endpoint_policy_gate_reasons: Dict[Tuple[str, int], str] = {}
         self._endpoint_policy_excluded_miners: Tuple[ActiveMiner, ...] = ()
         # {(lowercase miner_address, model_index): expected_receipt_count}
@@ -7840,6 +7848,86 @@ class ValidatorNeuron:
             gpu_uuids=list(getattr(entry, "gpu_uuids", ()) or ()),
         )
 
+    def _restore_endpoint_policy_score_state(
+        self,
+        miner: ActiveMiner,
+        persisted: Optional[dict],
+    ) -> None:
+        """Hydrate an on-chain entry's retained score without a chain lookup."""
+
+        if not persisted:
+            return
+        uid = getattr(miner, "bittensor_uid", None)
+        if uid is None:
+            uid = self._db.get_uid(miner.address)
+        if uid is None:
+            return
+        uid = int(uid)
+        address = str(miner.address).lower()
+        state = self.scorer.states.get(uid)
+        if state is None:
+            state = MinerScoreState(uid=uid, address=address)
+            self.scorer.states[uid] = state
+        elif state.address.lower() != address:
+            return
+        entry = state.entries.get(int(miner.model_index))
+        if entry is None:
+            entry = ModelEntryScore(
+                model_id=str(persisted.get("model_id") or miner.model_id),
+                model_index=int(miner.model_index),
+            )
+            state.entries[int(miner.model_index)] = entry
+        entry.model_id = str(persisted.get("model_id") or miner.model_id)
+        entry.ema_score = float(persisted.get("ema_score") or 0.0)
+        entry.total_epochs = int(persisted.get("total_epochs") or 0)
+        entry.scored_epochs = int(persisted.get("scored_epochs") or 0)
+
+    def _decay_endpoint_policy_excluded_scores(
+        self,
+        miners: Sequence[ActiveMiner],
+        *,
+        ema_alpha: float,
+    ) -> int:
+        """Decay policy-ineligible entries once at epoch close, without probation."""
+
+        persisted_by_key = {
+            (str(row["address"]).lower(), int(row["model_index"])): row
+            for row in self._db._get_all_entries()
+        }
+        decayed_count = 0
+        for miner in miners:
+            key = self._miner_model_key(miner.address, miner.model_index)
+            persisted = persisted_by_key.get(key)
+            if persisted is None:
+                continue
+            old_score = float(persisted.get("ema_score") or 0.0)
+            new_score = _decay_ineligible_endpoint_ema(old_score, ema_alpha)
+            total_epochs = int(persisted.get("total_epochs") or 0) + 1
+            scored_epochs = int(persisted.get("scored_epochs") or 0) + 1
+            self._db.save_score(
+                miner.address,
+                miner.model_index,
+                new_score,
+                total_epochs,
+                scored_epochs,
+            )
+            updated = dict(persisted)
+            updated.update(
+                ema_score=new_score,
+                total_epochs=total_epochs,
+                scored_epochs=scored_epochs,
+            )
+            self._restore_endpoint_policy_score_state(miner, updated)
+            if old_score != new_score:
+                decayed_count += 1
+        if miners:
+            bt.logging.info(
+                "Endpoint policy EMA decay: "
+                f"entries={len(miners)} changed={decayed_count} "
+                f"alpha={min(1.0, max(0.0, float(ema_alpha))):.4f}"
+            )
+        return decayed_count
+
     def _apply_mainnet_endpoint_policy(
         self,
         miners: Sequence[ActiveMiner],
@@ -7850,11 +7938,15 @@ class ValidatorNeuron:
         """Persist and remove endpoints the production proxy cannot route.
 
         Invalid registrations remain in the validator DB for public diagnosis,
-        but are inactive for shared-state routing. Their EMA is deliberately
-        retained and excluded at weight construction rather than destroyed.
+        but are inactive for shared-state routing. They earn no score, carry no
+        weight, and their stored EMA decays toward zero at every epoch close.
         """
 
         eligible_miners: list[ActiveMiner] = []
+        persisted_by_key = {
+            (str(row["address"]).lower(), int(row["model_index"])): row
+            for row in self._db._get_all_entries()
+        }
         endpoint_policy_excluded: list[ActiveMiner] = (
             list(getattr(self, "_endpoint_policy_excluded_miners", ()) or ())
             if preserve_existing else []
@@ -7868,6 +7960,11 @@ class ValidatorNeuron:
             for miner in endpoint_policy_excluded
         }
         for miner in miners:
+            key = self._miner_model_key(miner.address, miner.model_index)
+            self._restore_endpoint_policy_score_state(
+                miner,
+                persisted_by_key.get(key),
+            )
             reason = _mainnet_endpoint_eligibility_reason(
                 getattr(miner, "endpoint", ""),
                 netuid=getattr(self.config, "netuid", 0),
@@ -7876,7 +7973,6 @@ class ValidatorNeuron:
             if not reason:
                 eligible_miners.append(miner)
                 continue
-            key = self._miner_model_key(miner.address, miner.model_index)
             endpoint_policy_reasons[key] = reason
             if key not in existing_excluded_keys:
                 endpoint_policy_excluded.append(miner)
@@ -11093,15 +11189,29 @@ class ValidatorNeuron:
                 # Background dispatch — chain wait must not block epoch close
                 self._submit_report_offline(miner)
 
-        # ── Zero undiscovered miners ───────────────────────────────
+        # ── Decay ineligible and zero undiscovered miners ─────────
+        # Entries that remain registered but violate the public-endpoint
+        # policy get an ordinary zero-score EMA update. They are not proof
+        # failures and do not enter probation, but they also cannot preserve
+        # historical score indefinitely while remaining unroutable.
+        _endpoint_policy_excluded = tuple(
+            self._epoch_close_value("_endpoint_policy_excluded_miners", ())
+        )
+        self._decay_endpoint_policy_excluded_scores(
+            _endpoint_policy_excluded,
+            ema_alpha=scoring.ema_alpha,
+        )
+
+        # Entries absent from on-chain discovery are different: their lease
+        # expired or disappeared, so their stale EMA is removed immediately.
         # If a miner's lease expired or it wasn't discovered this epoch,
         # it's not serving — zero its EMA immediately.  This prevents
         # stale scores from persisting in get_weights() after miners
         # leave the network.  Transient issues (unreachable but still
         # discovered) are handled by the canary error penalty path above.
-        _discovered_keys = _score_retention_discovered_keys(
+        _discovered_keys = _epoch_seen_score_keys(
             epoch_miners,
-            self._epoch_close_value("_endpoint_policy_excluded_miners", ()),
+            _endpoint_policy_excluded,
         )
         self._full_context_debt = {
             key: debt_epoch

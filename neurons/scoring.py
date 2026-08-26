@@ -891,9 +891,9 @@ class CompositeScorer:
         WEIGHT(uid) = normalize( AGGREGATE )
 
         Authenticated organic work is already captured by the work factor.
-        No separate volume multiplier is applied. Excluded
-        entries retain their EMA history but contribute no emission while an
-        external policy gate such as probation is active.
+        No separate volume multiplier is applied. Excluded entries contribute
+        no emission while an external policy gate is active; the gate's
+        lifecycle determines whether their stored EMA is retained or decayed.
         """
         excluded = self._excluded_entry_keys(excluded_entries)
         raw = {}
