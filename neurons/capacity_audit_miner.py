@@ -1923,15 +1923,13 @@ class CapacityAuditMinerWorker:
                     "Capacity audit endpoint queue full; dropping only this destination: "
                     f"audit_id={audit_id[:12]} type={artifact_type} endpoint={endpoint}"
                 )
-                if self._validator_endpoint_is_non_owner(endpoint):
-                    bt.logging.debug(message)
-                else:
+                if not self._validator_endpoint_is_non_owner(endpoint):
                     bt.logging.warning(message)
-                    self._record_validator_publish_result(
-                        endpoint,
-                        False,
-                        failure_kind="transient",
-                    )
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
+                )
         return queued
 
     def _publisher_queue(self, endpoint: str) -> queue.Queue[_ValidatorDelivery]:
@@ -1968,15 +1966,13 @@ class CapacityAuditMinerWorker:
                 message = (
                     f"Capacity audit publisher worker error: endpoint={endpoint}: {exc}"
                 )
-                if self._validator_endpoint_is_non_owner(endpoint):
-                    bt.logging.debug(message)
-                else:
+                if not self._validator_endpoint_is_non_owner(endpoint):
                     bt.logging.warning(message)
-                    self._record_validator_publish_result(
-                        endpoint,
-                        False,
-                        failure_kind="transient",
-                    )
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
+                )
             finally:
                 endpoint_queue.task_done()
 
@@ -2004,27 +2000,30 @@ class CapacityAuditMinerWorker:
                     f"Capacity audit publish error: audit_id={audit_id[:12]} "
                     f"type={artifact_type} url={endpoint}{path}: {exc}"
                 )
-                if non_owner_endpoint:
-                    bt.logging.debug(message)
-                else:
+                if not non_owner_endpoint:
                     bt.logging.warning(message)
-                    self._record_validator_publish_result(
-                        endpoint,
-                        False,
-                        failure_kind="transient",
-                    )
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
+                )
                 retryable = True
             else:
                 if resp.status_code < 300:
                     self._record_validator_publish_result(endpoint, True)
                     break
                 if self._is_unknown_audit_slot_response(resp.status_code, resp.text):
-                    bt.logging.debug(
-                        "Capacity audit endpoint response: "
-                        f"audit_id={audit_id[:12]} type={artifact_type} "
-                        f"status=slot_unknown url={endpoint}{path}"
+                    if not non_owner_endpoint:
+                        bt.logging.debug(
+                            "Capacity audit endpoint response: "
+                            f"audit_id={audit_id[:12]} type={artifact_type} "
+                            f"status=slot_unknown url={endpoint}{path}"
+                        )
+                    self._record_validator_audit_rejection(
+                        endpoint,
+                        audit_id,
+                        log=not non_owner_endpoint,
                     )
-                    self._record_validator_audit_rejection(endpoint, audit_id)
                     return
                 message = (
                     f"Capacity audit publish failed: audit_id={audit_id[:12]} "
@@ -2032,12 +2031,10 @@ class CapacityAuditMinerWorker:
                     f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
                     f"url={endpoint}{path} status={resp.status_code} body={resp.text[:200]}"
                 )
-                if non_owner_endpoint:
-                    bt.logging.debug(message)
-                else:
+                if not non_owner_endpoint:
                     bt.logging.warning(message)
                 failure_kind = self._validator_endpoint_failure_kind(resp.status_code)
-                if failure_kind and not non_owner_endpoint:
+                if failure_kind:
                     self._record_validator_publish_result(
                         endpoint,
                         False,
@@ -2070,7 +2067,13 @@ class CapacityAuditMinerWorker:
                 return False
             return str(endpoint or "") in rejected.get(str(audit_id or ""), set())
 
-    def _record_validator_audit_rejection(self, endpoint: str, audit_id: str) -> None:
+    def _record_validator_audit_rejection(
+        self,
+        endpoint: str,
+        audit_id: str,
+        *,
+        log: bool = True,
+    ) -> None:
         audit_id = str(audit_id or "")
         endpoint = str(endpoint or "")
         if not audit_id or not endpoint:
@@ -2081,10 +2084,11 @@ class CapacityAuditMinerWorker:
                 rejected = {}
                 self._audit_endpoint_rejections = rejected
             rejected.setdefault(audit_id, set()).add(endpoint)
-        bt.logging.debug(
-            "Capacity audit endpoint response recorded: "
-            f"audit_id={audit_id[:12]} endpoint={endpoint}"
-        )
+        if log:
+            bt.logging.debug(
+                "Capacity audit endpoint response recorded: "
+                f"audit_id={audit_id[:12]} endpoint={endpoint}"
+            )
 
     def _validator_endpoint_urls(
         self,
@@ -2131,7 +2135,7 @@ class CapacityAuditMinerWorker:
         status = int(status_code)
         if status in {401, 403, 404}:
             return "hard"
-        if status == 429 or status >= 500:
+        if status in {409, 425, 429} or status >= 500:
             return "transient"
         return ""
 
