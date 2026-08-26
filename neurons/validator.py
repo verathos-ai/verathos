@@ -210,6 +210,18 @@ def _mainnet_endpoint_eligibility_reason(
     return ""
 
 
+def _score_retention_discovered_keys(
+    eligible_miners: Sequence[ActiveMiner],
+    endpoint_policy_excluded_miners: Sequence[ActiveMiner],
+) -> set[Tuple[str, int]]:
+    """Return entries whose retained EMA must survive epoch-close cleanup."""
+
+    return {
+        (str(miner.address).lower(), int(miner.model_index))
+        for miner in (*eligible_miners, *endpoint_policy_excluded_miners)
+    }
+
+
 class _ProofV3ValidatorConfigurationError(RuntimeError):
     """Local v3 configuration is unavailable; the miner is not at fault."""
 
@@ -11087,9 +11099,10 @@ class ValidatorNeuron:
         # stale scores from persisting in get_weights() after miners
         # leave the network.  Transient issues (unreachable but still
         # discovered) are handled by the canary error penalty path above.
-        _discovered_keys = {
-            (m.address.lower(), m.model_index) for m in epoch_miners
-        }
+        _discovered_keys = _score_retention_discovered_keys(
+            epoch_miners,
+            self._epoch_close_value("_endpoint_policy_excluded_miners", ()),
+        )
         self._full_context_debt = {
             key: debt_epoch
             for key, debt_epoch in self._full_context_debt.items()
