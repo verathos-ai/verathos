@@ -1919,15 +1919,19 @@ class CapacityAuditMinerWorker:
                 endpoint_queue.put_nowait(delivery)
                 queued += 1
             except queue.Full:
-                bt.logging.warning(
+                message = (
                     "Capacity audit endpoint queue full; dropping only this destination: "
                     f"audit_id={audit_id[:12]} type={artifact_type} endpoint={endpoint}"
                 )
-                self._record_validator_publish_result(
-                    endpoint,
-                    False,
-                    failure_kind="transient",
-                )
+                if self._validator_endpoint_is_non_owner(endpoint):
+                    bt.logging.debug(message)
+                else:
+                    bt.logging.warning(message)
+                    self._record_validator_publish_result(
+                        endpoint,
+                        False,
+                        failure_kind="transient",
+                    )
         return queued
 
     def _publisher_queue(self, endpoint: str) -> queue.Queue[_ValidatorDelivery]:
@@ -1961,14 +1965,18 @@ class CapacityAuditMinerWorker:
             try:
                 self._deliver_to_validator(endpoint, delivery)
             except Exception as exc:
-                bt.logging.warning(
+                message = (
                     f"Capacity audit publisher worker error: endpoint={endpoint}: {exc}"
                 )
-                self._record_validator_publish_result(
-                    endpoint,
-                    False,
-                    failure_kind="transient",
-                )
+                if self._validator_endpoint_is_non_owner(endpoint):
+                    bt.logging.debug(message)
+                else:
+                    bt.logging.warning(message)
+                    self._record_validator_publish_result(
+                        endpoint,
+                        False,
+                        failure_kind="transient",
+                    )
             finally:
                 endpoint_queue.task_done()
 
@@ -1981,6 +1989,7 @@ class CapacityAuditMinerWorker:
         artifact = delivery.artifact
         audit_id = str(artifact.get("audit_id") or "")
         artifact_type = str(artifact.get("artifact_type") or "")
+        non_owner_endpoint = self._validator_endpoint_is_non_owner(endpoint)
         if audit_id and self._validator_rejected_audit(endpoint, audit_id):
             return
         for attempt in range(delivery.attempts):
@@ -1991,15 +2000,19 @@ class CapacityAuditMinerWorker:
                     timeout=5.0,
                 )
             except Exception as exc:
-                bt.logging.warning(
+                message = (
                     f"Capacity audit publish error: audit_id={audit_id[:12]} "
                     f"type={artifact_type} url={endpoint}{path}: {exc}"
                 )
-                self._record_validator_publish_result(
-                    endpoint,
-                    False,
-                    failure_kind="transient",
-                )
+                if non_owner_endpoint:
+                    bt.logging.debug(message)
+                else:
+                    bt.logging.warning(message)
+                    self._record_validator_publish_result(
+                        endpoint,
+                        False,
+                        failure_kind="transient",
+                    )
                 retryable = True
             else:
                 if resp.status_code < 300:
@@ -2013,14 +2026,18 @@ class CapacityAuditMinerWorker:
                     )
                     self._record_validator_audit_rejection(endpoint, audit_id)
                     return
-                bt.logging.warning(
+                message = (
                     f"Capacity audit publish failed: audit_id={audit_id[:12]} "
                     f"type={artifact_type} B_select={artifact.get('B_select')} "
                     f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
                     f"url={endpoint}{path} status={resp.status_code} body={resp.text[:200]}"
                 )
+                if non_owner_endpoint:
+                    bt.logging.debug(message)
+                else:
+                    bt.logging.warning(message)
                 failure_kind = self._validator_endpoint_failure_kind(resp.status_code)
-                if failure_kind:
+                if failure_kind and not non_owner_endpoint:
                     self._record_validator_publish_result(
                         endpoint,
                         False,
@@ -2098,6 +2115,16 @@ class CapacityAuditMinerWorker:
                     resolver.record_publish_result(endpoint, success, failure_kind=failure_kind)
                 except TypeError:
                     resolver.record_publish_result(endpoint, success)
+
+    def _validator_endpoint_is_non_owner(self, endpoint: str) -> bool:
+        resolver = getattr(self, "_validator_endpoint_resolver", None)
+        method = getattr(resolver, "is_non_owner_endpoint", None)
+        if not callable(method):
+            return False
+        try:
+            return bool(method(endpoint))
+        except Exception:
+            return False
 
     @staticmethod
     def _validator_endpoint_failure_kind(status_code: int) -> str:

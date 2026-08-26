@@ -292,6 +292,37 @@ class CapacityAuditEndpointResolver:
         self._background_refreshing = False
         self._load_cache()
 
+    def is_non_owner_endpoint(self, endpoint: str) -> bool:
+        """Return true only for a chain target known not to be the signed owner."""
+
+        if not bool(
+            getattr(
+                self.config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+        ):
+            return False
+        owner_hotkey = str(
+            getattr(
+                self.config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
+        ).strip()
+        normalized = normalize_audit_endpoint(endpoint).lower()
+        if not owner_hotkey or not normalized:
+            return False
+        for item in self._endpoints:
+            if normalize_audit_endpoint(item.endpoint).lower() != normalized:
+                continue
+            address = str(item.address or "")
+            if not address.startswith("axon:"):
+                return False
+            return address != f"axon:{owner_hotkey}"
+        return False
+
     def current_urls(self, *, force_refresh: bool = False) -> tuple[str, ...]:
         now = time.time()
         cached = tuple(
