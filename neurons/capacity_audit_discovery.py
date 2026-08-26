@@ -485,7 +485,7 @@ class CapacityAuditEndpointResolver:
             until = time.time() + self.quarantine_s
             previous = float(self._endpoint_quarantine_until.get(key, 0) or 0)
             self._endpoint_quarantine_until[key] = until
-            if previous <= time.time():
+            if previous <= time.time() and not self.is_non_owner_endpoint(endpoint):
                 bt.logging.warning(
                     f"Quarantining capacity-audit validator endpoint {endpoint} "
                     f"for {self.quarantine_s:.0f}s after {failures} "
