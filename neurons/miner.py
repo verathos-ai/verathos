@@ -137,13 +137,13 @@ def _registered_endpoint_policy_result(
         )
     )
 
-    from neurons.miner_pool import _is_safe_endpoint
+    from neurons.endpoint_policy import is_safe_endpoint
 
     if is_mainnet:
-        if not _is_safe_endpoint(str(endpoint or ""), allow_private=False):
+        if not is_safe_endpoint(str(endpoint or ""), allow_private=False):
             return "error", _MAINNET_ENDPOINT_REMEDIATION
         return "", ""
-    if not _is_safe_endpoint(str(endpoint or ""), allow_private=True):
+    if not is_safe_endpoint(str(endpoint or ""), allow_private=True):
         return (
             "warning",
             "The supplied endpoint is malformed and may not be discoverable. "

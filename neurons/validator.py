@@ -203,11 +203,9 @@ def _mainnet_endpoint_eligibility_reason(
     if parsed.scheme.lower() != "https":
         return _HTTPS_MAINNET_REMEDIATION
 
-    # Reuse the already-shipped proxy policy rather than maintaining a second
-    # list of blocked mainnet networks in the scoring path.
-    from neurons.miner_pool import _is_safe_endpoint
+    from neurons.endpoint_policy import is_safe_endpoint
 
-    if not _is_safe_endpoint(str(endpoint or ""), allow_private=False):
+    if not is_safe_endpoint(str(endpoint or ""), allow_private=False):
         return _PUBLIC_HTTPS_MAINNET_REMEDIATION
     return ""
 
