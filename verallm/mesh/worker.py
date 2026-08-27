@@ -1487,6 +1487,41 @@ def slot_id_from_backend_response(response: dict[str, Any]) -> int:
     return -1
 
 
+def wait_for_backend_model_loaded(
+    backend_url: str,
+    *,
+    deadline_s: float = 3600.0,
+    poll_s: float = 10.0,
+    opener: Callable[..., Any] = urlopen,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Block until the llama backend reports the model loaded, or time out.
+
+    llama.cpp's ``/health`` answers 503 while weights are still loading and
+    200 only once the model is resident, so a 200 is the load-complete
+    signal. Returns True on 200, False when ``backend_url`` is empty or the
+    deadline passes; callers treat False as "proceed anyway" because every
+    caller is idempotent background work, never a correctness gate.
+    """
+
+    if not backend_url:
+        return False
+    deadline = clock() + max(0.0, float(deadline_s))
+    while True:
+        try:
+            with opener(
+                backend_url.rstrip("/") + "/health", timeout=5.0
+            ) as response:
+                if int(getattr(response, "status", 0) or 0) == 200:
+                    return True
+        except Exception:
+            pass
+        if clock() >= deadline:
+            return False
+        sleeper(max(0.1, float(poll_s)))
+
+
 def fetch_prompt_token_ids_from_backend(
     backend_base_url: str,
     openai_request: dict[str, Any],
@@ -4481,6 +4516,15 @@ def make_worker_server(
                     cache_root = proof_weight_cache_dir()
                     if cache_root is None:
                         return
+                    # The warm's dequant transients must never stack on top
+                    # of the backend's model load inside one memory budget:
+                    # on the 24GB-GPU miner box class (30-32GB RAM) the sum
+                    # OOM-kills the worker mid-formation. Wait for the
+                    # backend to finish loading first; the warm is
+                    # idempotent and hard audits fall back to per-draw
+                    # builds, so proceeding after a timeout stays safe.
+                    # Cache-disabled workers return above without waiting.
+                    wait_for_backend_model_loaded(backend_url)
                     # Worst-case ADDITIONAL bytes for what the active profile
                     # actually persists: i8 blobs plus tree nodes (~45% of i8
                     # at the canonical chunk size). Under the compact profile

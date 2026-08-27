@@ -1062,6 +1062,80 @@ def _listeners_on_port(port: int) -> tuple[set[int], bool]:
     return pids, bool(pids)
 
 
+def _serve_memory_high_bytes(cgroup_base: Path = Path("/sys/fs/cgroup")) -> int:
+    """memory.high for serve children: the container limit minus a margin.
+
+    Returns 0 when confinement should not run: no container limit (bare
+    metal / "max"), unreadable cgroupfs, or an explicit 0 override via
+    VERATHOS_SERVE_MEMORY_HIGH_BYTES. The margin keeps the worker daemon,
+    proof lanes, and audit workspace outside the reclaim storm.
+    """
+
+    override = os.environ.get("VERATHOS_SERVE_MEMORY_HIGH_BYTES", "").strip()
+    if override:
+        try:
+            return max(0, int(override))
+        except ValueError:
+            return 0
+    try:
+        raw = (cgroup_base / "memory.max").read_text().strip()
+    except OSError:
+        return 0
+    if raw == "max":
+        return 0
+    try:
+        limit = int(raw)
+    except ValueError:
+        return 0
+    margin = 4 << 30
+    floor = 8 << 30
+    high = limit - margin
+    if high < floor:
+        high = max(limit // 2, 1 << 30)
+    return high
+
+
+def _confine_serve_process_memory(
+    pid: int, cgroup_base: Path = Path("/sys/fs/cgroup")
+) -> str:
+    """Place a serve child under a memory.high sub-cgroup. Fail-open.
+
+    A GGUF load streams the whole model through page cache faster than a
+    memory-capped container reclaims; hitting memory.max OOM-kills the
+    worker tree mid-formation (observed on the 24GB-GPU box class with
+    30-32GiB limits). memory.high on a child group turns that death into
+    reclaim + throttle: the load slows down and completes. Returns the
+    cgroup path on success, "" when unavailable (bare metal, cgroup v1,
+    read-only cgroupfs) - the child then runs unconfined exactly as
+    before this fix.
+    """
+
+    high = _serve_memory_high_bytes(cgroup_base)
+    if high <= 0:
+        return ""
+    try:
+        subtree = cgroup_base / "cgroup.subtree_control"
+        if not os.access(subtree, os.W_OK):
+            return ""
+        try:
+            subtree.write_text("+memory")
+        except OSError:
+            pass  # already enabled or partially delegated; mkdir decides
+        # Opportunistic sweep of empty groups left by exited children.
+        for stale in cgroup_base.glob("verathos-serve-*"):
+            try:
+                stale.rmdir()
+            except OSError:
+                pass
+        cgroup = cgroup_base / f"verathos-serve-{int(pid)}"
+        cgroup.mkdir(exist_ok=True)
+        (cgroup / "memory.high").write_text(str(int(high)))
+        (cgroup / "cgroup.procs").write_text(str(int(pid)))
+        return str(cgroup)
+    except OSError:
+        return ""
+
+
 def _pcs_prover_threads() -> int:
     """Default thread count for the PCS/IPA prover inside worker units.
 
@@ -8575,6 +8649,14 @@ class LocalMeshRunner:
                 )
             self.procs.append(proc)
             self._record_spawned_group(proc)
+        confined = _confine_serve_process_memory(proc.pid)
+        if confined:
+            logger.info(
+                "serve child %s confined to %s (memory.high=%d)",
+                log_name,
+                confined,
+                _serve_memory_high_bytes(),
+            )
         return proc
 
     def _proc_registry_path(self) -> Path:
@@ -8660,7 +8742,14 @@ class LocalMeshRunner:
                 if os.getpgid(pid) != pgid:
                     continue  # pid recycled; not ours anymore
             except OSError:
-                continue  # already gone
+                # The recorded anchor pid is gone, but the GROUP can still
+                # hold survivors: an OOM kill takes the serve child while
+                # its llama-server lives on in the same pgid, squatting
+                # the whole GPU and poisoning every later launch on the
+                # box. A dead anchor therefore proves nothing; reap the
+                # group whenever anything in it is still alive.
+                if not _process_group_alive(pgid):
+                    continue  # genuinely all gone
             stale.append(pgid)
             try:
                 os.killpg(pgid, signal.SIGTERM)

@@ -224,10 +224,24 @@ class DeployReport:
 def _find_model_mesh(
     status: Mapping[str, Any], model_id: str
 ) -> tuple[str, dict[str, Any]]:
+    # Meshes iterate in manager insertion order, so a lingering corpse of
+    # an earlier generation (stopping/error, e.g. after a dead worker that
+    # can never ack its teardown) always precedes the live mesh of the
+    # same model and would shadow it. Pick by liveness instead: a serving
+    # mesh is the one to measure against, a mid-launch mesh (fetching,
+    # driving, or joining) is the one to adopt, and a corpse is only
+    # relevant when nothing livelier exists.
+    priority = {"serving": 0, "fetching": 1, "driving": 1, "joining": 1}
+    best_key: str = ""
+    best_mesh: dict[str, Any] = {}
+    best_rank = 99
     for mesh_key, mesh in (status.get("meshes") or {}).items():
-        if str(mesh.get("model_id", "")) == model_id:
-            return str(mesh_key), dict(mesh)
-    return "", {}
+        if str(mesh.get("model_id", "")) != model_id:
+            continue
+        rank = priority.get(str(mesh.get("status", "")), 2)
+        if rank < best_rank:
+            best_key, best_mesh, best_rank = str(mesh_key), dict(mesh), rank
+    return best_key, best_mesh
 
 
 def mesh_already_bound(
@@ -612,7 +626,7 @@ def run_deploy(
     if mesh and mesh_status == "serving":
         report.mesh_key = mesh_key
         out(f"[measure] reusing serving mesh {mesh_key}")
-    elif mesh and mesh_status in ("driving", "joining"):
+    elif mesh and mesh_status in ("fetching", "driving", "joining"):
         # A mesh for this model is mid-launch - typically the orphan of a
         # deploy that died between launching and its chain write. Its
         # workers are busy, so launching fresh here would only fail with
