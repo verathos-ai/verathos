@@ -111,7 +111,7 @@ class NeuronConfig(ChainConfig):
 
     # X402Gateway on-chain USDC collection + TaoFi bridge
     x402_gateway_address: str = ""  # X402Gateway contract on Base (empty = direct-to-EOA)
-    x402_base_rpc_url: str = ""  # Base RPC URL (empty = https://mainnet.base.org)
+    x402_base_rpc_url: str = ""  # Explicit operator-managed Base RPC URL.
 
     # Shared state between validator and proxy processes
     shared_state_path: str = "/tmp/verathos_validator_state.json"

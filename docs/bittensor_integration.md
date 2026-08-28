@@ -13,7 +13,7 @@ sequenceDiagram
     participant V as Validator
     participant M as Miner
 
-    Note over EVM: ModelRegistry (ModelSpec roots)<br/>MinerRegistry (endpoints)<br/>PaymentGateway (deposits)
+    Note over EVM: ModelRegistry (ModelSpec roots)<br/>MinerRegistry (endpoints)<br/>PaymentGateway (dormant)
     Note over Sub: Metagraph (UIDs, hotkeys)
     Note over EVM,Sub: Bridged via precompiles
 
@@ -45,7 +45,7 @@ sequenceDiagram
 |----------|---------|
 | **ModelRegistry** | Model identity and canonical roots used to authenticate proof manifests |
 | **MinerRegistry** | Miner endpoints, heartbeats, model registrations |
-| **PaymentGateway** | User deposits, treasury splits, staking |
+| **PaymentGateway** | Retained deployment; not used by the prepaid-credit runtime |
 | **UsageCheckpointRegistry** | On-chain usage snapshots for disaster recovery |
 
 ### Receipts

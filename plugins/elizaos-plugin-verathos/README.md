@@ -154,7 +154,7 @@ export VERATHOS_X402_TESTNET="true"
 
 Fully automatic — the agent just calls `runtime.useModel()` and gets a response.
 
-**Scheme:** x402 [`upto`](https://github.com/coinbase/x402/blob/main/specs/schemes/upto/scheme_upto.md) — the agent signs an authorisation for a session cap and the gateway settles for the actual cost after inference. Agents only pay for what they consume. For high-frequency callers, reuse the same `X-PAYMENT` header across requests within the signature's 10-minute deadline to aggregate consumption into a single on-chain settlement.
+**Scheme:** x402 [`upto`](https://github.com/coinbase/x402/blob/main/specs/schemes/upto/scheme_upto.md) — the agent signs an authorisation for a session cap. Every successful accountless inference costs at least `$0.01`; higher calculated usage is charged at its token price. Unused cap headroom is never settled. For high-frequency callers, reuse the same `X-PAYMENT` header within the signature's 10-minute deadline.
 
 ## Supported Model Types
 

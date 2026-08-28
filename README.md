@@ -38,7 +38,7 @@ The same proof system extends to training. The training prover verifies forward 
                              ┌─────────────────────┐
                              │  ModelRegistry      │  model specs + Merkle roots
                              │  MinerRegistry      │  endpoints, heartbeats
-                             │  PaymentGateway     │  deposits, staking
+                             │  PaymentGateway     │  retained, dormant
                              └──────────┬──────────┘
                                         │
         ┌───────────────────────────────┼───────────────────────────────┐
@@ -56,7 +56,7 @@ The same proof system extends to training. The training prover verifies forward 
 
 **Validator** – Epoch-based canary testing (~72 min cycles), proof verification, scoring (throughput x latency x proof), weight setting. Proof failure = instant score zero.
 
-**Gateway** – OpenAI-compatible API. Score-weighted routing to miners. Payments via TAO, USDC on Base, or [x402](https://www.x402.org/) pay-per-request.
+**Gateway** – OpenAI-compatible API. Score-weighted routing to miners. Wallet accounts use USD inference credit funded with TAO or USDC; [x402](https://www.x402.org/) supports accountless pay-per-request.
 
 ## Getting Started
 
@@ -152,7 +152,7 @@ docs/           Documentation
 - **[What is Verathos?](docs/intro.md)** – Overview, proof guarantees, and architecture
 - **[Quickstart](docs/quickstart.md)** – First API call in 2 minutes
 - **[Setup Guide](docs/setup.md)** – Hardware requirements, miner and validator setup
-- **[User Guide](docs/user_guide.md)** – API keys, deposits, inference, withdrawals
+- **[User Guide](docs/user_guide.md)** – Wallet accounts, API keys, inference credit, conviction, and x402
 - **[Integrations](docs/integrations.md)** – LiteLLM, LangChain, elizaOS, and more
 - **[API Reference](docs/api.md)** – Full HTTP API reference
 - **[Inference Protocol](docs/inference_protocol.md)** – Deep dive into sumcheck-based verification

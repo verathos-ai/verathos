@@ -133,13 +133,13 @@ be explicitly unverified; maintenance does not turn it into a valid proof.
 
 | Method | How it works |
 |--------|-------------|
-| **TAO deposit** | Deposit TAO to PaymentGateway. 100% buys subnet alpha (permanent buy pressure, higher emissions). Owner cut starts at 0%, configurable up to 20%. |
-| **USDC deposit** | Deposit USDC on Base L2. Credited as USD balance. |
+| **TAO prepaid credit** | Send native TAO from the linked SS58 wallet to the service's fixed receiver. Credited in USD after finalized verification using a fresh market price. |
+| **USDC prepaid credit** | Authorize an x402 Permit2 payment from the linked EVM wallet. Credited 1:1 after facilitator settlement. |
 | **x402 (pay-per-request)** | HTTP 402 protocol: attach USDC payment to each request. No account needed. Built for autonomous agents. |
 
 ## Quick Links
 
-- **[User Guide](user_guide.md)**: API keys, deposits, inference requests, withdrawals
+- **[User Guide](user_guide.md)**: wallet accounts, billing, conviction, API keys, and inference
 - **[Setup Guide](setup.md)**: Run a miner or validator
 - **[API Reference](api.md)**: Full HTTP API reference
 - **[Bittensor Integration](bittensor_integration.md)**: Epoch testing, scoring, architecture

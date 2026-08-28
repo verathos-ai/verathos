@@ -9,7 +9,7 @@ import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol
 
 /// @title PaymentGateway — prepaid credit system for Verathos inference
 /// @notice Users deposit TAO to purchase inference credits. Deposits are split:
-///         - ownerCutBps (default 0%, max 20%) → owner treasury
+///         - ownerCutBps (default 0%, max 100%) → owner treasury
 ///         - remainder → staked as alpha on the subnet via StakingV2 precompile
 ///
 ///         Credit accounting is off-chain (validator-side DB). The on-chain
@@ -34,7 +34,7 @@ contract PaymentGateway is Initializable, UUPSUpgradeable, OwnableUpgradeable, R
     address public ownerTreasury;
     uint16  public ownerCutBps;  // basis points, default 0 = 0%
 
-    uint16 constant MAX_OWNER_CUT_BPS = 2000;  // 20% cap
+    uint16 constant MAX_OWNER_CUT_BPS = 10000;  // 100% cap
 
     // ── Deposit tracking ────────────────────────────────────────────
 
@@ -134,7 +134,7 @@ contract PaymentGateway is Initializable, UUPSUpgradeable, OwnableUpgradeable, R
 
     // ── Owner admin ─────────────────────────────────────────────────
 
-    /// @notice Update the owner cut percentage (max 20%).
+    /// @notice Update the owner cut percentage (max 100%).
     function setOwnerCut(uint16 newBps) external onlyOwner {
         require(newBps <= MAX_OWNER_CUT_BPS, "Cut too high");
         uint16 oldBps = ownerCutBps;

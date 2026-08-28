@@ -1,153 +1,120 @@
 # Verathos User Guide
 
-How to use Verathos as an end user, from getting an API key to making inference requests.
+Use a wallet account for prepaid inference and API keys, or use x402 for
+accountless USDC pay-per-request.
 
-> **Preview mode:** Accounts, API keys, and deposits are not yet publicly available. You can try verified inference in the [chat](https://verathos.ai/chat) without an account. The guide below describes the full system that will be available once public API access launches.
+## Wallet account
 
-## Overview
+Open [verathos.ai/account](https://verathos.ai/account) and sign in with a
+Bittensor SS58 or Base EVM wallet. Signing proves control of the public address;
+it does not submit a transaction or expose a private key.
 
-1. Create an API key (email or wallet)
-2. Add funds (TAO, USDC on Base, or x402 pay-per-request)
-3. Send inference requests (OpenAI-compatible API)
+Wallet challenges are site-bound, expire after five minutes, and are consumed
+once. The browser receives a Secure, HttpOnly session cookie. Sessions expire
+after 30 days and rotate when you sign in again. Anonymous chat sessions remain
+separate from account identity.
 
-## 1. Create an API Key
+An account can link one SS58 conviction wallet and one EVM payment wallet.
+Addresses are unique across accounts. Link a missing wallet under **Account →
+Security** with another fresh signature.
 
-### Option A: Email/Password (quickest)
+## Balances and usage
 
-No wallet needed:
+All account balances use USD microcredits, where `1 credit = $1` of inference.
+The Account overview separates:
 
-```bash
-curl -X POST https://api.verathos.ai/v1/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email": "you@example.com", "password": "pick-a-password"}'
-# Returns: {"api_key": "vrt_sk_...", "user_id": "uuid-..."}
-```
+- paid credit available;
+- today's conviction entitlement, spent amount, and remaining amount; and
+- total available inference credit.
 
-Already registered? Login:
+Paid credits never expire, but are non-refundable and non-transferable. Usage
+reserves the request's maximum cost before dispatch, settles verified token
+usage afterward, and releases unused headroom. Conviction allowance is spent
+first; a single request may split between conviction and paid credit. The Usage
+page shows both charged amounts.
 
-```bash
-curl -X POST https://api.verathos.ai/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "you@example.com", "password": "pick-a-password"}'
-```
+## Add credits
 
-### Option B: EVM Wallet Signature
-
-For crypto-native users with an EVM wallet (MetaMask, etc.):
-
-```bash
-# 1. Get a challenge
-curl https://api.verathos.ai/v1/auth/challenge
-# Returns: {"challenge": "vrt_auth_abc123_1710000000"}
-
-# 2. Sign with your wallet (EIP-191 personal_sign), then:
-curl -X POST https://api.verathos.ai/v1/auth/wallet \
-  -H "Content-Type: application/json" \
-  -d '{
-    "address": "0xYourAddress",
-    "challenge": "vrt_auth_abc123_1710000000",
-    "signature": "0x...",
-    "name": "my-app"
-  }'
-# Returns: {"api_key": "vrt_sk_...", "user_id": "uuid-..."}
-```
-
-**Save the API key.** It is shown once and never stored in plaintext.
-
-### Managing API Keys
-
-```bash
-# List your keys
-curl https://api.verathos.ai/v1/api-keys \
-  -H "Authorization: Bearer vrt_sk_..."
-
-# Revoke a key
-curl -X DELETE https://api.verathos.ai/v1/api-keys/<key_hash> \
-  -H "Authorization: Bearer vrt_sk_..."
-```
-
-## 2. Add Funds
-
-You need credits to pay for inference. Three options:
-
-- **TAO**: deposit TAO on Bittensor
-- **USDC**: deposit USDC on Base L2
-- **x402**: pay per request with USDC, no deposit needed (see below)
-
-Each user gets unique deposit addresses for both TAO and USDC:
-
-```bash
-curl https://api.verathos.ai/v1/user/deposit-address \
-  -H "Authorization: Bearer vrt_sk_..."
-```
-
-Deposits are detected within 30 seconds. Your balance updates automatically. Balances are tracked separately; inference deducts from USD first, then TAO.
-
-```bash
-curl https://api.verathos.ai/v1/balance \
-  -H "Authorization: Bearer vrt_sk_..."
-# Returns: {"balance_tao": 0.1, "balance_usd": 10.0, "tao_usd": 500.0, "total_balance_usd": 60000000, ...}
-
-# Include withdrawable amounts (requires chain lookup):
-curl "https://api.verathos.ai/v1/balance?withdrawable=1" \
-  -H "Authorization: Bearer vrt_sk_..."
-# Additional fields: "withdrawable_tao": 0.095, "withdrawable_usd": 9.99
-```
+Open **Account → Billing**, choose the asset and amount, and select the Add
+button. The connected wallet opens immediately. Cancelling before the wallet
+sends creates no payment record.
 
 ### TAO
 
-Send TAO to the `tao.address` (SS58) returned above using any Bittensor wallet:
+- Network: Bittensor
+- Minimum: `0.01 TAO`
+- Sender: the linked SS58 wallet
+- Receiver: the service's fixed TAO receiver
 
-```bash
-btcli wallet transfer --dest 5G6xBZHQ... --amount 0.1 --wallet default
+Credit is issued only after the transfer is finalized and a fresh live TAO/USD
+price is available. The finalized price is applied once. If the price source is
+unavailable, no credit is issued until the same transaction can be verified
+with a fresh price. No configured fallback price is used to issue credit.
+If the browser closes after a valid transfer, the receiver reconciliation job
+recognizes the linked sender and credits it automatically. Billing history
+contains only successful, credited payments.
+
+### USDC
+
+- Network: Base
+- Minimum: `$0.10 USDC`
+- Sender: the linked EVM wallet
+- Settlement: x402 `upto` authorization through the configured facilitator
+
+USDC is credited 1:1. The first payment may require a USDC approval for Permit2
+before the wallet asks for the payment authorization. The backend binds that
+authorization to the selected amount, linked wallet, network, asset, receiver,
+and account billing resource. It verifies and settles through the facilitator,
+then atomically records the payment and credit. An authorization can be
+credited only once, and unsuccessful attempts do not appear in Billing history.
+
+## Conviction allowance
+
+The linked SS58 wallet qualifies only through a perpetual SN96 lock targeting
+the current subnet-owner hotkey. At a finalized snapshot, let `A` be eligible
+locked alpha:
+
+```text
+if A < 10:
+    daily allowance = $0
+else if A < 100:
+    daily allowance = $0.01 × A
+else:
+    daily allowance = min($25, $1 × sqrt(A / 100))
 ```
 
-Withdraw unconsumed TAO at any time. Supports both EVM (`0x...`) and SS58 (`5...`) destinations (SS58 uses `ISubtensorBalanceTransfer` precompile internally):
+| Locked alpha | Daily allowance |
+|---:|---:|
+| Below 10 | $0 |
+| 10 | $0.10 |
+| 50 | $0.50 |
+| 100 | $1 |
+| 400 | $2 |
+| 2,500 | $5 |
+| 10,000 | $10 |
+| 62,500+ | $25 cap |
+
+Allowance resets at `00:00 UTC`, never rolls over, and cannot be transferred or
+withdrawn. Lock state refreshes periodically and when the Account page opens.
+During a chain RPC outage, a recent finalized snapshot may be used briefly;
+after it becomes stale, conviction spending pauses while paid credit and x402
+continue.
+
+## API keys
+
+Create keys under **Account → API keys**. Key creation requires a fresh linked
+wallet signature. Name each key so it can be identified later.
+
+The full `vrt_sk_...` value is displayed once. Store it in a secret manager or
+environment variable; do not put it in source control or browser storage. Only
+a secure hash and non-secret prefix are retained by the service. An account can
+have at most ten active keys, and revocation takes effect immediately.
+
+Use the key with the OpenAI-compatible API:
 
 ```bash
-curl -X POST https://api.verathos.ai/v1/user/withdraw \
-  -H "Authorization: Bearer vrt_sk_..." \
-  -H "Content-Type: application/json" \
-  -d '{"amount_tao": 0.05, "destination": "0xYourEVMAddress"}'
-# Returns: {"tx_hash": "0x...", "amount_tao": 0.05, "destination_type": "evm", "chain": "bittensor", "status": "completed"}
-```
-
-### USDC (Base L2)
-
-Send USDC to the `base.address` returned above using any wallet on the Base network. Credited 1:1 as USD balance.
-
-> Only USDC is supported. Native ETH sent to deposit addresses will not be credited.
-
-Withdraw unconsumed USDC at any time. Destination must be a Base EVM address (validator auto-funds gas):
-
-```bash
-curl -X POST https://api.verathos.ai/v1/user/withdraw \
-  -H "Authorization: Bearer vrt_sk_..." \
-  -H "Content-Type: application/json" \
-  -d '{"amount_usdc": 5.0, "destination": "0xYourBaseAddress"}'
-# Returns: {"tx_hash": "0x...", "amount_usdc": 5.0, "destination_type": "evm", "chain": "base", "status": "completed"}
-```
-
-Withdrawals are rate limited to one per 5 minutes. Minimum: 0.01 TAO or $1 USDC. Only on-chain balance minus gas is withdrawable.
-
-## 3. Send Inference Requests
-
-The API is OpenAI-compatible. Use any OpenAI SDK or HTTP client.
-
-### List available models
-
-```bash
-curl https://api.verathos.ai/v1/models \
-  -H "Authorization: Bearer vrt_sk_..."
-```
-
-Each model shows `available_quants` (e.g. `["fp16", "gptq_int4"]`) and `qualified_ids` for requesting a specific quantization.
-
-### Chat completions
-
-```bash
-curl -X POST https://api.verathos.ai/v1/chat/completions \
-  -H "Authorization: Bearer vrt_sk_..." \
+curl https://api.verathos.ai/v1/chat/completions \
+  -H "Authorization: Bearer vrt_sk_YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "auto",
@@ -156,199 +123,57 @@ curl -X POST https://api.verathos.ai/v1/chat/completions \
   }'
 ```
 
-### Model selection
-
-Use `"auto"` to let Verathos pick the best available model. It selects the highest-scored healthy miner across all models. If that miner fails, it automatically falls through to the next-best endpoint regardless of model. This is the recommended default for most use cases.
-
-You can also specify a model explicitly:
-
-```bash
-# Auto - best available model and miner (recommended)
-"model": "auto"
-
-# Specific model
-"model": "qwen3-8b"
-
-# Specific model + quantization
-"model": "qwen3-8b:fp16"
-"model": "qwen3-8b:gptq_int4"
-"model": "qwen3-8b:fp8"
-```
-
-Check `/v1/models` for available models and quantizations.
-
-### Python (OpenAI SDK)
-
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="https://api.verathos.ai/v1",
-    api_key="vrt_sk_...",
+    api_key="vrt_sk_YOUR_KEY",
 )
 
 response = client.chat.completions.create(
-    model="qwen3-8b:fp16",  # or just "qwen3-8b" for auto
-    messages=[{"role": "user", "content": "Explain zero-knowledge proofs"}],
-    stream=True,
+    model="auto",
+    messages=[{"role": "user", "content": "Explain zero-knowledge proofs."}],
 )
-
-for chunk in response:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="", flush=True)
+print(response.choices[0].message.content)
 ```
 
-Works with any OpenAI-compatible tool. We provide dedicated plugins for [LiteLLM, LangChain, elizaOS, OpenClaw, Hermes, and AutoGen](integrations.md) with features like proof metadata, model discovery, and x402 payments.
+## Model selection and tools
 
-### Tool calling
+Use `auto` to select the highest-scored healthy route, or request a qualified
+model ID returned by `GET /v1/models`. Tool-capable model entries advertise
+`tools`, `tool_choice`, and `parallel_tool_calls` in `supported_parameters`.
+Raw API clients execute their own tools and send tool results back in the next
+chat-completion request.
 
-Verathos supports OpenAI-compatible tool-calling fields on routes whose miners advertise tool support. Check `GET /v1/models` first; tool-capable model entries include:
+## x402 pay-per-request
 
-```json
-{
-  "supported_parameters": ["tools", "tool_choice", "parallel_tool_calls"]
-}
-```
+x402 pays with USDC on Base without an account, prepaid balance, or API key.
+Send an unauthenticated inference request, read the HTTP 402 payment
+requirements, sign the requested Permit2 authorization with an x402-compatible
+client, and retry with its payment header.
 
-When supported, send `tools`, `tool_choice`, and optionally `parallel_tool_calls` to `/v1/chat/completions`. The model may return an assistant message with `tool_calls` and `finish_reason: "tool_calls"`. Your API client executes those tools, appends the assistant tool-call message plus a `role: "tool"` result message, then calls `/v1/chat/completions` again for the final answer.
+x402 is independent of account credit and settles to its configured receiver.
+It cannot fund an account balance. Each successful request costs at least
+`$0.01`; requests whose token price exceeds that minimum cost their calculated
+usage price. The `upto` scheme authorizes a cap, and unused headroom is never
+settled. A compatible authorization may be reused within its deadline for
+multiple requests, subject to its signed cap.
 
-The hosted Verathos webapp includes a SearXNG-backed `web_search` executor. Raw API clients should provide their own tool executors.
+The payer wallet must hold USDC on the requested Base network and complete any
+one-time Permit2 approval required by its x402 client.
 
-Use `stream: false` for the tool-decision request. The final answer request, after adding the tool result, can be streamed normally.
+## TEE inference
 
-### Example scripts
+TEE-qualified routes appear in `GET /v1/models` when available. Append the
+advertised `:tee` qualifier for OpenAI-compatible TEE routing. See the
+[API Reference](api.md#tee-encrypted-inference) for the encrypted TEE endpoints
+and current availability.
 
-Ready-to-run Python scripts in the `examples/` directory:
+## Account security
 
-- **`openai_client.py`**: Basic chat completion
-- **`streaming_client.py`**: Token-by-token streaming
-- **`x402_client.py`**: Pay with USDC (no API key)
-
-All support `--model`, `--quant`, and `--gateway` flags.
-
-## x402 Pay-Per-Request (USDC)
-
-Pay per request with USDC on Base, with no deposit, no API key, and no account needed. Uses the [Coinbase x402 protocol](https://docs.cdp.coinbase.com/x402). Built for autonomous agents: machine-native payment at inference time.
-
-**How it works**: Send a request without auth → gateway returns HTTP 402 with payment requirements → the x402 SDK signs a Permit2 authorization on Base and retransmits → inference proceeds. USDC settles on-chain after inference for the actual cost.
-
-**Setup**:
-- `pip install x402 eth-account`
-- Use the `x402HttpxClient` (or `x402_requests` wrapper) with your EVM wallet private key
-- The SDK handles the 402 → sign → retry flow automatically
-- One-time per-wallet: approve USDC for the canonical Permit2 contract (`0x000000000022D473030F116dDEE9F6B43aC78BA3`). The x402 client SDK does not do this for you — send one `USDC.approve(Permit2, max_uint256)` tx from your wallet before your first payment.
-- See `examples/x402_client.py` in the repo for a working example
-
-**Requirements**: EVM wallet with USDC + ETH (for gas) on Base. Testnet: Base Sepolia.
-
-**Scheme**: x402 [`upto`](https://github.com/coinbase/x402/blob/main/specs/schemes/upto/scheme_upto.md) — the client signs an authorisation for a maximum amount (cap); the gateway settles for the actual cost after inference. Users only pay for what they consume.
-
-**Session pass for high-frequency callers**: One signed authorisation is valid for 10 minutes and can back many follow-up requests. Reuse the same `X-PAYMENT` header across follow-ups (within the deadline) and the gateway aggregates the consumption into a single on-chain settlement. This is the recommended pattern for agentic workloads: dozens or hundreds of small requests amortise into one settlement, paying the on-chain gas only once. The Python x402 SDK signs a fresh authorisation per request by default — capture the signed header from the first 402 round-trip and attach it manually to follow-ups to get aggregation.
-
-**Cost**: Pay-per-token at the same rates as API-key callers. Settlement gas is paid by the Coinbase facilitator and amortised across the aggregated batch. For one-off requests on a fresh signature, the facilitator's gas-economic floor (~$0.01 per settlement) can dominate — reuse signatures across a session, or use API key + deposit for the lowest unit cost on small requests.
-
-## TEE Inference (Trusted Execution Environments)
-
-> **Not yet available on mainnet.** TEE support will be enabled once reproducible builds are validated across hardware platforms. Available on testnet.
-
-TEE inference runs models inside hardware-isolated enclaves (Intel TDX, AMD SEV-SNP, NVIDIA Confidential Computing). The miner operator cannot access model inputs or outputs at the hardware level. There are two ways to use TEE, depending on your trust model. Authentication and billing work the same as standard inference.
-
-### Find TEE-enabled models
-
-Models with TEE-enabled miners show `:tee` qualified IDs in the model list:
-
-```bash
-curl https://api.verathos.ai/v1/models -H "Authorization: Bearer vrt_sk_..."
-# qualified_ids like "qwen3-8b:gptq_int4:tee" indicate TEE availability
-```
-
-If no `:tee` variants appear, no TEE-enabled miners are currently online.
-
-### Option 1: TEE-verified inference (OpenAI-compatible)
-
-Append `:tee` to any model qualifier to route to a TEE-enabled miner. The API stays OpenAI-compatible, so no code changes are required beyond the model name. The gateway sees the plaintext, but the miner operator cannot (hardware isolation).
-
-```bash
-curl -X POST https://api.verathos.ai/v1/chat/completions \
-  -H "Authorization: Bearer vrt_sk_..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3-8b:gptq_int4:tee",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true
-  }'
-```
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="https://api.verathos.ai/v1", api_key="vrt_sk_...")
-response = client.chat.completions.create(
-    model="qwen3-8b:gptq_int4:tee",
-    messages=[{"role": "user", "content": "Explain zero-knowledge proofs"}],
-    stream=True,
-)
-for chunk in response:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="", flush=True)
-```
-
-The response includes `proof_mode: "attestation"` and TEE details (enclave key, attestation hash, platform) instead of cryptographic proof data.
-
-### Option 2: End-to-end encrypted inference (TEEClient)
-
-For privacy-sensitive workloads where neither the gateway nor the miner operator should see plaintext. Prompts are encrypted on your machine and decrypted only inside the miner's enclave.
-
-```bash
-pip install verathos  # includes pynacl for X25519 + XSalsa20
-```
-
-**Non-streaming:**
-
-```python
-from verallm.tee.client import TEEClient
-
-# Specify a model - the gateway assigns a TEE miner and returns its enclave key
-client = TEEClient.from_miner("https://api.verathos.ai", model="qwen3-8b")
-
-# Verify hardware attestation (genuine TEE, correct model weights)
-assert client.verify_attestation()
-
-# Encrypt, send, decrypt - all handled internally
-result = client.chat(
-    messages=[{"role": "user", "content": "Explain zero-knowledge proofs"}],
-    max_tokens=512,
-)
-print(result["output_text"])
-```
-
-**Streaming:**
-
-```python
-with TEEClient.from_miner("https://api.verathos.ai", model="qwen3-8b") as client:
-    for event in client.chat_stream(
-        messages=[{"role": "user", "content": "Hello!"}],
-        max_tokens=256,
-    ):
-        if event["type"] == "token":
-            print(event["text"], end="", flush=True)
-        elif event["type"] == "done":
-            print(f"\nProof verified: {event['proof_verified']}")
-```
-
-Use `model="auto"` to let the gateway pick the best available TEE miner across all models. The client handles key exchange, encryption, decryption, and automatic retry if a miner goes offline.
-
-See [Inference Protocol: TEE Verification](inference_protocol.md#tee-verification-trusted-execution-environments) for the full technical details on attestation, cryptography, and trust model.
-
-## Pricing
-
-Pricing is in USD per million tokens, with tiers based on model size. Ordinary
-v3 requests receive light proofs, while unpredictable canaries carry
-hard execution proofs; protocol enforcement cost is included in the service
-price. TAO-paying users are charged at the live market rate.
-
-Use `GET /v1/price` to compute exact costs before sending, or `GET /v1/models` to see per-model pricing. See the [pricing table](intro.md#pricing-usd-per-1m-tokens) for full details.
-
-## Rate Limits
-
-All endpoints are rate-limited per-IP (public) or per-API-key (authenticated). Inference is limited to 300 requests/min, auth endpoints to 10/min, withdrawals to 1 per 5 minutes. Exceeding limits returns HTTP 429 with a `Retry-After` header. All responses include `X-RateLimit-Limit` and `X-RateLimit-Remaining` headers.
+- Verify the domain shown by the wallet before signing.
+- Keep API keys in a secret manager and revoke any exposed key immediately.
+- Sign out from **Account → Security** to revoke the current browser session.
+- Treat every paid-credit purchase as final.
+- Use only the receiver and network displayed before approving a payment.

@@ -156,7 +156,7 @@ Query parameters: `model`, `input_tokens`, `output_tokens`, `verified` (default:
 
 #### `GET /v1/balance`
 
-Check credit balance (TAO + USD).
+Check the unified USD-microcredit balance for an account API key.
 
 ```bash
 curl https://api.verathos.ai/v1/balance \
@@ -166,20 +166,21 @@ curl https://api.verathos.ai/v1/balance \
 **Response:**
 ```json
 {
-  "balance_tao": 0.1,
-  "total_deposited_tao": 0.15,
-  "total_consumed_tao": 0.05,
-  "total_withdrawn_tao": 0.0,
-  "balance_usd": 10.0,
-  "total_deposited_usd": 10.0,
-  "total_consumed_usd": 0.0,
-  "total_withdrawn_usd": 0.0,
-  "tao_usd": 500.0,
-  "total_balance_usd": 60.0
+  "paid_available_usd_micros": 10000000,
+  "conviction_entitlement_usd_micros": 2000000,
+  "conviction_spent_usd_micros": 250000,
+  "conviction_available_usd_micros": 1750000,
+  "total_available_usd_micros": 11750000,
+  "conviction": {
+    "locked_alpha": 400.0,
+    "perpetual": true,
+    "eligible": true,
+    "snapshot_block": 123456,
+    "refreshed_at": 1787600000,
+    "next_reset": 1787616000
+  }
 }
 ```
-
-`tao_usd` and `total_balance_usd` are included when the price feed is active.
 
 #### `GET /v1/usage`
 
@@ -199,103 +200,66 @@ curl "https://api.verathos.ai/v1/usage?limit=50" \
       "model_id": "qwen3-8b",
       "input_tokens": 100,
       "output_tokens": 250,
-      "tao_cost": 0.000012,
+      "conviction_usd_micros": 35,
+      "paid_usd_micros": 8,
+      "total_usd_micros": 43,
       "timestamp": 1710000000
     }
   ]
 }
 ```
 
-### Deposits & Withdrawals
+### Account billing
 
-#### `GET /v1/user/deposit-address`
+#### Same-origin account API
 
-Get per-user deposit addresses (TAO on Bittensor + USDC on Base).
+Wallet sessions, linked wallets, API-key management, payment verification and
+settlement, billing history, and conviction refresh are exposed through
+the browser application's same-origin `/api/account/*` and `/api/auth/*` routes.
+These routes use a Secure, HttpOnly session cookie and are not API-key endpoints.
+Use [verathos.ai/account](https://verathos.ai/account) for these workflows.
 
-```bash
-curl https://api.verathos.ai/v1/user/deposit-address \
-  -H "Authorization: Bearer vrt_sk_..."
-```
+Account credit purchases support:
 
-**Response:**
-```json
-{
-  "tao": {
-    "address": "5G6xBZHQ...",
-    "evm_address": "0x...",
-    "network": "bittensor-mainnet"
-  },
-  "min_deposit_tao": 0.01,
-  "instructions": "Send TAO to tao.address, or USDC/ETH to base.address. Credits appear within 30 seconds.",
-  "base": {
-    "address": "0x...",
-    "network": "base-mainnet",
-    "usdc_contract": "0x..."
-  }
-}
-```
+- native TAO on Bittensor, minimum `0.01 TAO`;
+- x402 USDC on Base, minimum `$0.10 USDC`.
 
-The `base` field is only present when Base deposits are enabled by the validator. Send TAO to `tao.address` (SS58), or USDC to `base.address` on Base.
-
-#### `POST /v1/user/withdraw`
-
-Withdraw unconsumed TAO or USDC. Rate limited to 1 per 5 minutes.
-
-```bash
-# TAO withdrawal (to Bittensor EVM address)
-curl -X POST https://api.verathos.ai/v1/user/withdraw \
-  -H "Authorization: Bearer vrt_sk_..." \
-  -H "Content-Type: application/json" \
-  -d '{"amount_tao": 0.05, "destination": "0xYourEVMAddress"}'
-
-# USDC withdrawal (to Base address)
-curl -X POST https://api.verathos.ai/v1/user/withdraw \
-  -H "Authorization: Bearer vrt_sk_..." \
-  -H "Content-Type: application/json" \
-  -d '{"amount_usdc": 5.0, "destination": "0xYourBaseAddress"}'
-```
-
-Specify either `amount_tao` or `amount_usdc`, not both. Minimum: 0.01 TAO or $1.00 USDC.
-
-#### `POST /v1/deposits/base/verify`
-
-Verify a USDC deposit on Base by transaction hash. Credits the user's account after on-chain confirmation.
-
-```bash
-curl -X POST https://api.verathos.ai/v1/deposits/base/verify \
-  -H "Authorization: Bearer vrt_sk_..." \
-  -H "Content-Type: application/json" \
-  -d '{"tx_hash": "0x..."}'
-```
-
-#### `GET /v1/deposits/base`
-
-List your Base USDC deposits. Query parameter: `limit` (default 50, max 200).
-
-```bash
-curl "https://api.verathos.ai/v1/deposits/base?limit=10" \
-  -H "Authorization: Bearer vrt_sk_..."
-```
+TAO is credited only after independent finalized-chain verification. USDC is
+credited only after strict facilitator verification and settlement of an x402
+authorization from the linked EVM wallet. Paid credits are non-refundable,
+non-transferable, and do not expire. There are no per-user deposit addresses or
+customer withdrawal endpoints.
 
 #### `GET /v1/deposit-info`
 
-Public (no auth). Returns deposit configuration: contract addresses, validator hotkey, owner cut.
+Returns configured payment networks, assets, minimums, the fixed TAO receiver,
+and final-credit policy. The Billing page uses this metadata when constructing
+wallet requests.
+
+`POST /api/account/payments/tao/verify` accepts the exact atomic amount,
+transaction hash, and optional finalized Bittensor block number. `POST
+/api/account/payments/usdc` is an x402-protected credit purchase bound to the
+signed amount and linked EVM wallet. Successful settlement atomically inserts
+the payment and its USD credit. `GET /api/account/payments` returns only
+verified, credited payments; cancelled and failed wallet requests are absent.
+
+Legacy `/v1/user/deposit-address`, `/v1/user/withdraw`, and
+`/v1/deposits/base/*` routes return HTTP 410.
 
 ### Authentication
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/auth/register` | POST | Register with email/password, returns first API key |
-| `/v1/auth/login` | POST | Validate email/password credentials (no key created) |
-| `/v1/auth/keys` | POST | Validate email/password + create a new API key |
-| `/v1/auth/challenge` | GET | Get challenge string for wallet signature auth |
-| `/v1/auth/wallet` | POST | Authenticate with EIP-191 wallet signature, returns API key |
-| `/v1/api-keys` | GET | List your API keys |
-| `/v1/api-keys/{hash}` | DELETE | Revoke an API key |
+| `/api/auth/challenge` | GET | Create a domain-bound SS58 or EVM challenge |
+| `/api/auth/wallet` | POST | Verify the wallet proof and set an HttpOnly session cookie |
+| `/api/auth/session` | GET | Read the current wallet session |
+| `/api/auth/logout` | POST | Revoke the current session and clear its cookie |
+| `/api/account/api-keys` | GET/POST | List metadata or create a key with a fresh wallet signature |
+| `/api/account/api-keys/{hash}` | DELETE | Revoke an account API key immediately |
 
 See the [User Guide](user_guide.md) for step-by-step authentication walkthrough.
 
-**Authentication header:**
+Public inference authentication header:
 ```
 Authorization: Bearer vrt_sk_...
 ```
@@ -353,9 +317,9 @@ No API key or deposit needed. Pay per request with USDC on Base:
 3. Resend with `X-PAYMENT` header
 4. Inference proceeds, response returned. The gateway records per-request consumption against the signed authorisation; the on-chain settlement happens in background batches.
 
-**Scheme**: [`upto`](https://github.com/coinbase/x402/blob/main/specs/schemes/upto/scheme_upto.md). The client signs for a maximum, the gateway settles for the actual cost. You only pay for what you consume.
+**Scheme**: [`upto`](https://github.com/coinbase/x402/blob/main/specs/schemes/upto/scheme_upto.md). The client signs for a maximum. Each successful request costs at least `$0.01`; requests above that floor cost their calculated token usage. Unused authorization headroom is never settled.
 
-**Session pass**: Reuse the same `X-PAYMENT` header across multiple follow-up requests within the 10-minute deadline. The gateway aggregates consumption into a single on-chain settlement. Recommended for high-frequency / agentic callers — dozens of requests amortise into one settlement, paying the on-chain gas only once. One-off requests on a fresh signature settle at the Coinbase facilitator's gas-economic floor (~$0.01 per settlement). For sub-cent unit pricing, use API key + deposit or reuse signatures.
+**Session pass**: Reuse the same `X-PAYMENT` header across multiple follow-up requests within the 10-minute deadline. The gateway aggregates consumption into a single on-chain settlement. Recommended for high-frequency or agentic callers because many requests can share one authorization and settlement. Use prepaid account credit when per-token charges below the `$0.01` accountless minimum matter.
 
 **One-time wallet setup**: the x402 protocol uses Permit2 for gasless signed transfers. Each payer wallet must approve USDC for the canonical Permit2 contract once: `USDC.approve(0x000000000022D473030F116dDEE9F6B43aC78BA3, max_uint256)`. The x402 client SDK does not do this for you.
 
@@ -366,10 +330,9 @@ All endpoints are rate-limited. Responses include `X-RateLimit-Limit` and `X-Rat
 | Tier | Endpoints | Key | Limit |
 |------|-----------|-----|-------|
 | Inference | `POST /v1/chat/completions`, TEE variants | per-API-key | 300/min |
-| Auth | register, login, wallet | per-IP | 10/min |
-| Authenticated reads | balance, usage, keys, deposits | per-API-key | 60/min |
+| Auth | wallet challenge and login | per-IP | 10/min |
+| Authenticated reads | balance and usage | per-API-key | 60/min |
 | Public reads | `/v1/models`, `/v1/price`, `/health` | per-IP | 60/min |
-| Withdrawal | `POST /v1/user/withdraw` | per-API-key | 1/5min |
 
 ### Other
 

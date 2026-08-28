@@ -1,20 +1,46 @@
 # Quickstart
 
-Go from zero to your first verified API call in under 2 minutes.
+Go from a wallet sign-in to your first account-funded API call.
 
-> **Preview mode:** Accounts, API keys, and deposits are not yet publicly available. You can try verified inference in the [chat](https://verathos.ai/chat) without an account. The steps below will work once public API access launches.
+## 1. Sign in with a wallet
 
-## 1. Create an account
+Open [verathos.ai/account](https://verathos.ai/account) and sign a one-time
+challenge with either a Bittensor SS58 wallet or a Base EVM wallet. The
+challenge is bound to the site, expires after five minutes, and can be used
+only once. No email or password is required.
 
-```bash
-curl -X POST https://api.verathos.ai/v1/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email": "you@example.com", "password": "your-password"}'
-```
+Link the other wallet under **Account → Security** if you want both TAO and
+USDC top-ups. One SS58 wallet and one EVM wallet can be linked to an account.
 
-You'll receive an API key (`vrt_sk_...`) and $1.00 free credit, enough for thousands of tokens.
+## 2. Add inference credits
 
-## 2. Make your first request
+Open **Account → Billing**, choose TAO or USDC, enter an amount, and select
+**Add TAO** or **Add USDC**. The connected wallet opens immediately. Cancelling
+the wallet request creates no payment record.
+
+- Minimum TAO top-up: `0.01 TAO`
+- Minimum USDC top-up: `$0.10 USDC` on Base
+- `1 credit = $1` of inference
+- Paid credits do not expire, but are non-refundable and non-transferable
+
+TAO is credited after finalized-chain verification with a fresh market price.
+USDC uses an x402 Permit2 authorization and is credited only after facilitator
+settlement. Billing history contains only successful, credited payments. A
+background TAO reconciliation pass credits a valid transfer from a linked
+wallet if the browser closes before confirmation finishes.
+
+Eligible perpetual SN96 locks directed to the current subnet-owner hotkey also
+provide a daily inference allowance. The current formula and status are shown
+on the Account page. Daily allowance is consumed before paid credit and does
+not roll over.
+
+## 3. Create an API key
+
+Open **Account → API keys**, enter a name, and sign the fresh wallet challenge.
+Copy the key immediately: the full value is shown once and only its secure hash
+is stored. Each account can have up to ten active keys.
+
+## 4. Make your first request
 
 ```bash
 curl https://api.verathos.ai/v1/chat/completions \
@@ -27,12 +53,10 @@ curl https://api.verathos.ai/v1/chat/completions \
   }'
 ```
 
-Use `"auto"` to let Verathos pick the best available model, or specify one
-explicitly. The response is OpenAI-compatible. Ordinary v3 traffic is bound to
-a nonce-free light proof; unpredictable canaries carry the hard execution
-proofs that enforce registered-model serving across the network.
+The API is OpenAI-compatible. Use `auto` for score-weighted routing or select a
+qualified model returned by `GET /v1/models`.
 
-## 3. Use with any OpenAI SDK
+## 5. Use an OpenAI SDK
 
 ```python
 from openai import OpenAI
@@ -50,41 +74,15 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-Works with Python, TypeScript, Go, Rust, and any language with an OpenAI-compatible client. For AI agent frameworks, see [integrations](integrations.md) (LiteLLM, LangChain, elizaOS, OpenClaw, and more).
+## Accountless alternative
 
-## 4. Check your balance
-
-```bash
-curl https://api.verathos.ai/v1/balance \
-  -H "Authorization: Bearer vrt_sk_YOUR_KEY"
-```
-
-## Available models
-
-```bash
-curl https://api.verathos.ai/v1/models \
-  -H "Authorization: Bearer vrt_sk_YOUR_KEY"
-```
-
-The subnet maintains a curated model registry with verified weight commitments. Miners choose which registered models to serve, and the available list changes as miners join and leave the network.
-
-## Alternative: Pay with USDC (no account needed)
-
-Use [x402](https://docs.cdp.coinbase.com/x402) to pay per request with USDC on Base, with no registration and no API key. Install `pip install x402 eth-account` and see `examples/x402_client.py` for a working example. See the [User Guide](user_guide.md#x402-pay-per-request-usdc) for details.
-
-## Example scripts
-
-Ready-to-run Python scripts in the `examples/` directory:
-
-- **`openai_client.py`**: Basic chat with the OpenAI SDK (simplest integration)
-- **`streaming_client.py`**: Token-by-token streaming output
-- **`x402_client.py`**: Pay with USDC on Base (no API key needed)
-
-All support `--model`, `--quant` (e.g. `int4`, `fp16`), and `--gateway` flags.
+[x402](https://docs.cdp.coinbase.com/x402) supports USDC pay-per-request without
+an account or API key. See the [User Guide](user_guide.md#x402-pay-per-request)
+for the payment flow.
 
 ## What's next?
 
-- **[User Guide](user_guide.md)**: Deposits (TAO + USDC), withdrawals, x402, API keys
-- **[API Reference](api.md)**: Full endpoint documentation
-- **[What is Verathos?](intro.md)**: How verification works under the hood
-- **[Verified Chat](https://verathos.ai/chat)**: Try it in the browser with no setup
+- [User Guide](user_guide.md): accounts, billing, conviction, API keys, and x402
+- [API Reference](api.md): HTTP endpoint documentation
+- [What is Verathos?](intro.md): verification architecture
+- [Verified Chat](https://verathos.ai/chat): browser inference
