@@ -1358,6 +1358,40 @@ def _terminate_process(proc: subprocess.Popen | None) -> None:
         proc.wait()
 
 
+def _wait_port_free(
+    host: str,
+    port: int,
+    *,
+    timeout_s: float = 10.0,
+    poll_s: float = 0.25,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Block until (host, port) accepts a fresh bind, or time out.
+
+    Killing a backend releases its PROCESS before the kernel releases its
+    LISTENER (lingering sockets, PDEATHSIG-async children), so a respawn
+    that races the teardown binds against the dying instance, exits
+    immediately, and used to feed the crash-loop breaker with failures
+    that said nothing about the backend. A bind probe is the only honest
+    "free" signal: connect probes cannot tell a dying listener from a
+    healthy one.
+    """
+
+    deadline = clock() + max(0.0, float(timeout_s))
+    while True:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind((host, int(port)))
+            return True
+        except OSError:
+            if clock() >= deadline:
+                return False
+        finally:
+            probe.close()
+        sleeper(max(0.05, float(poll_s)))
+
+
 def _rpc_endpoint_is_ready(endpoint: str, *, timeout: float = 0.5) -> bool:
     if os.environ.get("VERATHOS_LLAMA_RPC_TCP_PROBE", "").strip() != "1":
         return True
@@ -2566,6 +2600,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
         rpc_thread.start()
     if args.llama_model or args.llama_hf:
         backend_url = payload["backend_url"]
+        from urllib.parse import urlparse as _urlparse
+
+        _llama_parsed = _urlparse(backend_url)
+        _llama_bind_host = _llama_parsed.hostname or "127.0.0.1"
+        _llama_bind_port = int(_llama_parsed.port or 8080)
 
         def launch_llama(spec: MeshSpec) -> None:
             nonlocal llama_proc, llama_plan_hash
@@ -2626,11 +2665,40 @@ def cmd_serve(args: argparse.Namespace) -> None:
                     and llama_plan_hash == plan_hash
                 ):
                     # Same plan, dead process = a crash (plan changes replace
-                    # the process legitimately and don't count).
-                    if _note_backend_crash("llama", llama_proc.returncode):
+                    # the process legitimately and don't count). Exception: a
+                    # near-instant death while the bind port is still held is
+                    # the relaunch bind race, not a backend fault - the port
+                    # wait below prevents the next one, and counting these
+                    # tripped the breaker on healthy relaunches.
+                    started = _proc_started.get("llama", 0.0)
+                    uptime = (time.monotonic() - started) if started else 0.0
+                    bind_race = (
+                        uptime < 2.0
+                        and not _wait_port_free(
+                            _llama_bind_host, _llama_bind_port, timeout_s=0.0
+                        )
+                    )
+                    if bind_race:
+                        print(
+                            "llama.cpp exited instantly with its port still "
+                            "held (relaunch bind race); not counting toward "
+                            "the crash breaker",
+                            flush=True,
+                        )
+                    elif _note_backend_crash("llama", llama_proc.returncode):
                         llama_stop.set()
                         return
                 _terminate_process(llama_proc)
+                if not _wait_port_free(
+                    _llama_bind_host, _llama_bind_port, timeout_s=10.0
+                ):
+                    print(
+                        f"llama.cpp port {_llama_bind_port} still held after "
+                        "terminating the previous instance; deferring the "
+                        "respawn to the next supervisor tick",
+                        flush=True,
+                    )
+                    return
                 cmd = list(payload["llama_server_command"])
                 cmd[0] = resolve_binary(cmd[0])
                 print(payload["llama_server_command_text"], flush=True)

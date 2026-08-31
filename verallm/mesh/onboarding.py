@@ -1503,4 +1503,12 @@ def setup_mesh_worker(token: str, passthrough: list[str]) -> None:
     argv += list(passthrough)
     completed = subprocess.run(argv, cwd=repo)
     if completed.returncode != 0:
-        raise SystemExit(completed.returncode)
+        # SystemExit(int) exits SILENTLY - the wizard used to just stop
+        # here with nothing on screen when the join script died without
+        # output of its own. Always say what failed and how loudly.
+        raise SystemExit(
+            f"worker join failed: join_pool.sh exited {completed.returncode}. "
+            "Scroll up for its last output; if it ended with no message, "
+            "rerun as 'bash -x scripts/join_pool.sh ...' to trace the "
+            "aborting command."
+        )

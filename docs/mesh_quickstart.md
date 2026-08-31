@@ -68,6 +68,27 @@ needs `curl`, `python3`, and `tar` — bare container images (for example
 `nvidia/cuda:*`) often lack curl, so run
 `apt-get update && apt-get install -y curl` first.
 
+### Machine requirements
+
+- **RAM**: at least the model's GGUF file size plus ~8 GB headroom (a
+  27B q4 model is a ~17 GB file, so 32 GB RAM works; 24 GB is too
+  tight). Memory-capped containers are supported: serve processes run
+  under a kernel memory limit a margin below the container's cap, so a
+  model load throttles instead of getting killed. `free` inside a
+  container often shows the HOST's RAM — check
+  `/sys/fs/cgroup/memory.max` for the real budget.
+- **Disk**: twice the model file size plus ~40 GB for the one-time
+  runtime build and caches.
+- **CPU**: the runtime compiles on the machine it runs on, so any
+  x86-64 CPU the box boots with is fine; expect the first join to spend
+  20-30 minutes building.
+- **Port-mapped containers** (cloud GPU rentals behind NAT): append the
+  published ports to the one-liner so validators can dial the machine —
+  `--advertise-host <public-ip> --mesh-port N --proof-port N+2
+  --rpc-port N+3`, using ports from your provider's mapped range. The
+  join refuses undialable addresses instead of joining a worker that
+  can only fail.
+
 The installer fetches the source bundle from the coordinator, installs
 dependencies, builds the patched llama.cpp for that machine's GPU, and
 starts **one PM2 worker unit per GPU** (`verathos-mesh-<host>-gpu0`,

@@ -53,6 +53,17 @@ from typing import Any, Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
+
+class CapacityAuditWorkspaceError(RuntimeError):
+    """Subnet worker cannot run capacity audits and must not serve.
+
+    Raised at audit-worker start when the hot-capacity workspace is
+    unavailable and the operator has not explicitly opted out. Callers
+    treat this as fatal for the worker process: serving without audits
+    means probating with no evidence and nothing in the logs.
+    """
+
+
 CAPACITY_DRAIN_FILE_NAME = "capacity-audit-drain.json"
 CAPACITY_ROSTER_FILE_NAME = "capacity-roster.json"
 
@@ -779,12 +790,27 @@ class MeshCapacityAuditWorker:
             return False
         ok, error = self._preflight_workspace()
         if not ok:
-            logger.error(
-                "mesh capacity audit worker disabled: hot-capacity "
-                "workspace unavailable: %s",
-                error[:300],
+            if os.environ.get("VERATHOS_ALLOW_NO_CAPACITY_AUDITS", "") == "1":
+                logger.error(
+                    "mesh capacity audit worker disabled: hot-capacity "
+                    "workspace unavailable: %s (explicitly allowed via "
+                    "VERATHOS_ALLOW_NO_CAPACITY_AUDITS=1)",
+                    error[:300],
+                )
+                return False
+            # Fail-closed: a subnet worker that serves without a working
+            # audit workspace runs audit-blind, records no evidence, and
+            # probates with nothing in its own logs explaining why. Dying
+            # loudly at start is the only honest behavior; light-tier or
+            # dev setups opt out explicitly with the env above.
+            raise CapacityAuditWorkspaceError(
+                "hot-capacity audit workspace unavailable on a subnet "
+                f"worker: {error[:300]} - install the matching "
+                "hot_capacity_workspace_cuda wheel from dist/ (the join "
+                "script does this when dist/ is present), or set "
+                "VERATHOS_ALLOW_NO_CAPACITY_AUDITS=1 to serve without "
+                "capacity audits (the slot will accumulate strikes)"
             )
-            return False
         # Ingest reachability probe. A worker that can run every audit but
         # cannot DELIVER the evidence is scored as a no-show and ends up
         # on probation with nothing in its own logs explaining why; probe

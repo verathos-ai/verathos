@@ -14,6 +14,10 @@
 # torch (plain pip installs the CPU wheel), LD_LIBRARY_PATH for the llama
 # binaries, and hf_xet crashes mid-download.
 set -euo pipefail
+# Every `set -e` abort names its culprit: without this trap a failing bare
+# command (no stderr of its own) killed the script - and the wizard above
+# it - with zero output, which read as a silent join death.
+trap 'echo "join_pool.sh: aborted at line $LINENO (exit $?): $BASH_COMMAND" >&2' ERR
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # One fatal exit for the whole installer. A half-installed worker that keeps
@@ -522,18 +526,20 @@ if [ "$BACKEND" = cuda ]; then
   if ! "$VENV/bin/python" -c "import torch, hot_capacity_workspace_cuda" >/dev/null 2>&1; then
     PYTAG="$("$VENV/bin/python" -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
     # A no-match `ls` exits non-zero; under `set -euo pipefail` the bare
-    # assignment aborts the WHOLE join here (exit 2) before the graceful
-    # "no wheel -> capacity disabled" branch below can run. The worker source
-    # bundle also excludes dist/, so a bundle-installed box legitimately has no
-    # wheel and must still join. Keep the lookup non-fatal.
+    # assignment aborts with exit 2 and no message, so keep the lookup
+    # itself tolerant and fail with a real explanation below. dist/ ships
+    # in the repo AND in the manager worker bundle, so a missing wheel
+    # means a broken or hand-pruned checkout, not a supported setup.
     HOTCAP_WHEEL="$(ls "$REPO"/dist/hot_capacity_workspace_cuda-*-"$PYTAG"-*.whl 2>/dev/null | head -1 || true)"
     if [ -n "$HOTCAP_WHEEL" ]; then
       "$VENV/bin/pip" install -q "$HOTCAP_WHEEL"
       "$VENV/bin/python" -c "import torch, hot_capacity_workspace_cuda" >/dev/null 2>&1 \
         || _die "hot-capacity workspace wheel installed but not importable"
       echo "installed hot-capacity workspace wheel ($(basename "$HOTCAP_WHEEL"))"
+    elif [ "${VERATHOS_ALLOW_NO_CAPACITY_AUDITS:-}" = "1" ]; then
+      echo "warning: no hot_capacity_workspace_cuda wheel for $PYTAG in $REPO/dist; capacity audits DISABLED (explicitly allowed via VERATHOS_ALLOW_NO_CAPACITY_AUDITS=1)" >&2
     else
-      echo "warning: no hot_capacity_workspace_cuda wheel for $PYTAG in $REPO/dist; capacity audits stay disabled on this worker" >&2
+      _die "no hot_capacity_workspace_cuda wheel for $PYTAG in $REPO/dist: a subnet worker without it serves audit-blind and probates. Restore dist/ in the checkout, or set VERATHOS_ALLOW_NO_CAPACITY_AUDITS=1 for a light-tier worker."
     fi
   fi
 fi

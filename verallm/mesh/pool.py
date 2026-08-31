@@ -12468,10 +12468,29 @@ def pool_worker_loop(
             )
             if audit_worker.start():
                 capacity_audit_state["worker"] = audit_worker
-        except Exception:
+        except Exception as exc:
+            from verallm.mesh.capacity_audit_worker import (
+                CapacityAuditWorkspaceError,
+            )
+
+            if isinstance(exc, CapacityAuditWorkspaceError):
+                # Fail closed: a subnet worker without a working audit
+                # workspace serves audit-blind and probates with nothing
+                # in its own logs. Dying here makes the defect loud in
+                # pm2 and in the manager's staleness view instead of
+                # burning epochs silently.
+                logger.critical(
+                    "capacity audit workspace unavailable; refusing to "
+                    "serve audit-blind: %s",
+                    exc,
+                )
+                os._exit(78)
+            # Transient failures must retry on the next heartbeat: the
+            # digest memo would otherwise pin this failed start forever.
+            capacity_audit_state["digest"] = ""
             logger.exception(
-                "capacity audit worker failed to start; mesh serving "
-                "continues without it"
+                "capacity audit worker failed to start; will retry on "
+                "the next context sync"
             )
 
     status = "idle"
