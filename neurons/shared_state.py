@@ -58,6 +58,10 @@ class MinerEntry:
     vram_gb: int = 0
     compute_capability: str = ""
     gpu_uuids: List[str] = field(default_factory=list)
+    # On-chain lease expiry (unix seconds) as read at this epoch's discovery.
+    # Refreshed on every shared-state write, so renewals are reflected; 0
+    # means the lease is unknown, never that it expired.
+    expires_at: int = 0
 
     def __post_init__(self) -> None:
         self.mesh_enabled = bool(self.mesh_enabled) or is_mesh_quant(self.quant)
@@ -192,7 +196,7 @@ def write_shared_state(
              "mesh_enabled": m.mesh_enabled,
              "gpu_name": m.gpu_name, "gpu_count": m.gpu_count,
              "vram_gb": m.vram_gb, "compute_capability": m.compute_capability,
-             "gpu_uuids": m.gpu_uuids}
+             "gpu_uuids": m.gpu_uuids, "expires_at": m.expires_at}
             for m in state.miner_endpoints
         ],
         "mesh_verification_snapshots": state.mesh_verification_snapshots,

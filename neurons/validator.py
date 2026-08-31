@@ -16953,6 +16953,7 @@ class ValidatorNeuron:
                 vram_gb=getattr(m, "vram_gb", 0),
                 compute_capability=getattr(m, "compute_capability", ""),
                 gpu_uuids=getattr(m, "gpu_uuids", []),
+                expires_at=int(getattr(m, "expires_at", 0) or 0),
             )
             for m in miners
             if m.address.lower() not in stale_addresses
