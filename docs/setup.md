@@ -171,7 +171,7 @@ auditability — you do not need to set them by hand.
 |---|---|---|
 | `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0` | sm_89+ FP8 | Disables the unqualified FlashInfer block-scale GEMM path and selects the proof-qualified fallback. No-op outside the FP8 block-scale path. |
 | `VLLM_USE_DEEP_GEMM=0` | sm_89+ FP8 | Disables DeepGEMM in-place weight requantisation so the committed weight root stays in sync with runtime bytes. No-op outside FP8. |
-| `compilation_config.mode = 1` (`STOCK_TORCH_COMPILE`) | Non-FP8 quantisation on sm_89+ | Required vLLM compile mode for fp16 / bf16 / INT4 / INT8 quantisation on Ada / Hopper / Blackwell. Auto-set by the miner. FP8 and NVFP4 keep the default `VLLM_COMPILE` mode. |
+| `compilation_config.mode = 2` (`DYNAMO_TRACE_ONCE`) with CUDA-graph replay | Non-FP8 hybrid GDN models on unqualified sm_89+ paths | Avoids the unsafe vLLM custom-pass path for fp16 / bf16 / INT4 / INT8 while retaining graphed decode. Auto-set by the miner. Qualified sm_120, FP8 and NVFP4 paths keep the default `VLLM_COMPILE` mode. |
 | FP32 activation hashing | sm_89+ split-mode capture | Required precision for cross-backend activation Merkle root consistency. |
 
 To override the auto-selected compile mode, set
