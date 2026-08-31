@@ -11,11 +11,12 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from neurons.capacity_audit import (
+from neurons.capacity_audit import (  # noqa: E402
     calibrated_gpu_class_names,
     capacity_audit_gpu_support_status,
     capacity_gpu_workload_spec,
 )
+from verallm.registry.gpu import detect_vram_gb  # noqa: E402
 
 
 def _print_supported() -> None:
@@ -27,10 +28,15 @@ def _print_supported() -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu-name", required=True)
-    parser.add_argument("--vram-gb", type=int, required=True)
+    parser.add_argument(
+        "--vram-gb",
+        type=int,
+        help="marketed VRAM in GB (defaults to runtime CUDA detection)",
+    )
     args = parser.parse_args(argv)
 
-    ok, reason, row = capacity_audit_gpu_support_status(args.gpu_name, args.vram_gb)
+    vram_gb = args.vram_gb if args.vram_gb is not None else detect_vram_gb()
+    ok, reason, row = capacity_audit_gpu_support_status(args.gpu_name, vram_gb)
     if ok and row is not None:
         spec = capacity_gpu_workload_spec(row)
         print(
@@ -42,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("")
     print("  ERROR: This GPU is not currently supported for hot-capacity score-gate mining.")
-    print(f"  Detected GPU: {args.gpu_name} ({args.vram_gb} GB)")
+    print(f"  Detected GPU: {args.gpu_name} ({vram_gb} GB)")
     if reason == "uncalibrated_gpu_class" and row is not None:
         print(f"  Matching row exists but is not enabled yet: {row.match_gpu_name}")
     else:
