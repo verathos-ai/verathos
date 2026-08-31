@@ -4885,10 +4885,26 @@ class PoolManager:
                     mesh["mesh_id"] = mesh_id
                     mesh["join_token"] = join_token
                     mesh["coordinator_endpoint"] = coordinator_endpoint
+                    # Remember the internal mesh identity on the durable
+                    # registration record: a future relaunch reuses it so
+                    # the coordinator resumes this mesh's snapshot chain.
+                    ready_registration = (
+                        self.state.get("mesh_registrations") or {}
+                    ).get(str(mesh.get("model_id", "") or ""))
+                    if isinstance(ready_registration, dict):
+                        ready_registration["mesh_id"] = mesh_id
                     if verification_snapshot_hash:
                         mesh["verification_snapshot_hash"] = (
                             verification_snapshot_hash
                         )
+                        reported_generation = body.get("snapshot_generation")
+                        if (
+                            type(reported_generation) is int
+                            and reported_generation >= 1
+                        ):
+                            # A resumed chain's generation, not the launch
+                            # counter, is what the served snapshot binds.
+                            mesh["snapshot_generation"] = reported_generation
                     worker["mesh"] = mesh["mesh_key"]
                     # The driver runs the coordinator AND computes its own stage,
                     # so it is a serving member too — not merely "driving".
@@ -5991,6 +6007,31 @@ class PoolManager:
                     "pick a different driver"
                 )
             mesh_key = "m-" + uuid.uuid4().hex[:10]
+            resume_mesh_id = ""
+            if chain_bound:
+                # Mesh identity is logical, not instance-scoped: a relaunch
+                # of the same chain-bound registration keeps its mesh key
+                # AND its internal mesh id, so the coordinator lands in the
+                # same mesh state dir, finds its persisted verification
+                # snapshot, and resumes that chain instead of minting a new
+                # one. A fresh identity would present the identical model as
+                # different verification terms mid-epoch, which a
+                # validator's pinned canary prices as a proof failure.
+                previous_registration = (
+                    self.state.get("mesh_registrations") or {}
+                ).get(model_id)
+                previous_key = (
+                    str(previous_registration.get("mesh_key", "") or "")
+                    if isinstance(previous_registration, dict)
+                    else ""
+                )
+                if previous_key and previous_key not in (
+                    self.state.get("meshes") or {}
+                ):
+                    mesh_key = previous_key
+                    resume_mesh_id = str(
+                        previous_registration.get("mesh_id", "") or ""
+                    )
             # Per-model proof tolerance overrides ride from the driver's
             # catalog entry into every stage's serve flags (see
             # _tolerance_flags). A driver that must FETCH has no catalog entry
@@ -6068,6 +6109,7 @@ class PoolManager:
                 "serving": [],
                 "serving_mode": self.serving_mode,
                 "created_at_unix": int(time.time()),
+                **({"resume_mesh_id": resume_mesh_id} if resume_mesh_id else {}),
                 **(
                     {
                         "validator_binding": dict(self.validator_binding),
@@ -6156,6 +6198,13 @@ class PoolManager:
                 "member_count": len(mesh["members"]),
                 "member_device_counts": member_device_counts,
                 "serving_mode": str(mesh.get("serving_mode", "")),
+                **(
+                    # Relaunch of the same registration: the driver resumes
+                    # the previous mesh identity and its snapshot chain.
+                    {"resume_mesh_id": str(mesh["resume_mesh_id"])}
+                    if mesh.get("resume_mesh_id")
+                    else {}
+                ),
                 **(
                     {"max_context_len": int(mesh["max_context_len"])}
                     if int(mesh.get("max_context_len", 0) or 0) > 0
@@ -9786,12 +9835,17 @@ class LocalMeshRunner:
             existing = MeshVerificationSnapshot.from_dict(
                 json.loads(snapshot_path.read_text(encoding="utf-8"))
             )
+            # The chain position (generation/epoch) is anchored by the
+            # persisted snapshot itself, not by this command: a resumed or
+            # rotated chain is legitimately ahead of the launch command's
+            # counter, and re-deriving from the command made every re-drive
+            # after a rotation fail this equality.
             expected = build_mesh_verification_snapshot(
                 spec,
                 coordinator=coordinator_identity,
                 policy=policy,
-                generation=generation,
-                epoch=binding["epoch"],
+                generation=int(existing.generation),
+                epoch=int(existing.epoch),
                 issued_at_unix=existing.issued_at_unix,
                 expires_at_unix=existing.expires_at_unix,
                 stage_bindings=stage_bindings,
@@ -9806,8 +9860,8 @@ class LocalMeshRunner:
             if not verify_mesh_verification_snapshot_signature(
                 existing,
                 expected_hotkey=spec.coordinator_hotkey,
-                expected_epoch=binding["epoch"],
-                expected_generation=generation,
+                expected_epoch=int(existing.epoch),
+                expected_generation=int(existing.generation),
                 expected_coordinator=coordinator_identity,
                 expected_model=expected.model,
                 expected_policy=policy,
@@ -9819,17 +9873,27 @@ class LocalMeshRunner:
             self._assert_command_active()
             return existing
 
-        snapshot = build_mesh_verification_snapshot(
-            spec,
-            coordinator=coordinator_identity,
+        signed = resume_mesh_verification_snapshot_chain(
+            snapshot_path,
+            spec=spec,
+            coordinator_identity=coordinator_identity,
             policy=policy,
-            generation=generation,
-            epoch=binding["epoch"],
-            issued_at_unix=issued_at,
-            expires_at_unix=issued_at + binding["snapshot_ttl_seconds"],
             stage_bindings=stage_bindings,
+            epoch=binding["epoch"],
+            keypair=keypair,
         )
-        signed = sign_mesh_verification_snapshot(snapshot, keypair)
+        if signed is None:
+            snapshot = build_mesh_verification_snapshot(
+                spec,
+                coordinator=coordinator_identity,
+                policy=policy,
+                generation=generation,
+                epoch=binding["epoch"],
+                issued_at_unix=issued_at,
+                expires_at_unix=issued_at + binding["snapshot_ttl_seconds"],
+                stage_bindings=stage_bindings,
+            )
+            signed = sign_mesh_verification_snapshot(snapshot, keypair)
         self._assert_command_active()
 
         # Re-read immediately before publication. The admission handler caps the
@@ -9881,6 +9945,7 @@ class LocalMeshRunner:
             "validator_nonce": secrets.token_hex(32),
             "validator_request_id": secrets.token_hex(32),
             "verification_snapshot_hash": snapshot.snapshot_hash_hex(),
+            "verification_snapshot_generation": int(snapshot.generation),
         }
 
     def _verify_serving(self, coordinator_endpoint: str, *, timeout: float = 120.0) -> None:
@@ -10244,6 +10309,7 @@ class LocalMeshRunner:
             max_context_len=max_context_len,
             total_layers=total_layers,
             epoch=epoch,
+            mesh_id=str(command.get("resume_mesh_id", "") or ""),
         )
         spec.proof_trace_manifest_format = "compact-raw-v3"
         spec.validate()
@@ -10743,6 +10809,14 @@ class LocalMeshRunner:
                     "subnet mesh drive completed without a signed snapshot"
                 )
             result["verification_snapshot_hash"] = snapshot_hash
+            # A resumed or rotated chain is ahead of the manager's launch
+            # counter; report the generation actually served so the manager's
+            # mesh record stays truthful for scoring-sample ordering.
+            generation_val = snapshot_binding.get(
+                "verification_snapshot_generation"
+            )
+            if type(generation_val) is int and generation_val >= 1:
+                result["snapshot_generation"] = generation_val
         return result
 
     def join(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -11058,6 +11132,103 @@ class LocalMeshRunner:
             "verification_snapshot_hash": signed.snapshot_hash_hex(),
             "snapshot_generation": int(signed.generation),
         }
+
+
+def resume_mesh_verification_snapshot_chain(
+    snapshot_path: Path,
+    *,
+    spec: Any,
+    coordinator_identity: Any,
+    policy: Any,
+    stage_bindings: Any,
+    epoch: int,
+    keypair: Any,
+) -> Any:
+    """Resume a relaunched mesh's persisted verification snapshot chain.
+
+    Mesh identity is logical: a relaunch of the same registration keeps its
+    mesh id, so the snapshot signed by the previous instance still binds this
+    exact assignment. Re-serving it unchanged (same epoch) keeps a
+    validator's epoch pin valid across an honest restart; rotating it (the
+    epoch moved while the mesh was down) is the standard boundary rotation
+    arriving late, and rotating an EXPIRED snapshot is that command's own
+    recovery case, so freshness is deliberately not enforced. Returns None
+    when no usable chain exists — a changed assignment, an unreadable file,
+    or a foreign signature — and the caller mints a new chain.
+    """
+
+    from verallm.mesh.verification_snapshot import (
+        MeshVerificationSnapshot,
+        build_mesh_verification_snapshot,
+        rotate_mesh_verification_snapshot,
+        verify_mesh_verification_snapshot_signature,
+    )
+
+    if not snapshot_path.is_file():
+        return None
+    try:
+        existing = MeshVerificationSnapshot.from_dict(
+            json.loads(snapshot_path.read_text(encoding="utf-8"))
+        )
+        expected = build_mesh_verification_snapshot(
+            spec,
+            coordinator=coordinator_identity,
+            policy=policy,
+            generation=int(existing.generation),
+            epoch=int(existing.epoch),
+            issued_at_unix=int(existing.issued_at_unix),
+            expires_at_unix=int(existing.expires_at_unix),
+            stage_bindings=stage_bindings,
+        )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.warning(
+            "persisted verification snapshot unusable (%s); minting a new chain",
+            exc,
+        )
+        return None
+    if existing.to_dict(include_signature=False) != expected.to_dict(
+        include_signature=False
+    ):
+        # Loud on purpose: a resume attempt that cannot adopt means the
+        # relaunch presents new verification terms and every validator
+        # pin on this slot fails until re-pin - if the assignment did
+        # not really change, an identity input (mesh id, stage secret,
+        # anchors) regressed to instance-scoped.
+        logger.warning(
+            "persisted verification snapshot binds a different assignment; "
+            "minting a new chain"
+        )
+        return None
+    if not verify_mesh_verification_snapshot_signature(
+        existing,
+        expected_hotkey=spec.coordinator_hotkey,
+        expected_epoch=int(existing.epoch),
+    ):
+        logger.warning(
+            "persisted verification snapshot signature invalid; minting a "
+            "new chain"
+        )
+        return None
+    if int(existing.epoch) == int(epoch):
+        logger.info(
+            "verification snapshot resumed across relaunch: generation=%d "
+            "epoch=%d hash=%s",
+            int(existing.generation),
+            int(existing.epoch),
+            existing.snapshot_hash_hex()[:16],
+        )
+        return existing
+    signed = rotate_mesh_verification_snapshot(
+        existing, epoch=int(epoch), keypair=keypair
+    )
+    logger.info(
+        "verification snapshot rotated on relaunch: generation=%d "
+        "epoch=%d->%d",
+        int(signed.generation),
+        int(existing.epoch),
+        int(epoch),
+    )
+    return signed
 
 
 def _run_pool_chat(

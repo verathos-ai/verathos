@@ -331,13 +331,30 @@ def create_mesh_state(
     spec: MeshSpec,
     root: str | Path | None = None,
 ) -> tuple[Path, dict[str, Any], MeshJoinToken]:
-    """Persist a coordinator mesh and return its join token."""
+    """Persist a coordinator mesh and return its join token.
+
+    A mesh id can only recur on a deliberate resume (fresh ids are
+    nonce-derived), and the internal auth secret feeds the verification
+    snapshot's stage bindings - so a resumed mesh must keep the secret
+    its previous instance persisted, or the snapshot chain can never be
+    adopted and every relaunch presents new verification terms.
+    """
 
     capability = _coordinator_capability(spec)
+    join_secret = ""
+    prior_dir = mesh_dir(root, spec.mesh_id)
+    try:
+        prior = load_mesh_state(prior_dir)
+        if str(prior.get("role", "")) == "coordinator" and (
+            state_mesh_spec(prior).mesh_id == spec.mesh_id
+        ):
+            join_secret = str(prior.get("join_secret", "") or "")
+    except (OSError, ValueError, KeyError):
+        join_secret = ""
     token = MeshJoinToken(
         mesh_id=spec.mesh_id,
         coordinator_endpoint=capability.endpoint,
-        join_secret=secrets.token_urlsafe(32),
+        join_secret=join_secret or secrets.token_urlsafe(32),
         coordinator_uid=spec.coordinator_uid,
         coordinator_hotkey=spec.coordinator_hotkey,
         model_id=spec.model_id,

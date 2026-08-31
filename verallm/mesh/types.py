@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -260,18 +261,28 @@ class MeshSpec:
         max_context_len: int = 0,
         epoch: int = 0,
         expires_at_unix: int = 0,
+        mesh_id: str = "",
     ) -> "MeshSpec":
-        seed = canonical_json_bytes(
-            {
-                "uid": coordinator_uid,
-                "hotkey": coordinator_hotkey,
-                "endpoint": endpoint,
-                "model_id": model_id,
-                "model_package_hash": model_package_hash,
-                "nonce": uuid.uuid4().hex,
-            }
-        )
-        mesh_id = "mesh-" + hashlib.sha256(seed).hexdigest()[:16]
+        # Mesh identity is logical when the caller says so: a relaunch of
+        # the same registration passes the previous mesh_id, so everything
+        # keyed by it (mesh state dir, verification snapshot chain, opaque
+        # stage ids) resumes instead of presenting the identical model as
+        # new verification terms. A fresh mesh keeps the nonce-derived id.
+        if mesh_id:
+            if not re.fullmatch(r"mesh-[0-9a-f]{16}", mesh_id):
+                raise ValueError("resumed mesh_id must be mesh-<16 hex>")
+        else:
+            seed = canonical_json_bytes(
+                {
+                    "uid": coordinator_uid,
+                    "hotkey": coordinator_hotkey,
+                    "endpoint": endpoint,
+                    "model_id": model_id,
+                    "model_package_hash": model_package_hash,
+                    "nonce": uuid.uuid4().hex,
+                }
+            )
+            mesh_id = "mesh-" + hashlib.sha256(seed).hexdigest()[:16]
         member = MeshMember(
             uid=coordinator_uid,
             hotkey=coordinator_hotkey,
