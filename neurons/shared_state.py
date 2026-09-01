@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import bittensor as bt
+import math
 import os
 import re
 import threading
@@ -452,6 +453,26 @@ def read_shared_state(
                 return None
             return int(value)
 
+        def normalize_last_weights(value: object) -> Dict[int, float]:
+            normalized: Dict[int, float] = {}
+            if not isinstance(value, dict):
+                return normalized
+            for raw_uid, raw_weight in value.items():
+                try:
+                    uid = int(raw_uid)
+                    weight = float(raw_weight)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (
+                    isinstance(raw_weight, bool)
+                    or not 0 <= uid <= 65_535
+                    or weight < 0.0
+                    or not math.isfinite(weight)
+                ):
+                    continue
+                normalized[uid] = weight
+            return normalized
+
         return ValidatorSharedState(
             chain_id=normalize_network_id(
                 data.get("chain_id"), minimum=1, maximum=2**64 - 1
@@ -504,6 +525,7 @@ def read_shared_state(
             if isinstance(data.get("mesh_verification_snapshots", {}), dict)
             else {},
             audit_drains=audit_drains,
+            last_weights=normalize_last_weights(data.get("last_weights", {})),
             demand_scores=data.get("demand_scores", {}),
             ss58_map=data.get("ss58_map", {}),
             blacklisted_addresses=data.get("blacklisted_addresses", []),

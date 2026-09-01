@@ -29,6 +29,21 @@ Usage:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# ``python neurons/validator.py`` otherwise places ``neurons/`` rather than
+# the release root at sys.path[0]. If the interpreter has an editable install
+# for an older checkout, absolute ``neurons.*`` imports can then silently mix
+# the selected entry file with stale package modules. Pin the entry file's own
+# release root before any local import; the stock ``python -m`` path is
+# unchanged.
+if __package__ in (None, ""):
+    _VALIDATOR_RELEASE_ROOT = str(Path(__file__).resolve().parents[1])
+    while _VALIDATOR_RELEASE_ROOT in sys.path:
+        sys.path.remove(_VALIDATOR_RELEASE_ROOT)
+    sys.path.insert(0, _VALIDATOR_RELEASE_ROOT)
+
 import argparse
 import asyncio
 import hashlib
@@ -40,7 +55,6 @@ import json
 import sqlite3
 import struct
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -187,6 +201,50 @@ from verallm.proof_v3.canary_policy import (
     canary_prompt_token_tolerance_v3,
 )
 from verallm.registry import get_model, ModelEntry, MODELS_BY_ID
+
+
+def _assert_validator_runtime_import_identity() -> dict[str, str]:
+    """Fail closed if validator-critical modules come from another tree."""
+
+    expected_root = Path(__file__).resolve().parents[1]
+    required_modules = (
+        "neurons.capacity_audit",
+        "neurons.shared_state",
+        "neurons.subnet_runtime_config",
+        "neurons.validator_db",
+        "neurons.version",
+    )
+    origins: dict[str, str] = {}
+    mismatches: list[str] = []
+    for module_name in required_modules:
+        if module_name not in sys.modules:
+            mismatches.append(f"{module_name}=<missing>")
+    local_modules = sorted(
+        module_name
+        for module_name, module in sys.modules.items()
+        if (
+            module_name == "neurons"
+            or module_name.startswith("neurons.")
+            or module_name == "verallm"
+            or module_name.startswith("verallm.")
+        )
+        and getattr(module, "__file__", None)
+    )
+    for module_name in local_modules:
+        module = sys.modules.get(module_name)
+        raw_origin = getattr(module, "__file__", None)
+        origin = Path(raw_origin).resolve()
+        origins[module_name] = str(origin)
+        try:
+            origin.relative_to(expected_root)
+        except ValueError:
+            mismatches.append(f"{module_name}={origin}")
+    if mismatches:
+        raise RuntimeError(
+            "validator runtime import identity mismatch: expected all "
+            f"critical modules under {expected_root}; " + "; ".join(mismatches)
+        )
+    return origins
 
 logger = logging.getLogger(__name__)
 _PROOF_V2_ARTIFACT_REFRESH_SECONDS = 3600.0
@@ -18184,6 +18242,17 @@ class ValidatorNeuron:
             write_shared_state,
         )
 
+        existing = None
+        needs_existing = (
+            int(self._current_epoch or 0) <= 0
+            or not hasattr(self, "_last_weights")
+        )
+        if needs_existing:
+            try:
+                existing = read_shared_state(self.config.shared_state_path)
+            except Exception:
+                existing = None
+
         if int(self._current_epoch or 0) <= 0:
             # Startup bootstrap write. Never regress a LIVE file with an
             # epoch-0 snapshot-free state: the co-located proxy adopts
@@ -18191,16 +18260,30 @@ class ValidatorNeuron:
             # active epoch" until the bootstrap pin cycle minutes later.
             # First-install bootstrap (no file / epoch-0 file)
             # still writes so a proxy without a validator gets endpoints.
-            try:
-                existing = read_shared_state(self.config.shared_state_path)
-            except Exception:
-                existing = None
             if existing is not None and int(existing.epoch_number or 0) > 0:
                 bt.logging.info(
                     "Skipping epoch-0 shared-state write: existing file "
                     f"is ahead (epoch {existing.epoch_number})"
                 )
                 return
+
+        if not hasattr(self, "_last_weights"):
+            # Weight submission is asynchronous and the last successful
+            # vector otherwise exists only in process memory. On restart, the
+            # first discovery/capacity write must not blank the proxy's
+            # already-published vector before the next epoch closes. Restore
+            # only a local state file bound to this chain/subnet and never
+            # override a value already computed by this process.
+            if (
+                existing is not None
+                and int(existing.chain_id or 0) == int(self.config.chain_id)
+                and int(existing.netuid or 0) == int(self.config.netuid)
+                and int(existing.epoch_number or 0)
+                <= int(self._current_epoch or 0)
+            ):
+                self._last_weights = dict(existing.last_weights or {})
+            else:
+                self._last_weights = {}
 
         shared = self._db.derive_shared_state(self._current_epoch)
         shared.chain_id = int(self.config.chain_id)
@@ -19906,6 +19989,7 @@ def build_validator_config(args) -> NeuronConfig:
 def main():
     from neurons.log import setup_neuron_logging, print_banner
 
+    _assert_validator_runtime_import_identity()
     args = parse_args()
     setup_neuron_logging(args)
 
