@@ -64,7 +64,11 @@ if [ "$SKIP_INSTALL" = false ] && command -v apt-get >/dev/null 2>&1; then
     command -v git >/dev/null || MISSING="$MISSING git"
     # Workers verify port ownership with lsof before every drive.
     command -v lsof >/dev/null || MISSING="$MISSING lsof"
-    dpkg -s python3-venv >/dev/null 2>&1 || MISSING="$MISSING python3-venv"
+    # Debian's version-specific package (for example python3.12-venv) is
+    # sufficient even when the python3-venv meta-package is absent. Test the
+    # capability the installer actually needs before asking apt for anything.
+    python3 -c "import ensurepip, venv" >/dev/null 2>&1 \
+        || MISSING="$MISSING python3-venv"
     dpkg -s python3-dev  >/dev/null 2>&1 || MISSING="$MISSING python3-dev"
     if [ -n "$MISSING" ]; then
         echo "  Installing system packages:$MISSING"
