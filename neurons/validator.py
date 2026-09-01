@@ -11831,7 +11831,12 @@ class ValidatorNeuron:
         if result.validator_error:
             raise MeshValidatorVerificationError(result.reason)
 
-        if not self._canary_epoch_active(epoch_number):
+        # A mesh request admitted before the boundary remains an exact
+        # execution obligation until its bounded transport/verifier call
+        # returns.  The generic canary path retains that identity in
+        # ``_cross_epoch_canaries``; checking only the current epoch here used
+        # to discard the result after all remote work had completed.
+        if not self._canary_execution_active(test, epoch_number):
             return
 
         proof_verified = bool(result.ok)
@@ -11852,8 +11857,27 @@ class ValidatorNeuron:
             if sanity_reason:
                 proof_verified = False
                 proof_failure_reason = f"mesh output sanity: {sanity_reason}"
+
+        late_completion = not self._canary_epoch_active(epoch_number)
+        if late_completion and proof_verified:
+            self._complete_cross_epoch_full_success(test, epoch_number)
+            if bool(test.verify_proof):
+                self._reconcile_late_hard_probation_pass(
+                    test,
+                    epoch_number,
+                )
+            bt.logging.info(
+                "Mesh canary completed after its scoring boundary for "
+                f"{test.miner_address[:10]} "
+                f"model_index={test.model_index}; terminal success "
+                "retained without newer-epoch scoring credit"
+            )
         self._record_mesh_canary_outcome(
-            test, epoch_number, result, proof_verified, proof_failure_reason,
+            test,
+            epoch_number,
+            result,
+            proof_verified,
+            proof_failure_reason,
         )
 
     def _mesh_audit_queue(self) -> list:
