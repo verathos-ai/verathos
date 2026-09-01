@@ -616,7 +616,7 @@ class _FakeRuntimeClient:
     def __init__(self, payload: dict):
         self.payload = payload
 
-    def get(self, *, current_epoch=None, force=False):
+    def get(self, *, current_epoch=None, current_block=None, force=False):
         from neurons.subnet_runtime_config import validate_subnet_config_payload
 
         return validate_subnet_config_payload(self.payload, source="test")
@@ -732,6 +732,44 @@ def test_runtime_refresh_still_applies_scalar_knobs(tmp_path):
         row["match_gpu_name"]
         for row in payload["capacity_audit"]["gpu_classes"]
     ]
+
+
+def test_restarted_worker_adopts_effective_config_before_first_window(tmp_path):
+    payload = _hosted_payload(9013)
+    payload["effective_epoch"] = 21_974
+    payload["epoch"]["epoch_blocks"] = 360
+    payload["capacity_audit"]["enabled"] = False
+    from neurons.subnet_runtime_config import validate_subnet_config_payload
+
+    cfg = validate_subnet_config_payload(payload, source="test")
+    calls = []
+
+    class Client:
+        def get(self, **kwargs):
+            calls.append(dict(kwargs))
+            block = kwargs.get("current_block")
+            return (
+                cfg
+                if block is not None
+                and block // cfg.epoch_blocks >= int(cfg.effective_epoch)
+                else None
+            )
+
+    worker = _worker(tmp_path)
+    worker._runtime_client = Client()
+    worker._runtime_authoritative = False
+    worker.runtime_cfg = None
+
+    # Mid-epoch restart: adoption happens before trigger/selection derivation,
+    # not only if the worker happens to observe an exact modulo boundary.
+    worker._on_block(21_974 * 360 + 1, b"\x11" * 32, None)
+
+    assert calls == [
+        {"current_epoch": None, "current_block": 21_974 * 360 + 1, "force": False}
+    ]
+    assert worker._runtime_authoritative is True
+    assert worker._epoch_blocks() == 360
+    assert worker.runtime_cfg.enabled is False
 
 
 def test_drain_clears_when_every_opening_settles_timing(tmp_path):

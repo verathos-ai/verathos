@@ -1530,6 +1530,7 @@ class RuntimeSubnetConfigClient:
         self.disabled = bool(disabled)
         self.log = log or logger
         self._active: RuntimeSubnetConfig | None = None
+        self._candidate: RuntimeSubnetConfig | None = None
         self._last_fetch_at = 0.0
         self._last_error = ""
         self._last_authoritative = False
@@ -1561,37 +1562,76 @@ class RuntimeSubnetConfigClient:
         self,
         *,
         current_epoch: int | None = None,
+        current_block: int | None = None,
         force: bool = False,
     ) -> RuntimeSubnetConfig | None:
         if self.disabled or not self.url:
             return None
         now = time.time()
-        if (
-            not force
-            and self._active is not None
-            and now - self._last_fetch_at < self.refresh_seconds
-            and self._is_effective(self._active, current_epoch)
-        ):
-            return self._active
+        if not force and now - self._last_fetch_at < self.refresh_seconds:
+            # Keep a successfully authenticated future config in memory. A
+            # worker can then activate it from the first observed block after
+            # its effective boundary without another HTTP fetch and without
+            # guessing the epoch width from stale local defaults.
+            if self._is_effective(
+                self._candidate,
+                current_epoch=current_epoch,
+                current_block=current_block,
+            ):
+                self._active = self._candidate
+                self._last_authoritative = True
+                return self._active
+            if self._is_effective(
+                self._active,
+                current_epoch=current_epoch,
+                current_block=current_block,
+            ):
+                return self._active
+            return None
 
         try:
             cfg = self._fetch()
             self._last_fetch_at = now
             self._last_error = ""
+            self._candidate = cfg
             self.refresh_seconds = max(1.0, float(cfg.refresh_seconds or self.refresh_seconds))
-            if self._is_effective(cfg, current_epoch):
+            if self._is_effective(
+                cfg,
+                current_epoch=current_epoch,
+                current_block=current_block,
+            ):
                 self._active = cfg
                 self._last_authoritative = True
                 return cfg
             self._last_authoritative = False
-            return self._active if self._is_effective(self._active, current_epoch) else None
+            return (
+                self._active
+                if self._is_effective(
+                    self._active,
+                    current_epoch=current_epoch,
+                    current_block=current_block,
+                )
+                else None
+            )
         except Exception as exc:
+            # A missing/unreachable config host must not turn a per-block
+            # worker activation check into synchronous HTTP on every block.
+            # Keep the normal refresh interval as a bounded retry backoff;
+            # explicit boundary/startup force-refresh calls still bypass it.
+            self._last_fetch_at = now
             self._last_error = f"{type(exc).__name__}: {exc}"
             self._last_authoritative = False
             self._warn(f"Runtime subnet config fetch failed: {self._last_error}")
-            if self._active is not None and self._is_effective(self._active, current_epoch):
+            if self._active is not None and self._is_effective(
+                self._active,
+                current_epoch=current_epoch,
+                current_block=current_block,
+            ):
                 return self._active
-            cached = self._load_cache(current_epoch=current_epoch)
+            cached = self._load_cache(
+                current_epoch=current_epoch,
+                current_block=current_block,
+            )
             if cached is not None:
                 self._active = cached
                 return cached
@@ -1600,15 +1640,25 @@ class RuntimeSubnetConfigClient:
     def _is_effective(
         self,
         cfg: RuntimeSubnetConfig | None,
+        *,
         current_epoch: int | None,
+        current_block: int | None = None,
     ) -> bool:
         if cfg is None:
             return False
         if cfg.effective_epoch is None:
             return True
-        if current_epoch is None:
-            return False
-        return int(cfg.effective_epoch) <= int(current_epoch)
+        if current_epoch is not None:
+            return int(cfg.effective_epoch) <= int(current_epoch)
+        if current_block is not None:
+            # A worker restarting mid-epoch does not yet know the active
+            # epoch width. Derive it from the authenticated candidate itself,
+            # so an already-effective config is adopted before the worker
+            # derives any audit window while a future config stays inactive.
+            return int(cfg.effective_epoch) <= (
+                int(current_block) // max(1, int(cfg.epoch_blocks))
+            )
+        return False
 
     def _fetch(self) -> RuntimeSubnetConfig:
         resp = httpx.get(self.url, timeout=self.timeout_seconds)
@@ -1618,11 +1668,20 @@ class RuntimeSubnetConfigClient:
         self._save_cache(cfg)
         return cfg
 
-    def _load_cache(self, *, current_epoch: int | None) -> RuntimeSubnetConfig | None:
+    def _load_cache(
+        self,
+        *,
+        current_epoch: int | None,
+        current_block: int | None = None,
+    ) -> RuntimeSubnetConfig | None:
         try:
             cfg = load_subnet_config_payload_from_path(self.cache_path)
             object.__setattr__(cfg, "source", str(self.cache_path))
-            if self._is_effective(cfg, current_epoch):
+            if self._is_effective(
+                cfg,
+                current_epoch=current_epoch,
+                current_block=current_block,
+            ):
                 return cfg
         except FileNotFoundError:
             return None

@@ -3409,34 +3409,42 @@ class ValidatorStateDB:
         roster_json: str,
         signature: str,
         received_at: Optional[float] = None,
+        receipt_ingress: bool = False,
     ) -> None:
         """Upsert one verified mesh roster document; prunes stale rows."""
         ts = time.time() if received_at is None else float(received_at)
-        with self._lock:
-            self._conn.execute(
-                """INSERT INTO capacity_rosters (
-                       slot_id, roster_epoch, roster_digest, roster_json,
-                       signature, received_at
-                   ) VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT (slot_id, roster_digest) DO UPDATE SET
-                       roster_epoch = excluded.roster_epoch,
-                       roster_json = excluded.roster_json,
-                       signature = excluded.signature,
-                       received_at = excluded.received_at""",
-                (
-                    str(slot_id),
-                    int(roster_epoch),
-                    str(roster_digest),
-                    str(roster_json),
-                    str(signature),
-                    ts,
-                ),
-            )
-            self._conn.execute(
-                "DELETE FROM capacity_rosters WHERE received_at < ?",
-                (ts - float(self.CAPACITY_ROSTER_RETENTION_SECONDS),),
-            )
-            self._conn.commit()
+        lock = self._capacity_ingress_lock if receipt_ingress else self._lock
+        conn = self._capacity_ingress_conn if receipt_ingress else self._conn
+        with lock:
+            try:
+                conn.execute(
+                    """INSERT INTO capacity_rosters (
+                           slot_id, roster_epoch, roster_digest, roster_json,
+                           signature, received_at
+                       ) VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (slot_id, roster_digest) DO UPDATE SET
+                           roster_epoch = excluded.roster_epoch,
+                           roster_json = excluded.roster_json,
+                           signature = excluded.signature,
+                           received_at = excluded.received_at""",
+                    (
+                        str(slot_id),
+                        int(roster_epoch),
+                        str(roster_digest),
+                        str(roster_json),
+                        str(signature),
+                        ts,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM capacity_rosters WHERE received_at < ?",
+                    (ts - float(self.CAPACITY_ROSTER_RETENTION_SECONDS),),
+                )
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     def get_capacity_roster(self, slot_id: str) -> Optional[dict]:
         """Return the newest stored roster row for one endpoint slot."""
@@ -3818,6 +3826,7 @@ class ValidatorStateDB:
         *,
         reason: str,
         reviewed_at: Optional[float] = None,
+        receipt_ingress: bool = False,
     ) -> dict[str, int]:
         """Fail-neutralize one window after a validator-owned timing failure.
 
@@ -3831,10 +3840,12 @@ class ValidatorStateDB:
         if not bounded_reason or len(bounded_reason) > 128:
             raise ValueError("a bounded validator-incident reason is required")
         ts = time.time() if reviewed_at is None else float(reviewed_at)
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+        lock = self._capacity_ingress_lock if receipt_ingress else self._lock
+        conn = self._capacity_ingress_conn if receipt_ingress else self._conn
+        with lock:
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                window_cur = self._conn.execute(
+                window_cur = conn.execute(
                     """UPDATE capacity_audit_windows
                        SET status = 'validator_incident',
                            incident_review_status = 'quarantined',
@@ -3844,7 +3855,7 @@ class ValidatorStateDB:
                          AND incident_review_status != 'quarantined'""",
                     (ts, ts, audit_id),
                 )
-                slot_cur = self._conn.execute(
+                slot_cur = conn.execute(
                     """UPDATE capacity_audit_slots
                        SET verdict = 'timing_excused',
                            timing_status = 'excused',
@@ -3859,7 +3870,7 @@ class ValidatorStateDB:
                          )""",
                     (bounded_reason, ts, audit_id),
                 )
-                history_cur = self._conn.execute(
+                history_cur = conn.execute(
                     """UPDATE capacity_audit_history
                        SET verdict = 'timing_excused',
                            timing_status = 'excused',
@@ -3874,9 +3885,10 @@ class ValidatorStateDB:
                          )""",
                     (bounded_reason, ts, audit_id),
                 )
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
                 raise
         return {
             "windows_changed": int(window_cur.rowcount or 0),
@@ -5118,35 +5130,43 @@ class ValidatorStateDB:
         model_index: int,
         received_at: Optional[float] = None,
         gpu_index: int = 0,
+        receipt_ingress: bool = False,
     ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
-        with self._lock:
-            cur = self._conn.execute(
-                """UPDATE capacity_audit_slots
-                   SET proof_received_at = COALESCE(proof_received_at, ?),
-                       proof_status = CASE
-                           WHEN proof_status = 'pending' THEN 'verify_pending'
-                           ELSE proof_status
-                       END,
-                       updated_at = ?
-                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?
-                     AND gpu_index = ?
-                     AND EXISTS (
-                       SELECT 1 FROM capacity_audit_windows w
-                       WHERE w.audit_id = capacity_audit_slots.audit_id
-                         AND w.chain_status != 'reorged'
-                         AND w.incident_review_status != 'quarantined'
-                     )""",
-                (
-                    ts,
-                    ts,
-                    audit_id,
-                    address.lower(),
-                    int(model_index),
-                    int(gpu_index),
-                ),
-            )
-            self._conn.commit()
+        lock = self._capacity_ingress_lock if receipt_ingress else self._lock
+        conn = self._capacity_ingress_conn if receipt_ingress else self._conn
+        with lock:
+            try:
+                cur = conn.execute(
+                    """UPDATE capacity_audit_slots
+                       SET proof_received_at = COALESCE(proof_received_at, ?),
+                           proof_status = CASE
+                               WHEN proof_status = 'pending' THEN 'verify_pending'
+                               ELSE proof_status
+                           END,
+                           updated_at = ?
+                       WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                         AND gpu_index = ?
+                         AND EXISTS (
+                           SELECT 1 FROM capacity_audit_windows w
+                           WHERE w.audit_id = capacity_audit_slots.audit_id
+                             AND w.chain_status != 'reorged'
+                             AND w.incident_review_status != 'quarantined'
+                         )""",
+                    (
+                        ts,
+                        ts,
+                        audit_id,
+                        address.lower(),
+                        int(model_index),
+                        int(gpu_index),
+                    ),
+                )
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
         return (cur.rowcount or 0) == 1
 
     def release_capacity_audit_drain(

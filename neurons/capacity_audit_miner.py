@@ -195,12 +195,17 @@ class CapacityAuditMinerWorker:
         self,
         *,
         current_epoch: int | None = None,
+        current_block: int | None = None,
         force: bool = False,
     ) -> bool:
         client = getattr(self, "_subnet_runtime_config_client", None)
         if client is None:
             return False
-        runtime = client.get(current_epoch=current_epoch, force=force)
+        runtime = client.get(
+            current_epoch=current_epoch,
+            current_block=current_block,
+            force=force,
+        )
         if runtime is None:
             self._subnet_runtime_config_authoritative = False
             return False
@@ -820,6 +825,13 @@ class CapacityAuditMinerWorker:
         # challenge wait, and proof assembly, preventing the stream from
         # retaining the B_proof hash needed by that very audit.
         self._pending.pop(block_number, None)
+
+        # An effective hosted config fetched during startup is held inactive
+        # until a real chain block establishes its epoch. Adopt it before any
+        # window derivation; the normal path is cache-only and adds no chain
+        # lookup to receipt or audit processing.
+        if not getattr(self, "_subnet_runtime_config_authoritative", False):
+            self._refresh_subnet_runtime_config(current_block=block_number)
 
         epoch_blocks = self._epoch_blocks(subtensor)
         if block_number % epoch_blocks == 0:
@@ -1988,7 +2000,11 @@ class CapacityAuditMinerWorker:
         non_owner_endpoint = self._validator_endpoint_is_non_owner(endpoint)
         if audit_id and self._validator_rejected_audit(endpoint, audit_id):
             return
-        for attempt in range(delivery.attempts):
+        attempts = int(delivery.attempts)
+        attempt = 0
+        retry_delay_s = float(delivery.retry_delay_s)
+        while attempt < attempts:
+            attempt += 1
             try:
                 resp = httpx.post(
                     f"{endpoint}{path}",
@@ -2041,11 +2057,23 @@ class CapacityAuditMinerWorker:
                         failure_kind=failure_kind,
                     )
                 retryable = resp.status_code in (409, 425, 429, 500, 502, 503, 504)
+                if (
+                    resp.status_code == 503
+                    and not non_owner_endpoint
+                    and "validator incident persistence unavailable"
+                    in str(resp.text or "").lower()
+                ):
+                    # This exact response means the owner received and
+                    # authenticated the artifact but could not yet persist
+                    # its fail-neutral incident. Extend only this destination;
+                    # unrelated dead/slow validators retain the normal bound.
+                    attempts = max(attempts, 12)
+                    retry_delay_s = max(retry_delay_s, 1.0)
                 if not retryable:
                     return
-            if attempt + 1 >= delivery.attempts:
+            if attempt >= attempts:
                 return
-            if self._publisher_stop.wait(max(0.1, delivery.retry_delay_s)):
+            if self._publisher_stop.wait(max(0.1, retry_delay_s)):
                 return
 
     def _wait_for_async_publishes_for_test(self, timeout_s: float = 2.0) -> bool:

@@ -865,6 +865,7 @@ class MeshCapacityAuditWorker:
         self,
         *,
         current_epoch: int | None = None,
+        current_block: int | None = None,
         force: bool = False,
     ) -> None:
         from neurons.subnet_runtime_config import (
@@ -880,7 +881,9 @@ class MeshCapacityAuditWorker:
         runtime = None
         try:
             runtime = self._runtime_client.get(
-                current_epoch=current_epoch, force=force
+                current_epoch=current_epoch,
+                current_block=current_block,
+                force=force,
             )
         except Exception as exc:
             logger.debug("runtime subnet config fetch failed: %s", exc)
@@ -1112,6 +1115,14 @@ class MeshCapacityAuditWorker:
             derive_audit_seed_from_hashes,
             match_gpu_class,
         )
+
+        # Startup may have fetched a valid config whose effective epoch could
+        # not yet be evaluated because no chain block was known. Resolve that
+        # authenticated candidate against its own epoch width before deriving
+        # this first window. This is a config-cache operation in the normal
+        # path; it performs no additional chain RPC.
+        if not self._runtime_authoritative:
+            self._refresh_runtime_config(current_block=block_number)
 
         epoch_blocks = self._epoch_blocks()
         if block_number % epoch_blocks == 0:

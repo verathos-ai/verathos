@@ -1428,6 +1428,8 @@ class ValidatorNeuron:
         self._last_block_hash_warning_at: float = 0.0
         self._capacity_audit_server = None
         self._capacity_audit_server_thread = None
+        self._capacity_audit_ingest_expected = False
+        self._capacity_audit_ingest_last_healthy_at = 0.0
         self._capacity_audit_schedule_lock = threading.Lock()
         self._capacity_audit_slot_snapshot_lock = threading.Lock()
         self._capacity_audit_slot_snapshot: list[tuple[CapacitySlot, object]] = []
@@ -3141,12 +3143,14 @@ class ValidatorNeuron:
         sid: str,
         roster: dict,
         signature: str,
+        *,
+        receipt_ingress: bool = False,
     ) -> None:
         record = getattr(self._db, "record_capacity_roster", None)
         if not callable(record):
             return
         try:
-            record(
+            kwargs = dict(
                 slot_id=sid,
                 roster_epoch=int(roster.get("roster_epoch", 0) or 0),
                 roster_digest=compute_roster_digest(roster),
@@ -3155,6 +3159,9 @@ class ValidatorNeuron:
                 ),
                 signature=signature,
             )
+            if receipt_ingress:
+                kwargs["receipt_ingress"] = True
+            record(**kwargs)
         except Exception as exc:
             bt.logging.debug(f"Mesh capacity roster store failed: {exc}")
 
@@ -4444,7 +4451,10 @@ class ValidatorNeuron:
         if row_digest and digest != row_digest:
             return "roster_digest mismatch"
         self._record_mesh_capacity_roster(
-            str(row.get("slot_id") or ""), dict(roster), signature,
+            str(row.get("slot_id") or ""),
+            dict(roster),
+            signature,
+            receipt_ingress=True,
         )
         return ""
 
@@ -4453,6 +4463,7 @@ class ValidatorNeuron:
         artifact: dict,
         *,
         receipt_ingress: bool = False,
+        allow_hash_recovery: bool = True,
     ) -> tuple[dict, Optional[str]]:
         audit_id = str(artifact.get("audit_id") or "")
         address = str(artifact.get("address") or artifact.get("miner_address") or "").lower()
@@ -4496,7 +4507,7 @@ class ValidatorNeuron:
             return row
 
         row = _lookup_slot()
-        if row is None:
+        if row is None and allow_hash_recovery and not receipt_ingress:
             self._recover_capacity_audit_window_from_artifact(artifact)
             row = _lookup_slot()
         if row is None:
@@ -4541,7 +4552,8 @@ class ValidatorNeuron:
         if row_roster_digest:
             if str(artifact.get("roster_digest") or "") != row_roster_digest:
                 return {}, "roster_digest mismatch"
-        row = self._recover_capacity_audit_hashes_for_artifact(row, artifact)
+        if allow_hash_recovery and not receipt_ingress:
+            row = self._recover_capacity_audit_hashes_for_artifact(row, artifact)
         return row, None
 
     def ingest_capacity_audit_artifact(
@@ -4648,10 +4660,14 @@ class ValidatorNeuron:
                         self._observe_live_capacity_audit_head()
                     )
                 if not live_head_ok or final_observed_block <= 0:
-                    return 503, {
-                        "ok": False,
-                        "error": "live chain head unavailable",
-                    }
+                    status, body, _row = (
+                        self._neutralize_capacity_audit_ingress_failure(
+                            audit_id,
+                            reason="validator_ingress_head_unavailable",
+                            received_at=ts,
+                        )
+                    )
+                    return status, body
                 if final_observed_block >= proof_challenge_block:
                     stored, recorded = self._db.record_capacity_audit_final(
                         audit_id=audit_id,
@@ -5045,6 +5061,7 @@ class ValidatorNeuron:
         artifact: dict,
         *,
         received_at: float,
+        ingress_head: Optional[_CapacityAuditIngressHead] = None,
     ) -> tuple[int, dict, Optional[dict]]:
         if not self._capacity_audit_cfg.enabled:
             return 404, {"ok": False, "error": "capacity audit disabled"}, None
@@ -5054,7 +5071,11 @@ class ValidatorNeuron:
         if artifact_type != "capacity_audit_proof_payload":
             return 400, {"ok": False, "error": "unknown artifact_type"}, None
 
-        row, error = self._validate_capacity_audit_artifact(artifact)
+        row, error = self._validate_capacity_audit_artifact(
+            artifact,
+            receipt_ingress=True,
+            allow_hash_recovery=False,
+        )
         if error:
             return 400, {"ok": False, "error": error}, None
         if str(row.get("status") or "") == "validator_incident":
@@ -5070,28 +5091,63 @@ class ValidatorNeuron:
         audit_id = str(row["audit_id"])
         address = str(row["miner_address"])
         model_index = int(row["model_index"])
-        if not str(row.get("proof_challenge_block_hash") or ""):
+        missing_proof_hash = not str(
+            row.get("proof_challenge_block_hash") or ""
+        )
+        missing_audit_hash = not str(row.get("audit_block_hash") or "")
+        if missing_proof_hash or missing_audit_hash:
             proof_challenge_block = int(row.get("proof_challenge_block") or 0)
             if proof_challenge_block <= 0:
                 return 409, {"ok": False, "error": "proof challenge block required"}, None
-            challenge_hash, real = self._get_chain_block_hash(proof_challenge_block)
-            if not real:
-                return 409, {"ok": False, "error": "proof challenge block hash required"}, None
-            self._db.set_capacity_audit_proof_challenge_hash(
+            if ingress_head is not None:
+                observed_block = int(ingress_head.block)
+                head_trustworthy = bool(ingress_head.trustworthy)
+            else:
+                # Direct callers use the same stream-owned cache. Proof
+                # ingress must never perform a chain/RPC lookup.
+                observed_block, head_trustworthy = (
+                    self._observe_live_capacity_audit_head()
+                )
+            if head_trustworthy and observed_block < proof_challenge_block:
+                return 409, {
+                    "ok": False,
+                    "error": "proof challenge block not observed yet",
+                }, None
+            missing = []
+            if missing_audit_hash:
+                missing.append("audit")
+            if missing_proof_hash:
+                missing.append("proof_challenge")
+            return self._neutralize_capacity_audit_ingress_failure(
                 audit_id,
-                self._block_hash_hex(challenge_hash),
-                observed_at=received_at,
+                reason=f"validator_missing_{'_and_'.join(missing)}_hash",
+                received_at=received_at,
             )
-        if not str(row.get("audit_block_hash") or ""):
-            return 409, {"ok": False, "error": "audit block hash required"}, None
 
-        self._db.record_capacity_audit_proof_received(
-            audit_id=audit_id,
-            address=address,
-            model_index=model_index,
-            received_at=received_at,
-            gpu_index=int(row.get("gpu_index") or 0),
-        )
+        try:
+            self._db.record_capacity_audit_proof_received(
+                audit_id=audit_id,
+                address=address,
+                model_index=model_index,
+                received_at=received_at,
+                gpu_index=int(row.get("gpu_index") or 0),
+                receipt_ingress=True,
+            )
+        except Exception as exc:
+            # The signed payload has already been bound to this scheduled
+            # slot. A failure of the validator's isolated writer must not age
+            # into a miner-side missing-proof verdict. Persist a fail-neutral
+            # incident (or return the dedicated retryable 503 if even that
+            # persistence is temporarily unavailable).
+            bt.logging.error(
+                "Capacity audit proof admission failed neutral: "
+                f"audit_id={audit_id[:12]} error={exc}"
+            )
+            return self._neutralize_capacity_audit_ingress_failure(
+                audit_id,
+                reason="validator_proof_ingress_persistence_failure",
+                received_at=received_at,
+            )
         return 202, {"ok": True, "proof_status": "verify_pending"}, row
 
     def _run_capacity_audit_proof_verification(self, artifact: dict, received_at: float) -> None:
@@ -5145,16 +5201,22 @@ class ValidatorNeuron:
         artifact: dict,
         *,
         received_at: Optional[float] = None,
+        ingress_head: Optional[_CapacityAuditIngressHead] = None,
     ) -> tuple[int, dict]:
         ts = time.time() if received_at is None else float(received_at)
         status, body, row = self._prepare_capacity_audit_proof_enqueue(
             artifact,
             received_at=ts,
+            ingress_head=ingress_head,
         )
         if status >= 300:
             return status, body
+        if row is None:
+            # An already quarantined or newly neutralized validator incident
+            # is terminally accepted without proof work.  This must work in
+            # owner and follower modes alike.
+            return status, body
         if self._proof_v3_follower_mode_active():
-            assert row is not None
             self._db.release_capacity_audit_drain(
                 audit_id=str(row["audit_id"]),
                 address=str(row["miner_address"]),
@@ -5170,6 +5232,55 @@ class ValidatorNeuron:
             ts,
         )
         return status, body
+
+    def _neutralize_capacity_audit_ingress_failure(
+        self,
+        audit_id: str,
+        *,
+        reason: str,
+        received_at: float,
+    ) -> tuple[int, dict, None]:
+        """Fail-neutralize a window for validator-owned ingress state loss."""
+
+        audit_id = str(audit_id or "")
+        bounded_reason = str(reason or "")[:128]
+        pending = getattr(self, "_capacity_audit_pending_ingress_incidents", None)
+        if pending is None:
+            pending = {}
+            self._capacity_audit_pending_ingress_incidents = pending
+        try:
+            result = self._db.quarantine_capacity_audit_window(
+                audit_id,
+                reason=bounded_reason,
+                reviewed_at=received_at,
+                receipt_ingress=True,
+            )
+            pending.pop(audit_id, None)
+            if int(result.get("windows_changed") or 0):
+                self._schedule_capacity_audit_shared_state_write()
+        except Exception as exc:
+            # Retain the incident in memory for close-time persistence. If the
+            # process dies first, the existing validator-outage reconciliation
+            # covers the same refused receipt/proof interval after restart.
+            pending[audit_id] = (bounded_reason, float(received_at))
+            bt.logging.error(
+                "Capacity audit ingress incident persistence deferred: "
+                f"audit_id={audit_id[:12]} reason={bounded_reason} error={exc}"
+            )
+            return 503, {
+                "ok": False,
+                "error": "validator incident persistence unavailable",
+                "retryable": True,
+                "validator_incident": True,
+                "incident_reason": bounded_reason,
+            }, None
+        return 200, {
+            "ok": True,
+            "verdict": "timing_excused",
+            "timing_status": "excused",
+            "validator_incident": True,
+            "incident_reason": bounded_reason,
+        }, None
 
     def _ensure_capacity_audit_receipt_metrics(self) -> None:
         if hasattr(self, "_capacity_audit_receipt_metrics_lock"):
@@ -5387,14 +5498,33 @@ class ValidatorNeuron:
                 )
                 or 32 * 1024 * 1024
             )
-            body = await request.body()
+            content_length = request.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > max_bytes:
+                        received_at = time.time()
+                        ingress_head = self._capture_capacity_audit_ingress_head()
+                        return 413, {
+                            "error": "payload_too_large",
+                            "max_bytes": max_bytes,
+                        }, received_at, ingress_head
+                except ValueError:
+                    pass
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > max_bytes:
+                    received_at = time.time()
+                    ingress_head = self._capture_capacity_audit_ingress_head()
+                    return 413, {
+                        "error": "payload_too_large",
+                        "max_bytes": max_bytes,
+                    }, received_at, ingress_head
+                chunks.append(chunk)
+            body = b"".join(chunks)
             received_at = time.time()
             ingress_head = self._capture_capacity_audit_ingress_head()
-            if len(body) > max_bytes:
-                return 413, {
-                    "error": "payload_too_large",
-                    "max_bytes": max_bytes,
-                }, received_at, ingress_head
             try:
                 payload = json.loads(body.decode("utf-8"))
             except Exception:
@@ -5479,12 +5609,13 @@ class ValidatorNeuron:
             return JSONResponse(status_code=status, content=body)
 
         async def _proof(request):
-            read_status, payload, received_at, _ingress_head = await _read_payload(request)
+            read_status, payload, received_at, ingress_head = await _read_payload(request)
             if read_status != 200:
                 return JSONResponse(status_code=read_status, content=payload)
             status, body = self.submit_capacity_audit_proof_artifact(
                 payload,
                 received_at=received_at,
+                ingress_head=ingress_head,
             )
             return JSONResponse(status_code=status, content=body)
 
@@ -5513,12 +5644,45 @@ class ValidatorNeuron:
                 receipt_ingress=True,
             )
             return status, body
+        except Exception as exc:
+            # A validator-owned persistence/runtime failure after a signed
+            # receipt reached the ingest service must not become a miner
+            # no-show. Revalidate the identity/binding, then quarantine the
+            # affected window. Malformed or unauthenticated traffic cannot
+            # enter this path.
+            try:
+                row, error = self._validate_capacity_audit_artifact(
+                    artifact,
+                    receipt_ingress=True,
+                )
+            except Exception:
+                row, error = {}, "validation unavailable"
+            if not error and row:
+                status, body, _row = (
+                    self._neutralize_capacity_audit_ingress_failure(
+                        str(row.get("audit_id") or artifact.get("audit_id") or ""),
+                        reason="validator_receipt_ingress_exception",
+                        received_at=received_at,
+                    )
+                )
+                bt.logging.error(
+                    "Capacity audit receipt ingest failed neutral: "
+                    f"audit_id={str(artifact.get('audit_id') or '')[:12]} "
+                    f"error={exc}"
+                )
+                return status, body
+            raise
         finally:
             queue_delay_s = max(0.0, processing_started_at - received_at)
             processing_s = max(0.0, time.time() - processing_started_at)
             head_unavailable = bool(
-                status == 503
-                and str(body.get("error") or "") == "live chain head unavailable"
+                (
+                    status == 503
+                    and str(body.get("error") or "")
+                    == "live chain head unavailable"
+                )
+                or str(body.get("incident_reason") or "")
+                == "validator_ingress_head_unavailable"
             )
             self._capacity_audit_receipt_finished(
                 ticket=ticket,
@@ -5538,12 +5702,14 @@ class ValidatorNeuron:
     def _start_capacity_audit_ingest_server(self) -> None:
         if not self._capacity_audit_cfg.enabled:
             return
+        self._capacity_audit_ingest_expected = True
         try:
             import uvicorn
             app = self._build_capacity_audit_ingest_app()
         except Exception as e:
-            bt.logging.warning(f"Capacity audit ingest disabled: FastAPI/uvicorn unavailable: {e}")
-            return
+            raise RuntimeError(
+                "capacity audit ingest cannot start: FastAPI/uvicorn unavailable"
+            ) from e
 
         host = str(getattr(self.config, "capacity_audit_ingest_host", "127.0.0.1") or "127.0.0.1")
         port = int(getattr(self.config, "capacity_audit_ingest_port", 8091) or 8091)
@@ -5556,7 +5722,69 @@ class ValidatorNeuron:
             daemon=True,
         )
         self._capacity_audit_server_thread.start()
+        deadline = time.monotonic() + 10.0
+        while (
+            self._capacity_audit_server_thread.is_alive()
+            and not bool(getattr(server, "started", False))
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        if (
+            not self._capacity_audit_server_thread.is_alive()
+            or not bool(getattr(server, "started", False))
+        ):
+            server.should_exit = True
+            self._capacity_audit_server_thread.join(timeout=2.0)
+            raise RuntimeError(
+                f"capacity audit ingest failed to bind or become ready on {host}:{port}"
+            )
+        self._capacity_audit_ingest_last_healthy_at = time.time()
         bt.logging.info(f"Capacity audit ingest listening on {host}:{port}")
+
+    def _ensure_capacity_audit_ingest_server_alive(self) -> None:
+        """Fail-stop if the required ingest service dies after startup.
+
+        A silent daemon-thread failure would leave the validator scoring while
+        refusing every capacity receipt.  Stopping the validator lets the
+        process supervisor restart the complete service, and the existing
+        persisted validator-outage reconciliation neutralizes receipts that
+        were refused during that interval.  This check performs no network or
+        chain call.
+        """
+
+        if not bool(getattr(self, "_capacity_audit_ingest_expected", False)):
+            return
+        thread = getattr(self, "_capacity_audit_server_thread", None)
+        server = getattr(self, "_capacity_audit_server", None)
+        healthy = bool(
+            thread is not None
+            and thread.is_alive()
+            and server is not None
+            and bool(getattr(server, "started", False))
+            and not bool(getattr(server, "should_exit", False))
+        )
+        if healthy:
+            self._capacity_audit_ingest_last_healthy_at = time.time()
+            return
+        failed_at = time.time()
+        last_healthy = float(
+            getattr(self, "_capacity_audit_ingest_last_healthy_at", 0.0)
+            or failed_at - 1e-3
+        )
+        try:
+            self._db.record_validator_outage_interval(
+                min(last_healthy, failed_at - 1e-3),
+                failed_at,
+            )
+        except Exception:
+            pass
+        self._running = False
+        bt.logging.critical(
+            "Capacity audit ingest server stopped unexpectedly; stopping the "
+            "validator for supervisor recovery so miners cannot be penalized "
+            "for refused receipts"
+        )
+        raise RuntimeError("capacity audit ingest server is not alive")
 
     def _capacity_audit_enforcement_enabled(
         self,
@@ -5868,6 +6096,8 @@ class ValidatorNeuron:
                 address,
                 model_index,
             )
+        if self._capacity_audit_ingress_incident_pending():
+            return ""
         if getattr(self, "_capacity_audit_verifier_unhealthy", False):
             reason = str(getattr(self, "_capacity_audit_verifier_last_error", "") or "")
             suffix = f": {reason[:160]}" if reason else ""
@@ -5950,6 +6180,8 @@ class ValidatorNeuron:
             # The signed per-entry capacity_gated bit already includes the
             # owner's endpoint and UID-quorum decision. Applying it in the
             # endpoint seam avoids recomputing owner evidence locally.
+            return ""
+        if self._capacity_audit_ingress_incident_pending():
             return ""
         if getattr(self, "_capacity_audit_verifier_unhealthy", False):
             return ""
@@ -6367,6 +6599,28 @@ class ValidatorNeuron:
     def _review_capacity_audit_failure_clusters(self) -> int:
         """Quarantine finalized validator-shaped cohort failures before penalties."""
 
+        pending = dict(
+            getattr(self, "_capacity_audit_pending_ingress_incidents", {}) or {}
+        )
+        for audit_id, incident in pending.items():
+            try:
+                reason, observed_at = incident
+                result = self._db.quarantine_capacity_audit_window(
+                    str(audit_id),
+                    reason=str(reason),
+                    reviewed_at=float(observed_at),
+                )
+                self._capacity_audit_pending_ingress_incidents.pop(
+                    audit_id, None
+                )
+                if int(result.get("windows_changed") or 0):
+                    self._schedule_capacity_audit_shared_state_write()
+            except Exception as exc:
+                bt.logging.warning(
+                    "Capacity audit deferred ingress incident still pending: "
+                    f"audit_id={str(audit_id)[:12]} error={exc}"
+                )
+
         cfg = self._epoch_close_value(
             "_capacity_audit_cfg",
             self._capacity_audit_cfg,
@@ -6419,6 +6673,36 @@ class ValidatorNeuron:
             self._write_shared_state()
         return quarantined
 
+    def _capacity_audit_ingress_incident_pending(self) -> bool:
+        """Whether validator-owned ingress evidence is not durable yet.
+
+        A signed, slot-bound artifact can reach the validator while its
+        incident/quarantine write fails.  Until that write is durable, every
+        capacity consequence stays neutral: applying a historical score gate
+        or probation in that state could blame miners for this validator's
+        storage failure.  Malformed or unauthenticated requests never create
+        entries in this map.
+        """
+
+        pending = bool(
+            getattr(self, "_capacity_audit_pending_ingress_incidents", {})
+            or {}
+        )
+        if pending:
+            logged_epoch = getattr(
+                self,
+                "_capacity_audit_pending_ingress_log_epoch",
+                None,
+            )
+            current_epoch = int(getattr(self, "_current_epoch", 0) or 0)
+            if logged_epoch != current_epoch:
+                self._capacity_audit_pending_ingress_log_epoch = current_epoch
+                bt.logging.warning(
+                    "Capacity audit consequences suppressed: authenticated "
+                    "validator-ingress incident is pending durable persistence"
+                )
+        return pending
+
     def _mesh_capacity_probation_suppressed(
         self,
         address: str,
@@ -6453,6 +6737,8 @@ class ValidatorNeuron:
         # frozen as neutral evidence before any endpoint EMA or probation
         # state can be mutated.
         self._review_capacity_audit_failure_clusters()
+        if self._capacity_audit_ingress_incident_pending():
+            return 0
         if self._maintenance_grace_active(
             action="suppress_capacity_score_gate"
         ) or self._maintenance_grace_active(action="suppress_probation"):
@@ -6944,6 +7230,7 @@ class ValidatorNeuron:
         Drives the epoch lifecycle: start epoch, dispatch canary tests,
         close epoch (pull receipts + score), set weights.
         """
+        self._ensure_capacity_audit_ingest_server_alive()
         # Liveness marker for the outage-void reconcile: written every ~30s
         # so a restart can measure exactly how long we were gone.
         _alive_mono = time.monotonic()

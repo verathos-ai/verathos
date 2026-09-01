@@ -1899,12 +1899,8 @@ class MinerNeuron:
                 if hasattr(block_value, "item"):
                     block_value = block_value.item()
                 block_number = int(block_value or 0)
-                epoch_blocks = max(1, int(self.config.epoch_blocks))
-                current_epoch = (
-                    block_number // epoch_blocks if block_number > 0 else None
-                )
                 runtime = self._subnet_runtime_config_client.get(
-                    current_epoch=current_epoch,
+                    current_block=(block_number if block_number > 0 else None),
                     force=False,
                 )
                 hard_auditor = _proof_v3_hard_auditor_record(
