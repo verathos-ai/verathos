@@ -37,6 +37,7 @@ import math
 import os
 import signal
 import json
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -107,6 +108,28 @@ from neurons.subnet_runtime_config import (
     select_proof_protocol_version,
 )
 from neurons.model_resolve import validate_capacity_recommended_model
+from neurons.output_sanity import check_output_sanity
+from verallm.mesh.capacity_roster import (
+    MAINNET_BACKEND_REASON_PREFIX,
+    is_verathos_mainnet,
+    mainnet_roster_backend_gate_reason,
+    roster_cuda_gpus,
+    roster_cuda_vram_total_gb,
+    roster_digest as compute_roster_digest,
+    validate_roster,
+    verify_roster_signature,
+)
+from verallm.mesh.proof import (
+    is_mesh_binding_violation,
+    mesh_binding_violation_reason,
+)
+from neurons.mesh_snapshot import (
+    MESH_SNAPSHOT_FETCH_TIMEOUT_S,
+    MeshSnapshotTrustAnchors,
+    discover_and_pin_mesh_verification_snapshot,
+    is_transient_snapshot_fetch_error,
+)
+from neurons.runtime import get_mesh_model_scoring_profile, is_mesh_quant
 from neurons.version import spec_version, version_str, validator_version, validator_version_str
 from neurons.receipts import (
     ServiceReceipt,
@@ -145,6 +168,14 @@ from verallm.api.proof_protocol import (
     SUPPORTED_PROOF_PROTOCOL_VERSIONS,
 )
 from verallm.config import Config
+from verallm.mesh.verification_snapshot import (
+    MESH_POSTCOMMIT_HARD_AUDIT_BPS,
+    MIN_SECURE_TRACE_CANDIDATES_PER_REQUEST,
+    MeshCoordinatorIdentity,
+    MeshModelAnchors,
+    MeshVerificationPolicy,
+    MeshVerificationSnapshot,
+)
 from verallm.proof_policy import (
     CURRENT_PROOF_PROTOCOL_VERSION,
     evaluate_proof_policy,
@@ -155,12 +186,15 @@ from verallm.proof_v3.canary_policy import (
     MAX_CANARY_FULL_PAIR_HOLD_SECONDS_V3,
     canary_prompt_token_tolerance_v3,
 )
-from verallm.registry import get_model, MODELS_BY_ID
+from verallm.registry import get_model, ModelEntry, MODELS_BY_ID
 
 logger = logging.getLogger(__name__)
 _PROOF_V2_ARTIFACT_REFRESH_SECONDS = 3600.0
 _PROOF_V3_ARTIFACT_REFRESH_SECONDS = 3600.0
 _BITTENSOR_MAINNET_EVM_CHAIN_ID = 964
+_MESH_MAINNET_DISABLED_REASON = (
+    "mesh admission is disabled by the authenticated SubnetConfig policy"
+)
 _HTTPS_MAINNET_REMEDIATION = (
     "HTTPS is required on mainnet. Configure TLS with scripts/setup_https.sh "
     "and re-register this endpoint using https://."
@@ -168,6 +202,46 @@ _HTTPS_MAINNET_REMEDIATION = (
 _PUBLIC_HTTPS_MAINNET_REMEDIATION = (
     "Register a publicly routable HTTPS endpoint on mainnet."
 )
+_MESH_MAINNET_BACKEND_REASON_PREFIX = MAINNET_BACKEND_REASON_PREFIX
+
+
+def _is_verathos_mainnet(*, netuid: object, chain_id: object) -> bool:
+    """Return whether both canonical Verathos mainnet identifiers match."""
+
+    return is_verathos_mainnet(netuid=netuid, chain_id=chain_id)
+
+
+def _mesh_mainnet_backend_gate_reason(
+    roster: object,
+    *,
+    netuid: object,
+    chain_id: object,
+) -> str:
+    """Fail closed for non-CUDA mainnet mesh rosters.
+
+    Metal admission will require a separate authenticated hardware policy.
+    Until that policy exists, changing a coordinator-signed backend label can
+    never remove a mainnet mesh from the CUDA capacity-audit universe.
+    """
+
+    return mainnet_roster_backend_gate_reason(
+        roster, netuid=netuid, chain_id=chain_id
+    )
+
+
+def _endpoint_policy_reason_code(reason: str) -> str:
+    """Return a stable proxy/debug code for one validator policy exclusion."""
+
+    value = str(reason or "")
+    if value.startswith(_MESH_MAINNET_BACKEND_REASON_PREFIX):
+        return "mainnet_mesh_backend_ineligible"
+    if value == _MESH_MAINNET_DISABLED_REASON:
+        return "mainnet_mesh_disabled"
+    if value == _HTTPS_MAINNET_REMEDIATION:
+        return "mainnet_https_required"
+    if value == _PUBLIC_HTTPS_MAINNET_REMEDIATION:
+        return "mainnet_public_https_required"
+    return "validator_policy_ineligible"
 
 
 def _mainnet_endpoint_eligibility_reason(
@@ -230,6 +304,17 @@ def _decay_ineligible_endpoint_ema(ema_score: float, ema_alpha: float) -> float:
     return 0.0 if decayed < 1e-6 else decayed
 
 
+def _decode_scoring_authority_hotkey(ss58_address: str) -> bytes:
+    """Decode one exact Substrate account id or fail closed."""
+
+    from verallm.chain.wallet import ss58_decode
+
+    authority = bytes(ss58_decode(str(ss58_address or "")))
+    if len(authority) != 32:
+        raise ValueError("decoded scoring authority is not 32 bytes")
+    return authority
+
+
 class _ProofV3ValidatorConfigurationError(RuntimeError):
     """Local v3 configuration is unavailable; the miner is not at fault."""
 
@@ -259,17 +344,6 @@ def _capacity_audit_head_number(block_header: object) -> int:
         return int(number, 0) if isinstance(number, str) else int(number)
     except (TypeError, ValueError):
         return 0
-
-
-def _decode_scoring_authority_hotkey(ss58_address: str) -> bytes:
-    """Decode one exact Substrate account id or fail closed."""
-
-    from verallm.chain.wallet import ss58_decode
-
-    authority = bytes(ss58_decode(str(ss58_address or "")))
-    if len(authority) != 32:
-        raise ValueError("decoded scoring authority is not 32 bytes")
-    return authority
 
 
 class _ProofV3FullPairBarrier:
@@ -521,6 +595,65 @@ def _effective_canary_counts(
     return low, advertised_light, hard
 
 
+# Canonical private-GGUF verification policy.  Changing proof weight K or any
+# sampling rate is a protocol-policy change and must be coordinated with the
+# snapshot produced by every mesh coordinator.
+MESH_VERIFICATION_POLICY_PROFILE = "gguf_mesh_v1"
+MESH_TRACE_MANIFEST_FORMAT = "compact-raw-v3"
+MESH_BASE_PROOF_SAMPLE_BPS = 10_000
+# Organic and canary traffic must carry the identical decode-audit rate.  The
+# rate is sent in cleartext at phase one, so any difference told the
+# coordinator which requests were canaries, and it could then serve those
+# honestly while cheating organic traffic, where the decode gate is the only
+# live semantic guard.  Both are pinned at the full rate rather than the old
+# organic 1000 bps: base proof coverage is already 10000 bps on this path, so
+# the decode audit rides on a capture that every request already pays for.
+# Zero by protocol: the light tier carries no
+# decode obligation (decode verification lives in hard draws and forced
+# hard canaries). Kept equal so the rate on the wire cannot identify a
+# canary; a non-zero rate forced a teacher-forced replay on every inline
+# light turn because tail capture is unavailable at --parallel > 1.
+MESH_ORGANIC_DECODE_SAMPLE_BPS = 0
+MESH_CANARY_DECODE_SAMPLE_BPS = 0
+MESH_PROOF_OPS_PER_REQUEST = 1
+MESH_PROOF_TRACE_CANDIDATES_PER_REQUEST = (
+    MIN_SECURE_TRACE_CANDIDATES_PER_REQUEST
+)
+MESH_ACTIVATION_DTYPE = "f16"
+
+
+def _canonical_mesh_verification_policy() -> MeshVerificationPolicy:
+    """Return the validator-owned proof policy for the current mesh profile."""
+
+    return MeshVerificationPolicy(
+        profile=MESH_VERIFICATION_POLICY_PROFILE,
+        trace_manifest_format=MESH_TRACE_MANIFEST_FORMAT,
+        base_proof_sample_bps=MESH_BASE_PROOF_SAMPLE_BPS,
+        organic_decode_sample_bps=MESH_ORGANIC_DECODE_SAMPLE_BPS,
+        canary_decode_sample_bps=MESH_CANARY_DECODE_SAMPLE_BPS,
+        proof_ops_per_request=MESH_PROOF_OPS_PER_REQUEST,
+        proof_trace_candidates_per_request=(
+            MESH_PROOF_TRACE_CANDIDATES_PER_REQUEST
+        ),
+        deferred_proof_enabled=False,
+        postcommit_hard_audit_bps=MESH_POSTCOMMIT_HARD_AUDIT_BPS,
+    )
+
+
+def _required_mesh_chain_digest(value: object, *, field_name: str) -> str:
+    """Return one non-zero 32-byte chain commitment as lowercase hex."""
+
+    try:
+        digest = bytes(value)  # HexBytes and bytes are both accepted here.
+    except Exception as exc:
+        raise ValueError(f"chain ModelSpec {field_name} is not bytes") from exc
+    if len(digest) != 32:
+        raise ValueError(f"chain ModelSpec {field_name} must be 32 bytes")
+    if digest == b"\x00" * 32:
+        raise ValueError(f"chain ModelSpec {field_name} is not committed")
+    return digest.hex()
+
+
 def _validator_probation_state_path() -> str:
     explicit = os.environ.get("VERATHOS_PROBATION_STATE_PATH", "").strip()
     if explicit:
@@ -536,6 +669,79 @@ def _coerce_nonnegative_int(value: object) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _is_mesh_runtime(miner: object) -> bool:
+    """Return whether a discovered entry uses the distributed GGUF runtime."""
+    return bool(getattr(miner, "mesh_enabled", False)) or is_mesh_quant(
+        getattr(miner, "quant", "")
+    )
+
+
+#: Minimum total CUDA VRAM a mesh roster must declare when the chain entry
+#: advertises a serving contract (max_context_len > 0). Deliberately a
+#: conservative universal floor: the accurate per-model+quant+context floor
+#: arrives with placement metadata and replaces this constant.
+MESH_CAPACITY_MIN_CUDA_VRAM_GB = 10
+
+#: Epochs a mesh entry may serve with NO learnable signed roster before the
+#: capacity-audit model gate closes on it. Covers fresh registrations (the
+#: validator needs a refresh cycle or two to pull the roster) without letting
+#: a roster-refusing mesh stay exempt from capacity audits forever.
+MESH_CAPACITY_ROSTER_GRACE_EPOCHS_DEFAULT = 2
+
+
+def _model_scoring_entry(model_id: str):
+    """Resolve an on-chain model ID to its scoring quality facts.
+
+    Mesh profiles resolve through their logical registry entry when one
+    exists; mesh-only models (no vLLM registry entry by design) fall back
+    to the catalogue's own quality facts carried on the profile.
+    """
+    mesh_profile = get_mesh_model_scoring_profile(model_id)
+    if mesh_profile is not None:
+        if mesh_profile.logical_model_id:
+            entry = get_model(mesh_profile.logical_model_id)
+            if entry is not None:
+                return entry
+        return mesh_profile.fallback_scoring_facts()
+    return get_model(model_id)
+
+
+def _resolve_model_scoring_runtime(
+    model_id: str,
+    quant: str,
+    max_context_len: int,
+):
+    """Resolve the scoring inputs for a registered runtime.
+
+    Mesh entries must match one explicit model/quant profile.  Context is
+    scored at the ADVERTISED (registered) value for mesh and vLLM alike:
+    the mesh registration flow measures it with the KV auto-fit and
+    validators canary at it. Mesh-only models score from the catalogue's
+    quality facts; single-GPU entries retain the registry lookup.
+    """
+    if is_mesh_quant(quant):
+        mesh_profile = get_mesh_model_scoring_profile(model_id, quant)
+        if mesh_profile is None:
+            return None
+        model_entry = None
+        if mesh_profile.logical_model_id:
+            model_entry = get_model(mesh_profile.logical_model_id)
+        if model_entry is None:
+            model_entry = mesh_profile.fallback_scoring_facts()
+        if model_entry is None:
+            return None
+        return (
+            model_entry,
+            mesh_profile.scored_context_len(max_context_len),
+            mesh_profile.scoring_quant,
+        )
+
+    model_entry = get_model(model_id)
+    if model_entry is None:
+        return None
+    return model_entry, _coerce_nonnegative_int(max_context_len), quant
 
 
 def _normalize_health_hardware(hw: object) -> tuple[bool, dict[str, object]]:
@@ -623,8 +829,39 @@ def _get_tokenizer(model_id: str):
     with _tokenizer_lock:
         if model_id in _tokenizer_cache:
             return _tokenizer_cache[model_id]
-        bt.logging.debug(f"Loading tokenizer for input commitment: {model_id}")
-        tokenizer = _AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        # Mesh model ids are registry ids, not HF repos, and their GGUF
+        # repos embed the tokenizer in the model file: resolve through the
+        # registry to the family's base model repo (same vocab as the
+        # GGUF-embedded tokenizer). vLLM lane ids pass through unchanged.
+        source = model_id
+        try:
+            from verallm.registry.models import mesh_tokenizer_source
+
+            mesh_source = mesh_tokenizer_source(model_id)
+            if mesh_source:
+                source = mesh_source
+        except Exception:
+            pass
+        bt.logging.debug(
+            f"Loading tokenizer for input commitment: {model_id}"
+            + (f" (source {source})" if source != model_id else "")
+        )
+        tokenizer = _AutoTokenizer.from_pretrained(source, trust_remote_code=True)
+        if getattr(tokenizer, "chat_template", None) is None:
+            # Some base repos ship no chat template at all; the authoritative
+            # template lives only in the GGUF metadata. The registry packages
+            # a committed copy of the GGUF's template for those families.
+            try:
+                from verallm.registry.models import mesh_chat_template_fallback
+
+                fallback = mesh_chat_template_fallback(model_id)
+            except Exception:
+                fallback = None
+            if fallback:
+                tokenizer.chat_template = fallback
+                bt.logging.info(
+                    f"Applied packaged chat template fallback for {model_id}"
+                )
         _tokenizer_cache[model_id] = tokenizer
         return tokenizer
 
@@ -862,6 +1099,9 @@ class ValidatorNeuron:
 
     def __init__(self, config: NeuronConfig):
         self.config = config
+        # Test and isolated validators may score the subnet without submitting
+        # weights. Production/default behavior remains enabled.
+        self._weight_setting_enabled: bool = True
         self.scorer = CompositeScorer(
             ema_alpha=config.ema_alpha,
             throughput_power=config.throughput_power,
@@ -879,6 +1119,17 @@ class ValidatorNeuron:
             "verathos_validator.db",
         )
         self._db = ValidatorStateDB(db_path=db_path)
+
+        # A validator outage must never read as miner failure: receipts due
+        # while THIS validator was down were refused at the door. Detect the
+        # gap from the persisted
+        # liveness marker and void the affected windows through the audited
+        # incident path before any scoring runs.
+        self._pending_outage_interval: Optional[Tuple[float, float]] = None
+        try:
+            self._reconcile_own_outage_no_shows()
+        except Exception as exc:
+            bt.logging.warning(f"Validator-outage audit reconcile failed: {exc}")
 
         self._proof_v3_failure_policy_cfg = (
             proof_v3_failure_policy_config_from_neuron_config(config)
@@ -919,6 +1170,7 @@ class ValidatorNeuron:
         self._last_model_emission_budgets: Dict[str, float] = {}
         self._last_model_emission_groups: Dict[str, str] = {}
         self._last_model_group_budgets: Dict[str, float] = {}
+        self._last_model_group_shares: Optional[Dict[str, float]] = None
         self._last_model_bucket_burn: float = 0.0
         self._bt_module = None
         self.__subtensor = None
@@ -1079,6 +1331,12 @@ class ValidatorNeuron:
         self._proof_v3_canary_policy = None
         self._proof_v3_local_release_model_ids: Set[str] = set()
         self._proof_v3_remote_refresh_after: float = 0.0
+        # {(lowercase coordinator EVM, model_index, epoch): signed snapshot}.
+        # Only validator-authenticated, chain-bound snapshots enter this cache;
+        # it is reset and repopulated before each epoch's canaries are planned.
+        self._mesh_snapshot_cache: Dict[
+            Tuple[str, int, int], MeshVerificationSnapshot
+        ] = {}
         # Digest of the last remote index whose complete releases and signed
         # policy were authenticated. The hourly refresh first compares this
         # bounded index so unchanged catalogs do not stall epoch setup.
@@ -1112,6 +1370,9 @@ class ValidatorNeuron:
         ] = {}
         self._load_probation_recovery_source_epochs()
         # Epoch close state
+        self._pending_epoch_closes: List[int] = []
+        # Compatibility mirror used by the auto-updater and lightweight tests;
+        # it is always the oldest row in the persistent ordered queue.
         self._pending_epoch_close: Optional[int] = None
         # Finalized-block callbacks can overlap while receipt pulling and
         # scoring hold the first callback for tens of seconds.  The completed
@@ -1163,6 +1424,7 @@ class ValidatorNeuron:
         # the boundary twice or overtake the callback that already claimed it.
         self._block_dispatch_lock = threading.Lock()
         self._highest_dispatched_block: int = -1
+        self._database_lock_failure_streak: int = 0
         self._last_block_hash_warning_at: float = 0.0
         self._capacity_audit_server = None
         self._capacity_audit_server_thread = None
@@ -1416,6 +1678,44 @@ class ValidatorNeuron:
             )
             == "follower"
         )
+
+    def _validator_outage_marred_epoch(self, epoch_number: int) -> bool:
+        """True when recorded validator outage overlaps this closing epoch
+        enough (>=60s) that miner-fault attribution is unsafe.
+
+        A validator that wedged or restarted during the epoch dispatched
+        canaries into its own dead window; the resulting obligation
+        shortfalls say nothing about miners, so the close must not probate
+        on them. Memoized per epoch so one close logs once.
+        """
+        cache = getattr(self, "_outage_marred_epochs", None)
+        if cache is None:
+            cache = {}
+            self._outage_marred_epochs = cache
+        if epoch_number in cache:
+            return cache[epoch_number]
+        marred = False
+        try:
+            epoch_blocks = max(1, int(self.config.epoch_blocks))
+            span_s = float(epoch_blocks * 12)
+            now = time.time()
+            overlap = self._db.validator_outage_overlap_seconds(
+                now - span_s - 120.0, now
+            )
+            if overlap >= 60.0:
+                marred = True
+                bt.logging.warning(
+                    f"Epoch {epoch_number} close: {overlap:.0f}s of recorded "
+                    "validator outage overlaps this epoch — miner probation "
+                    "suppressed for this close (validator-fault, not miner-fault)"
+                )
+        except Exception:
+            marred = False
+        cache[epoch_number] = marred
+        if len(cache) > 16:
+            for old in sorted(cache)[:-8]:
+                cache.pop(old, None)
+        return marred
 
     def _maintenance_grace_active(
         self,
@@ -1754,13 +2054,28 @@ class ValidatorNeuron:
         )
 
         authority = self._model_client.get_manifest_authority()
-        document = load_signed_canary_policy_document_v3(policy_path)
-        self._proof_v3_canary_policy = qualify_canary_policy_v3(
-            document,
-            qualified_releases=releases,
-            expected_authority_signers=tuple(authority.signers),
-            authority_threshold=int(authority.threshold),
-        )
+        try:
+            document = load_signed_canary_policy_document_v3(policy_path)
+            self._proof_v3_canary_policy = qualify_canary_policy_v3(
+                document,
+                qualified_releases=releases,
+                expected_authority_signers=tuple(authority.signers),
+                authority_threshold=int(authority.threshold),
+            )
+        except Exception as exc:
+            if self._proof_v3_required():
+                raise
+            # An unparseable or ahead-of-binary signed policy must not take
+            # the validator down at boot. Snapshot pinning and organic
+            # routing do not depend on the canary policy; degrade exactly
+            # like the periodic refresh does and let it adopt a corrected
+            # document as soon as one qualifies.
+            self._proof_v3_canary_policy = None
+            bt.logging.error(
+                "Proof-v3 canary policy failed to authenticate; continuing "
+                f"without v3 hard canaries until a refresh succeeds: {exc}"
+            )
+            return
         bt.logging.info(
             "Authenticated proof-v3 canary policy "
             f"{self._proof_v3_canary_policy.policy_abi_id}"
@@ -2114,6 +2429,7 @@ class ValidatorNeuron:
         # SS58 hotkey address for Sr25519 request signing (miner auth)
         self._validator_hotkey_ss58 = wallet.hotkey.ss58_address
         self._enforce_proof_v3_verdict_owner_guard()
+        self._warm_mesh_tokenizers()
 
         # Cached at the top of every _close_epoch (one eth_call/epoch, ~72 min).
         # Used by verify_service_receipt's total-stake gate.  Broader than
@@ -2519,6 +2835,10 @@ class ValidatorNeuron:
         if not self._capacity_audit_cfg.enabled:
             return
         self._hydrate_capacity_audit_hardware_from_cache(miners)
+        try:
+            self._refresh_mesh_capacity_rosters(miners)
+        except Exception as exc:
+            bt.logging.debug(f"Mesh capacity roster refresh failed: {exc}")
         self._store_capacity_audit_slot_snapshot(
             [(slot, None) for slot in self._capacity_audit_selection_slots(miners)],
             block_number=block_number,
@@ -2757,6 +3077,242 @@ class ValidatorNeuron:
             return []
         return active
 
+    def _mesh_capacity_slot_id(self, entry: object) -> str:
+        return slot_id({
+            "chain_id": int(getattr(self.config, "chain_id", 0) or 0),
+            "netuid": int(self.config.netuid),
+            "address": str(getattr(entry, "address", "") or "").lower(),
+            "model_index": int(getattr(entry, "model_index", 0) or 0),
+        })
+
+    def _mesh_capacity_roster_binds_slot(
+        self,
+        roster: dict,
+        signature: str,
+        entry: object,
+    ) -> bool:
+        """Verify a roster's signature and its binding to one chain entry."""
+        address = str(getattr(entry, "address", "") or "").lower()
+        if not verify_roster_signature(roster, signature, address):
+            return False
+        slot_meta = roster.get("slot") or {}
+        try:
+            return (
+                int(slot_meta.get("chain_id")) == int(getattr(self.config, "chain_id", 0) or 0)
+                and int(slot_meta.get("netuid")) == int(self.config.netuid)
+                and str(slot_meta.get("address") or "") == address
+                and int(slot_meta.get("model_index")) == int(getattr(entry, "model_index", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _fetch_mesh_capacity_roster(self, entry: object) -> Optional[tuple[dict, str]]:
+        """Live-pull the signed GPU roster from a mesh chain endpoint.
+
+        PULL is how the validator learns a mesh's GPU obligation without
+        waiting for a first audit receipt; authenticity rides the embedded
+        coordinator-EVM signature, verified against the on-chain address.
+        """
+        endpoint = str(getattr(entry, "endpoint", "") or "")
+        if not endpoint:
+            return None
+        try:
+            resp = httpx.get(
+                f"{endpoint.rstrip('/')}/capacity/roster",
+                timeout=5.0, verify=False,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        roster = data.get("roster")
+        signature = str(data.get("roster_signature") or "")
+        if not isinstance(roster, dict) or not signature:
+            return None
+        if not self._mesh_capacity_roster_binds_slot(roster, signature, entry):
+            return None
+        return roster, signature
+
+    def _record_mesh_capacity_roster(
+        self,
+        sid: str,
+        roster: dict,
+        signature: str,
+    ) -> None:
+        record = getattr(self._db, "record_capacity_roster", None)
+        if not callable(record):
+            return
+        try:
+            record(
+                slot_id=sid,
+                roster_epoch=int(roster.get("roster_epoch", 0) or 0),
+                roster_digest=compute_roster_digest(roster),
+                roster_json=json.dumps(
+                    roster, sort_keys=True, separators=(",", ":"),
+                ),
+                signature=signature,
+            )
+        except Exception as exc:
+            bt.logging.debug(f"Mesh capacity roster store failed: {exc}")
+
+    def _refresh_mesh_capacity_rosters(self, miners: list[ActiveMiner]) -> int:
+        """Refresh stored mesh rosters alongside the slot-snapshot refresh.
+
+        A mesh whose roster can neither be pulled nor found stored gets a
+        refusal-streak mark: serving without ever exposing the GPU roster
+        must eventually gate (grace window), or refusing the route would be
+        a permanent capacity-audit exemption.
+        """
+        refreshed = 0
+        epoch_number = int(getattr(self, "_current_epoch", 0) or 0)
+        for miner in list(miners or []):
+            if not _is_mesh_runtime(miner):
+                continue
+            sid = self._mesh_capacity_slot_id(miner)
+            fetched = self._fetch_mesh_capacity_roster(miner)
+            if fetched is None:
+                # Refreshes that run before the epoch loop knows the current
+                # epoch (startup) must not start a streak at epoch 0 — the
+                # gate could never measure it.
+                if (
+                    epoch_number > 0
+                    and self._stored_mesh_capacity_roster(sid) is None
+                ):
+                    self._mark_mesh_capacity_roster_missing(sid, epoch_number)
+                continue
+            roster, signature = fetched
+            self._record_mesh_capacity_roster(sid, roster, signature)
+            self._clear_mesh_capacity_roster_missing(sid)
+            refreshed += 1
+        return refreshed
+
+    def _mark_mesh_capacity_roster_missing(
+        self, sid: str, epoch_number: int
+    ) -> None:
+        record = getattr(self._db, "record_capacity_roster_missing", None)
+        if not callable(record):
+            return
+        try:
+            record(sid, epoch_number)
+        except Exception as exc:
+            bt.logging.debug(f"Mesh roster missing-mark failed: {exc}")
+
+    def _clear_mesh_capacity_roster_missing(self, sid: str) -> None:
+        clear = getattr(self._db, "clear_capacity_roster_missing", None)
+        if not callable(clear):
+            return
+        try:
+            clear(sid)
+        except Exception:
+            pass
+
+    def _mesh_capacity_roster_missing_epochs(
+        self, sid: str, epoch_number: int
+    ) -> int:
+        """How many epochs this slot's roster has been unlearnable (0 = none)."""
+        getter = getattr(self._db, "get_capacity_roster_missing", None)
+        if not callable(getter):
+            return 0
+        try:
+            row = getter(sid)
+        except Exception:
+            return 0
+        if not row:
+            return 0
+        first = int(row.get("first_missing_epoch", 0) or 0)
+        last = int(row.get("last_missing_epoch", 0) or 0)
+        if first <= 0:
+            return 0
+        # A gap in the marks means the streak BROKE (the slot deregistered
+        # or the roster was learnable in between): a resurrected ancient
+        # row must not instantly gate a fresh re-registration with no
+        # grace. Reset and start over.
+        if last > 0 and int(epoch_number) > last + 1:
+            self._clear_mesh_capacity_roster_missing(sid)
+            return 0
+        return max(0, int(epoch_number) - first + 1)
+
+    def _stored_mesh_capacity_roster(self, sid: str) -> Optional[dict]:
+        """Return the newest stored (already signature-verified) roster."""
+        getter = getattr(self._db, "get_capacity_roster", None)
+        if not callable(getter):
+            return None
+        try:
+            row = getter(sid)
+        except Exception:
+            return None
+        if not row:
+            return None
+        try:
+            roster = json.loads(str(row.get("roster_json") or ""))
+        except Exception:
+            return None
+        return roster if isinstance(roster, dict) else None
+
+    def _mesh_capacity_audit_payload(
+        self,
+        entry: object,
+        *,
+        allow_live_fetch: bool = True,
+    ) -> Optional[dict]:
+        """Resolve one mesh slot's audit obligation from its signed roster.
+
+        Auditable iff a roster is known, it declares at least one CUDA GPU,
+        every CUDA GPU maps to a calibrated workload class, and the declared
+        CUDA VRAM clears the serving-contract floor. Returns the scheduling
+        payload consumed as ``(CapacitySlot, payload)``:
+        ``{"mesh": True, "roster", "roster_digest",
+        "gpus": [(ordinal, gpu_row, gpu_name, vram_gb), ...]}``.
+        """
+        sid = self._mesh_capacity_slot_id(entry)
+        roster = self._stored_mesh_capacity_roster(sid)
+        if roster is None and allow_live_fetch:
+            fetched = self._fetch_mesh_capacity_roster(entry)
+            if fetched is not None:
+                roster, signature = fetched
+                self._record_mesh_capacity_roster(sid, roster, signature)
+        if roster is None:
+            return None
+        if _mesh_mainnet_backend_gate_reason(
+            roster,
+            netuid=getattr(self.config, "netuid", 0),
+            chain_id=getattr(self.config, "chain_id", 0),
+        ):
+            return None
+        try:
+            gpus = roster_cuda_gpus(roster)
+        except Exception:
+            return None
+        if not gpus:
+            # All-Metal/other rosters are audit-ineligible (the synthetic
+            # workload is CUDA-only), never failed.
+            return None
+        rows: list[tuple[int, object, str, int]] = []
+        for gpu in gpus:
+            gpu_row = match_gpu_class(
+                gpu.gpu_name, gpu.vram_gb, self._capacity_audit_cfg,
+            )
+            if gpu_row is None or not gpu_row.calibrated or capacity_gpu_pass_count(gpu_row) <= 0:
+                return None
+            rows.append((int(gpu.ordinal), gpu_row, gpu.gpu_name, int(gpu.vram_gb)))
+        # max_context_len > 0 signals a registered serving contract; a roster
+        # declaring less total CUDA VRAM than any real deployment needs is an
+        # under-declaration attempt to shrink the proof obligation.
+        if (
+            int(getattr(entry, "max_context_len", 0) or 0) > 0
+            and roster_cuda_vram_total_gb(roster) < MESH_CAPACITY_MIN_CUDA_VRAM_GB
+        ):
+            return None
+        return {
+            "mesh": True,
+            "roster": roster,
+            "roster_digest": compute_roster_digest(roster),
+            "gpus": rows,
+        }
+
     def _capacity_audit_active_slots(
         self,
         miners: Optional[list[ActiveMiner]] = None,
@@ -2767,6 +3323,29 @@ class ValidatorNeuron:
             registered_at = int(getattr(miner, "registered_at", 0) or 0)
             min_age = float(self._capacity_audit_cfg.min_registration_age_s or 0.0)
             if registered_at > 0 and min_age > 0 and now - registered_at < min_age:
+                continue
+            if _is_mesh_runtime(miner):
+                payload = self._mesh_capacity_audit_payload(miner)
+                if payload is None:
+                    continue
+                gpus = payload["gpus"]
+                slots.append((
+                    CapacitySlot(
+                        chain_id=int(getattr(self.config, "chain_id", 0) or 0),
+                        netuid=int(self.config.netuid),
+                        address=miner.address,
+                        model_index=int(miner.model_index),
+                        endpoint=miner.endpoint,
+                        model_id=miner.model_id,
+                        quant=miner.quant,
+                        max_context_len=int(miner.max_context_len or 0),
+                        miner_uid=self._db.get_uid(miner.address),
+                        gpu_count=len(gpus),
+                        vram_gb=sum(vram for _o, _r, _n, vram in gpus),
+                        group_key=self._capacity_slot_group_key(miner),
+                    ),
+                    payload,
+                ))
                 continue
             gpu_row = match_gpu_class(
                 getattr(miner, "gpu_name", "") or "",
@@ -2839,6 +3418,9 @@ class ValidatorNeuron:
             sid = slot_id(slot)
             if sid not in selected_ids or gpu_row is None:
                 continue
+            if isinstance(gpu_row, dict) and gpu_row.get("mesh"):
+                supported[sid] = (slot, gpu_row)
+                continue
             if capacity_gpu_pass_count(gpu_row) <= 0:
                 continue
             supported[sid] = (slot, gpu_row)
@@ -2853,6 +3435,19 @@ class ValidatorNeuron:
         for slot in selected_slots:
             sid = slot_id(slot)
             if sid in supported:
+                continue
+            if is_mesh_quant(str(getattr(slot, "quant", "") or "")):
+                # Mesh support is decided by the stored signed roster alone:
+                # the /health hardware resolution below is a vLLM contract
+                # and a mesh endpoint has no single-GPU health identity.
+                payload = self._mesh_capacity_audit_payload(
+                    slot, allow_live_fetch=False,
+                )
+                if payload is not None:
+                    supported[sid] = (slot, payload)
+                    resolved_count += 1
+                else:
+                    missing_hardware += 1
                 continue
             row = by_key.get((slot.address_lower, int(slot.model_index)))
             if not row:
@@ -3014,6 +3609,39 @@ class ValidatorNeuron:
         )
         return supported_slot, gpu_row
 
+    def _capacity_audit_selection_rosters(
+        self,
+        active: list[tuple[CapacitySlot, object]],
+        epoch_number: int,
+    ) -> Optional[dict[str, dict]]:
+        """Frozen rosters joining the selection domain for mesh slots.
+
+        Only rosters with ``roster_epoch <= epoch - 1`` may contribute group
+        tokens, so validator selection matches each mesh worker's
+        self-selection over the roster it was handed for that epoch.
+        """
+        getter = getattr(self._db, "get_capacity_roster_for_selection", None)
+        if not callable(getter):
+            return None
+        rosters: dict[str, dict] = {}
+        for slot, _payload in active:
+            if not is_mesh_quant(str(getattr(slot, "quant", "") or "")):
+                continue
+            sid = slot_id(slot)
+            try:
+                row = getter(sid, max_roster_epoch=int(epoch_number) - 1)
+            except Exception:
+                continue
+            if not row:
+                continue
+            try:
+                roster = json.loads(str(row.get("roster_json") or ""))
+            except Exception:
+                continue
+            if isinstance(roster, dict):
+                rosters[sid] = roster
+        return rosters or None
+
     def _capacity_audit_start_recoverable(self, audit_block: int, current_block: int) -> bool:
         """Return True while a late scheduler can still fairly judge timing."""
         if int(current_block or 0) <= 0:
@@ -3159,10 +3787,14 @@ class ValidatorNeuron:
             cohort_seed = derive_audit_seed(selection_block_hash, epoch_number)
         else:
             cohort_seed = derive_audit_seed_from_hashes(seed_hashes, epoch_number)
+        rosters_fn = getattr(self, "_capacity_audit_selection_rosters", None)
+        if not callable(rosters_fn):
+            rosters_fn = ValidatorNeuron._capacity_audit_selection_rosters.__get__(self)
         selected = select_capacity_audit_slots(
             [slot for slot, _row in active],
             cohort_seed,
             cfg,
+            rosters=rosters_fn(active, epoch_number),
         )
         if not selected:
             return
@@ -3211,7 +3843,7 @@ class ValidatorNeuron:
                     owner = owner_lookup(int(slot.miner_uid)) or {}
                     if str(owner.get("evm_address") or "").lower() == slot.address_lower:
                         miner_hotkey = str(owner.get("hotkey_ss58") or "")
-            rows.append({
+            base_row = {
                 "miner_address": slot.address_lower,
                 "model_index": slot.model_index,
                 "miner_uid": slot.miner_uid,
@@ -3220,14 +3852,39 @@ class ValidatorNeuron:
                 "model_id": slot.model_id,
                 "quant": slot.quant,
                 "max_context_len": slot.max_context_len,
-                "gpu_name": slot.gpu_name,
-                "gpu_count": slot.gpu_count,
-                "vram_gb": slot.vram_gb,
                 "group_key": slot.group_key,
                 "slot_id": sid,
                 "lease_id": lease_id(slot, epoch_number),
+                "transport_grace_s": cfg.transport_grace_s,
+                "payload_deadline_s": cfg.payload_deadline_s,
+                "drain_until_ts": drain_until_ts,
+            }
+            if isinstance(gpu_row, dict) and gpu_row.get("mesh"):
+                # One expected opening per roster GPU ordinal, all under the
+                # same audit_id/lease: every CUDA worker GPU in the mesh
+                # proves simultaneously.
+                for ordinal, ordinal_row, gpu_name, vram_gb in gpu_row["gpus"]:
+                    rows.append({
+                        **base_row,
+                        "gpu_name": gpu_name,
+                        "gpu_count": 1,
+                        "vram_gb": int(vram_gb),
+                        "claimed_gpu_class": ordinal_row.match_gpu_name,
+                        "gpu_index": int(ordinal),
+                        "roster_digest": str(gpu_row.get("roster_digest") or ""),
+                        "pass_count": capacity_gpu_pass_count(ordinal_row),
+                        "workload_spec": capacity_gpu_workload_spec(ordinal_row),
+                        "deadline_s": ordinal_row.deadline_s or cfg.deadline_s,
+                    })
+                continue
+            rows.append({
+                **base_row,
+                "gpu_name": slot.gpu_name,
+                "gpu_count": slot.gpu_count,
+                "vram_gb": slot.vram_gb,
                 "claimed_gpu_class": gpu_row.match_gpu_name,
                 "gpu_index": 0,
+                "roster_digest": "",
                 "pass_count": capacity_gpu_pass_count(gpu_row),
                 "workload_spec": (
                     capacity_gpu_workload_spec(gpu_row)
@@ -3235,9 +3892,6 @@ class ValidatorNeuron:
                     else {}
                 ),
                 "deadline_s": gpu_row.deadline_s or cfg.deadline_s,
-                "transport_grace_s": cfg.transport_grace_s,
-                "payload_deadline_s": cfg.payload_deadline_s,
-                "drain_until_ts": drain_until_ts,
             })
         if not rows:
             bt.logging.info(
@@ -3592,7 +4246,10 @@ class ValidatorNeuron:
         audit_id = str(row.get("audit_id") or artifact.get("audit_id") or "")
         if not audit_id or not address or model_index < 0:
             return row
-        updated = self._db.get_capacity_audit_slot(audit_id, address, model_index)
+        updated = self._db.get_capacity_audit_slot(
+            audit_id, address, model_index,
+            gpu_index=int(row.get("gpu_index") or 0),
+        )
         return updated if updated is not None else row
 
     def _handle_capacity_audit_block(
@@ -3624,6 +4281,12 @@ class ValidatorNeuron:
         )
         expired_slots = expired if isinstance(expired, list) else []
         expired_count = len(expired_slots) if isinstance(expired, list) else int(expired or 0)
+        # Second outage pass: deadlines that elapsed while we were down have
+        # only now been marked no_show by the expiry above.
+        try:
+            self._void_outage_audits("post-expire")
+        except Exception as exc:
+            bt.logging.warning(f"Outage void (post-expire) failed: {exc}")
         if expired_count:
             bt.logging.info(f"Capacity audit: expired {expired_count} pending slots")
             for slot in expired_slots:
@@ -3742,6 +4405,49 @@ class ValidatorNeuron:
                     block_hash=challenge_hash,
                 )
 
+    def _ingest_capacity_audit_embedded_roster(
+        self,
+        row: Mapping[str, Any],
+        artifact: dict,
+    ) -> str:
+        """Validate and store a receipt's embedded signed roster.
+
+        pass0 and final receipts from mesh workers embed the full roster plus
+        the coordinator signature; proof payloads carry only the digest (bound
+        in _validate_capacity_audit_artifact). Returns an error string for a
+        400 rejection, or "" when absent/accepted.
+        """
+        roster = artifact.get("roster")
+        if roster is None:
+            return ""
+        if not isinstance(roster, Mapping):
+            return "invalid roster"
+        try:
+            validate_roster(roster)
+        except ValueError:
+            return "invalid roster"
+        signature = str(artifact.get("roster_signature") or "")
+        entry = SimpleNamespace(
+            address=str(row.get("miner_address") or ""),
+            model_index=int(row.get("model_index") or 0),
+        )
+        if not signature or not self._mesh_capacity_roster_binds_slot(
+            dict(roster), signature, entry,
+        ):
+            return "invalid roster_signature"
+        digest = compute_roster_digest(roster)
+        if digest != str(artifact.get("roster_digest") or ""):
+            return "roster_digest mismatch"
+        row_digest = str(row.get("roster_digest") or "")
+        # The scheduled row's digest wins: a re-signed roster cannot swap the
+        # obligation an in-flight audit was scheduled against.
+        if row_digest and digest != row_digest:
+            return "roster_digest mismatch"
+        self._record_mesh_capacity_roster(
+            str(row.get("slot_id") or ""), dict(roster), signature,
+        )
+        return ""
+
     def _validate_capacity_audit_artifact(
         self,
         artifact: dict,
@@ -3763,20 +4469,36 @@ class ValidatorNeuron:
         if not verify_artifact_signature(artifact, address):
             return {}, "invalid miner_signature"
 
-        row = self._db.get_capacity_audit_slot(
-            audit_id,
-            address,
-            model_index,
-            receipt_ingress=receipt_ingress,
-        )
-        if row is None:
-            self._recover_capacity_audit_window_from_artifact(artifact)
+        # Mesh audits store one row per roster GPU ordinal, keyed by the
+        # artifact's own gpu_index. A missing or malformed value looks up
+        # opening 0 so the strict checks below still judge a real scheduled
+        # row and report the exact gpu_index error instead of a blind
+        # "unknown audit slot".
+        raw_gpu_index = artifact.get("gpu_index")
+        lookup_gpu_index = raw_gpu_index if type(raw_gpu_index) is int else 0
+
+        def _lookup_slot() -> Optional[dict]:
             row = self._db.get_capacity_audit_slot(
                 audit_id,
                 address,
                 model_index,
+                gpu_index=lookup_gpu_index,
                 receipt_ingress=receipt_ingress,
             )
+            if row is None and lookup_gpu_index != 0:
+                row = self._db.get_capacity_audit_slot(
+                    audit_id,
+                    address,
+                    model_index,
+                    gpu_index=0,
+                    receipt_ingress=receipt_ingress,
+                )
+            return row
+
+        row = _lookup_slot()
+        if row is None:
+            self._recover_capacity_audit_window_from_artifact(artifact)
+            row = _lookup_slot()
         if row is None:
             return {}, "unknown audit slot"
         if str(row.get("chain_status") or "") == "reorged":
@@ -3812,6 +4534,13 @@ class ValidatorNeuron:
         artifact_gpu_index = artifact["gpu_index"]
         if type(artifact_gpu_index) is not int or artifact_gpu_index != expected_gpu_index:
             return {}, "gpu_index mismatch"
+        # The scheduled row's roster binding wins over anything the artifact
+        # claims; the embedded-roster document itself is checked at receipt
+        # ingest.
+        row_roster_digest = str(row.get("roster_digest") or "")
+        if row_roster_digest:
+            if str(artifact.get("roster_digest") or "") != row_roster_digest:
+                return {}, "roster_digest mismatch"
         row = self._recover_capacity_audit_hashes_for_artifact(row, artifact)
         return row, None
 
@@ -3846,6 +4575,11 @@ class ValidatorNeuron:
         audit_id = str(row["audit_id"])
         address = str(row["miner_address"])
         model_index = int(row["model_index"])
+        gpu_index = int(row.get("gpu_index") or 0)
+
+        roster_error = self._ingest_capacity_audit_embedded_roster(row, artifact)
+        if roster_error:
+            return 400, {"ok": False, "error": roster_error}
 
         if artifact_type == "capacity_audit_pass0_receipt":
             pass0_root = str(artifact.get("pass0_root") or "")
@@ -3859,6 +4593,7 @@ class ValidatorNeuron:
                 artifact=artifact,
                 received_at=ts,
                 receipt_ingress=receipt_ingress,
+                gpu_index=gpu_index,
             )
             return 200, {"ok": True, "verdict": "pass0_seen"}
 
@@ -3934,6 +4669,7 @@ class ValidatorNeuron:
                         final_observed_block=final_observed_block,
                         received_at=ts,
                         receipt_ingress=receipt_ingress,
+                        gpu_index=gpu_index,
                     )
                     return 200, {
                         "ok": True,
@@ -3960,6 +4696,7 @@ class ValidatorNeuron:
                     final_observed_block=final_observed_block,
                     received_at=ts,
                     receipt_ingress=receipt_ingress,
+                    gpu_index=gpu_index,
                 )
                 stored_verdict = str(
                     (stored or {}).get("verdict") or "hard_proof_miss"
@@ -4004,6 +4741,7 @@ class ValidatorNeuron:
                 final_observed_block=final_observed_block,
                 received_at=ts,
                 receipt_ingress=receipt_ingress,
+                gpu_index=gpu_index,
             )
             if stored is None:
                 return 404, {"ok": False, "error": "capacity audit slot not found"}
@@ -4043,6 +4781,7 @@ class ValidatorNeuron:
                     address=address,
                     model_index=model_index,
                     released_at=ts,
+                    gpu_index=gpu_index,
                 )
             return 200, {"ok": True, "verdict": verdict, "timing_status": timing_status}
 
@@ -4054,6 +4793,7 @@ class ValidatorNeuron:
                 address=address,
                 model_index=model_index,
                 received_at=ts,
+                gpu_index=gpu_index,
             )
 
             def _record_hard_payload_miss(
@@ -4074,6 +4814,7 @@ class ValidatorNeuron:
                         proof_policy_required=proof_policy_required,
                     ),
                     received_at=ts,
+                    gpu_index=gpu_index,
                 )
                 self._schedule_capacity_audit_shared_state_write()
                 self._apply_finalized_capacity_audit_probations()
@@ -4138,7 +4879,6 @@ class ValidatorNeuron:
                         proof_policy_required=True,
                     )
                 proof_verify_ms: Optional[float] = None
-                gpu_index = int(row.get("gpu_index") or 0)
                 proof_challenge_block_hash = str(row.get("proof_challenge_block_hash") or "")
                 if not proof_challenge_block_hash:
                     proof_challenge_block = int(row.get("proof_challenge_block") or 0)
@@ -4200,6 +4940,7 @@ class ValidatorNeuron:
                         failure_reason="validator_verify_error",
                         proof_verify_ms=proof_verify_ms,
                         received_at=ts,
+                        gpu_index=gpu_index,
                     )
                     if current_verdict == "timing_pass":
                         self._db.release_capacity_audit_drain(
@@ -4207,6 +4948,7 @@ class ValidatorNeuron:
                             address=address,
                             model_index=model_index,
                             released_at=ts,
+                            gpu_index=gpu_index,
                         )
                         self._schedule_capacity_audit_shared_state_write()
                     bt.logging.warning(
@@ -4244,9 +4986,17 @@ class ValidatorNeuron:
                     )
                 self._mark_capacity_audit_verifier_healthy()
 
+                # Ordinal-suffixed for gpu_index > 0 so per-GPU mesh proofs
+                # never overwrite each other; opening 0 keeps the historical
+                # vLLM filename.
+                proof_basename = (
+                    f"{address}_{model_index}_proof_payload.json"
+                    if gpu_index == 0
+                    else f"{address}_{model_index}_{gpu_index}_proof_payload.json"
+                )
                 proof_path = os.path.join(
                     self._capacity_audit_artifact_dir(audit_id),
-                    f"{address}_{model_index}_proof_payload.json",
+                    proof_basename,
                 )
                 with open(proof_path, "w") as f:
                     json.dump(artifact, f, sort_keys=True)
@@ -4265,6 +5015,7 @@ class ValidatorNeuron:
                     proof_artifact_path=proof_path,
                     proof_verify_ms=proof_verify_ms,
                     received_at=ts,
+                    gpu_index=gpu_index,
                 )
                 if current_verdict == "timing_pass":
                     self._db.release_capacity_audit_drain(
@@ -4272,6 +5023,7 @@ class ValidatorNeuron:
                         address=address,
                         model_index=model_index,
                         released_at=ts,
+                        gpu_index=gpu_index,
                     )
                     self._schedule_capacity_audit_shared_state_write()
                 return 200, {
@@ -4338,6 +5090,7 @@ class ValidatorNeuron:
             address=address,
             model_index=model_index,
             received_at=received_at,
+            gpu_index=int(row.get("gpu_index") or 0),
         )
         return 202, {"ok": True, "proof_status": "verify_pending"}, row
 
@@ -4363,6 +5116,7 @@ class ValidatorNeuron:
                     verdict=current_verdict,
                     failure_reason="validator_verify_error",
                     received_at=received_at,
+                    gpu_index=int(row.get("gpu_index") or 0),
                 )
                 if current_verdict == "timing_pass":
                     self._db.release_capacity_audit_drain(
@@ -4370,6 +5124,7 @@ class ValidatorNeuron:
                         address=address,
                         model_index=model_index,
                         released_at=received_at,
+                        gpu_index=int(row.get("gpu_index") or 0),
                     )
                     self._schedule_capacity_audit_shared_state_write()
             except Exception:
@@ -4405,6 +5160,7 @@ class ValidatorNeuron:
                 address=str(row["miner_address"]),
                 model_index=int(row["model_index"]),
                 released_at=ts,
+                gpu_index=int(row.get("gpu_index") or 0),
             )
             self._schedule_capacity_audit_shared_state_write()
             return status, body
@@ -4891,13 +5647,118 @@ class ValidatorNeuron:
             bt.logging.warning(f"Capacity audit model gate: model list unavailable: {exc}")
             return None
 
+    def _mesh_capacity_audit_enforcement_active(self, epoch_number: int) -> bool:
+        """Whether mesh entries may be gated/convicted at this epoch.
+
+        The switch ships dark: 0 (or absent) means mesh scheduling and
+        ingest still run but no mesh entry is ever gated (observe-mode
+        evidence only) until the owner flips the epoch via the hosted config.
+        """
+        enforcement_epoch = int(
+            getattr(self.config, "mesh_capacity_audit_enforcement_epoch", 0) or 0
+        )
+        if enforcement_epoch <= 0:
+            return False
+        return int(epoch_number) >= enforcement_epoch
+
+    def _mesh_capacity_audit_model_gate_reason(
+        self,
+        miner: ActiveMiner,
+        epoch_number: int,
+    ) -> str:
+        """Mesh model gate over the signed roster; no vLLM hardware paths.
+
+        ``validate_capacity_recommended_model`` is deliberately skipped for
+        mesh entries: GGUF quants are not in the vLLM tier table, so running
+        it would zero every mesh entry.
+        """
+        sid = self._mesh_capacity_slot_id(miner)
+        roster = self._stored_mesh_capacity_roster(sid)
+        backend_reason = _mesh_mainnet_backend_gate_reason(
+            roster,
+            netuid=getattr(self.config, "netuid", 0),
+            chain_id=getattr(self.config, "chain_id", 0),
+        )
+        if backend_reason:
+            return backend_reason
+        if not self._mesh_capacity_audit_enforcement_active(epoch_number):
+            return ""
+        if roster is None:
+            # No known obligation yet — but only within the grace window.
+            # A mesh that never lets any validator learn its roster would
+            # otherwise be permanently exempt from capacity audits.
+            missing_epochs = self._mesh_capacity_roster_missing_epochs(
+                sid, epoch_number
+            )
+            grace = int(
+                getattr(
+                    self.config,
+                    "mesh_capacity_roster_grace_epochs",
+                    MESH_CAPACITY_ROSTER_GRACE_EPOCHS_DEFAULT,
+                )
+                or 0
+            )
+            if grace > 0 and missing_epochs > grace:
+                return (
+                    "capacity-audit model gate: no signed GPU roster "
+                    f"learnable for {missing_epochs} epochs "
+                    "(GET /capacity/roster refused or unreachable and no "
+                    "receipt-embedded roster)"
+                )
+            return ""
+        try:
+            gpus = roster_cuda_gpus(roster)
+        except Exception:
+            return ""
+        if not gpus:
+            # All-Metal rosters are audit-ineligible, not gated.
+            return ""
+        for gpu in gpus:
+            gpu_row = match_gpu_class(
+                gpu.gpu_name, gpu.vram_gb, self._capacity_audit_cfg,
+            )
+            if gpu_row is None:
+                return (
+                    "capacity-audit model gate: unsupported mesh roster GPU "
+                    f"class {gpu.gpu_name} {gpu.vram_gb}GB"
+                )
+            if not gpu_row.calibrated:
+                return (
+                    "capacity-audit model gate: uncalibrated mesh roster GPU "
+                    f"class {gpu_row.match_gpu_name}"
+                )
+        if (
+            int(getattr(miner, "max_context_len", 0) or 0) > 0
+            and roster_cuda_vram_total_gb(roster) < MESH_CAPACITY_MIN_CUDA_VRAM_GB
+        ):
+            return (
+                "capacity-audit model gate: mesh roster CUDA VRAM below "
+                f"{MESH_CAPACITY_MIN_CUDA_VRAM_GB}GB serving floor"
+            )
+        return ""
+
     def _capacity_audit_model_gate_reason(
         self,
         miner: ActiveMiner,
         epoch_number: int,
     ) -> str:
+        if _is_mesh_runtime(miner):
+            # Mainnet backend eligibility is independent from the hosted
+            # capacity-enforcement epoch. Otherwise a miner could label a
+            # CUDA fleet Metal/other while enforcement is dark and bypass the
+            # CUDA sieve entirely.
+            sid = self._mesh_capacity_slot_id(miner)
+            backend_reason = _mesh_mainnet_backend_gate_reason(
+                self._stored_mesh_capacity_roster(sid),
+                netuid=getattr(self.config, "netuid", 0),
+                chain_id=getattr(self.config, "chain_id", 0),
+            )
+            if backend_reason:
+                return backend_reason
         if not self._capacity_audit_enforcement_enabled(epoch_number):
             return ""
+        if _is_mesh_runtime(miner):
+            return self._mesh_capacity_audit_model_gate_reason(miner, epoch_number)
         gpu_name = str(getattr(miner, "gpu_name", "") or "")
         vram_gb = int(getattr(miner, "vram_gb", 0) or 0)
         if not gpu_name or vram_gb <= 0:
@@ -4927,6 +5788,64 @@ class ValidatorNeuron:
             f"quant={expected.quant}"
         )
 
+    def _mesh_capacity_entry_has_calibrated_roster(self, miner: object) -> bool:
+        """Whether a mesh entry's stored roster puts it in the audit universe."""
+        try:
+            roster = self._stored_mesh_capacity_roster(
+                self._mesh_capacity_slot_id(miner)
+            )
+        except Exception:
+            return False
+        if roster is None:
+            return False
+        try:
+            gpus = roster_cuda_gpus(roster)
+        except Exception:
+            return False
+        for gpu in gpus:
+            gpu_row = match_gpu_class(
+                gpu.gpu_name, gpu.vram_gb, self._capacity_audit_cfg,
+            )
+            if gpu_row is not None and gpu_row.calibrated:
+                return True
+        return False
+
+    def _capacity_audit_entry_eligible(
+        self, address: str, model_index: int
+    ) -> bool:
+        """Whether an entry belongs to the CURRENT capacity-audit universe.
+
+        Convictions persist in the DB for repeat_window_epochs, but the
+        entry they convicted may since have left the audit universe.
+        A mesh entry is in the universe iff a stored signed roster declares
+        at least one calibrated CUDA GPU: an all-Metal or roster-less mesh
+        has no auditable obligation, so counting its stale convictions
+        would punish nothing. This predicate
+        mirrors the slot-snapshot eligibility in
+        _capacity_audit_active_slots / _mesh_capacity_audit_payload.
+        """
+
+        needle_addr = str(address or "").lower()
+        needle_index = int(model_index)
+        for miner in list(getattr(self, "_epoch_miners", []) or []):
+            if str(getattr(miner, "address", "") or "").lower() != needle_addr:
+                continue
+            if int(getattr(miner, "model_index", -1)) != needle_index:
+                continue
+            if _is_mesh_runtime(miner):
+                # Ships dark: before the mesh enforcement epoch no mesh entry
+                # is convictable, roster or not.
+                if not self._mesh_capacity_audit_enforcement_active(
+                    int(getattr(self, "_current_epoch", 0) or 0)
+                ):
+                    return False
+                return self._mesh_capacity_entry_has_calibrated_roster(miner)
+            return True
+        # Not discovered this epoch: STILL counts. Deregistering a convicted
+        # entry must not launder the conviction (rotation abuse); only a
+        # runtime with no auditable obligation clears it.
+        return True
+
     def _capacity_audit_score_gate_reason(
         self,
         address: str,
@@ -4941,6 +5860,8 @@ class ValidatorNeuron:
         if not cfg.enabled or cfg.mode != "score_gate":
             return ""
         if not self._capacity_audit_enforcement_enabled(epoch_number):
+            return ""
+        if not self._capacity_audit_entry_eligible(address, model_index):
             return ""
         if self._proof_v3_follower_mode_active():
             return self._follower_capacity_gate_reason(
@@ -5047,6 +5968,17 @@ class ValidatorNeuron:
         )
         convicted: list[Tuple[str, int]] = []
         for key, row in counts.items():
+            # Stale convictions of entries that since left the audit
+            # universe (mesh runtime, dead registration) must not zero
+            # the UID.
+            try:
+                key_address, key_index = key
+            except (TypeError, ValueError):
+                continue
+            if not self._capacity_audit_entry_eligible(
+                str(key_address), int(key_index)
+            ):
+                continue
             if int(row.get("invalid_proof_failures", 0)) >= int(
                 cfg.invalid_proof_misses_for_zero_score
             ):
@@ -5080,6 +6012,7 @@ class ValidatorNeuron:
         address: str,
         model_index: int,
         uid: int,
+        cause: str = "for_cause",
     ) -> None:
         close_epoch = int(
             self._epoch_close_value(
@@ -5103,8 +6036,12 @@ class ValidatorNeuron:
             ):
                 endpoint = str(getattr(miner, "endpoint", "") or "")
                 break
-        tracker.enter_probation(key, close_epoch, endpoint=endpoint)
-        self._db.enter_probation(address, model_index, close_epoch, uid=int(uid))
+        tracker.enter_probation(
+            key, close_epoch, endpoint=endpoint, cause=cause
+        )
+        self._db.enter_probation(
+            address, model_index, close_epoch, uid=int(uid), cause=cause
+        )
         self._write_shared_state()
 
     def _apply_capacity_audit_score_gate(
@@ -5115,6 +6052,8 @@ class ValidatorNeuron:
         reason: str,
         *,
         uid_wide: bool = False,
+        persist: bool = True,
+        ensure_probation: bool = True,
     ) -> bool:
         if not reason:
             return False
@@ -5136,21 +6075,39 @@ class ValidatorNeuron:
             if entry is None:
                 return False
             targets = [(int(model_index), entry)]
-            self._ensure_capacity_audit_entry_probation(
-                address,
-                int(model_index),
-                int(uid),
-            )
+            if ensure_probation:
+                # Every capacity-audit consequence is for_cause, the
+                # timing and no-show lanes included. The audit's sybil
+                # defense is an elimination sieve over repeated windows:
+                # random beacon-driven cohorts eventually stress
+                # co-hosted slots SIMULTANEOUSLY, the shared hardware
+                # cannot serve every calibrated workload at once, the
+                # miss accumulates to the gate, and probation PARKS the
+                # slot out of the process while later windows sift the
+                # survivors — window by window the set converges to the
+                # slots with genuinely dedicated capacity. Probation is
+                # the sieve's removal step, not a penalty duration, so
+                # NOTHING outside the audit's own rules may lift it: not
+                # re-registration, not a deploy-gate pass, not an
+                # availability reclassification. Any such bypass
+                # reinserts eliminated sybils and unwinds the sieve.
+                self._ensure_capacity_audit_entry_probation(
+                    address,
+                    int(model_index),
+                    int(uid),
+                    cause="for_cause",
+                )
         for entry_model_index, entry in targets:
             if entry.ema_score != 0.0:
                 entry.ema_score = 0.0
-            self._db.save_score(
-                state.address,
-                entry_model_index,
-                entry.ema_score,
-                entry.total_epochs,
-                entry.scored_epochs,
-            )
+            if persist:
+                self._db.save_score(
+                    state.address,
+                    entry_model_index,
+                    entry.ema_score,
+                    entry.total_epochs,
+                    entry.scored_epochs,
+                )
         scope = "UID" if uid_wide else "entry"
         bt.logging.info(
             f"Capacity audit score gate: zeroed {scope} {uid} "
@@ -5166,12 +6123,17 @@ class ValidatorNeuron:
         uid: int,
         entry_reason: str,
         uid_reason: str,
+        *,
+        persist: bool = True,
+        ensure_probation: bool = True,
     ) -> bool:
         entry_gated = self._apply_capacity_audit_score_gate(
             address,
             model_index,
             uid,
             entry_reason,
+            persist=persist,
+            ensure_probation=ensure_probation,
         )
         uid_gated = self._apply_capacity_audit_score_gate(
             address,
@@ -5179,6 +6141,8 @@ class ValidatorNeuron:
             uid,
             uid_reason,
             uid_wide=True,
+            persist=persist,
+            ensure_probation=ensure_probation,
         )
         return entry_gated or uid_gated
 
@@ -5188,6 +6152,8 @@ class ValidatorNeuron:
         model_index: int,
         uid: int,
         reason: str,
+        *,
+        persist: bool = True,
     ) -> bool:
         if not reason:
             return False
@@ -5211,13 +6177,14 @@ class ValidatorNeuron:
             return False
         if entry.ema_score != 0.0:
             entry.ema_score = 0.0
-        self._db.save_score(
-            address,
-            model_index,
-            entry.ema_score,
-            entry.total_epochs,
-            entry.scored_epochs,
-        )
+        if persist:
+            self._db.save_score(
+                address,
+                model_index,
+                entry.ema_score,
+                entry.total_epochs,
+                entry.scored_epochs,
+            )
         bt.logging.info(
             f"Capacity audit model gate: zeroed UID {uid} "
             f"model_index={model_index} address={address[:10]} ({reason})"
@@ -5452,6 +6419,25 @@ class ValidatorNeuron:
             self._write_shared_state()
         return quarantined
 
+    def _mesh_capacity_probation_suppressed(
+        self,
+        address: str,
+        model_index: int,
+    ) -> bool:
+        """Whether a finalized penalty targets a mesh entry still in dark mode."""
+        if self._mesh_capacity_audit_enforcement_active(
+            int(getattr(self, "_current_epoch", 0) or 0)
+        ):
+            return False
+        needle = str(address or "").lower()
+        for miner in list(getattr(self, "_epoch_miners", []) or []):
+            if str(getattr(miner, "address", "") or "").lower() != needle:
+                continue
+            if int(getattr(miner, "model_index", -1)) != int(model_index):
+                continue
+            return _is_mesh_runtime(miner)
+        return False
+
     def _apply_finalized_capacity_audit_probations(self) -> int:
         """Apply each chain-finalized capacity proof penalty exactly once."""
 
@@ -5486,6 +6472,11 @@ class ValidatorNeuron:
             model_index = int(candidate.get("model_index") or 0)
             if not audit_id or not address:
                 continue
+            # Mesh convictions ship dark: leave the candidate unapplied (not
+            # consumed) so the penalty lands only if enforcement flips while
+            # the finalized evidence is still retained.
+            if self._mesh_capacity_probation_suppressed(address, model_index):
+                continue
             result = self._db.apply_finalized_capacity_audit_probation_once(
                 audit_id=audit_id,
                 address=address,
@@ -5502,6 +6493,7 @@ class ValidatorNeuron:
                     key,
                     self._current_epoch,
                     endpoint=endpoint,
+                    cause="for_cause",
                 )
                 self.scorer.halve_ema(address, model_index)
             bt.logging.info(
@@ -5513,6 +6505,148 @@ class ValidatorNeuron:
         if applied:
             self._write_shared_state()
         return applied
+
+    def _ingest_proxy_proof_failures(self) -> int:
+        """Apply owner-only organic proof failures reported by the local proxy."""
+
+        from neurons.proof_failure_ipc import (
+            acknowledge_proxy_proof_failure,
+            pending_proxy_proof_failures,
+        )
+
+        shared_state_path = str(
+            getattr(self.config, "shared_state_path", "") or ""
+        )
+        try:
+            pending = pending_proxy_proof_failures(
+                shared_state_path=shared_state_path,
+                limit=100,
+            )
+        except Exception as exc:
+            bt.logging.error(f"Proxy proof-failure spool is invalid: {exc}")
+            return 0
+
+        now = int(time.time())
+        current_epoch = int(getattr(self, "_current_epoch", 0) or 0)
+        applied = 0
+        for path, event in pending:
+            event_epoch = int(event["epoch_number"])
+            event_ts = int(event["timestamp"])
+            if (
+                event_ts > now + 60
+                or now - event_ts > 24 * 3600
+                or (
+                    current_epoch > 0
+                    and event_epoch not in {0, current_epoch, current_epoch - 1}
+                )
+            ):
+                bt.logging.warning(
+                    "Discarding stale proxy proof-failure event "
+                    f"{event['event_id']}"
+                )
+                acknowledge_proxy_proof_failure(path)
+                continue
+            try:
+                handled = self._apply_proxy_proof_failure_event(event)
+            except Exception as exc:
+                bt.logging.error(
+                    f"Failed to apply proxy proof-failure event "
+                    f"{event['event_id']}: {exc}"
+                )
+                continue
+            if not handled:
+                bt.logging.warning(
+                    "Deferring proxy proof-failure event until its miner "
+                    f"entry is available: {event['event_id']}"
+                )
+                continue
+            acknowledge_proxy_proof_failure(path)
+            applied += 1
+        return applied
+
+    def _apply_proxy_proof_failure_event(self, event: dict) -> bool:
+        """Apply one local proxy event exactly once and reconcile memory."""
+
+        address = str(event["address"]).lower()
+        model_index = int(event["model_index"])
+        endpoint = str(event.get("endpoint", "") or "")
+        key = self._miner_model_key(address, model_index)
+        if self._maintenance_grace_active(action="suppress_probation"):
+            bt.logging.info(
+                "Maintenance grace suppressed proxy proof-failure event "
+                f"{event['event_id']}"
+            )
+            return True
+        apply_event = getattr(
+            getattr(self, "_db", None),
+            "apply_proxy_proof_failure_event",
+            None,
+        )
+        if not callable(apply_event):
+            # Compatibility for tests and transitional validator DB adapters.
+            self._on_proof_failure(
+                address,
+                model_index,
+                endpoint=endpoint,
+            )
+            return True
+
+        result = apply_event(
+            event_id=str(event["event_id"]),
+            address=address,
+            model_index=model_index,
+            epoch_number=int(event["epoch_number"]),
+            event_timestamp=int(event["timestamp"]),
+        )
+        if not result.get("entry_found"):
+            return False
+
+        tracker = getattr(self, "_probation_tracker", None)
+        if tracker is not None:
+            reconcile = getattr(tracker, "reconcile_probation", None)
+            if callable(reconcile):
+                reconcile(
+                    key,
+                    entered_at_epoch=int(
+                        result.get("probation_entered_epoch")
+                        or event["epoch_number"]
+                    ),
+                    consecutive_passes=int(
+                        result.get("probation_consecutive_passes", 0)
+                    ),
+                    endpoint=endpoint,
+                )
+            elif not tracker.is_on_probation(key):
+                tracker.enter_probation(
+                    key,
+                    int(
+                        result.get("probation_entered_epoch")
+                        or event["epoch_number"]
+                    ),
+                    endpoint=endpoint,
+                )
+            elif result.get("applied"):
+                tracker.record_failure(key)
+
+        ema_score = result.get("ema_score")
+        scorer = getattr(self, "scorer", None)
+        if ema_score is not None and scorer is not None:
+            for miner_state in scorer.states.values():
+                if miner_state.address.lower() != address:
+                    continue
+                entry = miner_state.entries.get(model_index)
+                if entry is not None:
+                    entry.ema_score = float(ema_score)
+                break
+
+        self._write_shared_state()
+        action = "applied" if result.get("applied") else "reconciled replay"
+        bt.logging.info(
+            f"Proxy proof-failure event {action}: {address[:10]} "
+            f"model_index={model_index} event_id={event['event_id']}"
+        )
+        return True
+
 
     def _epoch_close_value(self, name: str, default=None):
         """Read a frozen old-epoch value while an async close is running."""
@@ -5574,10 +6708,24 @@ class ValidatorNeuron:
             _busy_skip_probations=busy_probations,
             _canary_errors=dict(self._canary_errors),
             _canary_error_times=canary_error_times,
+            # Mesh score provenance binds each slot EMA to the exact signed
+            # topology of the closing epoch; freeze the pinned snapshots so
+            # the async close never reads the NEXT epoch's cache.
+            _mesh_snapshot_cache=dict(
+                getattr(self, "_mesh_snapshot_cache", {}) or {}
+            ),
+            _inflight_canaries={
+                int(k): dict(v)
+                for k, v in getattr(self, "_inflight_canaries", {}).items()
+                if isinstance(v, dict)
+            },
             _shared_hard_prefetch_results=shared_prefetch,
             _shared_hard_proof_verdicts={},
             _receipt_pull_failed_keys=set(),
             _scoring=self._scoring,
+            _mesh_emission_bps=int(
+                getattr(self.config, "mesh_emission_bps", 0) or 0
+            ),
             _proof_v3_releases=dict(self._proof_v3_releases),
             _proof_v3_canary_policy=self._proof_v3_canary_policy,
             _proof_protocol_rollout_cfg=self._proof_protocol_rollout_cfg,
@@ -5711,6 +6859,79 @@ class ValidatorNeuron:
         )
         return True
 
+    def _reconcile_own_outage_no_shows(self) -> None:
+        """Void no_show audits whose receipt window overlapped our own downtime.
+
+        Runs once at boot. The liveness marker is written every ~30s by the
+        block loop, so the gap between it and now IS the outage. Routing
+        through reconcile_capacity_audit_incident keeps every safety property
+        of the manual tool: excused verdicts (never deleted history), window
+        status 'validator_incident' excluded from gate counts, and probation
+        cleared only under its strict blockers. Miners cannot exploit this:
+        the outage fact comes from our own DB, and a forced outage voids
+        every miner's slots equally - no selective gain.
+        """
+        raw = self._db.get_meta("validator_last_alive_at")
+        boot_ts = time.time()
+        self._db.set_meta("validator_last_alive_at", str(boot_ts))
+        if not raw:
+            return
+        try:
+            last_alive = float(raw)
+        except ValueError:
+            return
+        gap_s = boot_ts - last_alive
+        if gap_s < 10.0:
+            return
+        # Small grace on both edges: publishes racing the shutdown/boot are
+        # refused just the same.
+        self._pending_outage_interval = (last_alive - 5.0, boot_ts + 5.0)
+        # The restart gap also lands in the persistent interval store so the
+        # close-time probation suppression sees restarts and in-process
+        # stalls through one mechanism.
+        try:
+            self._db.record_validator_outage_interval(last_alive, boot_ts)
+        except Exception:
+            pass
+        self._void_outage_audits("boot")
+
+    def _void_outage_audits(self, phase: str) -> None:
+        """Apply the pending outage interval to currently-recorded no_shows.
+
+        Called at boot (rows the previous process already marked) and again
+        after the first miss-expiry pass (rows this process marks for
+        deadlines that elapsed while we were down). The interval is kept
+        until that second pass consumes it.
+        """
+        interval = self._pending_outage_interval
+        if not interval:
+            return
+        by_epoch = self._db.find_validator_outage_no_show_audits(*interval)
+        if phase == "post-expire":
+            self._pending_outage_interval = None
+        if not by_epoch:
+            return
+        gap_s = interval[1] - interval[0] - 10.0
+        for epoch_i, audit_ids in sorted(by_epoch.items()):
+            try:
+                result = self._db.reconcile_capacity_audit_incident(
+                    audit_ids,
+                    expected_epoch=epoch_i,
+                    reason=f"validator outage {int(gap_s)}s ({phase})",
+                    apply=True,
+                )
+                bt.logging.warning(
+                    f"Validator outage ({int(gap_s)}s) voided "
+                    f"{len(audit_ids)} audit window(s) in epoch {epoch_i} "
+                    f"({phase}): receipts due during our own downtime are "
+                    f"not miner failures. probation_cleared="
+                    f"{result.get('probation_to_clear')}"
+                )
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Outage incident reconcile failed for epoch {epoch_i}: {exc}"
+                )
+
     def on_finalized_block(
         self,
         block_number: int,
@@ -5723,6 +6944,52 @@ class ValidatorNeuron:
         Drives the epoch lifecycle: start epoch, dispatch canary tests,
         close epoch (pull receipts + score), set weights.
         """
+        # Liveness marker for the outage-void reconcile: written every ~30s
+        # so a restart can measure exactly how long we were gone.
+        _alive_mono = time.monotonic()
+        _alive_wall = time.time()
+        # In-process stall detection: the process can wedge WITHOUT a
+        # restart (memory pressure, IO stalls), so the boot-time gap check
+        # never fires. Any block-loop gap over 120s is recorded as an
+        # outage interval; the close suppresses miner probation for epochs
+        # such an interval mars - canaries dispatched into a stalled
+        # validator's window say nothing about the miner.
+        _prev_alive_wall = getattr(self, "_last_alive_wall", 0.0)
+        self._last_alive_wall = _alive_wall
+        if _prev_alive_wall and _alive_wall - _prev_alive_wall > 120.0:
+            try:
+                self._db.record_validator_outage_interval(
+                    _prev_alive_wall, _alive_wall
+                )
+                bt.logging.warning(
+                    f"Validator stall detected: no block processed for "
+                    f"{_alive_wall - _prev_alive_wall:.0f}s — recorded as an "
+                    "outage interval; miner penalties in this window are "
+                    "suppressed at the close"
+                )
+            except Exception:
+                pass
+        if _alive_mono - getattr(self, "_last_alive_persist_mono", 0.0) >= 30.0:
+            self._last_alive_persist_mono = _alive_mono
+            try:
+                self._db.set_meta("validator_last_alive_at", str(_alive_wall))
+            except Exception:
+                pass
+        # Proxy IPC ingest runs on EVERY block, including the pre-sync
+        # wait after a restart: the sync point can be most of an epoch
+        # away, and a mesh that relaunches in that window used to stay
+        # unroutable (requests spooled, nobody listening) until sync.
+        self._ingest_proxy_proof_failures()
+        self._ingest_mesh_repin_requests()
+        self._retry_excluded_mesh_entries()
+
+        # Keep the public diagnostics fresh even during the post-restart
+        # boundary wait (which can last most of an epoch): the export only
+        # reads the DB, and going stale exactly when an operator is looking
+        # at a restart's aftermath is the worst possible timing.
+        self._schedule_miner_debug_refresh(
+            current_epoch=block_number // max(1, int(self.config.epoch_blocks)),
+        )
         # Skip historical blocks — only process from sync point onward.
         if block_number < self._sync_block:
             return
@@ -5779,6 +7046,20 @@ class ValidatorNeuron:
         if block_number % epoch_blocks == 0:
             if self._pending_epoch_close is None:
                 self._start_new_epoch(block_number)
+            elif self._pending_epoch_close == block_number // epoch_blocks:
+                # Restart replay: startup discovery already started THIS
+                # epoch, and the catch-up stream is now re-processing its
+                # boundary block. Sealing here would freeze the epoch the
+                # validator just began — every canary would silently skip as
+                # stale, zero receipts would exist at close, and the
+                # integrity check would probate every miner for the
+                # validator's own outage. The epoch is already running;
+                # there is nothing older to close at this block.
+                bt.logging.warning(
+                    f"Epoch {self._pending_epoch_close} boundary replayed "
+                    "after restart; keeping the just-started epoch active "
+                    "instead of sealing it against itself"
+                )
             else:
                 closing_epoch = int(self._pending_epoch_close)
                 bt.logging.info(
@@ -5880,6 +7161,7 @@ class ValidatorNeuron:
                 model_budgets,
                 model_groups=getattr(self, "_last_model_emission_groups", {}),
                 group_budgets=getattr(self, "_last_model_group_budgets", {}),
+                group_shares=getattr(self, "_last_model_group_shares", None),
                 excluded_entries=excluded_entries,
             )
         else:
@@ -5994,6 +7276,263 @@ class ValidatorNeuron:
     # Epoch lifecycle
     # ------------------------------------------------------------------
 
+    _EPOCH_CLOSE_CONTEXT_VERSION = 1
+    _ACTIVE_MINER_CONTEXT_FIELDS = (
+        "address",
+        "model_id",
+        "endpoint",
+        "quant",
+        "max_context_len",
+        "model_index",
+        "expires_at",
+        "registered_at",
+        "hotkey_ss58",
+        "coldkey_ss58",
+        "tee_enabled",
+        "tee_platform",
+        "tee_model_weight_hash",
+        "enclave_public_key",
+        "mesh_enabled",
+        "gpu_name",
+        "gpu_count",
+        "vram_gb",
+        "compute_capability",
+        "gpu_uuids",
+    )
+
+    @classmethod
+    def _miner_to_epoch_close_dict(cls, miner: ActiveMiner) -> dict:
+        """Serialize only the stable ActiveMiner fields needed by close."""
+
+        return {
+            field: getattr(miner, field)
+            for field in cls._ACTIVE_MINER_CONTEXT_FIELDS
+        }
+
+    @classmethod
+    def _miner_from_epoch_close_dict(cls, raw: object) -> ActiveMiner:
+        if not isinstance(raw, dict):
+            raise ValueError("epoch-close miner must be an object")
+        if set(raw) != set(cls._ACTIVE_MINER_CONTEXT_FIELDS):
+            raise ValueError("epoch-close miner has unexpected fields")
+        return ActiveMiner(**raw)
+
+    @staticmethod
+    def _slot_map_to_epoch_close_rows(values: dict) -> list[dict]:
+        rows = []
+        for (address, model_index), value in values.items():
+            rows.append({
+                "address": str(address).lower(),
+                "model_index": int(model_index),
+                "value": value,
+            })
+        rows.sort(key=lambda row: (row["address"], row["model_index"]))
+        return rows
+
+    @staticmethod
+    def _slot_map_from_epoch_close_rows(rows: object) -> dict:
+        if not isinstance(rows, list):
+            raise ValueError("epoch-close slot map must be a list")
+        result = {}
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {
+                "address", "model_index", "value",
+            }:
+                raise ValueError("epoch-close slot row is invalid")
+            key = (str(row["address"]).lower(), int(row["model_index"]))
+            if key in result:
+                raise ValueError("epoch-close slot map contains a duplicate")
+            result[key] = row["value"]
+        return result
+
+    def _build_epoch_close_context(self, epoch_number: int) -> dict:
+        """Freeze the outgoing epoch before new-epoch setup resets its state."""
+
+        inflight = dict(
+            getattr(self, "_inflight_canaries", {}).get(epoch_number, {})
+        )
+        return {
+            "version": self._EPOCH_CLOSE_CONTEXT_VERSION,
+            "epoch_number": int(epoch_number),
+            "epoch_start_block": int(self._epoch_start_block),
+            "miners": [
+                self._miner_to_epoch_close_dict(miner)
+                for miner in self._epoch_miners
+            ],
+            "expected_receipts": self._slot_map_to_epoch_close_rows(
+                dict(self._expected_receipts)
+            ),
+            "inflight_canaries": self._slot_map_to_epoch_close_rows(inflight),
+            "busy_skips": self._slot_map_to_epoch_close_rows(
+                dict(self._busy_skips)
+            ),
+            "busy_skip_probations": self._slot_map_to_epoch_close_rows(
+                dict(self._busy_skip_probations)
+            ),
+            "canary_errors": self._slot_map_to_epoch_close_rows(
+                dict(getattr(self, "_canary_errors", {}))
+            ),
+            "canary_error_times": self._slot_map_to_epoch_close_rows(
+                dict(getattr(self, "_canary_error_times", {}))
+            ),
+        }
+
+    @classmethod
+    def _warm_mesh_tokenizers(self) -> None:
+        """Download and cache every mesh tokenizer once, at startup.
+
+        Both tokenizer consumers (canary prompt construction and the drift
+        hash) hit the network on first use. Paying that lazily meant the
+        first canary of a fresh validator spent its budget downloading a
+        tokenizer, and a transient HF failure mid-epoch marked a model
+        drifted (observed on every mesh model). Warming here makes the
+        cost a startup cost, and the HF hub cache makes it free on restart.
+        Best effort: a failure here is logged and re-tried lazily, never
+        fatal, because a validator with an unreachable hub must still
+        validate the models whose tokenizers it already has.
+        """
+
+        try:
+            from verallm.registry.models import MESH_GGUF_MODELS
+            from verallm.registry.tokenizer_hash import (
+                compute_tokenizer_hash,
+                resolve_tokenizer_source,
+            )
+        except Exception as exc:  # pragma: no cover - import guard
+            bt.logging.debug(f"Mesh tokenizer warm skipped: {exc}")
+            return
+        warmed, failed = 0, 0
+        for model_id in sorted(MESH_GGUF_MODELS):
+            try:
+                _get_tokenizer(model_id)
+                # Populates the same on-disk artifacts the drift hash reads,
+                # so the per-epoch check is a local file read from here on.
+                compute_tokenizer_hash(model_id)
+                warmed += 1
+            except Exception as exc:
+                failed += 1
+                bt.logging.warning(
+                    f"Mesh tokenizer warm failed for {model_id} "
+                    f"(source {resolve_tokenizer_source(model_id)}): {exc}"
+                )
+        bt.logging.info(
+            f"Mesh tokenizers warmed: {warmed} cached, {failed} unavailable"
+        )
+
+    @classmethod
+    def _decode_epoch_close_context(
+        cls,
+        raw_context: object,
+        *,
+        expected_epoch: int,
+    ) -> dict:
+        if isinstance(raw_context, str):
+            raw_context = json.loads(raw_context)
+        if not isinstance(raw_context, dict):
+            raise ValueError("epoch-close context must be an object")
+        required = {
+            "version",
+            "epoch_number",
+            "epoch_start_block",
+            "miners",
+            "expected_receipts",
+            "inflight_canaries",
+            "busy_skips",
+            "busy_skip_probations",
+            "canary_errors",
+            "canary_error_times",
+        }
+        if set(raw_context) != required:
+            raise ValueError("epoch-close context has unexpected fields")
+        if int(raw_context["version"]) != cls._EPOCH_CLOSE_CONTEXT_VERSION:
+            raise ValueError("unsupported epoch-close context version")
+        epoch_number = int(raw_context["epoch_number"])
+        if epoch_number != int(expected_epoch):
+            raise ValueError("epoch-close context epoch mismatch")
+        miners_raw = raw_context["miners"]
+        if not isinstance(miners_raw, list):
+            raise ValueError("epoch-close miners must be a list")
+        return {
+            "epoch_number": epoch_number,
+            "epoch_start_block": int(raw_context["epoch_start_block"]),
+            "miners": [
+                cls._miner_from_epoch_close_dict(miner) for miner in miners_raw
+            ],
+            "expected_receipts": cls._slot_map_from_epoch_close_rows(
+                raw_context["expected_receipts"]
+            ),
+            "inflight_canaries": cls._slot_map_from_epoch_close_rows(
+                raw_context["inflight_canaries"]
+            ),
+            "busy_skips": cls._slot_map_from_epoch_close_rows(
+                raw_context["busy_skips"]
+            ),
+            "busy_skip_probations": cls._slot_map_from_epoch_close_rows(
+                raw_context["busy_skip_probations"]
+            ),
+            "canary_errors": cls._slot_map_from_epoch_close_rows(
+                raw_context["canary_errors"]
+            ),
+            "canary_error_times": cls._slot_map_from_epoch_close_rows(
+                raw_context["canary_error_times"]
+            ),
+        }
+
+    def _refresh_pending_epoch_close_mirror(self) -> List[dict]:
+        getter = getattr(self._db, "get_pending_epoch_closes", None)
+        rows = getter() if callable(getter) else []
+        self._pending_epoch_closes = [int(row["epoch_number"]) for row in rows]
+        self._pending_epoch_close = (
+            self._pending_epoch_closes[0] if self._pending_epoch_closes else None
+        )
+        self._epoch_close_block = (
+            int(rows[0]["close_block"]) if rows else 0
+        )
+        return rows
+
+    def _seal_active_epoch_for_close(self) -> None:
+        if not getattr(self, "_epoch_context_started", False):
+            return
+        epoch_number = int(self._current_epoch)
+        context = self._build_epoch_close_context(epoch_number)
+        seal = getattr(self._db, "seal_epoch_close", None)
+        if callable(seal):
+            seal(epoch_number=epoch_number, context=context)
+        self._refresh_pending_epoch_close_mirror()
+
+    def _abandon_unrecoverable_collecting_epochs(
+        self,
+        through_epoch: int,
+        *,
+        reason: str,
+    ) -> int:
+        abandon = getattr(
+            self._db, "abandon_collecting_epoch_closes", None
+        )
+        if not callable(abandon) or through_epoch < 0:
+            return 0
+        count = abandon(through_epoch=through_epoch, reason=reason)
+        if count:
+            bt.logging.warning(
+                f"Abandoned {count} unsealed epoch-close context(s) through "
+                f"epoch {through_epoch}: {reason}"
+            )
+        return count
+
+    def _try_close_ready_epochs(self, block_number: int) -> None:
+        """Try at most the oldest ready close, preserving queue order."""
+
+        rows = self._refresh_pending_epoch_close_mirror()
+        if not rows:
+            return
+        oldest = rows[0]
+        if int(block_number) < int(oldest["close_block"]):
+            return
+        self._try_close_epoch(
+            int(oldest["epoch_number"]),
+            queue_row=oldest,
+            current_block=int(block_number),
+        )
     def _auto_update_busy(self) -> bool:
         """Return whether restarting could destroy live validator work."""
 
@@ -6042,8 +7581,11 @@ class ValidatorNeuron:
     def _start_new_epoch(self, epoch_start_block: int):
         """Start a new epoch — non-blocking; heavy setup runs on executor."""
         epoch_number = epoch_start_block // self.config.epoch_blocks
+        # The boundary sweep re-pins everything fresh; carry-over entries
+        # would double-retry slots the sweep already handled (or re-failed
+        # and re-recorded with the new epoch's reason).
+        self._mesh_excluded_this_epoch = {}
         self._refresh_subnet_runtime_config(current_epoch=epoch_number, force=True)
-        epoch_number = epoch_start_block // self.config.epoch_blocks
         if getattr(
             self,
             "_proof_v3_verdict_source_latched_epoch",
@@ -6331,6 +7873,16 @@ class ValidatorNeuron:
                 {},
             )
             epoch_inflight[key] = epoch_inflight.get(key, 0) + 1
+            # Own-activity interval opens here and closes in
+            # _mark_canary_finished: a canary execution (inference AND the
+            # trailing proof/replay exchange) occupies the miner, and a
+            # concurrent full canary that 503s against it must be excused
+            # by THIS record (see _busy_evidence_covers_full_obligations).
+            activity = getattr(self, "_own_canary_activity", None)
+            if activity is None:
+                activity = {}
+                self._own_canary_activity = activity
+            activity.setdefault(key, []).append([time.time(), 0.0])
 
     def _mark_canary_finished(
         self,
@@ -6345,6 +7897,12 @@ class ValidatorNeuron:
             lock = threading.Lock()
             self._canary_accounting_lock = lock
         with lock:
+            for interval in getattr(self, "_own_canary_activity", {}).get(
+                key, []
+            ):
+                if interval[1] == 0.0:
+                    interval[1] = time.time()
+                    break
             epoch_inflight = self._inflight_canaries.get(epoch_number)
             if not epoch_inflight:
                 if test is not None:
@@ -6570,11 +8128,28 @@ class ValidatorNeuron:
 
         return None
 
-    def _effective_expected_receipts(self, epoch_number: int, key: Tuple[str, int]) -> int:
-        """Return the exact preplanned obligation count for an epoch."""
+    def _effective_expected_receipts(
+        self,
+        epoch_number: int,
+        key: Tuple[str, int],
+        *,
+        expected_receipts: Optional[Dict[Tuple[str, int], int]] = None,
+        inflight_canaries: Optional[Dict[Tuple[str, int], int]] = None,
+    ) -> int:
+        """Return the exact preplanned obligation count for an epoch.
+
+        Planned 2+1 obligations are never weakened: the optional journal
+        snapshot only substitutes the map read at close time, and in-flight
+        canaries no longer reduce the expectation.
+        """
+        del inflight_canaries
         key = self._miner_model_key(key[0], key[1])
-        expected = self._epoch_close_value("_expected_receipts", {})
-        return max(0, expected.get(key, 0))
+        expected_map = (
+            self._epoch_close_value("_expected_receipts", {})
+            if expected_receipts is None
+            else expected_receipts
+        )
+        return max(0, expected_map.get(key, 0))
 
     @staticmethod
     def _canary_debt_key(key: Tuple[str, int]) -> str:
@@ -7492,6 +9067,8 @@ class ValidatorNeuron:
     def _register_canary_obligations(
         self,
         tests: Sequence[CanaryTest],
+        *,
+        epoch_number: Optional[int] = None,
     ) -> None:
         self._expected_receipts = {}
         self._expected_canary_obligations = {}
@@ -7526,6 +9103,53 @@ class ValidatorNeuron:
             self._expected_receipts[key] = len(inventory)
             if kind == "full" and key in self._full_context_debt:
                 test.is_full_context_debt = True
+        self._journal_planned_canary_obligations(tests, epoch_number)
+
+    def _journal_planned_canary_obligations(
+        self,
+        tests: Sequence[CanaryTest],
+        epoch_number: Optional[int],
+    ) -> None:
+        """Persist this plan's obligations so they survive a restart re-plan.
+
+        A validator restart mid-epoch re-plans the epoch under a fresh
+        secret salt; signed receipts produced under the discarded plan
+        remain in the local store and on the miner.  Journaling every plan
+        lets the epoch close recognize such a receipt as validator-produced
+        residue instead of zeroing an honest entry as a forgery.
+        Best effort: on journal failure the close simply falls back to the
+        active-plan-only view (the pre-journal behavior).
+        """
+
+        db = getattr(self, "_db", None)
+        recorder = getattr(db, "record_planned_canary_obligations", None)
+        if epoch_number is None or not callable(recorder):
+            return
+        try:
+            recorder(
+                int(epoch_number),
+                [
+                    {
+                        "obligation_id": str(test.obligation_id),
+                        "miner_address": str(test.miner_address).lower(),
+                        "model_index": int(test.model_index),
+                        "kind": (
+                            "full"
+                            if test.test_type == "full_context"
+                            else "low"
+                        ),
+                        "target_prompt_tokens": int(
+                            test.target_prompt_tokens
+                        ),
+                    }
+                    for test in tests
+                ],
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Planned canary obligation journal failed for epoch "
+                f"{epoch_number}: {exc}"
+            )
 
     @staticmethod
     def _receipt_completes_canary_obligation(
@@ -7572,7 +9196,6 @@ class ValidatorNeuron:
         expected: Mapping[bytes, Tuple[str, int]],
     ) -> Set[bytes]:
         completed: Set[bytes] = set()
-        duplicated: Set[bytes] = set()
         for receipt in own_receipts:
             obligation_id = bytes(
                 getattr(receipt, "canary_obligation_id", b"") or b""
@@ -7581,7 +9204,12 @@ class ValidatorNeuron:
             if item is None:
                 continue
             if obligation_id in completed:
-                duplicated.add(obligation_id)
+                # A surplus receipt for an already-completed obligation is
+                # benign validator-produced residue (retry/dispatch
+                # duplication across a mid-epoch roll or restart).  It must
+                # never un-complete verified work; the receipt-integrity
+                # check in scoring separately zeroes receipts whose
+                # geometry does not match any scheduled test.
                 continue
             if self._receipt_completes_canary_obligation(
                 receipt,
@@ -7589,7 +9217,7 @@ class ValidatorNeuron:
                 item,
             ):
                 completed.add(obligation_id)
-        return completed.difference(duplicated)
+        return completed
 
     def _busy_evidence_covers_full_obligations(
         self,
@@ -7610,6 +9238,22 @@ class ValidatorNeuron:
             ) is not None
             and interval[1] > interval[0]
         ]
+        # The validator's OWN canary executions occupy the miner too - the
+        # bracket spans inference plus the trailing proof/replay exchange,
+        # which holds a mesh's exclusive replay window for minutes. A full
+        # canary that 503s against the validator's own concurrent work must
+        # be excused by this record: on a network without organic traffic
+        # the receipt-overlap evidence alone can never exist, and the miner
+        # was punished for the validator's own load. Not gameable: the record
+        # is validator-internal ground truth.
+        now = time.time()
+        observed.extend(
+            (start, end if end > 0.0 else now)
+            for start, end in getattr(self, "_own_canary_activity", {}).get(
+                key, []
+            )
+            if (end if end > 0.0 else now) > start
+        )
         if not observed:
             return False
         records = self._epoch_close_value(
@@ -7742,6 +9386,10 @@ class ValidatorNeuron:
 
     @staticmethod
     def _is_http_503(exc: BaseException) -> bool:
+        from neurons.mesh_verify import MeshCanaryTransportError
+
+        if isinstance(exc, MeshCanaryTransportError):
+            return exc.status_code == 503
         if not isinstance(exc, httpx.HTTPStatusError):
             return False
         response = getattr(exc, "response", None)
@@ -7822,6 +9470,670 @@ class ValidatorNeuron:
         return runnable
 
     @staticmethod
+    def _mesh_snapshot_cache_key(
+        miner_address: str,
+        model_index: int,
+        epoch_number: int,
+    ) -> Tuple[str, int, int]:
+        return (str(miner_address).lower(), int(model_index), int(epoch_number))
+
+    def _mesh_snapshot_trust_anchors(
+        self,
+        miner: ActiveMiner,
+        epoch_number: int,
+    ) -> MeshSnapshotTrustAnchors:
+        """Build snapshot trust anchors exclusively from validator state.
+
+        Coordinator responses are deliberately absent from this method.  The
+        chain-approved MinerRegistry entry supplies coordinator/model-slot
+        identity, the metagraph supplies the hotkey, ModelRegistry supplies
+        model commitments, and the policy is a local protocol constant.
+        """
+
+        if not _is_mesh_runtime(miner):
+            raise ValueError("snapshot trust anchors require a mesh miner")
+
+        profile = get_mesh_model_scoring_profile(miner.model_id, miner.quant)
+        if profile is None:
+            raise ValueError("mesh model/quant pair is not approved")
+
+        # The exact chain specs live in _on_chain_model_spec_cache (filled at
+        # startup and on registry refresh); _model_spec_cache is a legacy dict
+        # nothing writes, so reading it here made every proxy-requested re-pin
+        # fail with "chain ModelSpec is unavailable" and left relaunched
+        # meshes unroutable until the next epoch boundary.
+        model_spec = getattr(self, "_on_chain_model_spec_cache", {}).get(
+            miner.model_id
+        ) or self._model_spec_cache.get(miner.model_id)
+        if model_spec is None:
+            # A model registered on chain AFTER this process started has no
+            # cached spec yet. Fetch it on demand —
+            # the chain is the source of truth the cache mirrors anyway.
+            client = getattr(self, "_model_client", None)
+            if client is not None:
+                try:
+                    model_spec = client.get_on_chain_model_spec(
+                        miner.model_id
+                    )
+                except Exception:
+                    model_spec = None
+                if model_spec is not None:
+                    self._on_chain_model_spec_cache[miner.model_id] = (
+                        model_spec
+                    )
+        if model_spec is None:
+            raise ValueError("chain ModelSpec is unavailable")
+        if str(getattr(model_spec, "model_id", "")) != miner.model_id:
+            raise ValueError("chain ModelSpec model_id does not match MinerRegistry")
+        chain_quantization_scheme = str(
+            getattr(model_spec, "quant_mode", "") or ""
+        ).strip().lower()
+        expected_quantization_scheme = "gguf_" + profile.gguf_scheme.lower()
+        if chain_quantization_scheme != expected_quantization_scheme:
+            raise ValueError(
+                "chain ModelSpec quant_mode does not match the approved GGUF profile"
+            )
+
+        uid = self._db.get_uid(miner.address)
+        if type(uid) is not int or uid < 0:
+            raise ValueError("coordinator UID is unavailable")
+        hotkey = str(getattr(miner, "hotkey_ss58", "") or "")
+        if not hotkey:
+            raise ValueError("coordinator hotkey is unavailable")
+        max_context_len = getattr(miner, "max_context_len", 0)
+        if (
+            type(max_context_len) is not int
+            or not 1 <= max_context_len < 2**32
+        ):
+            raise ValueError(
+                "MinerRegistry max_context_len must be a positive uint32 integer"
+            )
+
+        coordinator = MeshCoordinatorIdentity(
+            chain_id=int(self.config.chain_id),
+            netuid=int(self.config.netuid),
+            coordinator_uid=uid,
+            coordinator_hotkey=hotkey,
+            coordinator_evm_address=str(miner.address).lower(),
+            model_index=int(miner.model_index),
+        )
+        model = MeshModelAnchors(
+            model_id=miner.model_id,
+            model_package_hash=_required_mesh_chain_digest(
+                getattr(model_spec, "weight_file_hash", b""),
+                field_name="weight_file_hash",
+            ),
+            model_tensor_manifest_root=_required_mesh_chain_digest(
+                getattr(model_spec, "weight_merkle_root", b""),
+                field_name="weight_merkle_root",
+            ),
+            tokenizer_hash=_required_mesh_chain_digest(
+                getattr(model_spec, "tokenizer_hash", b""),
+                field_name="tokenizer_hash",
+            ),
+            total_layers=int(getattr(model_spec, "num_layers", 0) or 0),
+            max_context_len=max_context_len,
+            # MinerRegistry independently carries the runtime marker
+            # (gguf_mesh_*).  The signed snapshot binds the exact chain
+            # ModelSpec quant_mode emitted by the GGUF model-spec builder.
+            quantization_scheme=chain_quantization_scheme,
+            activation_dtype=MESH_ACTIVATION_DTYPE,
+        )
+        policy = _canonical_mesh_verification_policy()
+        anchors = MeshSnapshotTrustAnchors(
+            epoch=int(epoch_number),
+            coordinator=coordinator,
+            model=model,
+            policy=policy,
+        )
+        anchors.validate()
+        return anchors
+
+    def _sync_probation_tracker_from_db(self) -> None:
+        """Pull authoritative probation rows into the in-memory tracker.
+
+        The database carries probation across re-registration, including onto
+        a brand-new slot the tracker has never seen, so the tracker has to
+        follow it rather than only learn about probation from live events.
+        Entries the database does not mark are left alone: only rows it
+        actively reports as probated are pushed in, so a tracker row awaiting
+        its own reconciliation is not cleared out from under it.
+        """
+
+        tracker = getattr(self, "_probation_tracker", None)
+        if tracker is None:
+            return
+        reconcile = getattr(tracker, "reconcile_probation", None)
+        if not callable(reconcile):
+            return
+        get_entries = getattr(self._db, "get_active_entries", None)
+        if not callable(get_entries):
+            return
+        try:
+            entries = get_entries()
+        except Exception as exc:
+            bt.logging.debug(f"Probation sync skipped: {exc}")
+            return
+        for entry in entries:
+            entered = entry.get("probation_entered_epoch")
+            key = self._miner_model_key(
+                str(entry.get("address", "")), int(entry.get("model_index", 0)),
+            )
+            if entered is None:
+                # The row EXISTS with probation cleared — an EXPLICIT
+                # database state (availability clear on re-registration),
+                # not an absence. The DB is the authority for explicit
+                # clears, so the tracker row drops REGARDLESS of its local
+                # cause label: a restart or legacy load can mislabel a
+                # tracker row for_cause, and gating this drop on the local
+                # label wedges the miner in a ghost probation with no DB
+                # row left to exit through. Fail-closed retention applies
+                # only to rows the DB does not mention at all (this loop
+                # never touches those). The capacity lane's own guard is
+                # its persisted window history, which re-gates a
+                # still-oversubscribed slot on the next windows no matter
+                # what happens here.
+                drop = getattr(tracker, "reconcile_not_on_probation", None)
+                if callable(drop) and tracker.is_on_probation(key):
+                    drop(key)
+                    bt.logging.info(
+                        f"Probation dropped for {key[0][:10]} idx={key[1]}: "
+                        "database shows an explicit clear"
+                    )
+                continue
+            if tracker.is_on_probation(key):
+                continue
+            _db_source = str(entry.get("probation_source") or "")
+            reconcile(
+                key,
+                entered_at_epoch=int(entered),
+                consecutive_passes=int(
+                    entry.get("probation_consecutive_passes", 0) or 0
+                ),
+                endpoint=str(entry.get("endpoint", "") or ""),
+                # earned_availability restores as availability; every other
+                # source (earned/inherited for_cause, legacy NULL) stays
+                # for_cause, fail-closed.
+                cause=(
+                    "availability"
+                    if _db_source.endswith("availability")
+                    else "for_cause"
+                ),
+            )
+            bt.logging.info(
+                f"Probation tracked for {key[0][:10]} idx={key[1]} "
+                f"from database state (entered epoch {int(entered)})"
+            )
+
+    def _refresh_mesh_verification_snapshots(
+        self,
+        miners: List[ActiveMiner],
+        epoch_number: int,
+        *,
+        boundary_grace_s: float = 150.0,
+        retry_sleep_s: float = 15.0,
+        allow_mesh_change: bool = False,
+    ) -> List[ActiveMiner]:
+        """Pin signed snapshots and exclude every untrusted mesh entry.
+
+        The epoch boundary is inherently racy: a mesh re-signs its snapshot
+        only after OBSERVING the epoch flip, while this refresh runs at the
+        epoch's first block. An epoch-binding mismatch therefore retries
+        within a bounded grace window (observed: a healthy mesh was
+        excluded for a full epoch because its rotation landed ~60s after
+        the first-block pin). Transient transport failures retry inside
+        the same window: a coordinator busy enough to stall the snapshot
+        route (while /health stays sub-second) presents as a fetch
+        timeout, and one timed-out attempt cost glm two boundary pins. A genuinely dead manager
+        keeps failing for the whole window and is then excluded — the
+        grace bounds tolerance, it never masks death. Every definitive
+        verification failure excludes immediately.
+        """
+
+        # An epoch never reuses a previous epoch's coordinator view.  Retain
+        # nothing here even if discovery falls back to prior miner endpoints.
+        self._mesh_snapshot_cache = {}
+        accepted: List[ActiveMiner] = []
+        rejected = 0
+        deadline = time.monotonic() + max(0.0, boundary_grace_s)
+        # Superseded registrations (same address+model_id at a lower index
+        # than the newest) are never the serving registration - their
+        # successor is. Chasing their dead endpoints here cost every boot
+        # minutes of timeout-retry corridor and every epoch a round of
+        # exclusion warnings. Same stable index rule as
+        # the miner-debug export; the stale on-chain leases expire on
+        # their own.
+        # Mesh (gguf) lane only - the vLLM lane legitimately serves one
+        # model on several concurrent registrations.
+        latest_by_model: Dict[Tuple[str, str], int] = {}
+        for miner in miners:
+            if not str(getattr(miner, "quant", "") or "").startswith("gguf"):
+                continue
+            key_lm = (str(miner.address).lower(), str(miner.model_id))
+            if int(miner.model_index) > latest_by_model.get(key_lm, -1):
+                latest_by_model[key_lm] = int(miner.model_index)
+        # A recently-scoring entry is serving, whatever its registration
+        # order (the same model may scale across concurrent registrations) -
+        # always verify it.
+        try:
+            serving_exempt = self._db.recently_scored_mesh_keys(
+                int(epoch_number) - 2
+            )
+        except Exception:
+            serving_exempt = set()
+        superseded = [
+            miner for miner in miners
+            if int(miner.model_index) < latest_by_model.get(
+                (str(miner.address).lower(), str(miner.model_id)), -1
+            )
+            and (str(miner.address).lower(), int(miner.model_index))
+            not in serving_exempt
+        ]
+        if superseded:
+            bt.logging.info(
+                f"Skipping snapshot verification for {len(superseded)} "
+                "superseded registration(s): "
+                + ", ".join(
+                    f"model_index={m.model_index}"
+                    f"->{latest_by_model[(str(m.address).lower(), str(m.model_id))]}"
+                    for m in superseded
+                )
+            )
+        _skip_ids = {id(m) for m in superseded}
+        pending = [miner for miner in miners if id(miner) not in _skip_ids]
+        while pending:
+            racing: List[ActiveMiner] = []
+            for miner in pending:
+                if not _is_mesh_runtime(miner):
+                    accepted.append(miner)
+                    continue
+                key = self._mesh_snapshot_cache_key(
+                    miner.address, miner.model_index, epoch_number,
+                )
+                try:
+                    anchors = self._mesh_snapshot_trust_anchors(miner, epoch_number)
+                    snapshot = discover_and_pin_mesh_verification_snapshot(
+                        coordinator_endpoint=miner.endpoint,
+                        validator_hotkey_ss58=self._validator_hotkey_ss58,
+                        validator_hotkey_seed=self._validator_private_key,
+                        trust_anchors=anchors,
+                        state_db=self._db,
+                        timeout=MESH_SNAPSHOT_FETCH_TIMEOUT_S,
+                        allow_mesh_change=allow_mesh_change,
+                    )
+                except Exception as exc:
+                    epoch_race = "does not match expected epoch" in str(exc)
+                    transient = is_transient_snapshot_fetch_error(exc)
+                    if (
+                        (epoch_race or transient)
+                        and time.monotonic() + retry_sleep_s <= deadline
+                    ):
+                        reason = (
+                            "still binds the previous epoch"
+                            if epoch_race
+                            else f"fetch failed transiently ({exc})"
+                        )
+                        bt.logging.info(
+                            f"Mesh snapshot for {miner.address[:10]} "
+                            f"model_index={miner.model_index} {reason} — "
+                            f"boundary-grace retry in {retry_sleep_s:.0f}s"
+                        )
+                        racing.append(miner)
+                        continue
+                    rejected += 1
+                    bt.logging.warning(
+                        f"Mesh snapshot verification failed for {miner.address[:10]} "
+                        f"model_index={miner.model_index}: {exc} — excluding from epoch"
+                    )
+                    # An excluded slot cannot receive its planned canaries:
+                    # those obligations become unserviceable by the
+                    # validator's own decision, and counting them missing at
+                    # close turns a boundary pin race into probation for a
+                    # healthy mesh (a fresh registration can miss its first
+                    # pin fetch through no fault of its serving). Neutralize
+                    # the slot for this epoch — exclusion already costs the
+                    # miner its score, and a mesh that never presents a
+                    # valid snapshot earns zero forever, so neutrality here
+                    # is not an eligibility path.
+                    self._validator_canary_failures.add(
+                        self._miner_model_key(
+                            miner.address, miner.model_index
+                        )
+                    )
+                    # Exclusion must not be terminal for the epoch: record
+                    # the slot so the periodic retry re-attempts the pin
+                    # (a transient 503 or a coordinator mid-rebind after a
+                    # registration refresh used to cost up to a full epoch
+                    # of outage with no self-heal signal).
+                    try:
+                        self._mesh_excluded_this_epoch[
+                            (miner.address.lower(), int(miner.model_index))
+                        ] = str(exc)[:120]
+                    except AttributeError:
+                        self._mesh_excluded_this_epoch = {
+                            (miner.address.lower(), int(miner.model_index)):
+                            str(exc)[:120]
+                        }
+                    try:
+                        self._db.mark_entry_inactive(miner.address, miner.model_index)
+                    except Exception as db_exc:
+                        bt.logging.debug(
+                            f"Failed to mark rejected mesh entry inactive: {db_exc}"
+                        )
+                    continue
+                self._mesh_snapshot_cache[key] = snapshot
+                accepted.append(miner)
+                bt.logging.info(
+                    f"Pinned mesh verification snapshot for {miner.address[:10]} "
+                    f"model_index={miner.model_index} epoch={epoch_number} "
+                    f"generation={snapshot.generation}"
+                )
+            if not racing:
+                break
+            time.sleep(retry_sleep_s)
+            pending = racing
+
+        if rejected:
+            bt.logging.info(
+                f"Mesh snapshot verification: {len(accepted)}/{len(miners)} "
+                f"total entries accepted, {rejected} mesh entries excluded"
+            )
+        return accepted
+
+    def _refresh_epoch_model_specs(self, unique_models) -> None:
+        """Refresh cached ModelSpecs for this epoch's unique models.
+
+        Extracted verbatim from ``_do_epoch_setup`` so on-demand tooling
+        (scripts/vali_canary_drill.py) runs the identical epoch-setup
+        step; behavior is unchanged.
+        """
+        for model_id in unique_models:
+            try:
+                exact_reader = getattr(
+                    self._model_client, "get_on_chain_model_spec", None
+                )
+                if callable(exact_reader):
+                    from verallm.chain.types import on_chain_to_model_spec
+
+                    exact_spec = exact_reader(model_id)
+                    if exact_spec is None:
+                        self._on_chain_model_spec_cache.pop(model_id, None)
+                        spec = None
+                    else:
+                        self._on_chain_model_spec_cache[model_id] = exact_spec
+                        spec = on_chain_to_model_spec(exact_spec)
+                else:
+                    spec = self._model_client.get_model_spec(model_id)
+                if spec is not None:
+                    self._model_spec_cache[model_id] = spec
+                    bt.logging.info(f"Cached ModelSpec for {model_id}")
+                    # Tokenizer drift check: compare local tokenizer hash to
+                    # the on-chain anchor.  On mismatch, mark as drifted —
+                    # canary path will short-circuit and attribute correctly
+                    # without penalizing the miner.
+                    self._check_tokenizer_drift(model_id, spec)
+            except Exception as e:
+                if model_id in self._model_spec_cache:
+                    bt.logging.warning(f"Failed to refresh ModelSpec for {model_id}: {e} — using previous epoch's cache")
+                else:
+                    bt.logging.warning(f"Failed to fetch ModelSpec for {model_id}: {e} — no cache available")
+
+    def _plan_epoch_canaries(
+        self,
+        epoch_number: int,
+        epoch_start_block: int,
+    ) -> List[CanaryTest]:
+        """Build the signed-policy scheduler and plan this epoch's canaries.
+
+        Extracted verbatim from ``_do_epoch_setup`` so on-demand tooling
+        (scripts/vali_canary_drill.py) plans through the identical
+        production call path; behavior is unchanged.
+        """
+        # Reset per-epoch attempt state. Exact obligations are registered after
+        # the scheduler has produced the signed-policy plan.
+        self._expected_receipts = {}
+        self._expected_canary_obligations = {}
+        # Do not clear _validator_canary_failures here. Snapshot verification
+        # runs before planning and may already have marked an excluded slot as
+        # validator-neutral for this epoch. Clearing the set here would turn
+        # the validator's own exclusion into missing miner obligations.
+        self._canary_penalized_keys = set()
+        self._shared_hard_proof_verdicts = {}
+        with self._shared_hard_prefetch_lock:
+            self._shared_hard_prefetch_results = {}
+            self._shared_hard_prefetch_inflight = set()
+            self._shared_hard_prefetch_waves = set()
+        self._busy_skips = {}
+        self._busy_skip_probations = {}
+        # Fresh per-epoch own-activity record: stale intervals from a past
+        # epoch must never excuse a future busy window.
+        self._own_canary_activity = {}
+        self._canary_errors: Dict[Tuple[str, int], int] = {}
+        self._canary_error_times: Dict[Tuple[str, int], List[int]] = {}
+
+        # Check if TEE is enabled on the subnet (feature flag from SubnetConfig)
+        _subnet_tee_enabled = False
+        if self._subnet_config_client is not None:
+            tee_refresh_started = time.monotonic()
+            try:
+                _subnet_tee_enabled = self._subnet_config_client.is_tee_enabled_on_subnet()
+            except Exception:
+                pass
+            tee_refresh_elapsed = time.monotonic() - tee_refresh_started
+            if tee_refresh_elapsed > 12.0:
+                bt.logging.warning(
+                    "Epoch setup TEE feature lookup exceeded one block: "
+                    f"{tee_refresh_elapsed:.1f}s"
+                )
+        if not _subnet_tee_enabled:
+            # TEE disabled on subnet — treat all miners as non-TEE (use ZK proofs)
+            for miner in self._epoch_miners:
+                if getattr(miner, "tee_enabled", False):
+                    bt.logging.info(
+                        f"TEE disabled on subnet — forcing ZK mode for {miner.address[:10]}"
+                    )
+                    miner.tee_enabled = False
+                    miner.tee_platform = ""
+
+        # Plan the exact authority-signed inventory. An unsigned hosted config
+        # must not silently inflate the official canary load or scoring budget.
+        # The built-in compatibility path retains the protocol's 2+1 floor.
+        canary_policy = getattr(self, "_proof_v3_canary_policy", None)
+        hard_audit_enabled = _proof_v3_hard_auditor_active(
+            self.config,
+            self._validator_hotkey_ss58,
+        )
+        low_count, advertised_light_count, full_count = _effective_canary_counts(
+            self.config,
+            canary_policy,
+            hard_audit_enabled=hard_audit_enabled,
+        )
+        if (
+            self._configured_proof_v3_verdict_source() == "verify"
+            and getattr(
+                self.config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+            and not hard_audit_enabled
+        ):
+            bt.logging.warning(
+                "This validator is in verify mode but is not the active "
+                "subnet-configured hard auditor; scheduling light canaries "
+                "and independently verifying retained hard bundles"
+            )
+        # Candidate timing covers the complete epoch. A hard request that has
+        # already started may finish across a scoring boundary; unfinished
+        # validator work is neutral for the closed epoch, never a miner miss.
+        low_completion_reserve_blocks = 1
+        full_completion_reserve_blocks = 1
+        hard_audit_drought_epochs = (
+            int(canary_policy.max_hard_audit_drought_epochs)
+            if canary_policy is not None
+            else 2
+        )
+        hard_audit_due_entries = (
+            self._hard_audit_due_entries(
+                epoch_number=epoch_number,
+                drought_epochs=hard_audit_drought_epochs,
+            )
+            if hard_audit_enabled
+            else set()
+        )
+        self._canary_scheduler = CanaryScheduler(
+            epoch_number=epoch_number,
+            epoch_start_block=epoch_start_block,
+            epoch_blocks=self.config.epoch_blocks,
+            validator_hotkey=self._wallet.hotkey.ss58_address,
+            validator_seed=self._validator_private_key,
+            small_count=low_count,
+            advertised_context_light_count=advertised_light_count,
+            full_context_count=full_count,
+            proof_sample_rate=1.0,
+            probation_entries={
+                (addr, idx)
+                for addr, indices in self._db.get_probation_addresses().items()
+                for idx in indices
+            },
+            low_context_min_tokens=(
+                canary_policy.low_context_min_tokens
+                if canary_policy is not None
+                else 512
+            ),
+            low_context_max_tokens=(
+                canary_policy.low_context_max_tokens
+                if canary_policy is not None
+                else 2_048
+            ),
+            low_context_max_decode_tokens=(
+                canary_policy.low_context_max_decode_tokens
+                if canary_policy is not None
+                else 192
+            ),
+            full_context_decode_reserve_tokens=(
+                canary_policy.full_context_decode_reserve_tokens
+                if canary_policy is not None
+                else 256
+            ),
+            full_context_max_decode_tokens=(
+                canary_policy.full_context_max_decode_tokens
+                if canary_policy is not None
+                else 96
+            ),
+            full_context_max_attempts=(
+                canary_policy.full_context_max_attempts
+                if canary_policy is not None
+                else 4
+            ),
+            hard_candidate_target_per_epoch=(
+                canary_policy.hard_auditor_candidate_target_per_epoch
+                if canary_policy is not None
+                else 2
+            ),
+            hard_candidate_bps=(
+                canary_policy.hard_auditor_candidate_hard_bps
+                if canary_policy is not None
+                else 5_000
+            ),
+            advertised_context_target_bps=(
+                canary_policy.advertised_context_target_bps
+                if canary_policy is not None
+                else 9_000
+            ),
+            # v6 policy schema (main): the owner_full_context_* fields carry
+            # the signed min-heavy sizing for BOTH lanes; the mesh lane
+            # consumes the same values through its own geometric-band sizer.
+            mesh_full_min_prompt_bps=(
+                canary_policy.owner_full_context_min_prompt_bps
+                if canary_policy is not None
+                else 1_000
+            ),
+            mesh_full_max_draw_bps=(
+                canary_policy.owner_full_context_max_draw_bps
+                if canary_policy is not None
+                else 500
+            ),
+            owner_full_min_prompt_bps=(
+                canary_policy.owner_full_context_min_prompt_bps
+                if canary_policy is not None
+                else 1_000
+            ),
+            owner_full_max_draw_bps=(
+                canary_policy.owner_full_context_max_draw_bps
+                if canary_policy is not None
+                else 500
+            ),
+            owner_context_sizing_abi_id=(
+                canary_policy.owner_context_sizing_abi_id
+                if canary_policy is not None
+                else CANARY_OWNER_CONTEXT_SIZING_ABI_V3
+            ),
+            hard_decode_anchor_bps=(
+                canary_policy.hard_decode_anchor_bps
+                if canary_policy is not None
+                else 2_500
+            ),
+            hard_decode_tail_bps=(
+                canary_policy.hard_decode_tail_bps
+                if canary_policy is not None
+                else 1_000
+            ),
+            late_decode_min_output_bps=(
+                canary_policy.late_decode_min_output_bps
+                if canary_policy is not None
+                else 9_000
+            ),
+            repeat_prefix_target_bps=(
+                canary_policy.repeat_prefix_target_bps
+                if canary_policy is not None
+                else 5_000
+            ),
+            repeat_prefix_min_tokens=(
+                canary_policy.repeat_prefix_min_tokens
+                if canary_policy is not None
+                else 256
+            ),
+            hard_audit_enabled=hard_audit_enabled,
+            hard_audit_due_entries=hard_audit_due_entries,
+            low_completion_reserve_blocks=(
+                low_completion_reserve_blocks
+            ),
+            full_completion_reserve_blocks=(
+                full_completion_reserve_blocks
+            ),
+            hard_context_limits_by_model={
+                str(model_id): int(
+                    release.qualified_profile.profile.max_verified_context_tokens
+                )
+                for model_id, release in getattr(
+                    self,
+                    "_proof_v3_releases",
+                    {},
+                ).items()
+            },
+            hard_decode_limits_by_model={
+                str(model_id): int(model_policy.max_hard_audit_decode_tokens)
+                for model_id in getattr(
+                    self,
+                    "_proof_v3_releases",
+                    {},
+                )
+                for model_policy in (
+                    (
+                        canary_policy.model_policy(str(model_id))
+                        if canary_policy is not None
+                        else None
+                    ),
+                )
+                if model_policy is not None
+            },
+        )
+        tests = self._canary_scheduler.plan_epoch(self._epoch_miners)
+        self._register_canary_obligations(
+            tests,
+            epoch_number=int(self._canary_scheduler.epoch_number),
+        )
+        return tests
     def _active_miner_from_shared_entry(entry) -> ActiveMiner:
         """Restore a validator-owned fallback entry without dropping identity."""
 
@@ -7928,6 +10240,137 @@ class ValidatorNeuron:
             )
         return decayed_count
 
+    def _authenticated_mesh_enabled(self) -> bool:
+        """Resolve mainnet mesh admission from the owner-controlled contract."""
+
+        if not _is_verathos_mainnet(
+            netuid=getattr(self.config, "netuid", 0),
+            chain_id=getattr(self.config, "chain_id", 0),
+        ):
+            return True
+        client = getattr(self, "_subnet_config_client", None)
+        if client is None:
+            return False
+        try:
+            return bool(client.is_mesh_enabled_on_subnet())
+        except Exception as exc:
+            bt.logging.warning(
+                "Authenticated mesh admission read failed; mainnet mesh stays "
+                f"disabled: {exc}"
+            )
+            return False
+
+    def _apply_authenticated_mesh_policy(
+        self,
+        miners: Sequence[ActiveMiner],
+        *,
+        epoch_number: int,
+        preserve_existing: bool = False,
+    ) -> list[ActiveMiner]:
+        """Remove mainnet mesh entries before probes, scoring, and publication.
+
+        Excluded entries remain visible in validator diagnostics, but their
+        stored and in-memory EMA is zeroed immediately so the first release
+        cannot inherit or emit a stale mesh weight.
+        """
+
+        reasons: Dict[Tuple[str, int], str] = (
+            dict(getattr(self, "_endpoint_policy_gate_reasons", {}) or {})
+            if preserve_existing
+            else {}
+        )
+        excluded = (
+            list(getattr(self, "_endpoint_policy_excluded_miners", ()) or ())
+            if preserve_existing
+            else []
+        )
+
+        # Remove the previous flag-derived exclusions before evaluating the
+        # current authenticated value. Endpoint-policy exclusions use other
+        # reason strings and remain intact.
+        flag_keys = {
+            key for key, reason in reasons.items()
+            if reason == _MESH_MAINNET_DISABLED_REASON
+        }
+        if flag_keys:
+            excluded = [
+                miner for miner in excluded
+                if self._miner_model_key(miner.address, miner.model_index)
+                not in flag_keys
+            ]
+            for key in flag_keys:
+                reasons.pop(key, None)
+
+        if self._authenticated_mesh_enabled():
+            self._endpoint_policy_gate_reasons = reasons
+            self._endpoint_policy_excluded_miners = tuple(excluded)
+            return list(miners)
+
+        persisted_by_key = {
+            (str(row["address"]).lower(), int(row["model_index"])): row
+            for row in self._db._get_all_entries()
+        }
+        existing_excluded_keys = {
+            self._miner_model_key(miner.address, miner.model_index)
+            for miner in excluded
+        }
+        eligible: list[ActiveMiner] = []
+        disabled = 0
+        for miner in miners:
+            if not _is_mesh_runtime(miner):
+                eligible.append(miner)
+                continue
+            key = self._miner_model_key(miner.address, miner.model_index)
+            persisted = persisted_by_key.get(key)
+            self._restore_endpoint_policy_score_state(miner, persisted)
+            self._db.upsert_entry(
+                address=miner.address,
+                model_index=miner.model_index,
+                model_id=miner.model_id,
+                endpoint=miner.endpoint,
+                quant=miner.quant,
+                max_context_len=miner.max_context_len,
+                epoch=epoch_number,
+                hotkey_ss58=getattr(miner, "hotkey_ss58", ""),
+                coldkey_ss58=getattr(miner, "coldkey_ss58", ""),
+            )
+            miner_uid = getattr(miner, "bittensor_uid", None)
+            if miner_uid is not None:
+                self._db.set_uid(miner.address, int(miner_uid))
+            total_epochs = int((persisted or {}).get("total_epochs") or 0)
+            scored_epochs = int((persisted or {}).get("scored_epochs") or 0)
+            self._db.save_score(
+                miner.address,
+                miner.model_index,
+                0.0,
+                total_epochs,
+                scored_epochs,
+            )
+            uid = getattr(miner, "bittensor_uid", None)
+            if uid is None:
+                uid = self._db.get_uid(miner.address)
+            if uid is not None:
+                miner_state = self.scorer.states.get(int(uid))
+                if miner_state is not None:
+                    score_entry = miner_state.entries.get(int(miner.model_index))
+                    if score_entry is not None:
+                        score_entry.ema_score = 0.0
+            self._db.mark_entry_inactive(miner.address, miner.model_index)
+            reasons[key] = _MESH_MAINNET_DISABLED_REASON
+            if key not in existing_excluded_keys:
+                excluded.append(miner)
+                existing_excluded_keys.add(key)
+            disabled += 1
+
+        self._endpoint_policy_gate_reasons = reasons
+        self._endpoint_policy_excluded_miners = tuple(excluded)
+        if disabled:
+            bt.logging.info(
+                f"Authenticated mesh policy: excluded {disabled} mainnet "
+                "mesh entries with score and emission fixed at zero"
+            )
+        return eligible
+
     def _apply_mainnet_endpoint_policy(
         self,
         miners: Sequence[ActiveMiner],
@@ -8006,6 +10449,87 @@ class ValidatorNeuron:
             )
         return eligible_miners
 
+    def _apply_mainnet_mesh_backend_policy(
+        self,
+        miners: Sequence[ActiveMiner],
+        *,
+        epoch_number: int,
+    ) -> list[ActiveMiner]:
+        """Exclude non-CUDA mainnet mesh rosters before any routable publish."""
+
+        reasons = dict(getattr(self, "_endpoint_policy_gate_reasons", {}) or {})
+        excluded = list(
+            getattr(self, "_endpoint_policy_excluded_miners", ()) or ()
+        )
+        old_backend_keys = {
+            key
+            for key, reason in reasons.items()
+            if str(reason).startswith(_MESH_MAINNET_BACKEND_REASON_PREFIX)
+        }
+        if old_backend_keys:
+            excluded = [
+                miner
+                for miner in excluded
+                if self._miner_model_key(miner.address, miner.model_index)
+                not in old_backend_keys
+            ]
+            for key in old_backend_keys:
+                reasons.pop(key, None)
+
+        if not _is_verathos_mainnet(
+            netuid=getattr(self.config, "netuid", 0),
+            chain_id=getattr(self.config, "chain_id", 0),
+        ):
+            self._endpoint_policy_gate_reasons = reasons
+            self._endpoint_policy_excluded_miners = tuple(excluded)
+            return list(miners)
+
+        existing_excluded_keys = {
+            self._miner_model_key(miner.address, miner.model_index)
+            for miner in excluded
+        }
+        eligible: list[ActiveMiner] = []
+        for miner in miners:
+            if not _is_mesh_runtime(miner):
+                eligible.append(miner)
+                continue
+            key = self._miner_model_key(miner.address, miner.model_index)
+            roster = self._stored_mesh_capacity_roster(
+                self._mesh_capacity_slot_id(miner)
+            )
+            reason = _mesh_mainnet_backend_gate_reason(
+                roster,
+                netuid=getattr(self.config, "netuid", 0),
+                chain_id=getattr(self.config, "chain_id", 0),
+            )
+            if not reason:
+                eligible.append(miner)
+                continue
+            reasons[key] = reason
+            if key not in existing_excluded_keys:
+                excluded.append(miner)
+                existing_excluded_keys.add(key)
+            self._db.upsert_entry(
+                address=miner.address,
+                model_index=miner.model_index,
+                model_id=miner.model_id,
+                endpoint=miner.endpoint,
+                quant=miner.quant,
+                max_context_len=miner.max_context_len,
+                epoch=epoch_number,
+                hotkey_ss58=getattr(miner, "hotkey_ss58", ""),
+                coldkey_ss58=getattr(miner, "coldkey_ss58", ""),
+            )
+            self._db.mark_entry_inactive(miner.address, miner.model_index)
+            bt.logging.info(
+                f"Mesh backend policy gate: {miner.address[:10]} "
+                f"model_index={miner.model_index} — {reason}"
+            )
+
+        self._endpoint_policy_gate_reasons = reasons
+        self._endpoint_policy_excluded_miners = tuple(excluded)
+        return eligible
+
     def _do_epoch_setup(self, epoch_start_block: int, epoch_number: int):
         """Heavy epoch setup — runs on a background executor thread."""
         t0 = time.monotonic()
@@ -8082,6 +10606,15 @@ class ValidatorNeuron:
             )
         )
 
+        # Mainnet mesh admission is owner-authenticated and defaults off.
+        # Apply it before touching miner-controlled endpoints or scheduling
+        # any work. Testnet and vLLM entries pass through unchanged.
+        self._epoch_miners = self._apply_authenticated_mesh_policy(
+            self._epoch_miners,
+            epoch_number=epoch_number,
+            preserve_existing=used_fallback,
+        )
+
         # Apply the same public-endpoint policy used by the production proxy
         # before TCP probes, identity challenges, canaries or capacity audits.
         # The URL is on-chain registry data, so the decision requires no miner
@@ -8089,7 +10622,7 @@ class ValidatorNeuron:
         self._epoch_miners = self._apply_mainnet_endpoint_policy(
             self._epoch_miners,
             epoch_number=epoch_number,
-            preserve_existing=used_fallback,
+            preserve_existing=True,
         )
 
         # ── Fast TCP pre-filter: skip dead endpoints entirely ─────────
@@ -8099,7 +10632,7 @@ class ValidatorNeuron:
         # spawning threads or opening TLS sessions.  This makes discovery
         # O(1) per dead entry instead of O(15s) — critical at scale where
         # there may be hundreds of stale entries.
-        #
+
         # Cache: endpoints that fail the TCP check are remembered for
         # the next `tcp_prefilter_ttl_epochs` epochs so we don't re-test
         # them every epoch (further reducing wasted effort).
@@ -8279,6 +10812,27 @@ class ValidatorNeuron:
             block_number=epoch_start_block,
             source="epoch_setup",
         )
+        # The roster fetch above supplies the authenticated backend inventory.
+        # Apply its mainnet-only gate before health probes, canaries, scoring, or
+        # shared-state publication. Testnet Metal behavior remains unchanged.
+        self._epoch_miners = self._apply_mainnet_mesh_backend_policy(
+            self._epoch_miners,
+            epoch_number=epoch_number,
+        )
+        self._store_capacity_audit_slot_snapshot(
+            [
+                (slot, None)
+                for slot in self._capacity_audit_selection_slots(
+                    self._epoch_miners
+                )
+            ],
+            block_number=epoch_start_block,
+            source="epoch_setup_backend_policy",
+        )
+        if not self._epoch_miners:
+            self._canary_scheduler = None
+            self._write_shared_state()
+            return
 
         # ── Fetch hardware metadata from miner /health (best-effort) ──
         hardware_failed, _hardware_stats = self._refresh_miner_hardware_batch(
@@ -8340,6 +10894,7 @@ class ValidatorNeuron:
                 compute_capability=miner.compute_capability,
                 gpu_uuids=miner.gpu_uuids,
             )
+        self._sync_probation_tracker_from_db()
         # Mark entries not seen this epoch as inactive
         deactivated = self._db.mark_unseen_inactive(epoch_number)
         if deactivated > 0:
@@ -8373,36 +10928,7 @@ class ValidatorNeuron:
         # successful fetch. This way, RPC 429 at epoch start doesn't leave
         # the entire epoch without specs.
         unique_models = {m.model_id for m in self._epoch_miners}
-        for model_id in unique_models:
-            try:
-                exact_reader = getattr(
-                    self._model_client, "get_on_chain_model_spec", None
-                )
-                if callable(exact_reader):
-                    from verallm.chain.types import on_chain_to_model_spec
-
-                    exact_spec = exact_reader(model_id)
-                    if exact_spec is None:
-                        self._on_chain_model_spec_cache.pop(model_id, None)
-                        spec = None
-                    else:
-                        self._on_chain_model_spec_cache[model_id] = exact_spec
-                        spec = on_chain_to_model_spec(exact_spec)
-                else:
-                    spec = self._model_client.get_model_spec(model_id)
-                if spec is not None:
-                    self._model_spec_cache[model_id] = spec
-                    bt.logging.info(f"Cached ModelSpec for {model_id}")
-                    # Tokenizer drift check: compare local tokenizer hash to
-                    # the on-chain anchor.  On mismatch, mark as drifted —
-                    # canary path will short-circuit and attribute correctly
-                    # without penalizing the miner.
-                    self._check_tokenizer_drift(model_id, spec)
-            except Exception as e:
-                if model_id in self._model_spec_cache:
-                    bt.logging.warning(f"Failed to refresh ModelSpec for {model_id}: {e} — using previous epoch's cache")
-                else:
-                    bt.logging.warning(f"Failed to fetch ModelSpec for {model_id}: {e} — no cache available")
+        self._refresh_epoch_model_specs(unique_models)
 
         artifact_refresh_started = time.monotonic()
         self._refresh_remote_proof_v2_manifests(unique_models)
@@ -8414,236 +10940,23 @@ class ValidatorNeuron:
                 f"{artifact_refresh_elapsed:.1f}s"
             )
 
-        # Reset per-epoch attempt state. Exact obligations are registered after
-        # the scheduler has produced the signed-policy plan.
-        self._expected_receipts = {}
-        self._expected_canary_obligations = {}
+        # A mesh is eligible for this epoch only after its coordinator-signed,
+        # endpoint-free snapshot has been authenticated against fresh
+        # MinerRegistry/metagraph identity and chain ModelSpec commitments.
+        # vLLM entries pass through unchanged.
+        # Start the epoch's validator-neutral set immediately before pinning.
+        # The planner deliberately preserves any exclusions recorded below.
         self._validator_canary_failures = set()
-        self._canary_penalized_keys = set()
-        self._shared_hard_proof_verdicts = {}
-        with self._shared_hard_prefetch_lock:
-            self._shared_hard_prefetch_results = {}
-            self._shared_hard_prefetch_inflight = set()
-            self._shared_hard_prefetch_waves = set()
-        self._busy_skips = {}
-        self._busy_skip_probations = {}
-        self._canary_errors: Dict[Tuple[str, int], int] = {}
-        self._canary_error_times: Dict[Tuple[str, int], List[int]] = {}
+        self._epoch_miners = self._refresh_mesh_verification_snapshots(
+            self._epoch_miners,
+            epoch_number,
+        )
+        if not self._epoch_miners:
+            self._canary_scheduler = None
+            self._write_shared_state()
+            return
 
-        # Check if TEE is enabled on the subnet (feature flag from SubnetConfig)
-        _subnet_tee_enabled = False
-        if self._subnet_config_client is not None:
-            tee_refresh_started = time.monotonic()
-            try:
-                _subnet_tee_enabled = self._subnet_config_client.is_tee_enabled_on_subnet()
-            except Exception:
-                pass
-            tee_refresh_elapsed = time.monotonic() - tee_refresh_started
-            if tee_refresh_elapsed > 12.0:
-                bt.logging.warning(
-                    "Epoch setup TEE feature lookup exceeded one block: "
-                    f"{tee_refresh_elapsed:.1f}s"
-                )
-        if not _subnet_tee_enabled:
-            # TEE disabled on subnet — treat all miners as non-TEE (use ZK proofs)
-            for miner in self._epoch_miners:
-                if getattr(miner, "tee_enabled", False):
-                    bt.logging.info(
-                        f"TEE disabled on subnet — forcing ZK mode for {miner.address[:10]}"
-                    )
-                    miner.tee_enabled = False
-                    miner.tee_platform = ""
-
-        # Plan the exact authority-signed inventory. An unsigned hosted config
-        # must not silently inflate the official canary load or scoring budget.
-        # The built-in compatibility path retains the protocol's 2+1 floor.
-        canary_policy = getattr(self, "_proof_v3_canary_policy", None)
-        hard_audit_enabled = _proof_v3_hard_auditor_active(
-            self.config,
-            self._validator_hotkey_ss58,
-        )
-        low_count, advertised_light_count, full_count = _effective_canary_counts(
-            self.config,
-            canary_policy,
-            hard_audit_enabled=hard_audit_enabled,
-        )
-        if (
-            self._configured_proof_v3_verdict_source() == "verify"
-            and getattr(
-                self.config,
-                "proof_v3_hard_auditor_policy_enabled",
-                False,
-            )
-            and not hard_audit_enabled
-        ):
-            bt.logging.warning(
-                "This validator is in verify mode but is not the active "
-                "subnet-configured hard auditor; scheduling light canaries "
-                "and independently verifying retained hard bundles"
-            )
-        # Candidate timing covers the complete epoch. A hard request that has
-        # already started may finish across a scoring boundary; unfinished
-        # validator work is neutral for the closed epoch, never a miner miss.
-        low_completion_reserve_blocks = 1
-        full_completion_reserve_blocks = 1
-        hard_audit_drought_epochs = (
-            int(canary_policy.max_hard_audit_drought_epochs)
-            if canary_policy is not None
-            else 2
-        )
-        hard_audit_due_entries = (
-            self._hard_audit_due_entries(
-                epoch_number=epoch_number,
-                drought_epochs=hard_audit_drought_epochs,
-            )
-            if hard_audit_enabled
-            else set()
-        )
-        self._canary_scheduler = CanaryScheduler(
-            epoch_number=epoch_number,
-            epoch_start_block=epoch_start_block,
-            epoch_blocks=self.config.epoch_blocks,
-            validator_hotkey=self._wallet.hotkey.ss58_address,
-            validator_seed=self._validator_private_key,
-            small_count=low_count,
-            advertised_context_light_count=advertised_light_count,
-            full_context_count=full_count,
-            proof_sample_rate=1.0,
-            probation_entries={
-                (addr, idx)
-                for addr, indices in self._db.get_probation_addresses().items()
-                for idx in indices
-            },
-            low_context_min_tokens=(
-                canary_policy.low_context_min_tokens
-                if canary_policy is not None
-                else 512
-            ),
-            low_context_max_tokens=(
-                canary_policy.low_context_max_tokens
-                if canary_policy is not None
-                else 2_048
-            ),
-            low_context_max_decode_tokens=(
-                canary_policy.low_context_max_decode_tokens
-                if canary_policy is not None
-                else 192
-            ),
-            full_context_decode_reserve_tokens=(
-                canary_policy.full_context_decode_reserve_tokens
-                if canary_policy is not None
-                else 256
-            ),
-            full_context_max_decode_tokens=(
-                canary_policy.full_context_max_decode_tokens
-                if canary_policy is not None
-                else 96
-            ),
-            full_context_max_attempts=(
-                canary_policy.full_context_max_attempts
-                if canary_policy is not None
-                else 4
-            ),
-            hard_candidate_target_per_epoch=(
-                canary_policy.hard_auditor_candidate_target_per_epoch
-                if canary_policy is not None
-                else 2
-            ),
-            hard_candidate_bps=(
-                canary_policy.hard_auditor_candidate_hard_bps
-                if canary_policy is not None
-                else 5_000
-            ),
-            advertised_context_target_bps=(
-                canary_policy.advertised_context_target_bps
-                if canary_policy is not None
-                else 9_000
-            ),
-            owner_full_min_prompt_bps=(
-                getattr(
-                    canary_policy,
-                    "owner_full_context_min_prompt_bps",
-                    1_000,
-                )
-                if canary_policy is not None
-                else 1_000
-            ),
-            owner_full_max_draw_bps=(
-                getattr(
-                    canary_policy,
-                    "owner_full_context_max_draw_bps",
-                    10_000,
-                )
-                if canary_policy is not None
-                else 10_000
-            ),
-            owner_context_sizing_abi_id=(
-                canary_policy.owner_context_sizing_abi_id
-                if canary_policy is not None
-                else CANARY_OWNER_CONTEXT_SIZING_ABI_V3
-            ),
-            hard_decode_anchor_bps=(
-                canary_policy.hard_decode_anchor_bps
-                if canary_policy is not None
-                else 2_500
-            ),
-            hard_decode_tail_bps=(
-                canary_policy.hard_decode_tail_bps
-                if canary_policy is not None
-                else 1_000
-            ),
-            late_decode_min_output_bps=(
-                canary_policy.late_decode_min_output_bps
-                if canary_policy is not None
-                else 9_000
-            ),
-            repeat_prefix_target_bps=(
-                canary_policy.repeat_prefix_target_bps
-                if canary_policy is not None
-                else 5_000
-            ),
-            repeat_prefix_min_tokens=(
-                canary_policy.repeat_prefix_min_tokens
-                if canary_policy is not None
-                else 256
-            ),
-            hard_audit_enabled=hard_audit_enabled,
-            hard_audit_due_entries=hard_audit_due_entries,
-            low_completion_reserve_blocks=(
-                low_completion_reserve_blocks
-            ),
-            full_completion_reserve_blocks=(
-                full_completion_reserve_blocks
-            ),
-            hard_context_limits_by_model={
-                str(model_id): int(
-                    release.qualified_profile.profile.max_verified_context_tokens
-                )
-                for model_id, release in getattr(
-                    self,
-                    "_proof_v3_releases",
-                    {},
-                ).items()
-            },
-            hard_decode_limits_by_model={
-                str(model_id): int(model_policy.max_hard_audit_decode_tokens)
-                for model_id in getattr(
-                    self,
-                    "_proof_v3_releases",
-                    {},
-                )
-                for model_policy in (
-                    (
-                        canary_policy.model_policy(str(model_id))
-                        if canary_policy is not None
-                        else None
-                    ),
-                )
-                if model_policy is not None
-            },
-        )
-        tests = self._canary_scheduler.plan_epoch(self._epoch_miners)
-        self._register_canary_obligations(tests)
+        tests = self._plan_epoch_canaries(epoch_number, epoch_start_block)
 
         elapsed = time.monotonic() - t0
         _unique_miners = len({m.address for m in self._epoch_miners})
@@ -8840,6 +11153,8 @@ class ValidatorNeuron:
         or grants busy forgiveness.
         """
         import httpx as _httpx
+        from neurons.mesh_verify import MeshCanaryTransportError
+
         transport_retry_exc = (
             _httpx.RemoteProtocolError,
             _httpx.ReadError,
@@ -8996,6 +11311,26 @@ class ValidatorNeuron:
                         return
                 _record_precommit_busy(attempt_started, attempt_finished)
                 return
+            except MeshCanaryTransportError as exc:
+                # Mesh coordinators signal busy exactly like the vLLM path:
+                # a 503 before any origin receipt is a precommit-free busy
+                # signal and follows the shared reschedule/busy accounting.
+                if exc.status_code == 503:
+                    attempt_finished = time.time()
+                    _record_precommit_busy(attempt_started, attempt_finished)
+                    return
+                if not exc.retryable:
+                    raise
+                bt.logging.info(
+                    f"Mesh canary transport retry for "
+                    f"{test.miner_address[:10]} type={test.test_type} "
+                    f"(phase={exc.phase}): {type(exc).__name__}"
+                )
+                return self._execute_canary_test_once(
+                    test,
+                    epoch_number,
+                    _transport_retry_allowed=False,
+                )
             except transport_retry_exc as exc:
                 # The proof-v3 exchange reclassifies post-precommit transport
                 # loss as a peer proof failure. Only a precommit-free network
@@ -9373,6 +11708,769 @@ class ValidatorNeuron:
                     ) from exc
             raise
 
+    def _execute_mesh_canary(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+        *,
+        prompt: Optional[str] = None,
+    ) -> None:
+        """Canary for a GGUF-mesh miner (Tier-1 hard-fail verification).
+
+        Mirrors the vLLM canary accounting: epoch-staleness gates, receipt
+        push with expected-receipt decrement on push failure, analytics row,
+        and instant probation via ``_on_proof_failure`` when a served
+        response fails verification. A coordinator that is unreachable
+        raises so the shared canary-error handling (retry, busy forgiveness,
+        error attribution) applies exactly as for vLLM miners.
+        """
+        from neurons.mesh_verify import (
+            MeshCanaryTransportError,
+            MeshValidatorVerificationError,
+            run_mesh_canary,
+        )
+
+        key = self._mesh_snapshot_cache_key(
+            test.miner_address, test.model_index, epoch_number,
+        )
+        snapshot = self._mesh_snapshot_cache.get(key)
+        if snapshot is None:
+            raise MeshValidatorVerificationError(
+                "no validator-pinned mesh verification snapshot for canary"
+            )
+        miner = next(
+            (
+                item
+                for item in self._epoch_miners
+                if self._mesh_snapshot_cache_key(
+                    item.address, item.model_index, epoch_number,
+                ) == key
+            ),
+            None,
+        )
+        if miner is None:
+            raise MeshValidatorVerificationError(
+                "mesh canary coordinator is not active in this epoch"
+            )
+        if miner.endpoint != test.miner_endpoint or miner.model_id != test.model_id:
+            raise MeshValidatorVerificationError(
+                "mesh canary does not match the pinned coordinator slot"
+            )
+        try:
+            trust_anchors = self._mesh_snapshot_trust_anchors(miner, epoch_number)
+        except Exception as exc:
+            raise MeshValidatorVerificationError(
+                f"mesh canary trust anchors unavailable: {exc}"
+            ) from exc
+
+        timeout = (
+            self.config.canary_full_context_inference_timeout
+            if test.test_type == "full_context"
+            else self.config.canary_inference_timeout
+        )
+        # The hard demand for a mesh canary comes from the signed policy
+        # engine's hidden hard draw (``verify_proof``); ``mesh_audit_tier``
+        # remains as a direct override for tests and manual audits.
+        audit_tier = str(getattr(test, "mesh_audit_tier", "") or "")
+        if not audit_tier and bool(test.verify_proof):
+            audit_tier = "hard"
+        try:
+            result = run_mesh_canary(
+                endpoint=test.miner_endpoint,
+                model_id=test.model_id,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            prompt if prompt is not None else test.prompt
+                        ),
+                    }
+                ],
+                max_new_tokens=test.max_new_tokens,
+                # The currently audited GGUF backend is deterministic greedy.  Do
+                # not sign a stochastic request and let the coordinator rewrite it.
+                temperature=0.0,
+                timeout=timeout,
+                deferred=False,
+                verification_snapshot=snapshot,
+                expected_coordinator=trust_anchors.coordinator,
+                validator_hotkey_ss58=self._validator_hotkey_ss58,
+                validator_hotkey_seed=self._validator_private_key,
+                audit_tier=audit_tier,
+            )
+        except (MeshCanaryTransportError, MeshValidatorVerificationError):
+            raise
+        except Exception as exc:
+            # Preflight/signing/snapshot failures occur before a result can be
+            # attributed to the coordinator.
+            raise MeshValidatorVerificationError(
+                f"mesh canary local execution failed: {exc}"
+            ) from exc
+        if result.transport_error and result.transport_phase != "postcommit":
+            raise MeshCanaryTransportError(
+                result.reason,
+                status_code=result.transport_status_code,
+                retryable=result.transport_retryable,
+                phase=result.transport_phase or "inference",
+            )
+        if result.transport_error and result.transport_phase == "postcommit":
+            # Compatibility defense: once a signed origin has been served,
+            # failure to open it is a miner proof-obligation failure and must
+            # never escape into the outer transport retry/availability path.
+
+            # It is also a broken commitment rather than a failed check. The
+            # coordinator signed an origin receipt, learned the beacon, and
+            # then declined to open it, which is precisely the shape of an
+            # abort chosen after seeing an unfavourable draw. Repeated aborts
+            # are already priced geometrically by the EMA penalty, so the
+            # missing piece was the class, not a separate rate counter.
+            result.reason = mesh_binding_violation_reason(
+                result.reason
+                or "mesh postcommit proof obligation was not fulfilled"
+            )
+        if result.validator_error:
+            raise MeshValidatorVerificationError(result.reason)
+
+        if not self._canary_epoch_active(epoch_number):
+            return
+
+        proof_verified = bool(result.ok)
+        proof_failure_reason = None if proof_verified else (result.reason or "mesh verification failed")
+        if proof_verified:
+            # A proof only attests that the committed token ids are consistent
+            # with the computation, never that they decode into a plausible
+            # reply.  Without this a coordinator can return wholesale garbage
+            # with a verifying proof and is caught only when the decode gate
+            # happens to fire.  Enforcing on canaries is safe because the
+            # validator wrote the prompt, so a degenerate reply cannot be
+            # blamed on the user.
+            sanity_reason = check_output_sanity(
+                result.output_tokens,
+                result.full_text,
+                test.max_new_tokens,
+            )
+            if sanity_reason:
+                proof_verified = False
+                proof_failure_reason = f"mesh output sanity: {sanity_reason}"
+        self._record_mesh_canary_outcome(
+            test, epoch_number, result, proof_verified, proof_failure_reason,
+        )
+
+    def _mesh_audit_queue(self) -> list:
+        """Experimental legacy queue; the active validator never enqueues it."""
+        queue = getattr(self, "_pending_mesh_audits", None)
+        if queue is None:
+            queue = []
+            self._pending_mesh_audits = queue
+        return queue
+
+    def _process_pending_mesh_audits(self, current_block: int) -> None:
+        """Experimental compatibility resolver, not called by the active loop.
+
+        Randomness = chain block hash at request_block + delay: public and
+        recomputable by anyone, fixed only after the receipt was committed.
+        Tier-1 hard-fail: fetch failure or bundle mismatch is a proof
+        failure (instant probation), never a skip.
+        """
+        queue = self._mesh_audit_queue()
+        if not queue:
+            return
+        from neurons.mesh_verify import (
+            MESH_DEFERRED_AUDIT_DELAY_BLOCKS,
+            resolve_mesh_deferred_audit,
+        )
+
+        remaining = []
+        for item in queue:
+            due_block = item["request_block"] + MESH_DEFERRED_AUDIT_DELAY_BLOCKS
+            if current_block < due_block:
+                remaining.append(item)
+                continue
+            test = item["test"]
+            epoch_number = item["epoch_number"]
+            result = item["result"]
+            if not self._canary_epoch_active(epoch_number):
+                self._decrement_expected_receipt(
+                    epoch_number, (test.miner_address, test.model_index),
+                )
+                continue
+            randomness, from_chain = self._get_chain_block_hash(due_block)
+            if not from_chain:
+                bt.logging.warning(
+                    f"Deferred mesh audit for block {due_block} using synthetic "
+                    "block hash (chain unreachable)"
+                )
+            ok, reason = resolve_mesh_deferred_audit(
+                endpoint=test.miner_endpoint,
+                artifact=result.artifact,
+                openai_request=result.openai_request,
+                deferred_randomness=randomness.hex(),
+            )
+            self._record_mesh_canary_outcome(
+                test, epoch_number, result, ok, None if ok else reason,
+            )
+        queue[:] = remaining
+
+    def _try_repin_mesh_snapshot(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+    ) -> bool:
+        """Canary-refusal trigger for the shared re-pin core below."""
+
+        return self._repin_mesh_snapshot_slot(
+            test.miner_address,
+            int(test.model_index),
+            int(epoch_number),
+            trigger="canary refusal",
+        )
+
+    def _retry_excluded_mesh_entries(self) -> None:
+        """Self-heal epoch exclusions: periodically re-attempt the pin.
+
+        A slot excluded at the boundary/startup sweep is dropped from the
+        routable pool, so the proxy-triggered repin spool can NEVER fire
+        for it (no dispatches, no signal) — exclusion was terminal until
+        the next boundary, and any transient failure (coordinator 503,
+        snapshot mid-rebind after a registration refresh, fetch timeout)
+        cost up to a full epoch of outage.
+        This loop retries through the SAME capped, fully verified repin
+        core every ~3 minutes; the existing per-slot caps (3 repins + 3
+        adoptions per epoch) bound the total work, and every accepted pin
+        is canaried like any other.
+        """
+
+        excluded = getattr(self, "_mesh_excluded_this_epoch", None)
+        if not excluded:
+            return
+        now = time.monotonic()
+        next_at = getattr(self, "_excluded_retry_next_at", 0.0)
+        if now < next_at:
+            return
+        self._excluded_retry_next_at = now + 180.0
+        epoch_number = int(getattr(self, "_current_epoch", 0) or 0)
+        for (address, model_index), reason in list(excluded.items()):
+            healed = False
+            try:
+                healed = self._repin_mesh_snapshot_slot(
+                    address,
+                    int(model_index),
+                    epoch_number,
+                    trigger="excluded retry",
+                )
+            except Exception as exc:
+                bt.logging.debug(
+                    f"Excluded-entry retry failed for {address[:10]} "
+                    f"model_index={model_index}: {exc}"
+                )
+            if healed:
+                excluded.pop((address, model_index), None)
+                bt.logging.info(
+                    f"Excluded mesh entry self-healed for {address[:10]} "
+                    f"model_index={model_index} (was: {reason})"
+                )
+
+    def _repin_mesh_snapshot_slot(
+        self,
+        address: str,
+        model_index: int,
+        epoch_number: int,
+        *,
+        trigger: str,
+    ) -> bool:
+        """Re-pin when the coordinator presents a VALID current-epoch
+        snapshot — that is a legitimate mid-epoch relaunch, not evasion.
+        Healthy must mean serveable: without this, every relaunch cost the
+        mesh up to a full epoch of outage plus probation.
+
+        Triggered by a canary refusal or a proxy re-pin request (the proxy
+        sees the pin gap on the first routing attempt, so its trigger
+        closes the outage window in seconds instead of minutes).
+
+        Anti-evasion is preserved: the replacement snapshot must pass the
+        exact trust-anchor verification of the epoch pin, every accepted
+        re-pin is itself canaried next, and the attempt is rate-capped per
+        slot per epoch across ALL triggers — rotation buys no un-audited
+        window and a request storm buys at most the capped fetches.
+        """
+        cap_key = (
+            str(address).lower(),
+            int(model_index),
+            int(epoch_number),
+        )
+        repins = getattr(self, "_mesh_snapshot_repins", None)
+        if repins is None:
+            repins = self._mesh_snapshot_repins = {}
+        if repins.get(cap_key, 0) >= 3:
+            # This refusal used to be SILENT: a proxy in a pin gap kept
+            # re-filing requests that were consumed here with no trace,
+            # reading as a dead self-heal path.
+            bt.logging.info(
+                f"Mesh re-pin ({trigger}) refused for {str(address)[:10]} "
+                f"model_index={model_index}: per-slot cap reached "
+                f"({repins[cap_key]}/3 this epoch)"
+            )
+            return False
+        miner = next(
+            (
+                m
+                for m in (getattr(self, "_epoch_miners", None) or [])
+                if m.address.lower() == str(address).lower()
+                and int(m.model_index) == int(model_index)
+            ),
+            None,
+        )
+        if miner is None:
+            # The request may name a slot that no longer exists: an owner
+            # roll deactivates the old index and registers a successor at
+            # a NEW one mid-epoch. Adopt the successor instead of leaving
+            # the miner invisible until the boundary.
+            return self._adopt_repin_successor(
+                address, model_index, epoch_number, trigger=trigger
+            )
+        try:
+            anchors = self._mesh_snapshot_trust_anchors(miner, epoch_number)
+            snapshot = discover_and_pin_mesh_verification_snapshot(
+                coordinator_endpoint=miner.endpoint,
+                validator_hotkey_ss58=self._validator_hotkey_ss58,
+                validator_hotkey_seed=self._validator_private_key,
+                trust_anchors=anchors,
+                state_db=self._db,
+                timeout=MESH_SNAPSHOT_FETCH_TIMEOUT_S,
+                allow_mesh_change=True,
+            )
+        except Exception as exc:
+            bt.logging.info(
+                f"Mesh re-pin ({trigger}) failed for {str(address)[:10]} "
+                f"model_index={model_index}: {exc}"
+            )
+            # A dead pinned slot (entry deactivated mid-epoch) fails here
+            # too; check the chain for a successor entry before giving up.
+            return self._adopt_repin_successor(
+                address, model_index, epoch_number, trigger=trigger
+            )
+        key = self._mesh_snapshot_cache_key(
+            miner.address, miner.model_index, epoch_number,
+        )
+        self._mesh_snapshot_cache[key] = snapshot
+        repins[cap_key] = repins.get(cap_key, 0) + 1
+        # Publish immediately: proxies route organics off this pin, and the
+        # whole point is closing the relaunch outage window fast.
+        try:
+            self._write_shared_state()
+        except Exception as exc:
+            bt.logging.debug(f"Shared-state write after mesh re-pin failed: {exc}")
+        bt.logging.info(
+            f"Re-pinned mesh verification snapshot for {str(address)[:10]} "
+            f"model_index={model_index} ({trigger}, "
+            f"re-pin {repins[cap_key]}/3 this epoch)"
+        )
+        return True
+
+    def _adopt_repin_successor(
+        self,
+        address: str,
+        model_index: int,
+        epoch_number: int,
+        *,
+        trigger: str,
+    ) -> bool:
+        """Adopt a mid-epoch successor entry for a re-pin whose slot died.
+
+        An owner roll (box replacement, requant) deactivates the old index
+        and registers a successor at a NEW index. The old slot correctly
+        refuses to re-pin, but before this the successor stayed invisible
+        until the epoch boundary — a full-epoch outage for the model. A BOUNDED number of
+        rediscoveries per (slot, epoch) finds the address's untracked
+        active mesh entries, pins each through the SAME trust-anchor
+        verification as an epoch pin, and appends them to the epoch set.
+        The budget is 3, not 1: a successor mesh answers its first pin
+        seconds after relaunch and can transiently refuse ("coordinator
+        hotkey is unavailable"), and a
+        single pre-consumed attempt turned that race into a full-epoch
+        outage. Anti-evasion holds: the successor is a chain-registered
+        entry, its snapshot passes full verification, every adopted pin is
+        canaried like any re-pin, and the attempt budget stays strictly
+        bounded per epoch.
+        """
+        cap_key = (
+            "adopt",
+            str(address).lower(),
+            int(model_index),
+            int(epoch_number),
+        )
+        repins = getattr(self, "_mesh_snapshot_repins", None)
+        if repins is None:
+            repins = self._mesh_snapshot_repins = {}
+        _ADOPTION_ATTEMPTS_PER_EPOCH = 3
+        if repins.get(cap_key, 0) >= _ADOPTION_ATTEMPTS_PER_EPOCH:
+            bt.logging.info(
+                f"Successor adoption ({trigger}) refused for "
+                f"{str(address)[:10]} model_index={model_index}: attempt "
+                f"budget exhausted this epoch"
+            )
+            return False
+        repins[cap_key] = repins.get(cap_key, 0) + 1
+        if getattr(self, "_miner_client", None) is None:
+            bt.logging.info(
+                f"Successor adoption ({trigger}) unavailable for "
+                f"{str(address)[:10]} model_index={model_index}: no miner "
+                f"registry client"
+            )
+            return False
+        try:
+            fresh = discover_active_miners(
+                self._miner_client, self._model_client
+            )
+        except Exception as exc:
+            bt.logging.info(
+                f"Successor discovery ({trigger}) failed for "
+                f"{str(address)[:10]}: {exc}"
+            )
+            return False
+        current = {
+            (m.address.lower(), int(m.model_index))
+            for m in (getattr(self, "_epoch_miners", None) or [])
+        }
+        adopted = False
+        for cand in fresh:
+            if cand.address.lower() != str(address).lower():
+                continue
+            if (cand.address.lower(), int(cand.model_index)) in current:
+                continue
+            if not _is_mesh_runtime(cand):
+                continue
+            try:
+                anchors = self._mesh_snapshot_trust_anchors(
+                    cand, epoch_number
+                )
+                snapshot = discover_and_pin_mesh_verification_snapshot(
+                    coordinator_endpoint=cand.endpoint,
+                    validator_hotkey_ss58=self._validator_hotkey_ss58,
+                    validator_hotkey_seed=self._validator_private_key,
+                    trust_anchors=anchors,
+                    state_db=self._db,
+                    timeout=MESH_SNAPSHOT_FETCH_TIMEOUT_S,
+                    allow_mesh_change=True,
+                )
+            except Exception as exc:
+                bt.logging.info(
+                    f"Successor pin failed for {str(address)[:10]} "
+                    f"model_index={cand.model_index}: {exc}"
+                )
+                continue
+            key = self._mesh_snapshot_cache_key(
+                cand.address, cand.model_index, epoch_number
+            )
+            self._mesh_snapshot_cache[key] = snapshot
+            if getattr(self, "_epoch_miners", None) is None:
+                self._epoch_miners = []
+            self._epoch_miners.append(cand)
+            adopted = True
+            bt.logging.info(
+                f"Adopted successor mesh entry for {str(address)[:10]}: "
+                f"model_index={cand.model_index} replaces dead slot "
+                f"{model_index} ({trigger})"
+            )
+        if adopted:
+            # Success exhausts the epoch budget: the successor is tracked
+            # now, and further spool requests for the dead slot must not
+            # re-run chain rediscovery.
+            repins[cap_key] = _ADOPTION_ATTEMPTS_PER_EPOCH
+            try:
+                self._write_shared_state()
+            except Exception as exc:
+                bt.logging.debug(
+                    f"Shared-state write after successor adoption "
+                    f"failed: {exc}"
+                )
+        else:
+            bt.logging.info(
+                f"Successor adoption ({trigger}) found no untracked active "
+                f"mesh entry for {str(address)[:10]} (dead slot "
+                f"{model_index})"
+            )
+        return adopted
+
+    def _ingest_mesh_repin_requests(self) -> int:
+        """Serve proxy re-pin requests through the shared capped core."""
+
+        try:
+            from neurons.mesh_repin_ipc import (
+                acknowledge_mesh_repin_request,
+                pending_mesh_repin_requests,
+            )
+
+            pending = pending_mesh_repin_requests(
+                shared_state_path=str(
+                    getattr(self.config, "shared_state_path", "") or ""
+                ),
+            )
+        except Exception as exc:
+            # A broken spool silently disables the whole proxy-triggered
+            # self-heal path — that must be visible at default log level.
+            bt.logging.warning(f"Mesh repin spool scan failed: {exc}")
+            return 0
+        served = 0
+        for path, request in pending:
+            age_s = max(0.0, time.time() - float(request["requested_at"]))
+            bt.logging.info(
+                f"Mesh re-pin request ingested ({path.name}): "
+                f"{request['address'][:10]} "
+                f"model_index={request['model_index']} age={age_s:.0f}s "
+                f"reason={str(request['reason'])[:120]}"
+            )
+            try:
+                repinned = self._repin_mesh_snapshot_slot(
+                    request["address"],
+                    int(request["model_index"]),
+                    int(self._current_epoch or 0),
+                    trigger="proxy request",
+                )
+                served += 1
+                if not repinned:
+                    # The capped core has already logged WHY (cap reached,
+                    # fetch failure, successor refusal); this line binds
+                    # that outcome to the consumed request file.
+                    bt.logging.info(
+                        f"Mesh re-pin request not applied ({path.name}): "
+                        f"{request['address'][:10]} "
+                        f"model_index={request['model_index']}"
+                    )
+            except Exception as exc:
+                bt.logging.info(
+                    "Mesh repin request failed for "
+                    f"{request['address'][:10]} "
+                    f"model_index={request['model_index']}: {exc}"
+                )
+            finally:
+                # Requests are liveness signals: acted on (or refused by
+                # the cap) they are spent either way; the proxy re-files
+                # after its debounce if the gap persists.
+                acknowledge_mesh_repin_request(path)
+        return served
+
+    def _record_mesh_snapshot_refusal(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+        error: Exception,
+    ) -> None:
+        """Price a pinned-snapshot refusal as a proof failure.
+
+        No receipt exists to push, because the coordinator rejected the request
+        before serving anything, so the expected-receipt count is decremented
+        to keep the epoch-close integrity check honest.  The proof failure
+        itself carries the penalty.
+
+        EXCEPTION: a refusal backed by a valid current-epoch replacement
+        snapshot is a legitimate relaunch — re-pin and retest instead of
+        punishing (see _try_repin_mesh_snapshot).
+        """
+
+        if self._try_repin_mesh_snapshot(test, epoch_number):
+            # No receipt for this aborted canary; the next scheduled canary
+            # audits the freshly pinned snapshot.
+            self._decrement_expected_receipt(
+                epoch_number, (test.miner_address, test.model_index),
+            )
+            return
+
+        reason = (
+            "coordinator refused the verification snapshot pinned for this "
+            f"epoch: {error}"
+        )
+        bt.logging.warning(
+            f"Mesh snapshot refusal from {test.miner_address[:10]} "
+            f"{test.model_id}/{test.model_index}: {reason}"
+        )
+        # Refusing the pinned snapshot is a broken commitment, not a check the
+        # coordinator happened to fail, so it is priced as one.
+        self._on_proof_failure(
+            test.miner_address,
+            int(test.model_index),
+            endpoint=test.miner_endpoint,
+            binding_violation=True,
+        )
+        self._decrement_expected_receipt(
+            epoch_number, (test.miner_address, test.model_index),
+        )
+        try:
+            self._db.log_canary_result(
+                network=self.config.subtensor_network or "unknown",
+                chain_id=getattr(self.config, "chain_id", 0),
+                netuid=self.config.netuid,
+                epoch_number=epoch_number,
+                block_number=self._last_known_block or 0,
+                miner_address=test.miner_address,
+                miner_uid=self._db.get_uid(test.miner_address),
+                miner_hotkey_ss58=self._get_miner_ss58(
+                    test.miner_address, "hotkey"
+                ),
+                miner_coldkey_ss58=self._get_miner_ss58(
+                    test.miner_address, "coldkey"
+                ),
+                model_id=test.model_id,
+                model_index=test.model_index,
+                endpoint=test.miner_endpoint,
+                test_type=test.test_type,
+                test_index=test.test_index,
+                proof_requested=1,
+                tee_requested=0,
+                tee_verified=None,
+                enable_thinking=1 if test.enable_thinking else 0,
+                temperature=test.temperature,
+                max_new_tokens=test.max_new_tokens,
+                status="failed",
+                proof_verified=0,
+                proof_failure_reason=reason[:500],
+                receipt_pushed=0,
+            )
+        except Exception as db_error:
+            bt.logging.debug(
+                f"Failed to log mesh snapshot refusal: {db_error}"
+            )
+
+    def _record_mesh_canary_outcome(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+        result,
+        proof_verified: bool,
+        proof_failure_reason: Optional[str],
+    ) -> None:
+        if not proof_verified:
+            binding_violation = is_mesh_binding_violation(proof_failure_reason)
+            bt.logging.info(
+                f"Mesh verification FAILED for {test.miner_address[:10]} "
+                f"{test.model_id}/{test.model_index}: {proof_failure_reason}"
+            )
+            self._on_proof_failure(
+                test.miner_address, int(test.model_index),
+                endpoint=test.miner_endpoint,
+                binding_violation=binding_violation,
+            )
+
+        receipt_hash_hex = str(result.receipt.get("receipt_hash") or "")
+        try:
+            commitment_hash = bytes.fromhex(receipt_hash_hex)
+        except ValueError:
+            commitment_hash = b""
+        if len(commitment_hash) != 32:
+            commitment_hash = b"\x00" * 32
+
+        # Phase-one completion is the validator-observed inference/trace
+        # latency.  End-to-end total_ms also includes expensive postcommit
+        # proof generation and local verification and must not depress TPS.
+        inference_ms = float(result.inference_ms)
+        tokens_per_sec = (
+            result.output_tokens / (inference_ms / 1000)
+            if inference_ms > 0 and result.output_tokens > 0
+            else 0.0
+        )
+        observed_start_ts = float(result.phase_one_start_ts)
+        observed_end_ts = float(result.phase_one_end_ts)
+        if (
+            not math.isfinite(observed_start_ts)
+            or not math.isfinite(observed_end_ts)
+            or observed_start_ts <= 0
+            or observed_end_ts < observed_start_ts
+        ):
+            raise ValueError(
+                "mesh canary phase-one observed interval is invalid"
+            )
+        # ServiceReceipt v2 has a required float field; zero is its established
+        # unavailable sentinel and scoring excludes non-positive TTFT.  Keep the
+        # analytics value nullable so non-streaming latency is not mislabeled.
+        receipt_ttft_ms = (
+            float(result.ttft_ms) if result.ttft_ms is not None else 0.0
+        )
+
+        # Exact obligation accounting: the canary receipt must carry the
+        # planned obligation identity and the validator's own prompt-token
+        # measurement (the mesh runtime's count includes its chat-template
+        # overhead and is not the number the planner targeted).
+        try:
+            obligation_id = bytes.fromhex(test.obligation_id or "")
+        except ValueError:
+            obligation_id = b""
+        measured_prompt_tokens = int(
+            getattr(test, "measured_prompt_tokens", 0) or 0
+        )
+        receipt_prompt_tokens = (
+            measured_prompt_tokens
+            if measured_prompt_tokens > 0
+            else result.input_tokens
+        )
+        pushed_ok = self._push_receipt_to_miner(
+            miner_address=test.miner_address,
+            miner_endpoint=test.miner_endpoint,
+            model_id=test.model_id,
+            model_index=test.model_index,
+            epoch_number=epoch_number,
+            commitment_hash=commitment_hash,
+            ttft_ms=receipt_ttft_ms,
+            tokens_generated=result.output_tokens,
+            generation_time_ms=inference_ms,
+            tokens_per_sec=tokens_per_sec,
+            prompt_tokens=receipt_prompt_tokens,
+            proof_verified=proof_verified,
+            proof_requested=True,
+            tee_attestation_verified=None,
+            is_canary=True,
+            timestamp=int(observed_end_ts),
+            observed_start_ts=observed_start_ts,
+            observed_end_ts=observed_end_ts,
+            canary_obligation_id=obligation_id,
+            canary_kind=(
+                "full" if test.test_type == "full_context" else "low"
+            ),
+            canary_target_prompt_tokens=int(
+                getattr(test, "target_prompt_tokens", 0) or 0
+            ),
+        )
+        if not pushed_ok:
+            self._decrement_expected_receipt(
+                epoch_number, (test.miner_address, test.model_index),
+            )
+
+        try:
+            _uid = self._db.get_uid(test.miner_address)
+            self._db.log_canary_result(
+                network=self.config.subtensor_network or "unknown",
+                chain_id=getattr(self.config, "chain_id", 0),
+                netuid=self.config.netuid,
+                epoch_number=epoch_number,
+                block_number=self._last_known_block or 0,
+                miner_address=test.miner_address,
+                miner_uid=_uid,
+                miner_hotkey_ss58=self._get_miner_ss58(test.miner_address, "hotkey"),
+                miner_coldkey_ss58=self._get_miner_ss58(test.miner_address, "coldkey"),
+                model_id=test.model_id,
+                model_index=test.model_index,
+                endpoint=test.miner_endpoint,
+                test_type=test.test_type,
+                test_index=test.test_index,
+                proof_requested=1,
+                tee_requested=0,
+                tee_verified=None,
+                enable_thinking=1 if test.enable_thinking else 0,
+                temperature=test.temperature,
+                max_new_tokens=test.max_new_tokens,
+                status="ok",
+                ttft_ms=result.ttft_ms,
+                tokens_generated=result.output_tokens,
+                inference_ms=inference_ms,
+                tokens_per_sec=tokens_per_sec,
+                prompt_tokens=result.input_tokens,
+                proof_verified=1 if proof_verified else 0,
+                proof_failure_reason=proof_failure_reason,
+                commitment_hash=receipt_hash_hex or None,
+                receipt_pushed=1 if pushed_ok else 0,
+            )
+        except Exception as _db_err:
+            bt.logging.debug(f"Failed to log mesh canary result: {_db_err}")
+
     def _execute_canary_test_once(
         self,
         test: CanaryTest,
@@ -9387,6 +12485,11 @@ class ValidatorNeuron:
         all exceptions are caught and recorded as canary errors.
         """
         import httpx as _httpx
+        from neurons.mesh_verify import (
+            MESH_SNAPSHOT_MISMATCH_ERROR_CODE,
+            MeshCanaryTransportError,
+            MeshValidatorVerificationError,
+        )
         _transport_exc = (
             _httpx.RemoteProtocolError,
             _httpx.ReadError,
@@ -9451,6 +12554,18 @@ class ValidatorNeuron:
                 f"tokens={len(prompt_token_ids) if prompt_token_ids is not None else 'compat'} "
                 f"elapsed={time.monotonic() - preparation_started:.3f}s"
             )
+            if getattr(test, "verify_mesh", False):
+                # GGUF-mesh runtime: OpenAI transport + mesh receipt/proof
+                # verification instead of the vLLM /chat + ZK path.  The
+                # obligation was planned and the prompt materialized by the
+                # shared signed-policy scheduler; only execution differs.
+                # Transport errors raise into the shared handler below.
+                self._execute_mesh_canary(
+                    test,
+                    epoch_number,
+                    prompt=prompt,
+                )
+                return
             messages = [{"role": "user", "content": prompt}]
             proof_v3_release = ValidatorNeuron._proof_v3_release_for_canary(
                 self,
@@ -9980,6 +13095,19 @@ class ValidatorNeuron:
                     f"current_epoch={self._current_epoch}: {e}"
                 )
                 return
+            # A coordinator that refuses the snapshot this validator pinned for
+            # the epoch is declining verification on the agreed terms, so it is
+            # priced as a proof failure before any retry or availability
+            # handling can absorb it.  Otherwise rotating the snapshot
+            # mid-epoch would duck every canary for a whole epoch at the cost
+            # of availability score alone.  Honest rotation belongs at an epoch
+            # boundary, where the validator repins.
+            if (
+                isinstance(e, MeshCanaryTransportError)
+                and e.error_code == MESH_SNAPSHOT_MISMATCH_ERROR_CODE
+            ):
+                self._record_mesh_snapshot_refusal(test, epoch_number, e)
+                return
             # HTTP 503 (miner busy) is handled by the retry wrapper in
             # _execute_canary_test — if we get here it's a real error
             # (connection refused, timeout, non-503 HTTP error, etc.).
@@ -9987,8 +13115,34 @@ class ValidatorNeuron:
             # hasn't retried yet, re-raise so it can retry once.
             if _transport_retry_allowed and isinstance(e, _transport_exc):
                 raise
-            if _transport_retry_allowed and self._is_http_503(e):
+            if (
+                _transport_retry_allowed
+                and not isinstance(e, MeshCanaryTransportError)
+                and self._is_http_503(e)
+            ):
                 raise
+            if (
+                _transport_retry_allowed
+                and isinstance(e, MeshCanaryTransportError)
+                and e.retryable
+            ):
+                raise
+            if isinstance(e, MeshValidatorVerificationError):
+                # Validator-side mesh verification indeterminacy is never
+                # miner evidence.  Mark the slot so exact obligation
+                # reconciliation at close stays neutral for this endpoint.
+                bt.logging.warning(
+                    f"Mesh canary indeterminate due to validator verification "
+                    f"failure (NOT attributed to miner "
+                    f"{test.miner_address[:10]} model={test.model_id}): {e}"
+                )
+                if self._canary_epoch_active(epoch_number):
+                    self._validator_canary_failures.add(
+                        self._miner_model_key(
+                            test.miner_address, test.model_index
+                        )
+                    )
+                return
             from verallm.api.proof_v3_validator import ProofV3PeerFailure
             from verallm.proof_v3.errors import ProofV3UnavailableError
 
@@ -10202,7 +13356,8 @@ class ValidatorNeuron:
     def _try_close_epoch(self, epoch_number: int) -> bool:
         """Attempt epoch close with exponential backoff on failure.
 
-        On success, clears pending state and resets backoff.
+        The close is owned by a persistent queue row.  On success only that
+        row is completed; on failure it remains the oldest pending row.
         On failure (e.g. 429 rate limit), schedules retry with increasing delay
         to avoid hammering the RPC.
         """
@@ -10334,7 +13489,12 @@ class ValidatorNeuron:
             return False
         return key not in self._restart_forgiven
 
-    def _close_epoch(self, epoch_number: int):
+    def _close_epoch(
+        self,
+        epoch_number: int,
+        *,
+        close_context: Optional[dict] = None,
+    ):
         """Close an epoch: pull receipts from all miners, score, update EMAs.
 
         Two-pass approach:
@@ -10344,6 +13504,9 @@ class ValidatorNeuron:
         4. Post demand scores on-chain.
         """
         t0 = time.monotonic()
+        epoch_start_block = int(
+            self._epoch_close_value("_epoch_start_block", 0)
+        )
         epoch_miners = tuple(
             self._epoch_close_value("_epoch_miners", ())
         )
@@ -10361,6 +13524,61 @@ class ValidatorNeuron:
         )
         busy_skips = self._epoch_close_value("_busy_skips", {})
         scoring = self._epoch_close_value("_scoring", self._scoring)
+        expected_receipts = dict(
+            self._epoch_close_value("_expected_receipts", {})
+        )
+        _inflight_all = self._epoch_close_value("_inflight_canaries", {})
+        inflight_canaries = dict(
+            _inflight_all.get(epoch_number, {})
+            if isinstance(_inflight_all, dict)
+            else {}
+        )
+        busy_skip_probations = dict(
+            self._epoch_close_value("_busy_skip_probations", {})
+        )
+        canary_errors = dict(self._epoch_close_value("_canary_errors", {}))
+        canary_error_times = dict(
+            self._epoch_close_value("_canary_error_times", {})
+        )
+        # Mesh score provenance requires the exact pinned snapshots of the
+        # closing epoch; they are frozen with the rest of the close state.
+        mesh_snapshot_cache = dict(
+            self._epoch_close_value("_mesh_snapshot_cache", {})
+        )
+        # Every canary obligation this validator journaled at plan time for
+        # this epoch, keyed per entry.  A mid-epoch restart re-plans under a
+        # fresh salt; the journal keeps the discarded plan's obligations so
+        # their surviving signed receipts are recognized as validator
+        # residue at scoring instead of zeroing an honest entry.
+        # (Definition restored after the v0.1.41 merge dropped it while
+        # keeping its consumer - every close died with a NameError and
+        # retried forever)
+        planned_obligation_journal: Dict[
+            Tuple[str, int], Dict[bytes, Tuple[str, int]]
+        ] = {}
+        try:
+            journal_getter = getattr(
+                self._db, "get_planned_canary_obligations", None
+            )
+            journal_rows = (
+                journal_getter(epoch_number)
+                if callable(journal_getter)
+                else []
+            )
+            for row in journal_rows:
+                journal_key = self._miner_model_key(
+                    row["miner_address"], row["model_index"]
+                )
+                planned_obligation_journal.setdefault(journal_key, {})[
+                    bytes.fromhex(str(row["obligation_id"]))
+                ] = (str(row["kind"]), int(row["target_prompt_tokens"]))
+        except Exception as exc:
+            planned_obligation_journal = {}
+            bt.logging.warning(
+                f"Planned canary obligation journal read failed for epoch "
+                f"{epoch_number}: {exc}"
+            )
+        epoch_score_rows: list[dict] = []
         bt.logging.info(
             f"Epoch {epoch_number} closing: pulling receipts from {len(epoch_miners)} miners",
         )
@@ -10392,7 +13610,7 @@ class ValidatorNeuron:
         # ── Build the validator authority snapshot for receipt verification.
         # Done ONCE per epoch close so the per-receipt loop is pure dict +
         # array access (no RPC, no metagraph rebuild).
-        #
+
         # 1. Force a fresh metagraph fetch at the epoch boundary so we don't
         #    miss validators that registered in the last 0–4 minutes.
         #    Falls back to the last cached metagraph if Substrate is down.
@@ -10417,7 +13635,7 @@ class ValidatorNeuron:
                 # mg.S = chain's effective subnet stake (tao_weight * tao_stake
                 # + alpha_stake).  See ValidatorAuthority docstring for why
                 # we use total here instead of alpha_stake.
-                #
+
                 # TODO: minValidatorStake on chain stays at 0 (must — otherwise
                 # root validators with no alpha can't register).  That makes
                 # this stake check a functional no-op, leaving validator_permit
@@ -10460,7 +13678,7 @@ class ValidatorNeuron:
         # ── Pass 1: collect all receipts ──────────────────────────
         self._set_epoch_close_value("_receipt_pull_failed_keys", set())
         miner_receipts, all_epoch_receipts = self._collect_epoch_receipts(
-            epoch_number, receipt_authority,
+            epoch_number, receipt_authority, miners=epoch_miners,
         )
         current_shared_hard_verdicts = (
             self._verify_shared_hard_bundles_at_close(
@@ -10665,27 +13883,71 @@ class ValidatorNeuron:
                         f"  GPU dedup: skipping {_addr[:10]} model_index={_midx} (ema={_ema:.4f}, uid unresolved)"
                     )
 
+        slot_getter = getattr(self._db, "get_epoch_close_slot", None)
+        slot_completer = getattr(
+            self._db, "mark_epoch_close_slot_completed", None
+        )
+
+        def _slot_checkpoint(miner: ActiveMiner) -> Optional[dict]:
+            if not callable(slot_getter):
+                return None
+            return slot_getter(
+                epoch_number, miner.address, miner.model_index
+            )
+
+        def _complete_slot(miner: ActiveMiner) -> None:
+            if callable(slot_completer):
+                slot_completer(
+                    epoch_number, miner.address, miner.model_index
+                )
+
         # ── Pass 2: score each miner-model entry ─────────────────
         for miner in epoch_miners:
             if not self._running:
-                break
+                raise RuntimeError(
+                    f"epoch {epoch_number} close interrupted before all slots completed"
+                )
+
+            checkpoint = _slot_checkpoint(miner)
+            if checkpoint is not None and checkpoint.get("status") == "completed":
+                continue
 
             # GPU UUID dedup — skip endpoints sharing a GPU with a higher-scored one
             if (miner.address.lower(), miner.model_index) in _sybil_skip:
                 bt.logging.info(f"Skipping {miner.address[:10]} model_index={miner.model_index} (GPU UUID duplicate)")
+                self._apply_epoch_close_slot_event(
+                    epoch_number=epoch_number,
+                    miner_address=miner.address,
+                    model_index=miner.model_index,
+                    event_kind="gpu_uuid_dedup_zero",
+                    action="score_zero",
+                    endpoint=getattr(miner, "endpoint", ""),
+                )
+                _complete_slot(miner)
                 continue
 
             uid = self._resolve_uid(miner.address)
             if uid is None:
                 # Miner-side issue (not registered in metagraph), validator is fine.
                 bt.logging.info(f"Cannot resolve UID for {miner.address[:10]}, skipping")
+                _complete_slot(miner)
                 continue
 
-            model_entry = get_model(miner.model_id)
-            if model_entry is None:
-                # Miner registered for an unknown model — miner-side config issue.
-                bt.logging.info(f"Model {miner.model_id} not in registry, skipping")
+            scoring_runtime = _resolve_model_scoring_runtime(
+                miner.model_id,
+                miner.quant,
+                miner.max_context_len,
+            )
+            if scoring_runtime is None:
+                # Unknown models and unapproved mesh model/quant combinations
+                # fail closed as miner-side configuration errors.
+                bt.logging.info(
+                    f"Model runtime {miner.model_id} ({miner.quant}) is not "
+                    "eligible for scoring, skipping"
+                )
+                _complete_slot(miner)
                 continue
+            model_entry, scored_context_len, scored_quant = scoring_runtime
 
             # Filter receipts to THIS specific model entry (address + model_id
             # + model_index).  A miner can register the same model on multiple
@@ -10694,7 +13956,10 @@ class ValidatorNeuron:
             # combined pool from all endpoints.
             all_receipts = [
                 r for r in miner_receipts.get(miner.address, [])
-                if r.model_id == miner.model_id and r.model_index == miner.model_index
+                if str(r.miner_address).strip().lower()
+                == str(miner.address).strip().lower()
+                and r.model_id == miner.model_id
+                and r.model_index == miner.model_index
             ]
             own_receipts = [
                 r for r in all_receipts
@@ -10719,7 +13984,12 @@ class ValidatorNeuron:
             # Also migrate in DB (old_index is found automatically inside)
             # DB migrate_probation needs explicit old index; use tracker's side-effect
             # to keep them in sync.
-            expected = self._effective_expected_receipts(epoch_number, key)
+            expected = self._effective_expected_receipts(
+                epoch_number,
+                key,
+                expected_receipts=expected_receipts,
+                inflight_canaries=inflight_canaries,
+            )
             self._reconcile_capacity_audit_timing_excuses(
                 miner,
                 all_receipts,
@@ -10762,6 +14032,7 @@ class ValidatorNeuron:
                     miner.model_index,
                     uid,
                     model_gate_reason,
+                    persist=False,
                 )
                 gated = self._apply_capacity_audit_score_gates(
                     miner.address,
@@ -10769,13 +14040,34 @@ class ValidatorNeuron:
                     uid,
                     audit_score_gate_reason,
                     audit_uid_score_gate_reason,
+                    persist=False,
+                    ensure_probation=False,
                 ) or gated
+                if gated:
+                    self._apply_epoch_close_slot_event(
+                        epoch_number=epoch_number,
+                        miner_address=miner.address,
+                        model_index=miner.model_index,
+                        event_kind="capacity_score_zero",
+                        action="score_zero",
+                        endpoint=getattr(miner, "endpoint", ""),
+                    )
+                if audit_score_gate_reason:
+                    self._apply_epoch_close_slot_event(
+                        epoch_number=epoch_number,
+                        miner_address=miner.address,
+                        model_index=miner.model_index,
+                        event_kind="capacity_entry_probation",
+                        action="probation_failure",
+                        endpoint=getattr(miner, "endpoint", ""),
+                    )
                 if not gated:
                     bt.logging.warning(
                         f"Skipping canary score for {miner.address[:10]} "
                         f"model_index={miner.model_index}: validator-side v3 "
                         "configuration or storage failure"
                     )
+                _complete_slot(miner)
                 continue
 
             busy_skips_this_epoch = busy_skips.get(key, 0)
@@ -10785,6 +14077,7 @@ class ValidatorNeuron:
                     miner.model_index,
                     uid,
                     model_gate_reason,
+                    persist=False,
                 )
                 gated = self._apply_capacity_audit_score_gates(
                     miner.address,
@@ -10792,9 +14085,30 @@ class ValidatorNeuron:
                     uid,
                     audit_score_gate_reason,
                     audit_uid_score_gate_reason,
+                    persist=False,
+                    ensure_probation=False,
                 ) or gated
+                if gated:
+                    self._apply_epoch_close_slot_event(
+                        epoch_number=epoch_number,
+                        miner_address=miner.address,
+                        model_index=miner.model_index,
+                        event_kind="capacity_score_zero",
+                        action="score_zero",
+                        endpoint=getattr(miner, "endpoint", ""),
+                    )
+                if audit_score_gate_reason:
+                    self._apply_epoch_close_slot_event(
+                        epoch_number=epoch_number,
+                        miner_address=miner.address,
+                        model_index=miner.model_index,
+                        event_kind="capacity_entry_probation",
+                        action="probation_failure",
+                        endpoint=getattr(miner, "endpoint", ""),
+                    )
                 if not gated:
                     bt.logging.info(f"Skipping score for {miner.address[:10]} model_index={miner.model_index} — 0 canaries dispatched")
+                _complete_slot(miner)
                 continue
 
             expected_inventory = dict(
@@ -10804,6 +14118,18 @@ class ValidatorNeuron:
                 "_hard_canary_obligation_ids",
                 set(),
             )
+            # Journaled obligations of THIS epoch/entry that are not part of
+            # the active plan: a receipt matching one of these was produced
+            # by this validator under a plan later replaced by a restart
+            # re-plan. Scoring validates such receipts but never zeroes on
+            # them and never counts them toward the active inventory.
+            superseded_inventory = {
+                obligation_id: item
+                for obligation_id, item in planned_obligation_journal.get(
+                    key, {}
+                ).items()
+                if obligation_id not in expected_inventory
+            }
             completed_obligations = self._completed_canary_obligations(
                 own_receipts,
                 expected_inventory,
@@ -10828,10 +14154,14 @@ class ValidatorNeuron:
             absent_hard_obligations = hard_missing.difference(
                 received_obligation_ids
             )
-            suppress_probation = self._maintenance_grace_active(
-                current_epoch=epoch_number,
-                action="suppress_probation",
-            ) or self._probation_reset_covers_source_epoch(epoch_number)
+            suppress_probation = (
+                self._maintenance_grace_active(
+                    current_epoch=epoch_number,
+                    action="suppress_probation",
+                )
+                or self._probation_reset_covers_source_epoch(epoch_number)
+                or self._validator_outage_marred_epoch(epoch_number)
+            )
             prior_full_debt = key in self._full_context_debt
             pending_full = self._pending_cross_epoch_full_obligations(
                 epoch_number,
@@ -10896,11 +14226,23 @@ class ValidatorNeuron:
             )
             if obligation_failure and not suppress_probation:
                 if key not in canary_penalized_keys:
+                    # Canary obligation misses alone are the availability
+                    # signature (dead box / canary dodge — the one class
+                    # that may clear on re-registration). Hard-audit
+                    # obligations left in the missing set carry a policy
+                    # penalty and belong to the for_cause lane: those
+                    # misses ARE audit evidence and must survive
+                    # re-registration.
                     self._on_proof_failure(
                         miner.address,
                         miner.model_index,
                         endpoint=getattr(miner, "endpoint", ""),
                         source_epoch=epoch_number,
+                        cause=(
+                            "for_cause"
+                            if hard_failure_penalty_required
+                            else "availability"
+                        ),
                     )
                     canary_penalized_keys.add(key)
                 bt.logging.info(
@@ -11031,6 +14373,7 @@ class ValidatorNeuron:
                 own_receipts=own_receipts,
                 expected_own_receipt_count=expected,
                 expected_canary_obligations=expected_inventory,
+                superseded_canary_obligations=superseded_inventory,
                 all_receipts=all_receipts,
                 scoring_receipts=select_scoring_authority_receipts(
                     all_receipts,
@@ -11047,8 +14390,8 @@ class ValidatorNeuron:
                 tee_tests=len(tee_tested),
                 tee_failures=len(tee_failed),
                 tee_verified=len(tee_tested) > 0 and len(tee_failed) == 0,
-                max_context_len=miner.max_context_len,
-                quant=miner.quant,
+                max_context_len=scored_context_len,
+                quant=scored_quant,
                 quant_qualified=self._proof_v3_quant_qualified(miner),
                 busy_skip_count=busy_skips.get(key, 0),
             )
@@ -11065,24 +14408,89 @@ class ValidatorNeuron:
                 current_epoch=epoch_number,
                 action="suppress_score_zeroing",
             ) or self._probation_reset_covers_source_epoch(epoch_number)
-            epoch_score = self.scorer.update(
-                uid=uid,
-                address=miner.address,
-                model_index=miner.model_index,
-                outcome=outcome,
-                active_params_b=model_entry.active_params_b,
-                moe_dense_equivalent=model_entry.moe_dense_equivalent,
-                generation_quality=model_entry.generation_quality,
-                demand_bonus=demand_bonus,
-                peer_medians=peer_medians_by_model.get(miner.model_id),
-                tee_bonus=scoring.tee_bonus,
-                suppress_hard_failures=suppress_score_zeroing,
+            score_provenance = None
+            if _is_mesh_runtime(miner):
+                snapshot = mesh_snapshot_cache.get(
+                    self._mesh_snapshot_cache_key(
+                        miner.address,
+                        miner.model_index,
+                        epoch_number,
+                    )
+                )
+                if snapshot is None:
+                    # This is validator-local state loss, not evidence against
+                    # the miner.  Do not update the slot EMA without the exact
+                    # signed topology that produced the sample.
+                    bt.logging.error(
+                        f"Skipping mesh score for {miner.address[:10]} "
+                        f"model_index={miner.model_index} epoch={epoch_number}: "
+                        "pinned verification snapshot is unavailable"
+                    )
+                    _complete_slot(miner)
+                    continue
+                score_provenance = {
+                    "chain_id": int(snapshot.coordinator.chain_id),
+                    "netuid": int(snapshot.coordinator.netuid),
+                    "coordinator_address": str(
+                        snapshot.coordinator.coordinator_evm_address
+                    ).lower(),
+                    "model_index": int(snapshot.coordinator.model_index),
+                    "model_id": str(snapshot.model.model_id),
+                    "mesh_id": str(snapshot.mesh_id),
+                    "verification_snapshot_hash": snapshot.snapshot_hash_hex(),
+                    "snapshot_generation": int(snapshot.generation),
+                    "score_epoch": int(snapshot.epoch),
+                }
+            score_already_applied = bool(
+                checkpoint is not None and checkpoint.get("score_applied")
             )
+            entry = self.scorer.states.get(uid, SimpleNamespace(entries={})).entries.get(
+                miner.model_index
+            )
+            if score_already_applied:
+                epoch_score = (
+                    None
+                    if int(checkpoint.get("epoch_score_is_null") or 0)
+                    else float(checkpoint["epoch_score"])
+                )
+                if entry is not None:
+                    # Keep the live EMA loaded from miner_entries: an already
+                    # journaled penalty may legitimately be lower than the
+                    # immutable completed-score checkpoint.
+                    entry.total_epochs = int(checkpoint["total_epochs"])
+                    entry.scored_epochs = int(checkpoint["scored_epochs"])
+            else:
+                prior_entry = entry
+                prior_state = (
+                    (
+                        prior_entry.ema_score,
+                        prior_entry.total_epochs,
+                        prior_entry.scored_epochs,
+                        prior_entry.model_id,
+                    )
+                    if prior_entry is not None
+                    else None
+                )
+                epoch_score = self.scorer.update(
+                    uid=uid,
+                    address=miner.address,
+                    model_index=miner.model_index,
+                    outcome=outcome,
+                    active_params_b=model_entry.active_params_b,
+                    moe_dense_equivalent=model_entry.moe_dense_equivalent,
+                    generation_quality=model_entry.generation_quality,
+                    demand_bonus=demand_bonus,
+                    peer_medians=peer_medians_by_model.get(miner.model_id),
+                    tee_bonus=self._scoring.tee_bonus,
+                    suppress_hard_failures=suppress_score_zeroing,
+                )
+                entry = self.scorer.states[uid].entries.get(miner.model_index)
             gated = self._apply_capacity_audit_model_gate(
                 miner.address,
                 miner.model_index,
                 uid,
                 model_gate_reason,
+                persist=False,
             )
             gated = self._apply_capacity_audit_score_gates(
                 miner.address,
@@ -11090,22 +14498,64 @@ class ValidatorNeuron:
                 uid,
                 audit_score_gate_reason,
                 audit_uid_score_gate_reason,
+                persist=False,
+                ensure_probation=False,
             ) or gated
             if gated:
                 epoch_score = 0.0
 
-            # Persist score to DB (write-through)
-            if epoch_score is not None:
-                entry = self.scorer.states[uid].entries.get(miner.model_index)
-                if entry:
+            # Persist score and its replay checkpoint in one SQLite
+            # transaction.  If the DB write fails, restore the in-memory state
+            # so the next attempt cannot blend the same sample twice.
+            if not score_already_applied and entry is not None:
+                score_kwargs = {
+                    "epoch_close_number": epoch_number,
+                    "epoch_score": epoch_score,
+                }
+                if epoch_score is not None:
+                    score_kwargs["last_scored_epoch"] = epoch_number
+                    if score_provenance is not None:
+                        score_kwargs["score_provenance"] = score_provenance
+                try:
                     self._db.save_score(
                         miner.address, miner.model_index,
                         entry.ema_score, entry.total_epochs, entry.scored_epochs,
+                        **score_kwargs,
                     )
+                except Exception:
+                    if prior_state is None:
+                        self.scorer.states[uid].entries.pop(
+                            miner.model_index, None
+                        )
+                    else:
+                        (
+                            prior_entry.ema_score,
+                            prior_entry.total_epochs,
+                            prior_entry.scored_epochs,
+                            prior_entry.model_id,
+                        ) = prior_state
+                    raise
+
+            if gated and score_already_applied:
+                self._apply_epoch_close_slot_event(
+                    epoch_number=epoch_number,
+                    miner_address=miner.address,
+                    model_index=miner.model_index,
+                    event_kind="capacity_score_zero",
+                    action="score_zero",
+                    endpoint=getattr(miner, "endpoint", ""),
+                )
+            if audit_score_gate_reason:
+                self._apply_epoch_close_slot_event(
+                    epoch_number=epoch_number,
+                    miner_address=miner.address,
+                    model_index=miner.model_index,
+                    event_kind="capacity_entry_probation",
+                    action="probation_failure",
+                    endpoint=getattr(miner, "endpoint", ""),
+                )
 
             # Collect for summary table (printed after loop)
-            if not hasattr(self, "_epoch_score_rows"):
-                self._epoch_score_rows = []
             # Store references for late EMA lookup — the actual ema_score
             # may be modified by penalty handlers (halve_ema) that run
             # after scoring but before the table is printed.
@@ -11114,7 +14564,7 @@ class ValidatorNeuron:
             _gpu_short = _gpu.replace("NVIDIA ", "").replace("GeForce ", "").strip()
             # Shorten SXM/PCIe variants but keep memory size (A100 40GB vs 80GB matters)
             _gpu_short = _gpu_short.replace("-SXM4-", " ").replace("-SXM5-", " ").replace("-PCIe-", " ")
-            self._epoch_score_rows.append({
+            epoch_score_rows.append({
                 "uid": uid, "entry": miner.model_index,
                 "model": miner.model_id, "quant": miner.quant,
                 "gpu": _gpu_short,
@@ -11160,13 +14610,23 @@ class ValidatorNeuron:
                 and outcome.proof_failures > 0
                 and outcome.proof_failure_penalty_required
             )
+            # Hard-audit misses carried into obligation_failure are
+            # for_cause evidence even when every proof passed; only a pure
+            # canary obligation miss classifies as availability.
+            _entry_cause = (
+                "for_cause"
+                if (had_proof_failure or hard_failure_penalty_required)
+                else "availability"
+            )
             had_proof_failure = had_proof_failure or obligation_failure
             if had_proof_failure and not suppress_probation:
                 # Enter or reset probation (mid-epoch may have already entered)
                 self._probation_tracker.enter_probation(
-                    key, epoch_number, endpoint=getattr(miner, 'endpoint', ''))
+                    key, epoch_number, endpoint=getattr(miner, 'endpoint', ''),
+                    cause=_entry_cause)
                 self._db.enter_probation(
                     miner.address, miner.model_index, epoch_number,
+                    cause=_entry_cause,
                     uid=uid if uid is not None else -1,
                     hotkey_ss58=getattr(miner, "hotkey_ss58", "") or "",
                 )
@@ -11188,6 +14648,8 @@ class ValidatorNeuron:
                 bt.logging.info(f"Probation ESCALATION for {miner.address[:10]} model_index={miner.model_index} -> reportOffline")
                 # Background dispatch — chain wait must not block epoch close
                 self._submit_report_offline(miner)
+
+            _complete_slot(miner)
 
         # ── Decay ineligible and zero undiscovered miners ─────────
         # Entries that remain registered but violate the public-endpoint
@@ -11228,6 +14690,14 @@ class ValidatorNeuron:
                 f"Validator-local receipt GC failed: {exc}"
             )
         try:
+            self._db.gc_planned_canary_obligations(
+                max(0, int(epoch_number) - 3)
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Planned canary obligation journal GC failed: {exc}"
+            )
+        try:
             self._db.gc_proof_v3_hard_failures(
                 max(0, int(epoch_number) - 3)
             )
@@ -11256,7 +14726,7 @@ class ValidatorNeuron:
         # ── Print score summary table ─────────────────────────────
         # Resolve EMA at print time (not scoring time) so penalties
         # applied between scoring and printing are reflected.
-        rows = getattr(self, "_epoch_score_rows", [])
+        rows = epoch_score_rows
         if rows:
             for r in rows:
                 _ref = r.pop("_scorer_ref", None)
@@ -11293,7 +14763,6 @@ class ValidatorNeuron:
                     total_ema = sum(r["ema"] for r in uid_rows)
                     bt.logging.info(f"{uid_val:<5} {'':<5}  {'── total ──':<30}  {'':<5}  {'':<20}  {total_score:>8.4f}  {total_ema:>8.4f}")
             bt.logging.info("")
-        self._epoch_score_rows = []
 
         try:
             self._finalize_owner_verdict_snapshot(
@@ -12507,8 +15976,11 @@ class ValidatorNeuron:
         self,
         epoch_number: int,
         receipt_authority: ValidatorAuthority | None,
+        *,
+        miners: Optional[List[ActiveMiner]] = None,
     ) -> Tuple[Dict[str, List[ServiceReceipt]], List[ServiceReceipt]]:
         """Pull epoch receipts without sharing workers with canary execution."""
+        epoch_miners = self._epoch_miners if miners is None else miners
         miner_receipts: Dict[str, List[ServiceReceipt]] = {}
         all_epoch_receipts: List[ServiceReceipt] = []
         pull_failed_keys: Set[Tuple[str, int]] = set()
@@ -12651,21 +16123,25 @@ class ValidatorNeuron:
         path = f"/epoch/{epoch_number}/receipts"
 
         from neurons.request_signing import sign_request
-        auth_headers = sign_request(
-            method="GET", path=path, body=b"",
-            hotkey_ss58=self._validator_hotkey_ss58,
-            hotkey_seed=self._validator_private_key,
-        )
         transient_status = {408, 425, 429, 500, 502, 503, 504}
         transient_exc = (
             httpx.TimeoutException, httpx.ReadError, httpx.ConnectError,
             httpx.RemoteProtocolError, httpx.WriteError,
         )
         attempts = 3
+        signing_timestamp = int(time.time())
         last_err = None
         resp = None
         for attempt in range(1, attempts + 1):
             try:
+                auth_headers = sign_request(
+                    method="GET",
+                    path=path,
+                    body=b"",
+                    hotkey_ss58=self._validator_hotkey_ss58,
+                    hotkey_seed=self._validator_private_key,
+                    timestamp=signing_timestamp + attempt - 1,
+                )
                 resp = httpx.get(
                     url,
                     timeout=self.config.epoch_receipt_pull_timeout,
@@ -12714,10 +16190,21 @@ class ValidatorNeuron:
             verified = []
             seen_sigs: set[bytes] = set()
             duplicates = 0
+            expected_miner_address = str(miner.address).strip().lower()
             for r_dict in receipt_dicts:
                 try:
                     receipt = receipt_from_dict(r_dict)
                     if not verify_service_receipt(receipt, epoch_number, authority=authority):
+                        continue
+                    if (
+                        str(receipt.miner_address).strip().lower()
+                        != expected_miner_address
+                    ):
+                        bt.logging.debug(
+                            "Rejected cross-miner receipt replay from "
+                            f"{miner.address[:10]}: receipt binds "
+                            f"{str(receipt.miner_address)[:10]}"
+                        )
                         continue
                     if receipt.validator_signature in seen_sigs:
                         duplicates += 1
@@ -12867,10 +16354,25 @@ class ValidatorNeuron:
             httpx.TimeoutException, httpx.ReadError, httpx.ConnectError,
             httpx.RemoteProtocolError, httpx.WriteError,
         )
+        signing_timestamp = int(_time.time())
         last_status = None
         last_err = None
         for attempt in range(3):
             try:
+                # Sign the path we actually POST to: audit receipts go to
+                # /proof/v3/audit-receipt, and a signature minted for
+                # /epoch/receipt fails their auth with an opaque 403 on
+                # every attempt (observed: an entire epoch's audit
+                # receipts rejected, miner pulled 0/0 at close and entered
+                # probation despite verified canaries).
+                auth_headers = _sign(
+                    method="POST",
+                    path=receipt_path,
+                    body=receipt_body,
+                    hotkey_ss58=self._validator_hotkey_ss58,
+                    hotkey_seed=self._validator_private_key,
+                    timestamp=signing_timestamp + attempt,
+                )
                 resp = httpx.post(
                     url,
                     content=receipt_body,
@@ -12885,6 +16387,9 @@ class ValidatorNeuron:
                     )
                     return True
                 last_status = resp.status_code
+                # Keep the rejection REASON: an opaque "HTTP 403" cost a
+                # full debugging session; the body says why.
+                last_err = (resp.text or "")[:200]
                 if resp.status_code >= 500 and attempt < len(backoffs):
                     _time.sleep(backoffs[attempt])
                     continue
@@ -12899,7 +16404,7 @@ class ValidatorNeuron:
                 last_err = e
                 break
         reason = (
-            f"HTTP {last_status}" if last_status is not None
+            f"HTTP {last_status}: {last_err}" if last_status is not None
             else f"{type(last_err).__name__}: {last_err}"
         )
         bt.logging.info(
@@ -12950,20 +16455,100 @@ class ValidatorNeuron:
                 f"Tokenizer hash verified for {model_id}: {local[:8].hex()}"
             )
 
-    def _on_proof_failure(
+    def _reconcile_epoch_close_slot_result(
         self,
+        address: str,
+        model_index: int,
+        result: dict,
+        *,
+        endpoint: str = "",
+    ) -> None:
+        """Reconcile in-memory score/probation from one atomic DB result."""
+
+        address = address.lower()
+        ema_score = result.get("ema_score")
+        for state in self.scorer.states.values():
+            if state.address.lower() != address:
+                continue
+            entry = state.entries.get(int(model_index))
+            if entry is not None:
+                if ema_score is not None:
+                    entry.ema_score = float(ema_score)
+                if result.get("total_epochs") is not None:
+                    entry.total_epochs = int(result["total_epochs"])
+                if result.get("scored_epochs") is not None:
+                    entry.scored_epochs = int(result["scored_epochs"])
+            break
+
+        tracker = getattr(self, "_probation_tracker", None)
+        if tracker is None:
+            return
+        key = self._miner_model_key(address, model_index)
+        entered = result.get("probation_entered_epoch")
+        if entered is None:
+            clear = getattr(tracker, "reconcile_not_on_probation", None)
+            if callable(clear):
+                clear(key)
+            return
+        reconcile = getattr(tracker, "reconcile_probation", None)
+        if callable(reconcile):
+            reconcile(
+                key,
+                entered_at_epoch=int(entered),
+                consecutive_passes=int(
+                    result.get("probation_consecutive_passes", 0)
+                ),
+                endpoint=endpoint,
+            )
+
+    def _apply_epoch_close_slot_event(
+        self,
+        *,
+        epoch_number: int,
         miner_address: str,
         model_index: int,
+        event_kind: str,
+        action: str,
         endpoint: str = "",
-        *,
-        source_epoch: int | None = None,
-    ):
+    ) -> Optional[dict]:
+        apply_event = getattr(self._db, "apply_epoch_close_slot_event", None)
+        if not callable(apply_event):
+            return None
+        result = apply_event(
+            epoch_number=int(epoch_number),
+            address=miner_address,
+            model_index=int(model_index),
+            event_kind=event_kind,
+            action=action,
+        )
+        if not result.get("entry_found"):
+            raise RuntimeError("epoch-close journal target is missing")
+        self._reconcile_epoch_close_slot_result(
+            miner_address,
+            model_index,
+            result,
+            endpoint=endpoint,
+        )
+        return result
+
+    def _on_proof_failure(self, miner_address: str, model_index: int,
+                          endpoint: str = "", *,
+                          source_epoch: Optional[int] = None,
+                          epoch_close_number: Optional[int] = None,
+                          epoch_close_event_kind: str = "",
+                          binding_violation: bool = False,
+                          cause: str = "for_cause"):
         """Mid-epoch cutoff: immediately put miner on probation and notify proxy.
 
         Called as soon as a proof verification fails (not waiting for epoch close).
         Updates shared state so the proxy stops routing organic traffic to this miner.
         Halves EMA score on every failure — geometric decay punishes repeat
         offenders while keeping single failures recoverable.
+
+        ``binding_violation`` zeroes the EMA instead of halving it.  Halving
+        is calibrated for a miner having a bad epoch; a coordinator that broke
+        a commitment it had already made is not that, and geometric decay
+        would let it keep most of its accumulated score.
         """
         key = self._miner_model_key(miner_address, model_index)
         close_epoch = int(
@@ -12988,6 +16573,23 @@ class ValidatorNeuron:
                 f"{self._maintenance_grace_reason()}"
             )
             return
+        if epoch_close_number is not None:
+            if not epoch_close_event_kind:
+                raise ValueError("epoch-close proof penalty requires an event kind")
+            result = self._apply_epoch_close_slot_event(
+                epoch_number=epoch_close_number,
+                miner_address=miner_address,
+                model_index=model_index,
+                event_kind=epoch_close_event_kind,
+                action=(
+                    "binding_violation" if binding_violation
+                    else "proof_penalty"
+                ),
+                endpoint=endpoint,
+            )
+            if result is not None:
+                self._write_shared_state()
+                return
         # Look up UID + SS58 for human-readable logging.  These are only
         # used for log messages — the DB row itself is keyed on
         # (address, model_index).
@@ -13003,23 +16605,45 @@ class ValidatorNeuron:
             _ss58 = self._get_miner_ss58(miner_address, "hotkey") or ""
         except Exception:
             pass
+        # ``cause`` classifies the ENTRY: proof/integrity/binding callers
+        # keep the for_cause default; the canary obligation-miss caller
+        # passes "availability" (dead-box signature). The label only
+        # ratchets up afterwards, so a mislabeled for_cause here would
+        # permanently disable the availability re-registration clear.
+        _probation_cause = (
+            "availability" if cause == "availability" else "for_cause"
+        )
         if not self._probation_tracker.is_on_probation(key):
-            self._probation_tracker.enter_probation(key, close_epoch, endpoint=endpoint)
+            self._probation_tracker.enter_probation(
+                key, close_epoch, endpoint=endpoint, cause=_probation_cause)
             self._db.enter_probation(
                 miner_address, model_index, close_epoch,
+                cause=_probation_cause,
                 uid=_uid, hotkey_ss58=_ss58,
             )
         else:
             self._probation_tracker.record_failure(key)
             self._db.record_failure(miner_address, model_index)
+            if _probation_cause == "for_cause":
+                # A for_cause consequence during an availability probation
+                # upgrades the label (clocks untouched); the reverse never
+                # downgrades.
+                self._probation_tracker.ratchet_cause_for_cause(key)
+                self._db.ratchet_probation_source_for_cause(
+                    miner_address, model_index
+                )
 
-        # Halve EMA score immediately — don't wait for epoch close
-        self.scorer.halve_ema(miner_address, model_index)
-        self._db.halve_ema(miner_address, model_index)
+        # Cut the score immediately — don't wait for epoch close
+        if binding_violation:
+            self.scorer.zero_ema(miner_address, model_index)
+            self._db.zero_ema(miner_address, model_index)
+        else:
+            self.scorer.halve_ema(miner_address, model_index)
+            self._db.halve_ema(miner_address, model_index)
 
         # A genuine mid-epoch failure must reach the proxy immediately. During
         # epoch close, however, every entry is processed in one frozen batch
-        # and _close_epoch writes the complete state once at the end. Rewriting
+        # and the close writes the complete state once at the end. Rewriting
         # the full snapshot per failed entry can otherwise stall the next
         # epoch's setup for tens of seconds on a large network.
         close_local = getattr(self, "_epoch_close_local", None)
@@ -13031,8 +16655,9 @@ class ValidatorNeuron:
             self._write_shared_state()
             bt.logging.info(
                 f"Mid-epoch cutoff: {miner_address[:10]} "
-                f"model_index={model_index} on probation, shared state "
-                "updated for proxy"
+                f"model_index={model_index} on probation"
+                + (" for a binding violation" if binding_violation else "")
+                + ", shared state updated for proxy"
             )
         else:
             bt.logging.debug(
@@ -13213,7 +16838,11 @@ class ValidatorNeuron:
         served = {
             m.model_id
             for m in self._epoch_close_value("_epoch_miners", ())
-            if get_model(m.model_id) is not None
+            if _resolve_model_scoring_runtime(
+                m.model_id,
+                m.quant,
+                m.max_context_len,
+            ) is not None
         }
         if served:
             bt.logging.info(
@@ -13255,11 +16884,14 @@ class ValidatorNeuron:
         observed: Dict[str, Tuple[int, str]] = {}
         observed_score: Dict[str, float] = {}
         for miner in self._epoch_close_value("_epoch_miners", ()):
-            model_entry = get_model(miner.model_id)
-            if model_entry is None:
+            scoring_runtime = _resolve_model_scoring_runtime(
+                miner.model_id,
+                miner.quant,
+                miner.max_context_len,
+            )
+            if scoring_runtime is None:
                 continue
-            ctx = int(getattr(miner, "max_context_len", 0) or 0)
-            quant = getattr(miner, "quant", "") or ""
+            model_entry, ctx, quant = scoring_runtime
             if ctx <= 0 or not quant:
                 continue
             score = compute_model_base_utility(
@@ -13290,18 +16922,24 @@ class ValidatorNeuron:
         observed = self._observed_model_runtimes()
         budgets: Dict[str, float] = {}
         groups: Dict[str, str] = {}
+        group_families: Dict[str, str] = {}
         group_budgets: Dict[str, float] = {}
         skipped_unknown = 0
 
         for model_id in model_ids:
-            model_entry = get_model(model_id)
+            model_entry = _model_scoring_entry(model_id)
             if model_entry is None:
                 skipped_unknown += 1
                 continue
 
             ctx, quant = observed.get(model_id, (0, ""))
             if ctx <= 0 or not quant:
-                ctx, quant = self._best_registry_model_runtime(model_entry)
+                mesh_profile = get_mesh_model_scoring_profile(model_id)
+                if mesh_profile is not None:
+                    ctx = mesh_profile.native_context_len
+                    quant = mesh_profile.scoring_quant
+                else:
+                    ctx, quant = self._best_registry_model_runtime(model_entry)
             if ctx <= 0 or not quant:
                 continue
 
@@ -13326,8 +16964,18 @@ class ValidatorNeuron:
                 )
             variant_budget = base_utility * demand_bonus
             budgets[model_id] = variant_budget
-            group_id = self._model_emission_group(model_entry) or model_id
+            family = (
+                "mesh"
+                if get_mesh_model_scoring_profile(model_id) is not None
+                else "vllm"
+            )
+            logical_model = self._model_emission_group(model_entry) or model_id
+            # Runtime families normalize independently. Prefixing also prevents
+            # a mesh quant and a vLLM checkpoint of the same base model from
+            # silently merging into one logical bucket.
+            group_id = f"{family}:{logical_model}"
             groups[model_id] = group_id
+            group_families[group_id] = family
             group_budgets[group_id] = max(
                 group_budgets.get(group_id, 0.0),
                 variant_budget,
@@ -13338,12 +16986,39 @@ class ValidatorNeuron:
                 f"Model emission buckets: skipped {skipped_unknown} approved "
                 "model(s) missing from local registry"
             )
+        mesh_emission_bps = int(
+            self._epoch_close_value(
+                "_mesh_emission_bps",
+                getattr(self.config, "mesh_emission_bps", 0),
+            )
+            or 0
+        )
+        mesh_emission_bps = min(10_000, max(0, mesh_emission_bps))
+        family_shares = {
+            "vllm": (10_000 - mesh_emission_bps) / 10_000.0,
+            "mesh": mesh_emission_bps / 10_000.0,
+        }
+        family_totals = {
+            family: sum(
+                value
+                for group_id, value in group_budgets.items()
+                if group_families.get(group_id) == family
+            )
+            for family in family_shares
+        }
+        group_shares = {
+            group_id: family_shares[family] * value / family_totals[family]
+            for group_id, value in group_budgets.items()
+            for family in (group_families[group_id],)
+            if family_shares[family] > 0 and family_totals[family] > 0
+        }
+
         if budgets:
-            group_total = sum(group_budgets.values())
+            group_total = sum(group_shares.values())
             group_top = {
-                group_id: f"{value / group_total:.1%}"
+                group_id: f"{value:.1%}"
                 for group_id, value in sorted(
-                    group_budgets.items(), key=lambda item: -item[1]
+                    group_shares.items(), key=lambda item: -item[1]
                 )[:5]
             } if group_total > 0 else {}
             variant_total = sum(budgets.values())
@@ -13354,9 +17029,16 @@ class ValidatorNeuron:
                 )[:5]
             } if variant_total > 0 else {}
             bt.logging.info(f"Logical model emission bucket shares: {group_top}")
+            bt.logging.info(
+                "Runtime-family emission shares: "
+                f"vllm={family_shares['vllm']:.1%} "
+                f"mesh={family_shares['mesh']:.1%} "
+                f"reserved_unallocated={max(0.0, 1.0 - group_total):.1%}"
+            )
             bt.logging.info(f"Approved variant budget weights: {top}")
         self._last_model_emission_groups = groups
         self._last_model_group_budgets = group_budgets
+        self._last_model_group_shares = group_shares
         return budgets
 
     def _refresh_blacklist(self, addresses) -> None:
@@ -14129,6 +17811,16 @@ class ValidatorNeuron:
                     getattr(self, "_endpoint_policy_gate_reasons", {}) or {}
                 )
                 network_state = ValidatorNeuron._miner_debug_network_snapshot(self)
+                # Mesh health for the debug export: entries pinned for THIS
+                # epoch (routable) and entries excluded by snapshot-verify.
+                mesh_pinned_now: set = set()
+                try:
+                    for _ck in (getattr(self, "_mesh_snapshot_cache", {}) or {}):
+                        _a, _i, _e = _ck
+                        if int(_e) == int(epoch):
+                            mesh_pinned_now.add((str(_a).lower(), int(_i)))
+                except Exception:
+                    mesh_pinned_now = set()
                 snapshot = self._db.build_miner_debug_snapshots(
                     current_epoch=epoch,
                     capacity_audit_cfg=self._capacity_audit_cfg,
@@ -14139,6 +17831,10 @@ class ValidatorNeuron:
                     capacity_audit_gate_enforced=enforcement_enabled,
                     capacity_audit_gate_suppression_reason=suppression_reason,
                     uid_network_state=network_state,
+                    mesh_excluded=dict(
+                        getattr(self, "_mesh_excluded_this_epoch", {}) or {}
+                    ),
+                    mesh_pinned=mesh_pinned_now,
                     epoch_seconds=max(
                         1,
                         int(getattr(self.config, "epoch_blocks", 360) or 360) * 12,
@@ -14169,9 +17865,35 @@ class ValidatorNeuron:
         Derives scores and probation from the validator state DB, then
         overlays the current epoch's miner endpoints (live from discovery).
         """
-        from neurons.shared_state import write_shared_state, MinerEntry
+        from neurons.shared_state import (
+            MinerEntry,
+            RoutingExclusion,
+            mesh_snapshot_slot_key,
+            read_shared_state,
+            write_shared_state,
+        )
+
+        if int(self._current_epoch or 0) <= 0:
+            # Startup bootstrap write. Never regress a LIVE file with an
+            # epoch-0 snapshot-free state: the co-located proxy adopts
+            # epoch 0 and every pin it retained becomes "not for the
+            # active epoch" until the bootstrap pin cycle minutes later.
+            # First-install bootstrap (no file / epoch-0 file)
+            # still writes so a proxy without a validator gets endpoints.
+            try:
+                existing = read_shared_state(self.config.shared_state_path)
+            except Exception:
+                existing = None
+            if existing is not None and int(existing.epoch_number or 0) > 0:
+                bt.logging.info(
+                    "Skipping epoch-0 shared-state write: existing file "
+                    f"is ahead (epoch {existing.epoch_number})"
+                )
+                return
 
         shared = self._db.derive_shared_state(self._current_epoch)
+        shared.chain_id = int(self.config.chain_id)
+        shared.netuid = int(self.config.netuid)
         shared.epoch_start_block = self._epoch_start_block
         shared.last_weights = getattr(self, "_last_weights", {})
         shared.demand_scores = getattr(self, "_last_demand_scores", {})
@@ -14182,6 +17904,17 @@ class ValidatorNeuron:
             if str(a or "").strip()
         }
         shared.stale_miner_addresses = sorted(stale_addresses)
+        shared.routing_excluded_entries = [
+            RoutingExclusion(
+                address=str(address).lower(),
+                model_index=int(model_index),
+                reason_code=_endpoint_policy_reason_code(reason),
+                reason=str(reason),
+            )
+            for (address, model_index), reason in sorted(
+                (getattr(self, "_endpoint_policy_gate_reasons", {}) or {}).items()
+            )
+        ]
         try:
             shared.proof_v3_hard_failures = (
                 self._db.get_proof_v3_hard_failures(
@@ -14273,15 +18006,35 @@ class ValidatorNeuron:
                 tee_enabled=getattr(m, "tee_enabled", False) and _subnet_tee,
                 tee_platform=getattr(m, "tee_platform", "") if _subnet_tee else "",
                 enclave_public_key=getattr(m, "enclave_public_key", "") if _subnet_tee else "",
+                mesh_enabled=getattr(m, "mesh_enabled", False),
                 gpu_name=getattr(m, "gpu_name", ""),
                 gpu_count=getattr(m, "gpu_count", 0),
                 vram_gb=getattr(m, "vram_gb", 0),
                 compute_capability=getattr(m, "compute_capability", ""),
                 gpu_uuids=getattr(m, "gpu_uuids", []),
+                expires_at=int(getattr(m, "expires_at", 0) or 0),
             )
             for m in miners
             if m.address.lower() not in stale_addresses
         ]
+
+        # Publish only snapshots that the validator pinned for this exact
+        # epoch and whose coordinator/model slot remains in the accepted live
+        # set above.  The signed payload is endpoint-free; the proxy will
+        # still revalidate every binding before using it for organic traffic.
+        accepted_mesh_slots = {
+            (str(m.address).lower(), int(m.model_index))
+            for m in miners
+            if _is_mesh_runtime(m)
+        }
+        shared.mesh_verification_snapshots = {
+            mesh_snapshot_slot_key(address, model_index): snapshot.to_dict()
+            for (address, model_index, epoch), snapshot in getattr(
+                self, "_mesh_snapshot_cache", {}
+            ).items()
+            if int(epoch) == int(self._current_epoch)
+            and (str(address).lower(), int(model_index)) in accepted_mesh_slots
+        }
 
         write_shared_state(shared, self.config.shared_state_path)
         bt.logging.info(f"Shared state written: epoch={self._current_epoch}, {len(shared.miner_scores)} miner scores")
@@ -14333,17 +18086,23 @@ class ValidatorNeuron:
         if loaded:
             bt.logging.info(f"Loaded {loaded} score entries from validator DB")
 
-    def _set_weights(self, weights: Dict[int, float]):
+    def _set_weights(self, weights: Dict[int, float]) -> bool:
         """Set weights on Bittensor substrate."""
+        if not getattr(self, "_weight_setting_enabled", True):
+            bt.logging.info(
+                "Weight submission disabled (--no-set-weights); "
+                "computed weights were not sent to Subtensor"
+            )
+            return False
         if not weights:
-            return
+            return False
 
         uids = list(weights.keys())
         vals = [weights[uid] for uid in uids]
 
         max_val = max(vals) if vals else 1.0
         if max_val <= 0:
-            return
+            return False
 
         import torch
         uid_tensor = torch.tensor(uids, dtype=torch.long)
@@ -14366,6 +18125,7 @@ class ValidatorNeuron:
             bt.logging.success(
                 f"Weights set for {len(uids)} UIDs (version_key={spec_version}): {dict(zip(uids, vals))}",
             )
+            return True
         except Exception as e:
             bt.logging.error(f"Failed to set weights: {e}")
             raise
@@ -14513,6 +18273,105 @@ class ValidatorNeuron:
     # Main loop (unchanged)
     # ------------------------------------------------------------------
 
+    def _initialize_epoch_from_head(
+        self,
+        current: int,
+        *,
+        start_at_current: bool,
+    ) -> None:
+        """Choose restart semantics from one authoritative chain head.
+
+        Early restarts explicitly rebuild the current epoch instead of waiting
+        for a historical boundary callback that will never arrive.  Late
+        restarts wait for the next boundary and abandon any unsealed current
+        row fail-neutrally; fabricating its lost miner/accounting context would
+        be unsafe.
+        """
+
+        epoch_blocks = self.config.epoch_blocks
+        blocks_into_epoch = current % epoch_blocks
+        current_epoch_start = current - blocks_into_epoch
+        current_epoch = current_epoch_start // epoch_blocks
+        if start_at_current or blocks_into_epoch <= epoch_blocks // 4:
+            self._sync_block = current if start_at_current else current_epoch_start
+            self._start_new_epoch(current_epoch_start)
+        else:
+            self._sync_block = current_epoch_start + epoch_blocks
+            self._abandon_unrecoverable_collecting_epochs(
+                current_epoch,
+                reason=(
+                    "validator restarted too late to reconstruct the current "
+                    "epoch safely"
+                ),
+            )
+            # Scoring fail-neutrally skips this epoch, but proxies route
+            # organics off OUR pinned snapshots: waiting for the boundary
+            # left every mesh unroutable for up to an epoch after each
+            # validator restart. Restore routability now; scoring still
+            # begins cleanly at the boundary.
+            self._bootstrap_serving_pins(current_epoch, current_epoch_start)
+
+    def _bootstrap_serving_pins(
+        self,
+        epoch_number: int,
+        epoch_start_block: int,
+    ) -> None:
+        """Pin mesh snapshots for the ACTIVE epoch right after a late restart
+        and publish shared state, so organic routing does not wait for the
+        scoring boundary. No canary/scoring machinery is armed here."""
+        try:
+            miners = discover_active_miners(
+                self._miner_client, self._model_client
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Serving bootstrap: miner discovery failed ({exc}) — "
+                "organics resume at the next epoch boundary"
+            )
+            return
+        try:
+            # Same order as the epoch path: mesh trust anchors need the
+            # ModelSpecs AND the metagraph ss58 enrichment, and both boot
+            # caches are cold — each missing one failed every bootstrap pin
+            # ("ModelSpec is unavailable", "coordinator hotkey is
+            # unavailable").
+            self._refresh_epoch_model_specs({m.model_id for m in miners})
+            self._enrich_miners_from_metagraph(miners)
+            miners = self._apply_authenticated_mesh_policy(
+                miners,
+                epoch_number=epoch_number,
+            )
+            # Validator-initiated pins: a mesh relaunched while the
+            # validator was down carries a new mesh_id, and the anti-swap
+            # guard would otherwise reject the whole healthy fleet until
+            # the boundary (live: 0/2 pinned twice in one afternoon).
+            accepted = self._refresh_mesh_verification_snapshots(
+                miners, epoch_number, allow_mesh_change=True
+            )
+            if not accepted and any(_is_mesh_runtime(m) for m in miners):
+                # Cold-boot RPC flakes are common; one bounded retry turns
+                # a 72-minute outage into a 30-second one.
+                time.sleep(30.0)
+                self._refresh_epoch_model_specs({m.model_id for m in miners})
+                self._enrich_miners_from_metagraph(miners)
+                accepted = self._refresh_mesh_verification_snapshots(
+                    miners, epoch_number, allow_mesh_change=True
+                )
+            self._epoch_miners = accepted
+            self._current_epoch = epoch_number
+            self._epoch_start_block = epoch_start_block
+            self._write_shared_state()
+            bt.logging.info(
+                f"Serving bootstrap: pinned mesh snapshots for active epoch "
+                f"{epoch_number} ({len(accepted)} miner entries) — organic "
+                "routing restored ahead of the scoring boundary"
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Serving bootstrap failed ({exc}) — organics resume at the "
+                "next epoch boundary"
+            )
+
     def main_loop(self):
         """Run the validator via WebSocket subscription to current-head block headers.
 
@@ -14532,22 +18391,16 @@ class ValidatorNeuron:
         current = self._get_current_block_with_retry()
         epoch_blocks = self.config.epoch_blocks
         blocks_into_epoch = current % epoch_blocks
-        current_epoch_start = current - blocks_into_epoch
         start_at_current = str(os.getenv("VERATHOS_VALIDATOR_START_AT_CURRENT_BLOCK", "")).lower() in {
             "1",
             "true",
             "yes",
             "on",
         }
-        if start_at_current:
-            self._sync_block = current
-        elif blocks_into_epoch <= epoch_blocks // 4:
-            # Early in epoch — start from current epoch boundary so we can
-            # still schedule and run tests in this epoch.
-            self._sync_block = current_epoch_start
-        else:
-            # Too far into epoch for a full test cycle — wait for next.
-            self._sync_block = current_epoch_start + epoch_blocks
+        self._initialize_epoch_from_head(
+            current,
+            start_at_current=start_at_current,
+        )
         bt.logging.info(f"Sync: current block={current}, epoch_offset={blocks_into_epoch}/{epoch_blocks}, will start processing at block {self._sync_block}")
 
         self._run_with_streaming()
@@ -14921,6 +18774,7 @@ class ValidatorNeuron:
             # process created before this guard existed.
             dispatch_lock = threading.Lock()
             self._block_dispatch_lock = dispatch_lock
+        database_lock_seen = False
         for block_num in range(last_block + 1, current_block + 1):
             if not self._running:
                 break
@@ -14954,12 +18808,70 @@ class ValidatorNeuron:
                         block_hash_real=block_hash_real,
                     )
                 except Exception as e:
-                    bt.logging.debug(f"Block {block_num} processing: {e}")
+                    if self._handle_database_lock_failure(e, block_num):
+                        database_lock_seen = True
+                    else:
+                        bt.logging.debug(f"Block {block_num} processing: {e}")
             last_block = block_num
         confirmer = getattr(self, "_confirm_capacity_audit_finalized_blocks", None)
-        if callable(confirmer):
-            confirmer(subtensor_obj)
+        if callable(confirmer) and self._running:
+            try:
+                confirmer(subtensor_obj)
+            except Exception as exc:
+                if self._handle_database_lock_failure(exc, current_block):
+                    database_lock_seen = True
+                else:
+                    raise
+        if not database_lock_seen:
+            self._database_lock_failure_streak = 0
         return last_block
+
+    @staticmethod
+    def _is_database_lock_error(error: BaseException) -> bool:
+        """Return whether an exception chain represents SQLite writer lockout."""
+
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if (
+                isinstance(current, sqlite3.OperationalError)
+                and "database is locked" in str(current).lower()
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _handle_database_lock_failure(
+        self,
+        error: BaseException,
+        block_number: int,
+    ) -> bool:
+        """Recover an abandoned transaction or terminate after bounded retries."""
+
+        if not self._is_database_lock_error(error):
+            return False
+        streak = int(getattr(self, "_database_lock_failure_streak", 0) or 0) + 1
+        self._database_lock_failure_streak = streak
+        recovered: tuple[str, ...] = ()
+        recovery_error = ""
+        try:
+            recovered = tuple(self._db.rollback_abandoned_transactions())
+        except Exception as exc:
+            recovery_error = f"{type(exc).__name__}: {exc}"
+        bt.logging.error(
+            "Validator SQLite writer lock detected; "
+            f"block={int(block_number)} streak={streak} "
+            f"rolled_back={','.join(recovered) or 'none'}"
+            + (f" recovery_error={recovery_error}" if recovery_error else "")
+        )
+        if streak >= 3:
+            bt.logging.critical(
+                "Validator SQLite writer lock persisted for three block "
+                "callbacks; stopping so the process supervisor can recover"
+            )
+            self._running = False
+        return True
 
     def _poll_current_head_catch_up(
         self,
@@ -14997,6 +18909,13 @@ class ValidatorNeuron:
                 self._schedule_metagraph_stats_refresh()
             if current % 5 == 0 and hasattr(self, '_cached_metagraph_parts'):
                 bt.logging.info(f"Metagraph | block={current} | {' | '.join(self._cached_metagraph_parts)}")
+            # Public diagnostics must not freeze during this wait (it can
+            # last most of an epoch, and it always follows a restart - the
+            # exact moment operators are watching). The schedule has its own
+            # 60s throttle.
+            self._schedule_miner_debug_refresh(
+                current_epoch=current // max(1, int(self.config.epoch_blocks)),
+            )
 
         return self._process_current_head_block_range(
             last_block,
@@ -15418,6 +19337,9 @@ def parse_args():
                              "want to fund an EVM mirror with TAO. Network still works "
                              "fine: dead miners get cleaned up via 24h lease expiry and "
                              "other validators' reportOffline votes.")
+    parser.add_argument("--no-set-weights", action="store_true",
+                        help="Compute scores but do not submit Bittensor weights "
+                             "(isolated/test validators only).")
     parser.add_argument("--capacity-audit", action="store_true",
                         help="Enable hot-capacity audit windows (default mode: observe).")
     parser.add_argument("--capacity-audit-mode", default=None,
@@ -15484,6 +19406,8 @@ def parse_args():
                         help="Active-entry fraction independently convicted before UID-wide zeroing.")
     parser.add_argument("--capacity-audit-uid-escalation-max-entries", type=int, default=None,
                         help="Maximum independently convicted entries required for UID-wide zeroing.")
+    parser.add_argument("--mesh-capacity-audit-enforcement-epoch", type=int, default=None,
+                        help="First epoch at which mesh (GGUF) entries are gated by the capacity audit; 0 disables mesh gating (observe only).")
     timing_gate = parser.add_mutually_exclusive_group()
     timing_gate.add_argument("--capacity-audit-allow-timing-only-score-gate",
                              dest="capacity_audit_allow_timing_only_score_gate",
@@ -15498,12 +19422,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    from neurons.log import setup_neuron_logging, print_banner
+def build_validator_config(args) -> NeuronConfig:
+    """Build the validator NeuronConfig exactly as ``main()`` does.
 
-    args = parse_args()
-    setup_neuron_logging(args)
-
+    Extracted verbatim from ``main()`` so on-demand tooling
+    (scripts/vali_canary_drill.py) constructs an identical config from
+    the same argparse surface; behavior is unchanged.
+    """
     extra_kwargs = {}
     if args.ema_alpha is not None:
         extra_kwargs["ema_alpha"] = args.ema_alpha
@@ -15573,6 +19498,8 @@ def main():
         extra_kwargs["capacity_audit_uid_escalation_max_entries"] = args.capacity_audit_uid_escalation_max_entries
     if args.capacity_audit_allow_timing_only_score_gate is not None:
         extra_kwargs["capacity_audit_allow_timing_only_score_gate"] = args.capacity_audit_allow_timing_only_score_gate
+    if args.mesh_capacity_audit_enforcement_epoch is not None:
+        extra_kwargs["mesh_capacity_audit_enforcement_epoch"] = args.mesh_capacity_audit_enforcement_epoch
     config = NeuronConfig.from_env(
         wallet_name=args.wallet,
         hotkey_name=args.hotkey,
@@ -15662,7 +19589,23 @@ def main():
     config.proof_v3_canary_policy_path = _resolve_proof_v3_canary_policy_path(
         args.proof_v3_canary_policy,
     )
+    return config
+
+
+def main():
+    from neurons.log import setup_neuron_logging, print_banner
+
+    args = parse_args()
+    setup_neuron_logging(args)
+
+    config = build_validator_config(args)
     neuron = ValidatorNeuron(config)
+    neuron._weight_setting_enabled = not args.no_set_weights
+    if not neuron._weight_setting_enabled:
+        bt.logging.warning(
+            "Weight submission disabled (--no-set-weights); "
+            "this validator will score miners without changing chain weights"
+        )
     if args.analytics:
         bt.logging.info("Analytics database enabled (--analytics)")
     else:
@@ -15721,9 +19664,14 @@ def main():
         )
         neuron._epoch_miners_discovery_valid = True
         neuron._enrich_miners_from_metagraph(neuron._epoch_miners)
+        neuron._epoch_miners = neuron._apply_authenticated_mesh_policy(
+            neuron._epoch_miners,
+            epoch_number=0,
+        )
         neuron._epoch_miners = neuron._apply_mainnet_endpoint_policy(
             neuron._epoch_miners,
             epoch_number=0,
+            preserve_existing=True,
         )
         # Fetch hardware metadata from miners at startup (best-effort).
         neuron._refresh_miner_hardware_batch(

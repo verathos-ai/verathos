@@ -27,7 +27,8 @@ curl -X POST https://api.verathos.ai/v1/chat/completions \
 **Request fields:**
 
 - `messages`: array of `{role, content}` objects (required)
-- `model`: model ID or `"auto"` (required). Use `"auto"` to let Verathos pick the best available model based on miner scores. Retries automatically fall through to the next-best endpoint across all models.
+- `model`: model ID or `"kvasir"` (required). Use `"kvasir"` (legacy alias: `"auto"`) to route through Kvasir, the network's intelligent router: it classifies each request into a task class (code, math, creative writing, ...) and picks the best-fit qualified model. Retries automatically fall through to the next-best endpoint across all models. Specific models accept a quantization suffix: vLLM lanes like `qwen3.5-9b:fp16` / `:gptq_int4`, GGUF mesh rungs like `qwen3.8-27b:q4-k-m` / `glm-5.2:iq2-m`. Check `/v1/models` for live ids and rungs.
+- `router_intensity`: optional Kvasir routing mode, only meaningful with `model: "kvasir"`. `"swift"` picks one expert speed-first, `"auto"` (default) picks one expert by best class fit, `"council"` fans the request out to a panel of distinct models and streams the best seat's synthesis of their drafts (each seat is a normally billed and receipted request). Aliases `fast`/`balanced`/`best` are accepted; unknown values behave like `"auto"`.
 - `max_tokens`: max output tokens
 - `stream`: enable SSE streaming (default: false)
 - `temperature`: sampling temperature (default: 1.0)

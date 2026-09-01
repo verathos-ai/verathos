@@ -1,0 +1,233 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 12bbee10f..378618a62 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1181,6 +1181,11 @@ static int64_t verathos_cpu_graph_max_src1_rows = 0;
+ static int64_t verathos_cpu_selected_ops_graph[64] = {0};
+ static int64_t verathos_cpu_selected_ops_intra[64] = {0};
+ static int verathos_cpu_selected_ops_count = 0;
++// Name-armed dump filter (n:<weight name> entries): matches any small-row
++// instance whose src0 weight carries the name, on every graph and at every
++// intra ordinal (see the CUDA hook for the rationale).
++static char verathos_cpu_selected_names[16][96] = {{0}};
++static int verathos_cpu_selected_names_count = 0;
+ static FILE * verathos_cpu_manifest_file = NULL;
+ static char verathos_cpu_manifest_path[8192] = {0};
+ 
+@@ -1316,6 +1321,7 @@ static void verathos_cpu_parse_selected_manifest_indexes(const char * token) {
+ 
+ static void verathos_cpu_parse_selected_ops(const char * token) {
+     verathos_cpu_selected_ops_count = 0;
++    verathos_cpu_selected_names_count = 0;
+     if (token == NULL) {
+         return;
+     }
+@@ -1328,6 +1334,24 @@ static void verathos_cpu_parse_selected_ops(const char * token) {
+         while (*selected == ' ' || *selected == '\t' || *selected == ',') {
+             selected++;
+         }
++        // n:<name> arms by src0 weight name (emitted after the ordinal
++        // entries; parsers without name support stop here harmlessly).
++        if (selected[0] == 'n' && selected[1] == ':') {
++            selected += 2;
++            size_t len = 0;
++            while (selected[len] != '\0' && selected[len] != ',' &&
++                   selected[len] != ' ' && selected[len] != '\t' &&
++                   selected[len] != '|') {
++                len++;
++            }
++            if (len > 0 && len < 96 && verathos_cpu_selected_names_count < 16) {
++                memcpy(verathos_cpu_selected_names[verathos_cpu_selected_names_count], selected, len);
++                verathos_cpu_selected_names[verathos_cpu_selected_names_count][len] = '\0';
++                verathos_cpu_selected_names_count++;
++            }
++            selected += len;
++            continue;
++        }
+         if (*selected < '0' || *selected > '9') {
+             break;
+         }
+@@ -1358,6 +1382,28 @@ static bool verathos_cpu_should_dump_selected_op(int64_t graph_sequence, int64_t
+     return false;
+ }
+ 
++static bool verathos_cpu_selected_op_arming_active(void) {
++    return verathos_cpu_selected_ops_count > 0 || verathos_cpu_selected_names_count > 0;
++}
++
++// Name-armed entries are graph- and intra-agnostic but small-row only, so
++// an armed window cannot be made to dump whole prefill activations.
++static bool verathos_cpu_should_dump_selected_op_named(
++        int64_t graph_sequence, int64_t intra_index, int64_t src1_rows,
++        const char * src0_name) {
++    if (verathos_cpu_should_dump_selected_op(graph_sequence, intra_index)) {
++        return true;
++    }
++    if (src0_name != NULL && src1_rows <= 8) {
++        for (int i = 0; i < verathos_cpu_selected_names_count; ++i) {
++            if (strcmp(verathos_cpu_selected_names[i], src0_name) == 0) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ static bool verathos_cpu_should_dump_manifest_index(int64_t manifest_index) {
+     if (verathos_cpu_selected_manifest_count > 0) {
+         for (int i = 0; i < verathos_cpu_selected_manifest_count; ++i) {
+@@ -2085,8 +2131,10 @@ static void verathos_cpu_try_dump_mul_mat_trace(const struct ggml_tensor * dst)
+             verathos_cpu_graph_sequence, intra_graph_index, src0, src1, dst);
+     verathos_cpu_graph_written_rows++;
+ 
+-    const bool selected_op_dump = verathos_cpu_selected_ops_count > 0 &&
+-        verathos_cpu_should_dump_selected_op(verathos_cpu_graph_sequence, intra_graph_index);
++    const bool selected_op_dump = verathos_cpu_selected_op_arming_active() &&
++        verathos_cpu_should_dump_selected_op_named(
++            verathos_cpu_graph_sequence, intra_graph_index,
++            src1->ne[1], src0->name);
+ 
+     // Streaming anchors for ONE selected op execution. The instance gate is
+     // load bearing, not an optimization: without it the stream spans every
+@@ -2111,7 +2159,7 @@ static void verathos_cpu_try_dump_mul_mat_trace(const struct ggml_tensor * dst)
+         free(anchor_src1);
+         free(anchor_dst);
+     }
+-    if (!selected_op_dump && verathos_cpu_selected_ops_count > 0) {
++    if (!selected_op_dump && verathos_cpu_selected_op_arming_active()) {
+         return;
+     }
+     if (!selected_op_dump && !verathos_cpu_should_dump_manifest_index(manifest_index)) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 050e90c1f..a2d9d4776 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -125,6 +125,12 @@ static int64_t verathos_cuda_mmid_dumped = 0;
+ static thread_local bool verathos_cuda_in_graph_capture = false;
+ static int64_t verathos_cuda_graph_max_src1_rows = 0;
+ static std::vector<std::pair<int64_t, int64_t>> verathos_cuda_selected_ops;
++// Name-armed dump filter (n:<weight name> entries): matches any small-row
++// instance whose src0 weight carries the name, on every graph and at every
++// intra ordinal. This is the arming that survives architectures whose op
++// stream is length-dependent (glm-dsa sparse attention switches its indexer
++// path with KV state, shifting intra ordinals between graph kinds).
++static std::vector<std::string> verathos_cuda_selected_names;
+ 
+ // ---------------------------------------------------------------------------
+ // Streaming prefill execution anchors (verathos-anchor.h primitives).
+@@ -561,6 +567,7 @@ static void verathos_cuda_parse_selected_manifest_indexes(const std::string & to
+ 
+ static void verathos_cuda_parse_selected_ops(const std::string & token) {
+     verathos_cuda_selected_ops.clear();
++    verathos_cuda_selected_names.clear();
+     const std::string marker = "selected_v3=";
+     size_t pos = token.find(marker);
+     if (pos == std::string::npos) {
+@@ -571,6 +578,21 @@ static void verathos_cuda_parse_selected_ops(const std::string & token) {
+         while (pos < token.size() && (token[pos] == ' ' || token[pos] == '\t' || token[pos] == ',')) {
+             ++pos;
+         }
++        // n:<name> arms by src0 weight name (emitted after the ordinal
++        // entries; parsers without name support stop here harmlessly).
++        if (pos + 1 < token.size() && token[pos] == 'n' && token[pos + 1] == ':') {
++            size_t name_end = pos + 2;
++            while (name_end < token.size() && token[name_end] != ',' &&
++                   token[name_end] != ' ' && token[name_end] != '\t' &&
++                   token[name_end] != '|') {
++                ++name_end;
++            }
++            if (name_end > pos + 2 && verathos_cuda_selected_names.size() < 16) {
++                verathos_cuda_selected_names.push_back(token.substr(pos + 2, name_end - (pos + 2)));
++            }
++            pos = name_end;
++            continue;
++        }
+         // '*' as the graph ordinal arms the intra for EVERY graph in the
+         // window (ord-agnostic). Real replay graph ordinals drift from the
+         // committed layout whenever the scheduler splits a pass into extra
+@@ -632,7 +654,8 @@ static bool verathos_cuda_should_dump_selected_op(int64_t graph_sequence, int64_
+ // per-token structure) so an armed window cannot be made to dump whole
+ // prefill activations for every graph.
+ static bool verathos_cuda_should_dump_selected_op_rows(
+-        int64_t graph_sequence, int64_t intra_index, int64_t src1_rows) {
++        int64_t graph_sequence, int64_t intra_index, int64_t src1_rows,
++        const char * src0_name) {
+     for (const auto & item : verathos_cuda_selected_ops) {
+         if (item.second != intra_index) {
+             continue;
+@@ -644,9 +667,22 @@ static bool verathos_cuda_should_dump_selected_op_rows(
+             return true;
+         }
+     }
++    // Name-armed entries are graph- and intra-agnostic but small-row only,
++    // so an armed window cannot be made to dump whole prefill activations.
++    if (src0_name != nullptr && src1_rows <= 8) {
++        for (const auto & name : verathos_cuda_selected_names) {
++            if (name == src0_name) {
++                return true;
++            }
++        }
++    }
+     return false;
+ }
+ 
++static bool verathos_cuda_selected_op_arming_active() {
++    return !verathos_cuda_selected_ops.empty() || !verathos_cuda_selected_names.empty();
++}
++
+ static bool verathos_cuda_should_dump_manifest_index(int64_t manifest_index) {
+     if (!verathos_cuda_selected_manifest_indexes.empty()) {
+         for (int64_t selected : verathos_cuda_selected_manifest_indexes) {
+@@ -839,7 +875,7 @@ static bool verathos_cuda_selected_dump_pending() {
+     if (!verathos_cuda_trace_enabled()) {
+         return false;
+     }
+-    return !verathos_cuda_selected_ops.empty() ||
++    return verathos_cuda_selected_op_arming_active() ||
+         !verathos_cuda_selected_manifest_indexes.empty();
+ }
+ 
+@@ -847,7 +883,7 @@ static bool verathos_cuda_capture_work_pending() {
+     if (!verathos_cuda_trace_enabled()) {
+         return false;
+     }
+-    if (!verathos_cuda_selected_ops.empty() || !verathos_cuda_selected_manifest_indexes.empty()) {
++    if (verathos_cuda_selected_op_arming_active() || !verathos_cuda_selected_manifest_indexes.empty()) {
+         return true;
+     }
+     if (!verathos_cuda_manifest_disabled()) {
+@@ -1564,9 +1600,10 @@ static void verathos_cuda_try_dump_mul_mat_trace(
+     // all) instead of equal to the op-manifest entry's own src1_shape[1]
+     // that the verifier checks against. It also keeps two experts of one 3-D
+     // MoE tensor in separate streams rather than merged into one.
+-    const bool selected_op_dump = !verathos_cuda_selected_ops.empty() &&
++    const bool selected_op_dump = verathos_cuda_selected_op_arming_active() &&
+         verathos_cuda_should_dump_selected_op_rows(
+-            verathos_cuda_graph_sequence, intra_graph_index, src1->ne[1]);
++            verathos_cuda_graph_sequence, intra_graph_index, src1->ne[1],
++            src0 != nullptr ? src0->name : nullptr);
+     const bool anchor_instance_selected =
+         selected_op_dump ||
+         verathos_cuda_should_dump_manifest_index(manifest_index);
+@@ -1591,7 +1628,7 @@ static void verathos_cuda_try_dump_mul_mat_trace(
+             }
+         }
+     }
+-    if (!selected_op_dump && !verathos_cuda_selected_ops.empty()) {
++    if (!selected_op_dump && verathos_cuda_selected_op_arming_active()) {
+         return;
+     }
+     if (!selected_op_dump && !verathos_cuda_should_dump_manifest_index(manifest_index)) {
+@@ -3732,9 +3769,10 @@ static void verathos_cuda_try_dump_mul_mat_id_trace(ggml_backend_cuda_context &
+     // sampling is exhausted, so sharing that budget captured zero experts.
+     // A small budget of routed-pair witnesses is enough for the verifier to
+     // challenge expert GEMMs. Selected-op second pass still honored.
+-    const bool selected_op_dump = !verathos_cuda_selected_ops.empty() &&
++    const bool selected_op_dump = verathos_cuda_selected_op_arming_active() &&
+         verathos_cuda_should_dump_selected_op_rows(
+-            verathos_cuda_graph_sequence, intra_graph_index, src1->ne[1]);
++            verathos_cuda_graph_sequence, intra_graph_index, src1->ne[1],
++            src0 != nullptr ? src0->name : nullptr);
+     // Replay arming by MANIFEST INDEX (the witness-replay path): a beacon-
+     // selected expert op is re-captured exactly like a dense op. Without
+     // this the replay re-dumped only dense ops, so a selected MUL_MAT_ID

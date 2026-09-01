@@ -91,6 +91,10 @@ class NeuronConfig(ChainConfig):
     # Demand bonus
     demand_bonus_enabled: bool = True  # enable per-model demand bonus
     demand_bonus_max: float = 0.20  # 20% max bonus for highest-demand model
+    # Signed hosted-policy share reserved for the distributed mesh runtime.
+    # This is intentionally not an environment override: validators must agree
+    # on one epoch-latched family allocation. 0 ships mesh emission dark.
+    mesh_emission_bps: int = 0
 
     # Miner heartbeat
     heartbeat_interval_sec: float = 43200.0  # 12 hours (half of 24h lease)
@@ -108,10 +112,6 @@ class NeuronConfig(ChainConfig):
     x402_recipient: str = ""  # Validator's Base USDC address (empty = x402 disabled)
     x402_testnet: bool = False  # Use Base Sepolia instead of mainnet
     x402_facilitator_url: str = ""  # Override facilitator URL (empty = auto)
-
-    # X402Gateway on-chain USDC collection + TaoFi bridge
-    x402_gateway_address: str = ""  # X402Gateway contract on Base (empty = direct-to-EOA)
-    x402_base_rpc_url: str = ""  # Explicit operator-managed Base RPC URL.
 
     # Shared state between validator and proxy processes
     shared_state_path: str = "/tmp/verathos_validator_state.json"
@@ -197,6 +197,13 @@ class NeuronConfig(ChainConfig):
     capacity_audit_slot_refresh_blocks: int = 0
     capacity_audit_slot_snapshot_stale_blocks: int = 0
     capacity_audit_proof_verify_workers: int = 4
+    # First epoch at which mesh (GGUF) entries are gated/convicted by the
+    # capacity audit; 0 = disabled (mesh scheduling/ingest still run, observe
+    # mode only). Ships dark until the owner flips it via the hosted config.
+    mesh_capacity_audit_enforcement_epoch: int = 0
+    # Epochs a mesh entry may serve with no learnable signed roster before
+    # the capacity-audit model gate closes on it (0 = never gate on absence).
+    mesh_capacity_roster_grace_epochs: int = 2
 
     @classmethod
     def from_env(cls, **overrides) -> NeuronConfig:
@@ -230,8 +237,6 @@ class NeuronConfig(ChainConfig):
             "x402_recipient": "VERATHOS_X402_RECIPIENT",
             "x402_testnet": "VERATHOS_X402_TESTNET",
             "x402_facilitator_url": "VERATHOS_X402_FACILITATOR_URL",
-            "x402_gateway_address": "VERATHOS_X402_GATEWAY",
-            "x402_base_rpc_url": "VERATHOS_X402_BASE_RPC",
             "shared_state_path": "VERATHOS_SHARED_STATE_PATH",
             "miner_debug_enabled": "VERATHOS_MINER_DEBUG_ENABLED",
             "miner_debug_state_path": "VERATHOS_MINER_DEBUG_STATE_PATH",
@@ -297,6 +302,8 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_slot_refresh_blocks": "VERATHOS_CAPACITY_AUDIT_SLOT_REFRESH_BLOCKS",
             "capacity_audit_slot_snapshot_stale_blocks": "VERATHOS_CAPACITY_AUDIT_SLOT_SNAPSHOT_STALE_BLOCKS",
             "capacity_audit_proof_verify_workers": "VERATHOS_CAPACITY_AUDIT_PROOF_VERIFY_WORKERS",
+            "mesh_capacity_audit_enforcement_epoch": "VERATHOS_MESH_CAPACITY_AUDIT_ENFORCEMENT_EPOCH",
+            "mesh_capacity_roster_grace_epochs": "VERATHOS_MESH_CAPACITY_ROSTER_GRACE_EPOCHS",
         }
 
         _float_fields = {
@@ -341,6 +348,8 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_slot_snapshot_stale_blocks",
             "capacity_audit_proof_verify_workers",
             "capacity_audit_max_proof_payload_bytes",
+            "mesh_capacity_audit_enforcement_epoch",
+            "mesh_capacity_roster_grace_epochs",
             "maintenance_grace_until_epoch", "maintenance_grace_until_unix_ts",
         }
         _bool_fields = {

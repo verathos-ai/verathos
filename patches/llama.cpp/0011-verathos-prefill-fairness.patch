@@ -1,0 +1,71 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c27ad775a..cf18e0f44 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3303,7 +3303,50 @@ private:
+         if (!vera_dp_skip_prompt && (params_base.cont_batching || batch.size() == 0)) {
+             bool add_ok = true; // false means the batch is full, skip remaining slots
+ 
+-            iterate(slots, [&](server_slot & slot) {
++            // Verathos prefill fairness: upstream fills the prompt section of
++            // every batch pass by iterating `slots` in fixed vector order, so
++            // a slot mid-way through a 100k+ token prefill consumes the whole
++            // prompt budget on every pass and a newly-arrived small prompt on
++            // a later slot cannot place a single token until the giant
++            // prefill finishes (live signature: "processing task", then the
++            // client cancels ~60s later with zero tokens emitted). Fix: fill
++            // from prompt-pending slots in ascending order of remaining
++            // prompt tokens. A small prompt fits inside its first pass with
++            // budget to spare, so it reaches decode immediately, while the
++            // remainder of every pass's budget still flows to the giant
++            // prefill, which therefore keeps progressing (no starvation in
++            // either direction). Token order within each slot is unchanged;
++            // only the fill order across slots changes.
++            static const bool vera_pf_enabled = [] {
++                const char * v = std::getenv("VERATHOS_PREFILL_FAIRNESS");
++                return v == nullptr || atoi(v) != 0;
++            }();
++
++            std::vector<server_slot *> vera_pf_order;
++            if (vera_pf_enabled) {
++                vera_pf_order.reserve(slots.size());
++                for (auto & slot : slots) {
++                    vera_pf_order.push_back(&slot);
++                }
++                const auto vera_pf_remaining = [](const server_slot * s) -> int64_t {
++                    if (s->state == SLOT_STATE_PROCESSING_PROMPT) {
++                        return (int64_t) s->task->n_tokens() - s->prompt.n_tokens();
++                    }
++                    if (s->state == SLOT_STATE_STARTED) {
++                        // cache reuse is unknown until the slot launches; the
++                        // full prompt length is a conservative upper bound
++                        return (int64_t) s->task->n_tokens();
++                    }
++                    return -1; // no pending prompt: the fill lambda no-ops on it
++                };
++                // stable: ties keep slot order so they cannot flip between passes
++                std::stable_sort(vera_pf_order.begin(), vera_pf_order.end(),
++                        [&](const server_slot * a, const server_slot * b) {
++                            return vera_pf_remaining(a) < vera_pf_remaining(b);
++                        });
++            }
++
++            const auto vera_pf_fill = [&](server_slot & slot) {
+                 if (!add_ok || batch.size() >= n_batch_prompt) {
+                     return; // batch is full, skip remaining slots
+                 }
+@@ -3889,7 +3932,13 @@ private:
+                 if (!slot_batched) {
+                     slot_batched = &slot;
+                 }
+-            });
++            };
++
++            if (vera_pf_enabled) {
++                iterate(vera_pf_order, vera_pf_fill);
++            } else {
++                iterate(slots, vera_pf_fill);
++            }
+         }
+     }
+ 

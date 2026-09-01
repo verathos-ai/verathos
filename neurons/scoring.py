@@ -65,7 +65,7 @@ import bittensor as bt
 import os
 import struct
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Set, Tuple
 
 from neurons.receipts import ServiceReceipt
@@ -117,6 +117,17 @@ class EpochOutcome:
     expected_own_receipt_count: int = 0
     # Exact signed v4 obligations: id -> (kind, target prompt tokens).
     expected_canary_obligations: Dict[bytes, Tuple[str, int]] = field(
+        default_factory=dict
+    )
+    # Obligations this validator ALSO scheduled for the same epoch/entry but
+    # that are no longer part of the active plan (a mid-epoch validator
+    # restart re-plans the epoch under a fresh secret salt; obligations of
+    # the discarded plan may already have produced signed receipts). A
+    # receipt matching one of these is validator-produced residue: it is
+    # validated but never scored and never treated as a forgery. Receipt
+    # count cannot inflate score — scoring uses the expected obligation
+    # inventory, not the receipt count.
+    superseded_canary_obligations: Dict[bytes, Tuple[str, int]] = field(
         default_factory=dict
     )
 
@@ -197,7 +208,16 @@ def compute_model_base_utility(
     )
     utility = math.log2(max(quality_params, 1.0)) ** 1.8
     ctx_value = math.log2(max(max_context_len / 1024, 1))
-    quant_q = QUANT_QUALITY.get(quant, 0.80)
+    quant_q = QUANT_QUALITY.get(quant)
+    if quant_q is None and quant.startswith("gguf_"):
+        # Mesh profiles carry the exact GGUF scheme (gguf_iq2_m, ...): a
+        # q4_k_m and an iq2_m of the same model must not score the same
+        # quality. The per-scheme table lives with the catalogue.
+        from verallm.registry.models import gguf_quant_quality
+
+        quant_q = gguf_quant_quality(quant[len("gguf_"):])
+    if quant_q is None:
+        quant_q = 0.80
     return utility * ctx_value * quant_q * generation_quality
 
 
@@ -293,6 +313,31 @@ def select_scoring_authority_receipts(
     ]
 
 
+def _receipt_matches_canary_obligation(
+    receipt: ServiceReceipt,
+    expected: Tuple[str, int],
+) -> bool:
+    """Check one signed canary receipt against one planned obligation.
+
+    Kind, exact target and the materializer's prompt-token tolerance must
+    all agree — a receipt claiming an obligation with mismatched geometry
+    is misattributed or forged and must never be excused.
+    """
+
+    expected_kind, expected_target = expected
+    actual_target = int(
+        getattr(receipt, "canary_target_prompt_tokens", 0) or 0
+    )
+    prompt_tokens = int(receipt.prompt_tokens or 0)
+    tolerance = canary_prompt_token_tolerance_v3(int(expected_target))
+    return (
+        str(getattr(receipt, "canary_kind", "") or "") == expected_kind
+        and actual_target == int(expected_target)
+        and 0 < prompt_tokens <= int(expected_target)
+        and int(expected_target) - prompt_tokens <= tolerance
+    )
+
+
 def compute_epoch_entry_score(
     outcome: EpochOutcome,
     active_params_b: float,
@@ -331,41 +376,51 @@ def compute_epoch_entry_score(
 
     expected_obligations = dict(outcome.expected_canary_obligations)
     if expected_obligations:
+        superseded_obligations = dict(
+            getattr(outcome, "superseded_canary_obligations", {}) or {}
+        )
         seen: Dict[bytes, ServiceReceipt] = {}
         invalid = False
         for receipt in outcome.own_receipts:
+            if not receipt.is_canary:
+                continue
             obligation_id = bytes(
                 getattr(receipt, "canary_obligation_id", b"") or b""
             )
             if obligation_id in outcome.neutral_hard_obligation_ids:
+                # Main's neutral-hard scoping: obligations the validator
+                # itself neutralized must not zero the miner.
                 continue
-            if not receipt.is_canary:
+            if int(getattr(receipt, "receipt_version", 1) or 1) < 4:
+                invalid = True
                 continue
             expected_item = expected_obligations.get(obligation_id)
-            if (
-                int(getattr(receipt, "receipt_version", 1) or 1) < 4
-                or expected_item is None
-                or obligation_id in seen
-            ):
+            if expected_item is None:
+                superseded_item = superseded_obligations.get(obligation_id)
+                if superseded_item is not None and (
+                    _receipt_matches_canary_obligation(
+                        receipt, superseded_item
+                    )
+                ):
+                    # Benign validator-side residue: this validator scheduled
+                    # and verified the test under an earlier plan of the same
+                    # epoch (mid-epoch restart re-plan). Ignoring it cannot
+                    # inflate score; zeroing it would fail an honest serve.
+                    continue
+                # A receipt for a test never scheduled in this epoch is a
+                # forged or misattributed receipt -> hard integrity failure.
                 invalid = True
                 continue
-            expected_kind, expected_target = expected_item
-            actual_target = int(
-                getattr(receipt, "canary_target_prompt_tokens", 0) or 0
-            )
-            prompt_tokens = int(receipt.prompt_tokens or 0)
-            tolerance = canary_prompt_token_tolerance_v3(
-                int(expected_target)
-            )
-            if (
-                str(getattr(receipt, "canary_kind", "") or "")
-                != expected_kind
-                or actual_target != int(expected_target)
-                or prompt_tokens <= 0
-                or prompt_tokens > int(expected_target)
-                or int(expected_target) - prompt_tokens > tolerance
-            ):
+            if not _receipt_matches_canary_obligation(receipt, expected_item):
                 invalid = True
+                continue
+            if obligation_id in seen:
+                # Benign duplicate of an already-satisfied obligation
+                # (retry/dispatch duplication, e.g. across a mid-epoch mesh
+                # roll). The obligation is fulfilled and count inflation
+                # cannot increase score, so the duplicate is ignored. A
+                # duplicate with mismatched geometry fails the check above
+                # and still zeroes.
                 continue
             seen[obligation_id] = receipt
         missing = set(expected_obligations).difference(seen)
@@ -920,6 +975,7 @@ class CompositeScorer:
         model_budgets: Dict[str, float],
         model_groups: Optional[Dict[str, str]] = None,
         group_budgets: Optional[Dict[str, float]] = None,
+        group_shares: Optional[Dict[str, float]] = None,
         *,
         excluded_entries: Optional[Set[Tuple[str, int]]] = None,
     ) -> Tuple[Dict[int, float], float]:
@@ -931,6 +987,11 @@ class CompositeScorer:
         Approved quantized variants are eligible but do not get reserved
         sub-buckets. If a logical group has no positive-scoring endpoints,
         its share is returned as ``unallocated`` so the validator can burn it.
+        ``group_shares`` optionally supplies absolute, already-normalized
+        logical-group shares whose total may be less than one. This is used for
+        independently normalized runtime families; the missing total remains
+        unallocated and is burned by the caller. Omitting it preserves the
+        historical single-family normalization exactly.
         """
         weights: Dict[int, float] = {uid: 0.0 for uid in self.states}
         budgets = {
@@ -942,7 +1003,20 @@ class CompositeScorer:
             return weights, 0.0
         groups = model_groups or {}
 
-        if group_budgets is None:
+        if group_shares is not None:
+            logical_budgets = {
+                group_id: float(value)
+                for group_id, value in group_shares.items()
+                if float(value) > 0
+            }
+            if any(
+                not math.isfinite(float(value)) or float(value) < 0
+                for value in group_shares.values()
+            ):
+                raise ValueError("logical group shares must be finite and non-negative")
+            if sum(logical_budgets.values()) > 1.0 + 1e-9:
+                raise ValueError("logical group shares must not exceed one")
+        elif group_budgets is None:
             logical_budgets: Dict[str, float] = {}
             for model_id, budget in budgets.items():
                 group_id = groups.get(model_id) or model_id
@@ -959,7 +1033,7 @@ class CompositeScorer:
 
         logical_total = sum(logical_budgets.values())
         if logical_total <= 0:
-            return weights, 0.0
+            return weights, 1.0 if group_shares is not None else 0.0
 
         approved_groups: Dict[str, Set[str]] = {}
         for model_id, budget in budgets.items():
@@ -986,9 +1060,17 @@ class CompositeScorer:
                     continue
                 entries_by_group.setdefault(group_id, []).append((uid, score))
 
-        unallocated = 0.0
+        unallocated = (
+            max(0.0, 1.0 - logical_total)
+            if group_shares is not None
+            else 0.0
+        )
         for group_id, logical_budget in logical_budgets.items():
-            logical_share = logical_budget / logical_total
+            logical_share = (
+                logical_budget
+                if group_shares is not None
+                else logical_budget / logical_total
+            )
             entries = entries_by_group.get(group_id, [])
             group_score_total = sum(score for _uid, score in entries)
             if group_score_total <= 0:
@@ -1017,6 +1099,27 @@ class CompositeScorer:
                 old = entry.ema_score
                 entry.ema_score *= 0.5
                 bt.logging.info(f"EMA halved for {address[:10]} model_index={model_index}: {old:.4f} -> {entry.ema_score:.4f}")
+                return
+
+    def zero_ema(self, address: str, model_index: int) -> None:
+        """Zero the EMA score after a broken commitment.
+
+        Halving assumes a single failure is recoverable, which is right for a
+        miner having a bad epoch. A coordinator that broke a commitment it had
+        already made keeps most of its accumulated score under geometric
+        decay, so that case starts from zero instead.
+        """
+        for _uid, mstate in self.states.items():
+            if mstate.address.lower() != address.lower():
+                continue
+            entry = mstate.entries.get(model_index)
+            if entry is not None:
+                old = entry.ema_score
+                entry.ema_score = 0.0
+                bt.logging.info(
+                    f"EMA zeroed for {address[:10]} model_index={model_index} "
+                    f"(binding violation): {old:.4f} -> 0.0000"
+                )
                 return
 
     def _update_entry_ema(
@@ -1056,6 +1159,12 @@ class ProbationState:
     required_passes: int = 3  # must pass N consecutive epochs to exit
     escalation_epochs: int = 5  # report offline after N epochs on probation
     endpoint: str = ""  # endpoint URL when probation started (for migration checks)
+    # Why probation entered. "availability" = missed obligations only (a
+    # dead or unreachable box, zero dishonesty evidence); "for_cause" =
+    # any proof, integrity, or evasion failure. A fresh registration may
+    # clear availability probation; for_cause always serves the full
+    # consecutive-pass exit. Unknown/legacy state reads as for_cause.
+    cause: str = "for_cause"
 
 
 class ProbationTracker:
@@ -1089,7 +1198,7 @@ class ProbationTracker:
         self._load()
 
     def enter_probation(self, key: Tuple[str, int], epoch: int,
-                        endpoint: str = "") -> None:
+                        endpoint: str = "", cause: str = "for_cause") -> None:
         """Put a miner-model entry on probation (or reset if already on)."""
         with self._lock:
             if key in self._probation:
@@ -1097,6 +1206,11 @@ class ProbationTracker:
                 self._probation[key].consecutive_passes = 0
                 if endpoint:
                     self._probation[key].endpoint = endpoint
+                if cause == "for_cause":
+                    # Severity only ratchets up: an availability entry that
+                    # later fails a proof becomes for_cause; it never
+                    # downgrades back.
+                    self._probation[key].cause = "for_cause"
                 bt.logging.info(f"Probation RESET for {key[0][:10]} model_index={key[1]} (new failure during probation)")
             else:
                 self._probation[key] = ProbationState(
@@ -1104,9 +1218,55 @@ class ProbationTracker:
                     required_passes=self.required_passes,
                     escalation_epochs=self.escalation_epochs,
                     endpoint=endpoint,
+                    cause=cause if cause in ("availability", "for_cause") else "for_cause",
                 )
                 bt.logging.info(f"Probation ENTERED for {key[0][:10]} model_index={key[1]} at epoch {epoch} endpoint={endpoint} (must pass {self.required_passes} consecutive epochs to exit)")
             self._save()
+
+    def reconcile_probation(
+        self,
+        key: Tuple[str, int],
+        *,
+        entered_at_epoch: int,
+        consecutive_passes: int,
+        endpoint: str = "",
+        cause: str = "for_cause",
+    ) -> None:
+        """Replace one local probation row with authoritative DB state.
+
+        ``cause`` must come from the DB row's probation_source so a
+        restart-reconstructed row keeps its true class: defaulting an
+        availability row to for_cause would permanently disable its
+        re-registration clear (the label only ratchets up afterwards).
+        Unknown/legacy sources stay for_cause, fail-closed.
+        """
+
+        with self._lock:
+            current = self._probation.get(key)
+            self._probation[key] = ProbationState(
+                entered_at_epoch=int(entered_at_epoch),
+                consecutive_passes=max(0, int(consecutive_passes)),
+                required_passes=(
+                    current.required_passes if current else self.required_passes
+                ),
+                escalation_epochs=(
+                    current.escalation_epochs
+                    if current
+                    else self.escalation_epochs
+                ),
+                endpoint=endpoint or (current.endpoint if current else ""),
+                cause=(
+                    "availability" if cause == "availability" else "for_cause"
+                ),
+            )
+            self._save()
+
+    def reconcile_not_on_probation(self, key: Tuple[str, int]) -> None:
+        """Remove a stale local row after authoritative DB reconciliation."""
+
+        with self._lock:
+            if self._probation.pop(key, None) is not None:
+                self._save()
 
     def record_pass(self, key: Tuple[str, int]) -> bool:
         """Record a clean epoch (all proofs passed) for a probation entry.
@@ -1137,6 +1297,45 @@ class ProbationTracker:
                 self._probation[key].consecutive_passes = 0
                 bt.logging.info(f"Probation pass counter RESET for {key[0][:10]} model_index={key[1]} (proof failure)")
                 self._save()
+
+    def ratchet_cause_for_cause(self, key: Tuple[str, int]) -> bool:
+        """Upgrade an active availability row to for_cause. Up only.
+
+        A for_cause consequence landing while an availability probation is
+        already active must upgrade the label without disturbing the
+        probation clocks — otherwise the availability re-registration
+        clear would later release a slot that earned a for_cause record.
+        Returns True when a row was upgraded.
+        """
+        with self._lock:
+            state = self._probation.get(key)
+            if state is None or state.cause != "availability":
+                return False
+            state.cause = "for_cause"
+            self._save()
+        bt.logging.info(
+            f"Probation cause RATCHETED to for_cause for {key[0][:10]} "
+            f"model_index={key[1]}"
+        )
+        return True
+
+    def clear_availability_probation(self, key: Tuple[str, int]) -> bool:
+        """Drop a probation row whose cause is availability-only.
+
+        Used when the authoritative database cleared the row after a
+        changed registration. For_cause rows are never dropped here.
+        """
+        with self._lock:
+            state = self._probation.get(key)
+            if state is None or state.cause != "availability":
+                return False
+            del self._probation[key]
+            self._save()
+            bt.logging.info(
+                f"Probation dropped for {key[0][:10]} model_index={key[1]}: "
+                f"database cleared an availability-only record"
+            )
+            return True
 
     def is_on_probation(self, key: Tuple[str, int]) -> bool:
         """Check if a miner-model entry is on probation."""
@@ -1199,7 +1398,23 @@ class ProbationTracker:
             if key not in self._probation:
                 return False
             state = self._probation[key]
-            return (current_epoch - state.entered_at_epoch) >= state.escalation_epochs
+            elapsed = current_epoch - state.entered_at_epoch
+            if elapsed < 0 or elapsed > 10 * max(1, state.escalation_epochs):
+                # Epoch NUMBERING changed under the stored entry (the owner
+                # retimed epoch_blocks via the hosted config: 360 -> 180 doubled
+                # every epoch number) or the clock ran
+                # backwards. The stored age is meaningless either way — re-anchor
+                # to now instead of instantly escalating a healthy rehab to
+                # reportOffline.
+                bt.logging.warning(
+                    f"Probation age for {key[0][:10]} idx={key[1]} is implausible "
+                    f"(entered_at_epoch={state.entered_at_epoch}, current="
+                    f"{current_epoch}); re-anchoring to the current epoch"
+                )
+                self._probation[key] = replace(state, entered_at_epoch=int(current_epoch))
+                self._save()
+                return False
+            return elapsed >= state.escalation_epochs
 
     def get_probation_entries(self) -> Set[Tuple[str, int]]:
         """Get all (miner_address, model_index) pairs currently on probation."""
@@ -1234,6 +1449,7 @@ class ProbationTracker:
             self._save()
             return count
 
+
     def _save(self) -> None:
         """Persist probation state to disk (atomic write)."""
         with self._lock:
@@ -1247,6 +1463,7 @@ class ProbationTracker:
                     "required_passes": state.required_passes,
                     "escalation_epochs": state.escalation_epochs,
                     "endpoint": state.endpoint,
+                    "cause": state.cause,
                 })
             tmp_path = self._state_path + ".tmp"
             try:
@@ -1274,6 +1491,7 @@ class ProbationTracker:
                         required_passes=entry.get("required_passes", self.required_passes),
                         escalation_epochs=entry.get("escalation_epochs", self.escalation_epochs),
                         endpoint=entry.get("endpoint", ""),
+                        cause=str(entry.get("cause") or "for_cause"),
                     )
                 if self._probation:
                     bt.logging.info(f"Loaded {len(self._probation)} probation entries from {self._state_path}")

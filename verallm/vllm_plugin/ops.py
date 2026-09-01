@@ -349,7 +349,7 @@ def _buffer_copy_residual_boundaries_rows_padded_kernel(
     )
 
 
-@torch.library.custom_op("verallm::buffer_copy", mutates_args=("dst",))
+@torch.library.triton_op("verallm::buffer_copy", mutates_args=("dst",))
 def buffer_copy(dst: torch.Tensor, src: torch.Tensor, n_tokens: int) -> None:
     """Static-grid Triton copy: dst[:n_tokens] = src[:n_tokens].
 
@@ -361,17 +361,41 @@ def buffer_copy(dst: torch.Tensor, src: torch.Tensor, n_tokens: int) -> None:
     n_elements = n_tokens * hidden_dim
     BLOCK_SIZE = 1024
     grid = ((dst.numel() + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    _buffer_copy_kernel[grid](src, dst, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    torch.library.wrap_triton(_buffer_copy_kernel)[grid](
+        src,
+        dst,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
 
 
-@torch.library.register_fake("verallm::buffer_copy")
-def _buffer_copy_fake(
-    dst: torch.Tensor, src: torch.Tensor, n_tokens: int,
+@torch.library.triton_op(
+    "verallm::activation_row_stage",
+    mutates_args=("staging",),
+)
+def activation_row_stage(
+    staging: torch.Tensor,
+    src: torch.Tensor,
 ) -> None:
-    return None
+    """Traceably stage bounded runtime rows for the shared root reducer."""
+
+    block_size = 1024
+    total = src.shape[0] * src.shape[1]
+    grid = (triton.cdiv(total, block_size),)
+    torch.library.wrap_triton(_buffer_copy_rows_padded_kernel)[grid](
+        src,
+        staging,
+        src.shape[0],
+        src.shape[1],
+        src.stride(0),
+        src.stride(1),
+        staging.stride(0),
+        staging.stride(1),
+        BLOCK_SIZE=block_size,
+    )
 
 
-@torch.library.custom_op("verallm::buffer_gather_rows", mutates_args=("dst",))
+@torch.library.triton_op("verallm::buffer_gather_rows", mutates_args=("dst",))
 def buffer_gather_rows(
     dst: torch.Tensor,
     src: torch.Tensor,
@@ -396,7 +420,7 @@ def buffer_gather_rows(
     block_size = 1024
     active_elements = active_rows * dst.shape[1]
     grid = ((active_elements + block_size - 1) // block_size,)
-    _buffer_gather_rows_kernel[grid](
+    torch.library.wrap_triton(_buffer_gather_rows_kernel)[grid](
         src,
         dst,
         row_indices,
@@ -411,16 +435,7 @@ def buffer_gather_rows(
     )
 
 
-@torch.library.register_fake("verallm::buffer_gather_rows")
-def _buffer_gather_rows_fake(
-    dst: torch.Tensor,
-    src: torch.Tensor,
-    row_indices: torch.Tensor,
-) -> None:
-    return None
-
-
-@torch.library.custom_op(
+@torch.library.triton_op(
     "verallm::buffer_scatter_root_history",
     mutates_args=("dst",),
 )
@@ -465,7 +480,7 @@ def buffer_scatter_root_history(
     block_size = 256
     active_elements = int(src.shape[0]) * active_rows * 32
     grid = ((active_elements + block_size - 1) // block_size,)
-    _buffer_scatter_root_history_kernel[grid](
+    torch.library.wrap_triton(_buffer_scatter_root_history_kernel)[grid](
         src,
         dst,
         row_indices,
@@ -480,17 +495,7 @@ def buffer_scatter_root_history(
     )
 
 
-@torch.library.register_fake("verallm::buffer_scatter_root_history")
-def _buffer_scatter_root_history_fake(
-    dst: torch.Tensor,
-    src: torch.Tensor,
-    row_indices: torch.Tensor,
-    reference: torch.Tensor,
-) -> None:
-    return None
-
-
-@torch.library.custom_op(
+@torch.library.triton_op(
     "verallm::buffer_copy_three_rows_padded",
     mutates_args=("dst0", "dst1", "dst2"),
 )
@@ -531,7 +536,7 @@ def buffer_copy_three_rows_padded(
         int(src2.shape[1]),
     )
     grid = ((active_elements + block_size - 1) // block_size,)
-    _buffer_copy_three_rows_padded_kernel[grid](
+    torch.library.wrap_triton(_buffer_copy_three_rows_padded_kernel)[grid](
         src0,
         src1,
         src2,
@@ -552,19 +557,7 @@ def buffer_copy_three_rows_padded(
     )
 
 
-@torch.library.register_fake("verallm::buffer_copy_three_rows_padded")
-def _buffer_copy_three_rows_padded_fake(
-    dst0: torch.Tensor,
-    dst1: torch.Tensor,
-    dst2: torch.Tensor,
-    src0: torch.Tensor,
-    src1: torch.Tensor,
-    src2: torch.Tensor,
-) -> None:
-    return None
-
-
-@torch.library.custom_op(
+@torch.library.triton_op(
     "verallm::buffer_copy_input_router_sum_rows_padded",
     mutates_args=("dst0", "dst1", "dst2"),
 )
@@ -610,7 +603,9 @@ def buffer_copy_input_router_sum_rows_padded(
         int(src2a.shape[1]),
     )
     grid = ((active_elements + block_size - 1) // block_size,)
-    _buffer_copy_input_router_sum_rows_padded_kernel[grid](
+    torch.library.wrap_triton(
+        _buffer_copy_input_router_sum_rows_padded_kernel
+    )[grid](
         src0,
         src1,
         src2a,
@@ -633,22 +628,7 @@ def buffer_copy_input_router_sum_rows_padded(
     )
 
 
-@torch.library.register_fake(
-    "verallm::buffer_copy_input_router_sum_rows_padded"
-)
-def _buffer_copy_input_router_sum_rows_padded_fake(
-    dst0: torch.Tensor,
-    dst1: torch.Tensor,
-    dst2: torch.Tensor,
-    src0: torch.Tensor,
-    src1: torch.Tensor,
-    src2a: torch.Tensor,
-    src2b: torch.Tensor,
-) -> None:
-    return None
-
-
-@torch.library.custom_op(
+@torch.library.triton_op(
     "verallm::buffer_copy_residual_boundaries_rows_padded",
     mutates_args=("residual_dst", "output_dst"),
 )
@@ -685,7 +665,9 @@ def buffer_copy_residual_boundaries_rows_padded(
     block_size = 1024
     active_elements = row_count * int(residual.shape[1])
     grid = ((active_elements + block_size - 1) // block_size,)
-    _buffer_copy_residual_boundaries_rows_padded_kernel[grid](
+    torch.library.wrap_triton(
+        _buffer_copy_residual_boundaries_rows_padded_kernel
+    )[grid](
         residual,
         hidden,
         output_residual,
@@ -700,19 +682,6 @@ def buffer_copy_residual_boundaries_rows_padded(
         output_dst.stride(0),
         BLOCK_SIZE=block_size,
     )
-
-
-@torch.library.register_fake(
-    "verallm::buffer_copy_residual_boundaries_rows_padded"
-)
-def _buffer_copy_residual_boundaries_rows_padded_fake(
-    residual_dst: torch.Tensor,
-    output_dst: torch.Tensor,
-    residual: torch.Tensor,
-    hidden: torch.Tensor,
-    output_residual: torch.Tensor,
-) -> None:
-    return None
 
 
 @torch.library.custom_op(

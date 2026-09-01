@@ -1,0 +1,3581 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 7918845..d054fe1 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -34,6 +34,13 @@
+ #include <limits.h>
+ #include <stdarg.h>
+ #include <signal.h>
++#if defined(_WIN32)
++#include <direct.h>
++#include <io.h>
++#else
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ #if defined(__gnu_linux__)
+ #include <syscall.h>
+ #endif
+@@ -1161,6 +1168,795 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+ 
+ // ggml_compute_forward_mul_mat
+ 
++static int64_t verathos_cpu_trace_sequence = 0;
++static int64_t verathos_cpu_manifest_sequence = 0;
++static char verathos_cpu_trace_capture_token[4096] = {0};
++static int64_t verathos_cpu_selected_manifest_indexes[64] = {0};
++static int verathos_cpu_selected_manifest_count = 0;
++static int64_t verathos_cpu_graph_sequence = 0;
++static int64_t verathos_cpu_intra_graph_index = 0;
++static int64_t verathos_cpu_graph_dim_valid_ops = 0;
++static int64_t verathos_cpu_graph_written_rows = 0;
++static int64_t verathos_cpu_graph_max_src1_rows = 0;
++static int64_t verathos_cpu_selected_ops_graph[64] = {0};
++static int64_t verathos_cpu_selected_ops_intra[64] = {0};
++static int verathos_cpu_selected_ops_count = 0;
++static FILE * verathos_cpu_manifest_file = NULL;
++static char verathos_cpu_manifest_path[8192] = {0};
++
++static const char * verathos_cpu_trace_dir(void) {
++    static const char * verathos_cpu_trace_dir_value;
++    static bool verathos_cpu_trace_dir_read;
++    if (!verathos_cpu_trace_dir_read) {
++        verathos_cpu_trace_dir_value = getenv("VERATHOS_GGML_TRACE_DIR");
++        verathos_cpu_trace_dir_read = true;
++    }
++    return verathos_cpu_trace_dir_value;
++}
++
++static int64_t verathos_cpu_env_i64(const char * name, int64_t fallback) {
++    const char * raw = getenv(name);
++    if (raw == NULL || raw[0] == '\0') {
++        return fallback;
++    }
++    char * end = NULL;
++    const long long parsed = strtoll(raw, &end, 10);
++    if (end == raw) {
++        return fallback;
++    }
++    return (int64_t) parsed;
++}
++
++static bool verathos_cpu_env_bool(const char * name, bool fallback) {
++    const char * raw = getenv(name);
++    if (raw == NULL || raw[0] == '\0') {
++        return fallback;
++    }
++    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' ||
++           raw[0] == 'y' || raw[0] == 'Y';
++}
++
++static int64_t verathos_cpu_trace_max_ops(void) {
++    const char * per_capture = getenv("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE");
++    if (per_capture != NULL && per_capture[0] != '\0') {
++        return verathos_cpu_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE", 64);
++    }
++    return verathos_cpu_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_TOTAL", 64);
++}
++
++static bool verathos_cpu_read_capture_token_uncached(const char * path, char * out, size_t out_size) {
++    if (out == NULL || out_size == 0) {
++        return false;
++    }
++    out[0] = '\0';
++    FILE * file = fopen(path, "rb");
++    if (file == NULL) {
++        return false;
++    }
++    size_t n = fread(out, 1, out_size - 1, file);
++    fclose(file);
++    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\t')) {
++        n--;
++    }
++    out[n] = '\0';
++    if (n == 0) {
++        snprintf(out, out_size, "present");
++    }
++    return true;
++}
++
++// Called once per graph_compute; a stat cache avoids the per-graph
++// open+read, which cost measurable decode throughput on a live mesh.
++#if defined(__APPLE__)
++#define verathos_st_mtim st_mtimespec
++#else
++#define verathos_st_mtim st_mtim
++#endif
++static bool verathos_cpu_read_capture_token(const char * path, char * out, size_t out_size) {
++#if !defined(_WIN32)
++    static bool cache_valid = false;
++    static dev_t cache_dev;
++    static ino_t cache_ino;
++    static off_t cache_size;
++    static struct timespec cache_mtim;
++    static char cache_token[4096];
++    struct stat st;
++    if (stat(path, &st) != 0) {
++        cache_valid = false;
++        return false;
++    }
++    if (cache_valid && st.st_dev == cache_dev && st.st_ino == cache_ino &&
++        st.st_size == cache_size &&
++        st.verathos_st_mtim.tv_sec == cache_mtim.tv_sec &&
++        st.verathos_st_mtim.tv_nsec == cache_mtim.tv_nsec) {
++        snprintf(out, out_size, "%s", cache_token);
++        return true;
++    }
++    if (!verathos_cpu_read_capture_token_uncached(path, out, out_size)) {
++        return false;
++    }
++    cache_valid = true;
++    cache_dev = st.st_dev;
++    cache_ino = st.st_ino;
++    cache_size = st.st_size;
++    cache_mtim = st.verathos_st_mtim;
++    snprintf(cache_token, sizeof(cache_token), "%s", out);
++    return true;
++#else
++    return verathos_cpu_read_capture_token_uncached(path, out, out_size);
++#endif
++}
++
++static void verathos_cpu_parse_selected_manifest_indexes(const char * token) {
++    verathos_cpu_selected_manifest_count = 0;
++    if (token == NULL) {
++        return;
++    }
++    const char * selected = strstr(token, "selected=");
++    if (selected == NULL) {
++        return;
++    }
++    selected += 9;
++    while (*selected != '\0' && verathos_cpu_selected_manifest_count < 64) {
++        while (*selected == ' ' || *selected == '\t' || *selected == ',') {
++            selected++;
++        }
++        if (*selected < '0' || *selected > '9') {
++            break;
++        }
++        char * end = NULL;
++        long long value = strtoll(selected, &end, 10);
++        if (end == selected) {
++            break;
++        }
++        verathos_cpu_selected_manifest_indexes[verathos_cpu_selected_manifest_count++] = (int64_t) value;
++        selected = end;
++    }
++}
++
++static void verathos_cpu_parse_selected_ops(const char * token) {
++    verathos_cpu_selected_ops_count = 0;
++    if (token == NULL) {
++        return;
++    }
++    const char * selected = strstr(token, "selected_v3=");
++    if (selected == NULL) {
++        return;
++    }
++    selected += 12;
++    while (*selected != '\0' && verathos_cpu_selected_ops_count < 64) {
++        while (*selected == ' ' || *selected == '\t' || *selected == ',') {
++            selected++;
++        }
++        if (*selected < '0' || *selected > '9') {
++            break;
++        }
++        char * end = NULL;
++        long long graph_value = strtoll(selected, &end, 10);
++        if (end == selected || *end != ':') {
++            break;
++        }
++        selected = end + 1;
++        long long intra_value = strtoll(selected, &end, 10);
++        if (end == selected) {
++            break;
++        }
++        verathos_cpu_selected_ops_graph[verathos_cpu_selected_ops_count] = (int64_t) graph_value;
++        verathos_cpu_selected_ops_intra[verathos_cpu_selected_ops_count] = (int64_t) intra_value;
++        verathos_cpu_selected_ops_count++;
++        selected = end;
++    }
++}
++
++static bool verathos_cpu_should_dump_selected_op(int64_t graph_sequence, int64_t intra_index) {
++    for (int i = 0; i < verathos_cpu_selected_ops_count; ++i) {
++        if (verathos_cpu_selected_ops_graph[i] == graph_sequence &&
++            verathos_cpu_selected_ops_intra[i] == intra_index) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool verathos_cpu_should_dump_manifest_index(int64_t manifest_index) {
++    if (verathos_cpu_selected_manifest_count > 0) {
++        for (int i = 0; i < verathos_cpu_selected_manifest_count; ++i) {
++            if (verathos_cpu_selected_manifest_indexes[i] == manifest_index) {
++                return true;
++            }
++        }
++        return false;
++    }
++    const int64_t max_total = verathos_cpu_trace_max_ops();
++    return max_total < 0 || verathos_cpu_trace_sequence < max_total;
++}
++
++static void verathos_cpu_refresh_capture_token(const char * enable_file) {
++    char token[sizeof(verathos_cpu_trace_capture_token)];
++    if (!verathos_cpu_read_capture_token(enable_file, token, sizeof(token))) {
++        snprintf(token, sizeof(token), "present");
++    }
++    if (strncmp(verathos_cpu_trace_capture_token, token, sizeof(verathos_cpu_trace_capture_token)) != 0) {
++        snprintf(verathos_cpu_trace_capture_token, sizeof(verathos_cpu_trace_capture_token), "%s", token);
++        verathos_cpu_trace_sequence = 0;
++        verathos_cpu_manifest_sequence = 0;
++        verathos_cpu_graph_sequence = 0;
++        verathos_cpu_intra_graph_index = 0;
++        verathos_cpu_graph_dim_valid_ops = 0;
++        verathos_cpu_graph_written_rows = 0;
++        verathos_cpu_graph_max_src1_rows = 0;
++        verathos_cpu_parse_selected_manifest_indexes(token);
++        verathos_cpu_parse_selected_ops(token);
++        if (verathos_cpu_manifest_file != NULL) {
++            fflush(verathos_cpu_manifest_file);
++            fclose(verathos_cpu_manifest_file);
++            verathos_cpu_manifest_file = NULL;
++        }
++        verathos_cpu_manifest_path[0] = '\0';
++    }
++}
++
++static bool verathos_cpu_trace_enabled(void) {
++    const char * dir = verathos_cpu_trace_dir();
++    if (dir == NULL || dir[0] == '\0') {
++        return false;
++    }
++    const char * enable_file = getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file != NULL && enable_file[0] != '\0') {
++#if defined(_WIN32)
++        if (_access(enable_file, 0) != 0) {
++#else
++        if (access(enable_file, F_OK) != 0) {
++#endif
++            return false;
++        }
++        verathos_cpu_refresh_capture_token(enable_file);
++    }
++    return true;
++}
++
++static int64_t verathos_cpu_unix_ns(void) {
++    struct timespec ts;
++#if defined(_WIN32)
++    timespec_get(&ts, TIME_UTC);
++#else
++    clock_gettime(CLOCK_REALTIME, &ts);
++#endif
++    return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
++}
++
++static void verathos_cpu_trace_mkdir(const char * dir) {
++    if (dir == NULL || dir[0] == '\0') {
++        return;
++    }
++#if defined(_WIN32)
++    _mkdir(dir);
++#else
++    mkdir(dir, 0755);
++#endif
++}
++
++static bool verathos_cpu_tensor_to_f32(const struct ggml_tensor * tensor, float * out) {
++    if (tensor == NULL || tensor->data == NULL || out == NULL) {
++        return false;
++    }
++    if (!ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    const int64_t n = ggml_nelements(tensor);
++    if (n <= 0) {
++        return false;
++    }
++    if (tensor->type == GGML_TYPE_F32) {
++        memcpy(out, tensor->data, (size_t) n * sizeof(float));
++        return true;
++    }
++    const struct ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
++    if (traits == NULL || traits->to_float == NULL) {
++        return false;
++    }
++    traits->to_float(tensor->data, out, n);
++    return true;
++}
++
++static bool verathos_cpu_write_f32(const char * path, const float * values, int64_t n) {
++    FILE * out = fopen(path, "wb");
++    if (out == NULL) {
++        return false;
++    }
++    const size_t written = fwrite(values, sizeof(float), (size_t) n, out);
++    const int close_rc = fclose(out);
++    return written == (size_t) n && close_rc == 0;
++}
++
++static bool verathos_cpu_write_raw(const char * path, const void * data, size_t nbytes) {
++    FILE * out = fopen(path, "wb");
++    if (out == NULL) {
++        return false;
++    }
++    const size_t written = fwrite(data, 1, nbytes, out);
++    const int close_rc = fclose(out);
++    return written == nbytes && close_rc == 0;
++}
++
++static void verathos_cpu_json_escape(FILE * out, const char * raw) {
++    for (const char * p = raw == NULL ? "" : raw; *p != '\0'; ++p) {
++        switch (*p) {
++            case '\\': fputs("\\\\", out); break;
++            case '"':  fputs("\\\"", out); break;
++            case '\n': fputs("\\n", out); break;
++            case '\r': fputs("\\r", out); break;
++            case '\t': fputs("\\t", out); break;
++            default:   fputc(*p, out); break;
++        }
++    }
++}
++
++static void verathos_cpu_hex_escape(FILE * out, const char * raw) {
++    static const char * hex = "0123456789abcdef";
++    for (const unsigned char * p = (const unsigned char *)(raw == NULL ? "" : raw); *p != '\0'; ++p) {
++        fputc(hex[*p >> 4], out);
++        fputc(hex[*p & 0x0f], out);
++    }
++}
++
++static void verathos_cpu_compact_field(FILE * out, const char * raw) {
++    for (const char * p = raw == NULL ? "" : raw; *p != '\0'; ++p) {
++        if (*p == '\t' || *p == '\n' || *p == '\r') {
++            fputc(' ', out);
++        } else {
++            fputc(*p, out);
++        }
++    }
++}
++
++static bool verathos_cpu_manifest_compact(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && (
++        strcmp(raw, "compact") == 0 ||
++        strcmp(raw, "compact-raw") == 0 ||
++        strcmp(raw, "compact-raw-v2") == 0 ||
++        strcmp(raw, "compact-raw-v3") == 0 ||
++        strcmp(raw, "raw") == 0 ||
++        strcmp(raw, "decode") == 0 ||
++        strcmp(raw, "decode-only") == 0);
++}
++
++static bool verathos_cpu_manifest_compact_raw(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && (
++        strcmp(raw, "compact-raw") == 0 ||
++        strcmp(raw, "compact-raw-v2") == 0 ||
++        strcmp(raw, "compact-raw-v3") == 0 ||
++        strcmp(raw, "raw") == 0);
++}
++
++static bool verathos_cpu_manifest_v3(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && strcmp(raw, "compact-raw-v3") == 0;
++}
++
++static bool verathos_cpu_manifest_disabled(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && (
++        strcmp(raw, "none") == 0 ||
++        strcmp(raw, "off") == 0 ||
++        strcmp(raw, "0") == 0);
++}
++
++static bool verathos_cpu_manifest_decode_only(void) {
++    const char * raw = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != NULL && (
++        strcmp(raw, "decode") == 0 ||
++        strcmp(raw, "decode-only") == 0);
++}
++
++static bool verathos_cpu_str_ends_with(const char * value, const char * suffix) {
++    const size_t value_len = strlen(value == NULL ? "" : value);
++    const size_t suffix_len = strlen(suffix == NULL ? "" : suffix);
++    return value_len >= suffix_len &&
++        strncmp(value + value_len - suffix_len, suffix, suffix_len) == 0;
++}
++
++static bool verathos_cpu_is_decode_candidate(
++        const struct ggml_tensor * src0,
++        const struct ggml_tensor * src1,
++        const struct ggml_tensor * dst) {
++    const char * tensor_name = src0 != NULL ? src0->name : "";
++    const char * src1_name = src1 != NULL ? src1->name : "";
++    const char * dst_name = dst != NULL ? dst->name : "";
++    if (strncmp(tensor_name, "output.weight", 14) == 0 ||
++        strncmp(tensor_name, "lm_head.weight", 15) == 0 ||
++        verathos_cpu_str_ends_with(tensor_name, ".lm_head.weight")) {
++        return true;
++    }
++    if (strstr(tensor_name, "attn_output") != NULL) {
++        return false;
++    }
++    return strncmp(dst_name, "logits", 7) == 0 ||
++        strncmp(dst_name, "result_output", 14) == 0 ||
++        (strstr(dst_name, "result_output") != NULL &&
++         (strstr(src1_name, "result_norm") != NULL ||
++          strstr(src1_name, "final") != NULL));
++}
++
++static void verathos_cpu_manifest_suffix(char * out, size_t out_size) {
++    if (out == NULL || out_size == 0) {
++        return;
++    }
++    out[0] = '\0';
++    size_t in = 0;
++    size_t n = 0;
++    const char * token = verathos_cpu_trace_capture_token;
++    while (token[in] >= '0' && token[in] <= '9' && n + 2 < out_size && in < 64) {
++        if (n == 0) {
++            out[n++] = '-';
++        }
++        out[n++] = token[in++];
++    }
++    out[n] = '\0';
++    if (n == 1) {
++        out[0] = '\0';
++    }
++}
++
++static FILE * verathos_cpu_manifest_for_capture(const char * dir) {
++    if (verathos_cpu_manifest_disabled()) {
++        return NULL;
++    }
++    char suffix[80];
++    char manifest_path[sizeof(verathos_cpu_manifest_path)];
++    verathos_cpu_manifest_suffix(suffix, sizeof(suffix));
++    snprintf(
++            manifest_path,
++            sizeof(manifest_path),
++            "%s/manifest%s.%s",
++            dir,
++            suffix,
++            verathos_cpu_manifest_compact() ? "vmanifest" : "jsonl");
++    if (verathos_cpu_manifest_file == NULL ||
++            strncmp(verathos_cpu_manifest_path, manifest_path, sizeof(verathos_cpu_manifest_path)) != 0) {
++        if (verathos_cpu_manifest_file != NULL) {
++            fflush(verathos_cpu_manifest_file);
++            fclose(verathos_cpu_manifest_file);
++        }
++        snprintf(verathos_cpu_manifest_path, sizeof(verathos_cpu_manifest_path), "%s", manifest_path);
++        verathos_cpu_manifest_file = fopen(verathos_cpu_manifest_path, "ab");
++    }
++    return verathos_cpu_manifest_file;
++}
++
++static void verathos_cpu_write_manifest_entry(
++        const char * dir,
++        int64_t now_ns,
++        int64_t manifest_index,
++        bool proof_eligible,
++        int64_t graph_sequence,
++        int64_t intra_graph_index,
++        const struct ggml_tensor * src0,
++        const struct ggml_tensor * src1,
++        const struct ggml_tensor * dst) {
++    if (verathos_cpu_manifest_decode_only() && !verathos_cpu_is_decode_candidate(src0, src1, dst)) {
++        return;
++    }
++    FILE * manifest = verathos_cpu_manifest_for_capture(dir);
++    if (manifest == NULL) {
++        return;
++    }
++    if (verathos_cpu_manifest_compact()) {
++        const bool raw_compact = verathos_cpu_manifest_compact_raw();
++        const char * manifest_format = getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++        const bool raw_compact_v3 = verathos_cpu_manifest_v3();
++        const bool raw_compact_v2 = raw_compact_v3 ||
++            (manifest_format != NULL && strcmp(manifest_format, "compact-raw-v2") == 0);
++        if (raw_compact_v2) {
++            fprintf(manifest, raw_compact_v3
++                    ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V3"
++                    : "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V2");
++            fprintf(manifest, "\t%lld", (long long) now_ns);
++            fprintf(manifest, "\t%lld", (long long) manifest_index);
++            fprintf(manifest, "\t"); verathos_cpu_compact_field(manifest, src0->name);
++            fprintf(manifest, "\t"); verathos_cpu_compact_field(manifest, src1->name);
++            fprintf(manifest, "\t"); verathos_cpu_compact_field(manifest, dst->name);
++            fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                    (long long) src0->ne[0], (long long) src0->ne[1],
++                    (long long) src0->ne[2], (long long) src0->ne[3]);
++            fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                    (long long) src1->ne[0], (long long) src1->ne[1],
++                    (long long) src1->ne[2], (long long) src1->ne[3]);
++            fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                    (long long) dst->ne[0], (long long) dst->ne[1],
++                    (long long) dst->ne[2], (long long) dst->ne[3]);
++            fprintf(manifest, "\t%s\t%s\t%s",
++                    ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
++            fprintf(manifest, "\tllama_cpp_cpu\tCPU");
++            fprintf(manifest, "\t%s", proof_eligible ? "1" : "0");
++            if (raw_compact_v3) {
++                fprintf(manifest, "\t%lld\t%lld",
++                        (long long) graph_sequence, (long long) intra_graph_index);
++            }
++            fprintf(manifest, "\n");
++            fflush(manifest);
++            return;
++        }
++        fprintf(manifest, "%s", raw_compact ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V1" : "VERATHOS_GGML_OP_MANIFEST_COMPACT_V1");
++        fprintf(manifest, "\t%lld", (long long) now_ns);
++        fprintf(manifest, "\t%lld", (long long) manifest_index);
++        fprintf(manifest, "\t");
++        char graph_id[96];
++        snprintf(graph_id, sizeof(graph_id), "cpu-mul-mat-%lld", (long long) manifest_index);
++        if (raw_compact) { verathos_cpu_compact_field(manifest, graph_id); } else { verathos_cpu_hex_escape(manifest, graph_id); }
++        fprintf(manifest, "\t%lld", (long long) manifest_index);
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, src0->name); } else { verathos_cpu_hex_escape(manifest, src0->name); }
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, src0->name); } else { verathos_cpu_hex_escape(manifest, src0->name); }
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, src1->name); } else { verathos_cpu_hex_escape(manifest, src1->name); }
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, dst->name); } else { verathos_cpu_hex_escape(manifest, dst->name); }
++        fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                (long long) src0->ne[0], (long long) src0->ne[1],
++                (long long) src0->ne[2], (long long) src0->ne[3]);
++        fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                (long long) src1->ne[0], (long long) src1->ne[1],
++                (long long) src1->ne[2], (long long) src1->ne[3]);
++        fprintf(manifest, "\t%lld,%lld,%lld,%lld",
++                (long long) dst->ne[0], (long long) dst->ne[1],
++                (long long) dst->ne[2], (long long) dst->ne[3]);
++        fprintf(manifest, "\t%s\t%s\t%s",
++                ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, "llama_cpp_cpu"); } else { verathos_cpu_hex_escape(manifest, "llama_cpp_cpu"); }
++        fprintf(manifest, "\t"); if (raw_compact) { verathos_cpu_compact_field(manifest, "CPU"); } else { verathos_cpu_hex_escape(manifest, "CPU"); }
++        fprintf(manifest, "\t%s\n", proof_eligible ? "1" : "0");
++        fflush(manifest);
++        return;
++    }
++    fprintf(manifest, "{\"version\":1");
++    fprintf(manifest, ",\"created_unix_ns\":%lld", (long long) now_ns);
++    fprintf(manifest, ",\"manifest_index\":%lld", (long long) manifest_index);
++    fprintf(manifest, ",\"graph_id\":\"cpu-mul-mat-%lld\"", (long long) manifest_index);
++    fprintf(manifest, ",\"op_index\":%lld", (long long) manifest_index);
++    fprintf(manifest, ",\"op_type\":\"GGML_OP_MUL_MAT\"");
++    fprintf(manifest, ",\"tensor_name\":\"");
++    verathos_cpu_json_escape(manifest, src0->name);
++    fprintf(manifest, "\"");
++    fprintf(manifest, ",\"src0_name\":\"");
++    verathos_cpu_json_escape(manifest, src0->name);
++    fprintf(manifest, "\"");
++    fprintf(manifest, ",\"src1_name\":\"");
++    verathos_cpu_json_escape(manifest, src1->name);
++    fprintf(manifest, "\"");
++    fprintf(manifest, ",\"dst_name\":\"");
++    verathos_cpu_json_escape(manifest, dst->name);
++    fprintf(manifest, "\"");
++    fprintf(manifest, ",\"src0_shape\":[%lld,%lld,%lld,%lld]",
++            (long long) src0->ne[0], (long long) src0->ne[1],
++            (long long) src0->ne[2], (long long) src0->ne[3]);
++    fprintf(manifest, ",\"src1_shape\":[%lld,%lld,%lld,%lld]",
++            (long long) src1->ne[0], (long long) src1->ne[1],
++            (long long) src1->ne[2], (long long) src1->ne[3]);
++    fprintf(manifest, ",\"dst_shape\":[%lld,%lld,%lld,%lld]",
++            (long long) dst->ne[0], (long long) dst->ne[1],
++            (long long) dst->ne[2], (long long) dst->ne[3]);
++    fprintf(manifest, ",\"source_types\":{\"src0\":\"%s\",\"src1\":\"%s\",\"dst\":\"%s\"}",
++            ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
++    fprintf(manifest, ",\"backend\":\"llama_cpp_cpu\"");
++    fprintf(manifest, ",\"device\":\"CPU\"");
++    fprintf(manifest, ",\"proof_eligible\":%s}\n", proof_eligible ? "true" : "false");
++    fflush(manifest);
++}
++
++static void verathos_cpu_try_dump_mul_mat_trace(const struct ggml_tensor * dst) {
++    const char * dir = verathos_cpu_trace_dir();
++    if (dir == NULL || dir[0] == '\0' || dst == NULL || dst->op != GGML_OP_MUL_MAT) {
++        return;
++    }
++    const struct ggml_tensor * src0 = dst->src[0];
++    const struct ggml_tensor * src1 = dst->src[1];
++    if (src0 == NULL || src1 == NULL) {
++        return;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        dst->ne[2]  != 1 || dst->ne[3]  != 1) {
++        return;
++    }
++    if (src0->ne[0] != src1->ne[0] ||
++        dst->ne[0]  != src0->ne[1] ||
++        dst->ne[1]  != src1->ne[1]) {
++        return;
++    }
++
++    // Intra-graph index counts every dim-valid MUL_MAT regardless of size
++    // eligibility, so it stays stable across batch row counts (co-batched
++    // organic graphs vs solo replay graphs address the same structural op).
++    const int64_t intra_graph_index = verathos_cpu_intra_graph_index++;
++    verathos_cpu_graph_dim_valid_ops++;
++    if (src1->ne[1] > verathos_cpu_graph_max_src1_rows) {
++        verathos_cpu_graph_max_src1_rows = src1->ne[1];
++    }
++
++    verathos_cpu_trace_mkdir(dir);
++    const int64_t now_ns = verathos_cpu_unix_ns();
++    const int64_t manifest_index = ++verathos_cpu_manifest_sequence;
++    const int64_t src0_ne = ggml_nelements(src0);
++    const int64_t src1_ne = ggml_nelements(src1);
++    const int64_t dst_ne  = ggml_nelements(dst);
++    const int64_t total_elems = src0_ne + src1_ne + dst_ne;
++    const int64_t max_elems = verathos_cpu_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    const bool proof_eligible =
++        verathos_cpu_is_decode_candidate(src0, src1, dst) ||
++        !(max_elems > 0 && total_elems > max_elems);
++    if (!proof_eligible) {
++        return;
++    }
++    verathos_cpu_write_manifest_entry(
++            dir, now_ns, manifest_index, proof_eligible,
++            verathos_cpu_graph_sequence, intra_graph_index, src0, src1, dst);
++    verathos_cpu_graph_written_rows++;
++
++    const bool selected_op_dump = verathos_cpu_selected_ops_count > 0 &&
++        verathos_cpu_should_dump_selected_op(verathos_cpu_graph_sequence, intra_graph_index);
++    if (!selected_op_dump && verathos_cpu_selected_ops_count > 0) {
++        return;
++    }
++    if (!selected_op_dump && !verathos_cpu_should_dump_manifest_index(manifest_index)) {
++        return;
++    }
++    const bool skip_src0_dump = verathos_cpu_env_bool("VERATHOS_GGML_TRACE_SKIP_SRC0_DUMP", false);
++    float * src0_f32 = skip_src0_dump ? NULL : (float *) malloc((size_t) src0_ne * sizeof(float));
++    float * src1_f32 = (float *) malloc((size_t) src1_ne * sizeof(float));
++    float * dst_f32  = (float *) malloc((size_t) dst_ne  * sizeof(float));
++    if ((!skip_src0_dump && src0_f32 == NULL) || src1_f32 == NULL || dst_f32 == NULL) {
++        free(src0_f32);
++        free(src1_f32);
++        free(dst_f32);
++        return;
++    }
++    if ((!skip_src0_dump && !verathos_cpu_tensor_to_f32(src0, src0_f32)) ||
++        !verathos_cpu_tensor_to_f32(src1, src1_f32) ||
++        !verathos_cpu_tensor_to_f32(dst, dst_f32)) {
++        free(src0_f32);
++        free(src1_f32);
++        free(dst_f32);
++        return;
++    }
++
++    char base[4096];
++    char src0_path[8192];
++    char src0_raw_path[8192];
++    char src1_path[8192];
++    char dst_path[8192];
++    char json_path[8192];
++    snprintf(base, sizeof(base), "%s/trace-%lld-cpu-op%lld",
++             dir, (long long) now_ns, (long long) manifest_index);
++    snprintf(src0_path, sizeof(src0_path), "%s-src0.f32", base);
++    snprintf(src0_raw_path, sizeof(src0_raw_path), "%s-src0.raw", base);
++    snprintf(src1_path, sizeof(src1_path), "%s-src1.f32", base);
++    snprintf(dst_path,  sizeof(dst_path),  "%s-dst.f32",  base);
++    snprintf(json_path, sizeof(json_path), "%s.json",     base);
++    if ((!skip_src0_dump && !verathos_cpu_write_f32(src0_path, src0_f32, src0_ne)) ||
++        (!skip_src0_dump && !verathos_cpu_write_raw(src0_raw_path, src0->data, ggml_nbytes(src0))) ||
++        !verathos_cpu_write_f32(src1_path, src1_f32, src1_ne) ||
++        !verathos_cpu_write_f32(dst_path,  dst_f32,  dst_ne)) {
++        free(src0_f32);
++        free(src1_f32);
++        free(dst_f32);
++        return;
++    }
++    free(src0_f32);
++    free(src1_f32);
++    free(dst_f32);
++
++    FILE * meta = fopen(json_path, "wb");
++    if (meta == NULL) {
++        return;
++    }
++    fprintf(meta, "{\n");
++    fprintf(meta, "  \"version\": 1,\n");
++    fprintf(meta, "  \"created_unix_ns\": %lld,\n", (long long) now_ns);
++    fprintf(meta, "  \"manifest_index\": %lld,\n", (long long) manifest_index);
++    fprintf(meta, "  \"graph_seq\": %lld,\n", (long long) verathos_cpu_graph_sequence);
++    fprintf(meta, "  \"intra_graph_index\": %lld,\n", (long long) intra_graph_index);
++    fprintf(meta, "  \"graph_id\": \"cpu-mul-mat-%lld\",\n", (long long) manifest_index);
++    fprintf(meta, "  \"op_index\": %lld,\n", (long long) manifest_index);
++    fprintf(meta, "  \"op_type\": \"GGML_OP_MUL_MAT\",\n");
++    fprintf(meta, "  \"tensor_name\": \"");
++    verathos_cpu_json_escape(meta, src0->name);
++    fprintf(meta, "\",\n");
++    fprintf(meta, "  \"src0_name\": \"");
++    verathos_cpu_json_escape(meta, src0->name);
++    fprintf(meta, "\",\n");
++    fprintf(meta, "  \"src1_name\": \"");
++    verathos_cpu_json_escape(meta, src1->name);
++    fprintf(meta, "\",\n");
++    fprintf(meta, "  \"dst_name\": \"");
++    verathos_cpu_json_escape(meta, dst->name);
++    fprintf(meta, "\",\n");
++    fprintf(meta, "  \"src0_shape\": [%lld,%lld,%lld,%lld],\n",
++            (long long) src0->ne[0], (long long) src0->ne[1],
++            (long long) src0->ne[2], (long long) src0->ne[3]);
++    fprintf(meta, "  \"src1_shape\": [%lld,%lld,%lld,%lld],\n",
++            (long long) src1->ne[0], (long long) src1->ne[1],
++            (long long) src1->ne[2], (long long) src1->ne[3]);
++    fprintf(meta, "  \"dst_shape\": [%lld,%lld,%lld,%lld],\n",
++            (long long) dst->ne[0], (long long) dst->ne[1],
++            (long long) dst->ne[2], (long long) dst->ne[3]);
++    const char * src0_file = strrchr(src0_path, '/');
++    const char * src0_raw_file = strrchr(src0_raw_path, '/');
++    const char * src1_file = strrchr(src1_path, '/');
++    const char * dst_file  = strrchr(dst_path,  '/');
++#if defined(_WIN32)
++    const char * src0_file_win = strrchr(src0_path, '\\');
++    const char * src0_raw_file_win = strrchr(src0_raw_path, '\\');
++    const char * src1_file_win = strrchr(src1_path, '\\');
++    const char * dst_file_win  = strrchr(dst_path,  '\\');
++    if (src0_file_win != NULL && (src0_file == NULL || src0_file_win > src0_file)) src0_file = src0_file_win;
++    if (src0_raw_file_win != NULL && (src0_raw_file == NULL || src0_raw_file_win > src0_raw_file)) src0_raw_file = src0_raw_file_win;
++    if (src1_file_win != NULL && (src1_file == NULL || src1_file_win > src1_file)) src1_file = src1_file_win;
++    if (dst_file_win  != NULL && (dst_file  == NULL || dst_file_win  > dst_file))  dst_file  = dst_file_win;
++#endif
++    if (!skip_src0_dump) {
++        fprintf(meta, "  \"src0_f32\": \"%s\",\n", src0_file == NULL ? src0_path : src0_file + 1);
++        fprintf(meta, "  \"src0_raw\": \"%s\",\n", src0_raw_file == NULL ? src0_raw_path : src0_raw_file + 1);
++    }
++    fprintf(meta, "  \"src0_raw_type\": \"%s\",\n", ggml_type_name(src0->type));
++    fprintf(meta, "  \"src1_f32\": \"%s\",\n", src1_file == NULL ? src1_path : src1_file + 1);
++    fprintf(meta, "  \"dst_f32\": \"%s\",\n",  dst_file  == NULL ? dst_path  : dst_file  + 1);
++    fprintf(meta, "  \"source_types\": {\"src0\": \"%s\", \"src1\": \"%s\", \"dst\": \"%s\"},\n",
++            ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
++    fprintf(meta, "  \"backend\": \"llama_cpp_cpu\",\n");
++    fprintf(meta, "  \"device\": \"CPU\"\n");
++    fprintf(meta, "}\n");
++    fclose(meta);
++}
++
++static void verathos_cpu_trace_begin_graph(void) {
++    if (!verathos_cpu_trace_enabled()) {
++        return;
++    }
++    verathos_cpu_graph_sequence++;
++    verathos_cpu_intra_graph_index = 0;
++    verathos_cpu_graph_dim_valid_ops = 0;
++    verathos_cpu_graph_written_rows = 0;
++    verathos_cpu_graph_max_src1_rows = 0;
++}
++
++static void verathos_cpu_trace_end_graph(void) {
++    if (verathos_cpu_graph_dim_valid_ops <= 0) {
++        return;
++    }
++    const char * dir = verathos_cpu_trace_dir();
++    if (dir == NULL || dir[0] == '\0' || !verathos_cpu_manifest_v3()) {
++        return;
++    }
++    FILE * manifest = verathos_cpu_manifest_for_capture(dir);
++    if (manifest == NULL) {
++        return;
++    }
++    fprintf(manifest, "VERATHOS_GGML_GRAPH_V1\t%lld\t%lld\t%lld\t%lld\t%lld\tllama_cpp_cpu\tCPU\n",
++            (long long) verathos_cpu_unix_ns(),
++            (long long) verathos_cpu_graph_sequence,
++            (long long) verathos_cpu_graph_dim_valid_ops,
++            (long long) verathos_cpu_graph_written_rows,
++            (long long) verathos_cpu_graph_max_src1_rows);
++    fflush(manifest);
++}
++
++static void verathos_cpu_trace_after_mul_mat(
++        const struct ggml_compute_params * params,
++        const struct ggml_tensor * dst) {
++    if (!verathos_cpu_trace_enabled()) {
++        return;
++    }
++    if (params->threadpool != NULL && params->nth > 1) {
++        ggml_barrier(params->threadpool);
++    }
++    if (params->ith == 0) {
++        verathos_cpu_try_dump_mul_mat_trace(dst);
++    }
++    if (params->threadpool != NULL && params->nth > 1) {
++        ggml_barrier(params->threadpool);
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_one_chunk(
+     const struct ggml_compute_params * params,
+     struct ggml_tensor * dst,
+@@ -1314,6 +2110,7 @@ void ggml_compute_forward_mul_mat(
+                                      src1->type,
+                                      dst->type))
+                     goto UseGgmlGemm1;
++        verathos_cpu_trace_after_mul_mat(params, dst);
+         return;
+     }
+ UseGgmlGemm1:;
+@@ -1382,6 +2179,7 @@ UseGgmlGemm1:;
+                                      vec_dot_type,
+                                      dst->type))
+                     goto UseGgmlGemm2;
++        verathos_cpu_trace_after_mul_mat(params, dst);
+         return;
+     }
+ UseGgmlGemm2:;
+@@ -1449,6 +2247,7 @@ UseGgmlGemm2:;
+ 
+         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+     }
++    verathos_cpu_trace_after_mul_mat(params, dst);
+ }
+ 
+ // ggml_compute_forward_mul_mat_id
+@@ -3354,6 +4153,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     GGML_ASSERT(cplan->n_threads > 0);
+     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
+ 
++    verathos_cpu_trace_begin_graph();
++
+     int n_threads                               = cplan->n_threads;
+     struct ggml_threadpool * threadpool = cplan->threadpool;
+ 
+@@ -3421,6 +4222,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+         ggml_threadpool_free(threadpool);
+     }
+ 
++    verathos_cpu_trace_end_graph();
++
+     return ret;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cb7e933..a63819f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -78,7 +78,11 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cfloat>
++#include <chrono>
+ #include <initializer_list>
++#include <fstream>
++#include <thread>
++#include <atomic>
+ #include <limits>
+ #include <map>
+ #include <memory>
+@@ -86,11 +90,1214 @@
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
++#include <sstream>
+ #include <string>
+ #include <vector>
++#if defined(_WIN32)
++#include <direct.h>
++#include <io.h>
++#else
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ 
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ 
++static int64_t verathos_cuda_trace_sequence = 0;
++static int64_t verathos_cuda_manifest_sequence = 0;
++static std::string verathos_cuda_trace_capture_token;
++static std::vector<int64_t> verathos_cuda_selected_manifest_indexes;
++static std::ofstream verathos_cuda_manifest_stream;
++static std::string verathos_cuda_manifest_path;
++static std::string verathos_cuda_manifest_buffer;
++static bool verathos_cuda_trace_active_for_graph = false;
++static int64_t verathos_cuda_graph_sequence = 0;
++static int64_t verathos_cuda_intra_graph_index = 0;
++static int64_t verathos_cuda_graph_dim_valid_ops = 0;
++static int64_t verathos_cuda_graph_written_rows = 0;
++static int64_t verathos_cuda_mmid_dumped = 0;
++// True while THIS thread is recording a CUDA graph (between Begin/EndCapture
++// in ggml_backend_cuda_graph_compute). The dump hooks consult this instead of
++// trusting cudaStreamIsCapturing: the capture-record pass evaluates the same
++// op code path, and any D2H copy or stream sync in it aborts the process
++// ("operation not permitted when stream is capturing"). Deferred/async error
++// semantics make the API check unreliable; a flag we set ourselves is not.
++static thread_local bool verathos_cuda_in_graph_capture = false;
++static int64_t verathos_cuda_graph_max_src1_rows = 0;
++static std::vector<std::pair<int64_t, int64_t>> verathos_cuda_selected_ops;
++
++static const char * verathos_cuda_trace_dir() {
++    // Environment is fixed at spawn; these helpers sit on per-op hot paths
++    // where a getenv (linear environ scan) per call cost real throughput.
++    static const char * value = std::getenv("VERATHOS_GGML_TRACE_DIR");
++    return value;
++}
++
++static void verathos_cuda_trace_mkdir(const char * dir);
++
++static int64_t verathos_cuda_env_i64(const char * name, int64_t fallback) {
++    const char * raw = std::getenv(name);
++    if (raw == nullptr || raw[0] == '\0') {
++        return fallback;
++    }
++    try {
++        return std::stoll(raw);
++    } catch (...) {
++        return fallback;
++    }
++}
++
++static bool verathos_cuda_env_bool(const char * name, bool fallback) {
++    const char * raw = std::getenv(name);
++    if (raw == nullptr || raw[0] == '\0') {
++        return fallback;
++    }
++    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' ||
++           raw[0] == 'y' || raw[0] == 'Y';
++}
++
++static int64_t verathos_cuda_trace_max_ops() {
++    static const int64_t value = [] {
++        const char * per_capture = std::getenv("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE");
++        if (per_capture != nullptr && per_capture[0] != '\0') {
++            return verathos_cuda_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE", 64);
++        }
++        return verathos_cuda_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_TOTAL", 64);
++    }();
++    return value;
++}
++
++#if defined(__APPLE__)
++#define verathos_st_mtim st_mtimespec
++#else
++#define verathos_st_mtim st_mtim
++#endif
++static bool verathos_cuda_read_capture_token(const char * path, std::string & token) {
++#if !defined(_WIN32)
++    // Called once per graph_compute; on a live 4090 mesh the per-graph
++    // open+read cost measurable decode throughput. stat() is an order of
++    // magnitude cheaper and observes every rewrite via inode/size/mtime.
++    static struct {
++        bool valid;
++        dev_t dev;
++        ino_t ino;
++        off_t size;
++        struct timespec mtim;
++        std::string token;
++    } cache = {};
++    struct stat st;
++    if (::stat(path, &st) != 0) {
++        cache.valid = false;
++        return false;
++    }
++    if (cache.valid && st.st_dev == cache.dev && st.st_ino == cache.ino &&
++        st.st_size == cache.size &&
++        st.verathos_st_mtim.tv_sec == cache.mtim.tv_sec &&
++        st.verathos_st_mtim.tv_nsec == cache.mtim.tv_nsec) {
++        token = cache.token;
++        return true;
++    }
++#endif
++    std::ifstream in(path, std::ios::binary);
++    if (!in) {
++        return false;
++    }
++    std::ostringstream out;
++    out << in.rdbuf();
++    token = out.str();
++    while (!token.empty() &&
++           (token.back() == '\n' || token.back() == '\r' || token.back() == ' ' || token.back() == '\t')) {
++        token.pop_back();
++    }
++    if (token.empty()) {
++        token = "present";
++    } else if (token.size() > 4095) {
++        token.resize(4095);
++    }
++#if !defined(_WIN32)
++    cache.valid = true;
++    cache.dev = st.st_dev;
++    cache.ino = st.st_ino;
++    cache.size = st.st_size;
++    cache.mtim = st.verathos_st_mtim;
++    cache.token = token;
++#endif
++    return true;
++}
++
++static void verathos_cuda_parse_selected_manifest_indexes(const std::string & token) {
++    verathos_cuda_selected_manifest_indexes.clear();
++    const std::string marker = "selected=";
++    size_t pos = token.find(marker);
++    if (pos == std::string::npos) {
++        return;
++    }
++    pos += marker.size();
++    while (pos < token.size() && verathos_cuda_selected_manifest_indexes.size() < 64) {
++        while (pos < token.size() && (token[pos] == ' ' || token[pos] == '\t' || token[pos] == ',')) {
++            ++pos;
++        }
++        if (pos >= token.size() || token[pos] < '0' || token[pos] > '9') {
++            break;
++        }
++        size_t end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        try {
++            verathos_cuda_selected_manifest_indexes.push_back(std::stoll(token.substr(pos, end - pos)));
++        } catch (...) {
++            break;
++        }
++        pos = end;
++    }
++}
++
++static void verathos_cuda_parse_selected_ops(const std::string & token) {
++    verathos_cuda_selected_ops.clear();
++    const std::string marker = "selected_v3=";
++    size_t pos = token.find(marker);
++    if (pos == std::string::npos) {
++        return;
++    }
++    pos += marker.size();
++    while (pos < token.size() && verathos_cuda_selected_ops.size() < 64) {
++        while (pos < token.size() && (token[pos] == ' ' || token[pos] == '\t' || token[pos] == ',')) {
++            ++pos;
++        }
++        if (pos >= token.size() || token[pos] < '0' || token[pos] > '9') {
++            break;
++        }
++        size_t end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        if (end >= token.size() || token[end] != ':') {
++            break;
++        }
++        int64_t graph_value = 0;
++        int64_t intra_value = 0;
++        try {
++            graph_value = std::stoll(token.substr(pos, end - pos));
++        } catch (...) {
++            break;
++        }
++        pos = end + 1;
++        end = pos;
++        while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
++            ++end;
++        }
++        if (end == pos) {
++            break;
++        }
++        try {
++            intra_value = std::stoll(token.substr(pos, end - pos));
++        } catch (...) {
++            break;
++        }
++        verathos_cuda_selected_ops.emplace_back(graph_value, intra_value);
++        pos = end;
++    }
++}
++
++static bool verathos_cuda_should_dump_selected_op(int64_t graph_sequence, int64_t intra_index) {
++    for (const auto & item : verathos_cuda_selected_ops) {
++        if (item.first == graph_sequence && item.second == intra_index) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool verathos_cuda_should_dump_manifest_index(int64_t manifest_index) {
++    if (!verathos_cuda_selected_manifest_indexes.empty()) {
++        for (int64_t selected : verathos_cuda_selected_manifest_indexes) {
++            if (selected == manifest_index) {
++                return true;
++            }
++        }
++        return false;
++    }
++    const int64_t max_total = verathos_cuda_trace_max_ops();
++    return max_total < 0 || verathos_cuda_trace_sequence < max_total;
++}
++
++static void verathos_cuda_write_graph_marker(int device);
++
++static void verathos_cuda_flush_manifest_buffer() {
++    if (!verathos_cuda_manifest_buffer.empty() && verathos_cuda_manifest_stream.is_open()) {
++        verathos_cuda_manifest_stream << verathos_cuda_manifest_buffer;
++        verathos_cuda_manifest_buffer.clear();
++    }
++}
++
++static void verathos_cuda_refresh_capture_token(const char * enable_file) {
++    std::string token;
++    if (!verathos_cuda_read_capture_token(enable_file, token)) {
++        token = "present";
++    }
++    if (token != verathos_cuda_trace_capture_token) {
++        verathos_cuda_trace_capture_token = token;
++        verathos_cuda_trace_sequence = 0;
++        verathos_cuda_manifest_sequence = 0;
++        verathos_cuda_graph_sequence = 0;
++        verathos_cuda_intra_graph_index = 0;
++        verathos_cuda_graph_dim_valid_ops = 0;
++        verathos_cuda_graph_written_rows = 0;
++        verathos_cuda_mmid_dumped = 0;
++        verathos_cuda_graph_max_src1_rows = 0;
++        verathos_cuda_parse_selected_manifest_indexes(token);
++        verathos_cuda_parse_selected_ops(token);
++        if (verathos_cuda_manifest_stream.is_open()) {
++            verathos_cuda_flush_manifest_buffer();
++            verathos_cuda_manifest_stream.flush();
++            verathos_cuda_manifest_stream.close();
++        }
++        verathos_cuda_manifest_buffer.clear();
++        verathos_cuda_manifest_path.clear();
++    }
++}
++
++static bool verathos_cuda_prepare_trace_for_graph() {
++    const char * dir = verathos_cuda_trace_dir();
++    if (dir == nullptr || dir[0] == '\0') {
++        verathos_cuda_trace_active_for_graph = false;
++        return false;
++    }
++    const char * enable_file = std::getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file != nullptr && enable_file[0] != '\0') {
++#if defined(_WIN32)
++        if (_access(enable_file, 0) != 0) {
++#else
++        if (access(enable_file, F_OK) != 0) {
++#endif
++            verathos_cuda_trace_active_for_graph = false;
++            return false;
++        }
++        verathos_cuda_refresh_capture_token(enable_file);
++    }
++    verathos_cuda_trace_mkdir(dir);
++    verathos_cuda_trace_active_for_graph = true;
++    verathos_cuda_graph_sequence++;
++    verathos_cuda_intra_graph_index = 0;
++    verathos_cuda_graph_dim_valid_ops = 0;
++    verathos_cuda_graph_written_rows = 0;
++    verathos_cuda_mmid_dumped = 0;
++    verathos_cuda_graph_max_src1_rows = 0;
++    return true;
++}
++
++static bool verathos_cuda_trace_enabled() {
++    return verathos_cuda_trace_active_for_graph;
++}
++
++static int64_t verathos_cuda_unix_ns() {
++    using namespace std::chrono;
++    return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
++}
++
++static void verathos_cuda_trace_mkdir(const char * dir) {
++    if (dir == nullptr || dir[0] == '\0') {
++        return;
++    }
++#if defined(_WIN32)
++    _mkdir(dir);
++#else
++    mkdir(dir, 0755);
++#endif
++}
++
++static std::string verathos_cuda_json_escape(const char * raw) {
++    std::ostringstream out;
++    for (const char * p = raw ? raw : ""; *p; ++p) {
++        switch (*p) {
++            case '\\': out << "\\\\"; break;
++            case '"': out << "\\\""; break;
++            case '\n': out << "\\n"; break;
++            case '\r': out << "\\r"; break;
++            case '\t': out << "\\t"; break;
++            default: out << *p; break;
++        }
++    }
++    return out.str();
++}
++
++static std::string verathos_cuda_hex_escape(const char * raw) {
++    static const char * hex = "0123456789abcdef";
++    std::string out;
++    for (const unsigned char * p = reinterpret_cast<const unsigned char *>(raw ? raw : ""); *p; ++p) {
++        out.push_back(hex[*p >> 4]);
++        out.push_back(hex[*p & 0x0f]);
++    }
++    return out;
++}
++
++static std::string verathos_cuda_compact_field(const char * raw) {
++    std::string out(raw ? raw : "");
++    for (char & ch : out) {
++        if (ch == '\t' || ch == '\n' || ch == '\r') {
++            ch = ' ';
++        }
++    }
++    return out;
++}
++
++static bool verathos_cuda_manifest_v3() {
++    static const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && std::string(raw) == "compact-raw-v3";
++}
++
++static bool verathos_cuda_manifest_compact() {
++    static const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "compact" ||
++        std::string(raw) == "compact-raw" ||
++        std::string(raw) == "compact-raw-v2" ||
++        std::string(raw) == "compact-raw-v3" ||
++        std::string(raw) == "raw" ||
++        std::string(raw) == "decode" ||
++        std::string(raw) == "decode-only");
++}
++
++static bool verathos_cuda_manifest_compact_raw() {
++    static const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "compact-raw" ||
++        std::string(raw) == "compact-raw-v2" ||
++        std::string(raw) == "compact-raw-v3" ||
++        std::string(raw) == "raw");
++}
++
++static bool verathos_cuda_manifest_disabled() {
++    static const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "none" ||
++        std::string(raw) == "off" ||
++        std::string(raw) == "0");
++}
++
++// True while this capture window still has trace work that requires the
++// unfused op stream: pending selected-op/manifest-index dumps (exclusive
++// replay windows), per-op manifest emission, or remaining candidate-dump
++// budget. Once the candidate budget is exhausted (manifest disabled),
++// fused kernels can resume — the rest of the request runs at native speed.
++static bool verathos_cuda_capture_work_pending();
++
++static bool verathos_cuda_manifest_decode_only() {
++    static const char * raw = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++    return raw != nullptr && (
++        std::string(raw) == "decode" ||
++        std::string(raw) == "decode-only");
++}
++
++// True only while an exclusive replay window with SELECTED op/index dumps is
++// armed. Ordinary serve windows (shared capture, manifest rows) must NOT
++// match: rows and graph markers are emitted at graph level and never need the
++// eager op stream, while selected witness dumps do.
++static bool verathos_cuda_selected_dump_pending() {
++    if (!verathos_cuda_trace_enabled()) {
++        return false;
++    }
++    return !verathos_cuda_selected_ops.empty() ||
++        !verathos_cuda_selected_manifest_indexes.empty();
++}
++
++static bool verathos_cuda_capture_work_pending() {
++    if (!verathos_cuda_trace_enabled()) {
++        return false;
++    }
++    if (!verathos_cuda_selected_ops.empty() || !verathos_cuda_selected_manifest_indexes.empty()) {
++        return true;
++    }
++    if (!verathos_cuda_manifest_disabled()) {
++        return true;
++    }
++    const int64_t max_total = verathos_cuda_trace_max_ops();
++    return max_total < 0 || verathos_cuda_trace_sequence < max_total;
++}
++
++static std::string verathos_cuda_filename(const std::string & path) {
++    const size_t slash = path.find_last_of("/\\");
++    return slash == std::string::npos ? path : path.substr(slash + 1);
++}
++
++static bool verathos_cuda_ends_with(const std::string & value, const std::string & suffix) {
++    return value.size() >= suffix.size() &&
++        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
++}
++
++static bool verathos_cuda_is_decode_candidate(
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * dst) {
++    // Runs for every MUL_MAT while capture is armed: plain C string checks,
++    // no per-call std::string allocations.
++    const char * tensor_name = src0 != nullptr ? src0->name : "";
++    const char * src1_name = src1 != nullptr ? src1->name : "";
++    const char * dst_name = dst != nullptr ? dst->name : "";
++    if (strcmp(tensor_name, "output.weight") == 0 ||
++        strcmp(tensor_name, "lm_head.weight") == 0) {
++        return true;
++    }
++    const size_t name_len = strlen(tensor_name);
++    static const char suffix[] = ".lm_head.weight";
++    const size_t suffix_len = sizeof(suffix) - 1;
++    if (name_len >= suffix_len &&
++        strcmp(tensor_name + name_len - suffix_len, suffix) == 0) {
++        return true;
++    }
++    if (strstr(tensor_name, "attn_output") != nullptr) {
++        return false;
++    }
++    return strcmp(dst_name, "logits") == 0 ||
++        strcmp(dst_name, "result_output") == 0 ||
++        (strstr(dst_name, "result_output") != nullptr &&
++         (strstr(src1_name, "result_norm") != nullptr ||
++          strstr(src1_name, "final") != nullptr));
++}
++
++static std::string verathos_cuda_manifest_suffix() {
++    std::string suffix;
++    for (char ch : verathos_cuda_trace_capture_token) {
++        if (ch < '0' || ch > '9') {
++            break;
++        }
++        if (suffix.size() >= 64) {
++            break;
++        }
++        suffix.push_back(ch);
++    }
++    return suffix.empty() ? "" : "-" + suffix;
++}
++
++static bool verathos_cuda_write_f32(const std::string & path, const std::vector<float> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size() * sizeof(float));
++    return bool(out);
++}
++
++static bool verathos_cuda_write_raw(const std::string & path, const std::vector<uint8_t> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size());
++    return bool(out);
++}
++
++static std::ostream * verathos_cuda_manifest_for_capture(const char * dir) {
++    if (verathos_cuda_manifest_disabled()) {
++        return nullptr;
++    }
++    const std::string path = std::string(dir) + "/manifest" + verathos_cuda_manifest_suffix() +
++        (verathos_cuda_manifest_compact() ? ".vmanifest" : ".jsonl");
++    if (verathos_cuda_manifest_path != path || !verathos_cuda_manifest_stream.is_open()) {
++        if (verathos_cuda_manifest_stream.is_open()) {
++            verathos_cuda_flush_manifest_buffer();
++            verathos_cuda_manifest_stream.flush();
++            verathos_cuda_manifest_stream.close();
++        }
++        verathos_cuda_manifest_buffer.clear();
++        verathos_cuda_manifest_path = path;
++        verathos_cuda_manifest_stream.open(path, std::ios::app);
++    }
++    if (!verathos_cuda_manifest_stream) {
++        return nullptr;
++    }
++    return &verathos_cuda_manifest_stream;
++}
++
++static void verathos_cuda_write_graph_marker(int device) {
++    if (!verathos_cuda_trace_active_for_graph ||
++        !verathos_cuda_manifest_v3() ||
++        verathos_cuda_graph_dim_valid_ops <= 0) {
++        return;
++    }
++    const char * dir = verathos_cuda_trace_dir();
++    if (dir == nullptr || dir[0] == '\0') {
++        return;
++    }
++    if (verathos_cuda_manifest_for_capture(dir) == nullptr) {
++        return;
++    }
++    std::string line = "VERATHOS_GGML_GRAPH_V1";
++    line += "\t" + std::to_string(verathos_cuda_unix_ns());
++    line += "\t" + std::to_string(verathos_cuda_graph_sequence);
++    line += "\t" + std::to_string(verathos_cuda_graph_dim_valid_ops);
++    line += "\t" + std::to_string(verathos_cuda_graph_written_rows);
++    line += "\t" + std::to_string(verathos_cuda_graph_max_src1_rows);
++    line += "\tllama_cpp_cuda\tCUDA" + std::to_string(device);
++    line.push_back('\n');
++    verathos_cuda_manifest_buffer += line;
++}
++
++static void verathos_cuda_write_manifest_entry(
++        const char * dir,
++        int64_t now_ns,
++        int64_t manifest_index,
++        int device,
++        bool proof_eligible,
++        int64_t graph_sequence,
++        int64_t intra_graph_index,
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * dst) {
++    if (verathos_cuda_manifest_decode_only() && !verathos_cuda_is_decode_candidate(src0, src1, dst)) {
++        return;
++    }
++    std::ostream * manifest_stream = verathos_cuda_manifest_for_capture(dir);
++    if (manifest_stream == nullptr) {
++        return;
++    }
++    std::ostream & manifest = *manifest_stream;
++    if (verathos_cuda_manifest_compact()) {
++        const bool raw_compact = verathos_cuda_manifest_compact_raw();
++        static const char * manifest_format = std::getenv("VERATHOS_GGML_TRACE_MANIFEST_FORMAT");
++        const bool raw_compact_v3 = verathos_cuda_manifest_v3();
++        const bool raw_compact_v2 = raw_compact_v3 ||
++            (manifest_format != nullptr && std::string(manifest_format) == "compact-raw-v2");
++        const std::string graph_id = std::string("cuda") + std::to_string(device) + "-mul-mat-" + std::to_string(manifest_index);
++        const std::string device_name = std::string("CUDA") + std::to_string(device);
++        if (raw_compact_v2) {
++            std::string line;
++            line.reserve(320);
++            auto append_field = [&](const std::string & value) {
++                line.push_back('\t');
++                line += value;
++            };
++            line += raw_compact_v3
++                ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V3"
++                : "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V2";
++            append_field(std::to_string(now_ns));
++            append_field(std::to_string(manifest_index));
++            append_field(verathos_cuda_compact_field(src0->name));
++            append_field(verathos_cuda_compact_field(src1->name));
++            append_field(verathos_cuda_compact_field(dst->name));
++            append_field(
++                std::to_string(src0->ne[0]) + "," + std::to_string(src0->ne[1]) + "," +
++                std::to_string(src0->ne[2]) + "," + std::to_string(src0->ne[3]));
++            append_field(
++                std::to_string(src1->ne[0]) + "," + std::to_string(src1->ne[1]) + "," +
++                std::to_string(src1->ne[2]) + "," + std::to_string(src1->ne[3]));
++            append_field(
++                std::to_string(dst->ne[0]) + "," + std::to_string(dst->ne[1]) + "," +
++                std::to_string(dst->ne[2]) + "," + std::to_string(dst->ne[3]));
++            append_field(ggml_type_name((ggml_type) src0->type));
++            append_field(ggml_type_name((ggml_type) src1->type));
++            append_field(ggml_type_name((ggml_type) dst->type));
++            append_field("llama_cpp_cuda");
++            append_field(verathos_cuda_compact_field(device_name.c_str()));
++            append_field(proof_eligible ? "1" : "0");
++            if (raw_compact_v3) {
++                append_field(std::to_string(graph_sequence));
++                append_field(std::to_string(intra_graph_index));
++            }
++            line.push_back('\n');
++            verathos_cuda_manifest_buffer += line;
++            return;
++        }
++        manifest << (raw_compact ? "VERATHOS_GGML_OP_MANIFEST_COMPACT_RAW_V1" : "VERATHOS_GGML_OP_MANIFEST_COMPACT_V1");
++        manifest << "\t" << now_ns;
++        manifest << "\t" << manifest_index;
++        manifest << "\t" << (raw_compact ? verathos_cuda_compact_field(graph_id.c_str()) : verathos_cuda_hex_escape(graph_id.c_str()));
++        manifest << "\t" << manifest_index;
++        manifest << "\t" << (raw_compact ? verathos_cuda_compact_field(src0->name) : verathos_cuda_hex_escape(src0->name));
++        manifest << "\t" << (raw_compact ? verathos_cuda_compact_field(src0->name) : verathos_cuda_hex_escape(src0->name));
++        manifest << "\t" << (raw_compact ? verathos_cuda_compact_field(src1->name) : verathos_cuda_hex_escape(src1->name));
++        manifest << "\t" << (raw_compact ? verathos_cuda_compact_field(dst->name) : verathos_cuda_hex_escape(dst->name));
++        manifest << "\t" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3];
++        manifest << "\t" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3];
++        manifest << "\t" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3];
++        manifest << "\t" << ggml_type_name((ggml_type) src0->type);
++        manifest << "\t" << ggml_type_name((ggml_type) src1->type);
++        manifest << "\t" << ggml_type_name((ggml_type) dst->type);
++        manifest << "\t" << (raw_compact ? verathos_cuda_compact_field("llama_cpp_cuda") : verathos_cuda_hex_escape("llama_cpp_cuda"));
++        manifest << "\t" << (raw_compact ? verathos_cuda_compact_field(device_name.c_str()) : verathos_cuda_hex_escape(device_name.c_str()));
++        manifest << "\t" << (proof_eligible ? "1" : "0") << "\n";
++        manifest.flush();
++        return;
++    }
++    manifest << "{\"version\":1";
++    manifest << ",\"created_unix_ns\":" << now_ns;
++    manifest << ",\"manifest_index\":" << manifest_index;
++    manifest << ",\"graph_id\":\"cuda" << device << "-mul-mat-" << manifest_index << "\"";
++    manifest << ",\"op_index\":" << manifest_index;
++    manifest << ",\"op_type\":\"GGML_OP_MUL_MAT\"";
++    manifest << ",\"tensor_name\":\"" << verathos_cuda_json_escape(src0->name) << "\"";
++    manifest << ",\"src0_name\":\"" << verathos_cuda_json_escape(src0->name) << "\"";
++    manifest << ",\"src1_name\":\"" << verathos_cuda_json_escape(src1->name) << "\"";
++    manifest << ",\"dst_name\":\"" << verathos_cuda_json_escape(dst->name) << "\"";
++    manifest << ",\"src0_shape\":[" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "]";
++    manifest << ",\"src1_shape\":[" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3] << "]";
++    manifest << ",\"dst_shape\":[" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << "]";
++    manifest << ",\"source_types\":{\"src0\":\"" << ggml_type_name((ggml_type) src0->type)
++             << "\",\"src1\":\"" << ggml_type_name((ggml_type) src1->type)
++             << "\",\"dst\":\"" << ggml_type_name((ggml_type) dst->type) << "\"}";
++    manifest << ",\"backend\":\"llama_cpp_cuda\"";
++    manifest << ",\"device\":\"CUDA" << device << "\"";
++    manifest << ",\"proof_eligible\":" << (proof_eligible ? "true" : "false") << "}\n";
++    manifest.flush();
++}
++
++static bool verathos_cuda_tensor_raw_to_host(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * tensor,
++        std::vector<uint8_t> & raw) {
++    if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr) {
++        return false;
++    }
++    const char * buft_name_raw = tensor->buffer->buft->iface.get_name(tensor->buffer->buft);
++    const std::string buft_name = buft_name_raw ? buft_name_raw : "";
++    if (buft_name.rfind(GGML_CUDA_NAME, 0) != 0 ||
++        buft_name.find("_Split") != std::string::npos ||
++        buft_name.find("_Host") != std::string::npos) {
++        return false;
++    }
++    if (!ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    const size_t nbytes = ggml_nbytes(tensor);
++    if (nbytes == 0) {
++        return false;
++    }
++    raw.resize(nbytes);
++    ggml_cuda_set_device(ctx.device);
++    CUDA_CHECK(cudaMemcpyAsync(raw.data(), tensor->data, nbytes, cudaMemcpyDeviceToHost, ctx.stream()));
++    return true;
++}
++
++static bool verathos_cuda_raw_to_f32(
++        const ggml_tensor * tensor,
++        const std::vector<uint8_t> & raw,
++        std::vector<float> & out) {
++    const int64_t n = ggml_nelements(tensor);
++    if (n <= 0) {
++        return false;
++    }
++    out.resize(n);
++    if (tensor->type == GGML_TYPE_F32) {
++        if (raw.size() != sizeof(float) * (size_t) n) {
++            return false;
++        }
++        memcpy(out.data(), raw.data(), raw.size());
++        return true;
++    }
++    const ggml_type_traits * traits = ggml_get_type_traits((ggml_type) tensor->type);
++    if (traits == nullptr || traits->to_float == nullptr) {
++        return false;
++    }
++    traits->to_float(raw.data(), out.data(), n);
++    return true;
++}
++
++// Verathos tail ring (probe-free light tier). The light tier's only witness
++// VALUES are the trailing decode-audit window's final-logit rows, but the
++// serve-time candidate budget is spent on the earliest tokens, so the audit
++// had to regenerate those rows with teacher-forced probes inside an
++// exclusive capture window. The ring keeps the last K final-logit decode
++// instances of the current generation in pinned host memory (stream-async
++// D2H after each graph, no sync on the decode path) and writes them out as
++// ordinary trace files once the generation goes idle, so the light proof
++// assembles from serve-time material with no replay and no exclusive
++// window. Selected-op witness dumps (hard tier, probe fallback) are
++// untouched. The final-logit dst carries GGML_TENSOR_FLAG_OUTPUT, so its
++// buffer is stable after the graph; src1 is copied best-effort only (the
++// light payload never opens src1 values).
++
++struct verathos_cuda_tail_pending {
++    const ggml_tensor * src0;
++    const ggml_tensor * src1;
++    const ggml_tensor * dst;
++    int64_t graph_seq;
++    int64_t intra_graph_index;
++    int64_t manifest_index;
++};
++
++struct verathos_cuda_tail_slot {
++    void * src1_host = nullptr;
++    void * dst_host = nullptr;
++    size_t src1_capacity = 0;
++    size_t dst_capacity = 0;
++    size_t src1_nbytes = 0;
++    size_t dst_nbytes = 0;
++    cudaEvent_t ready = nullptr;
++    int64_t ns = 0;
++    int64_t graph_seq = -1;
++    int64_t intra_graph_index = -1;
++    int64_t manifest_index = -1;
++    int device = 0;
++    int64_t src0_ne[2] = {0, 0};
++    int64_t src1_ne[2] = {0, 0};
++    int64_t dst_ne[2] = {0, 0};
++    ggml_type src0_type = GGML_TYPE_F32;
++    std::string src0_name;
++    std::string src1_name;
++    std::string dst_name;
++    bool valid = false;
++};
++
++struct verathos_cuda_tail_pool {
++    std::vector<verathos_cuda_tail_slot> slots;
++    size_t head = 0;
++    size_t count = 0;
++};
++
++static std::mutex verathos_cuda_tail_mutex;
++static verathos_cuda_tail_pool verathos_cuda_tail_pools[2];
++static int verathos_cuda_tail_active_pool = 0;
++static std::atomic<int64_t> verathos_cuda_tail_last_insert_ns{0};
++static std::atomic<bool> verathos_cuda_tail_flush_asap{false};
++static long long verathos_cuda_tail_signal_seen = 0;
++static std::vector<verathos_cuda_tail_pending> verathos_cuda_tail_staging;
++
++static bool verathos_cuda_tail_ring_on() {
++    static const bool value = verathos_cuda_env_bool("VERATHOS_GGML_TAIL_RING", true);
++    return value;
++}
++
++static int64_t verathos_cuda_tail_ring_slots() {
++    static const int64_t value = [] {
++        int64_t raw = verathos_cuda_env_i64("VERATHOS_GGML_TAIL_RING_SLOTS", 48);
++        if (raw < 4) {
++            raw = 4;
++        }
++        if (raw > 512) {
++            raw = 512;
++        }
++        return raw;
++    }();
++    return value;
++}
++
++static int64_t verathos_cuda_tail_ring_flush_ms() {
++    static const int64_t value = [] {
++        int64_t raw = verathos_cuda_env_i64("VERATHOS_GGML_TAIL_RING_FLUSH_MS", 60);
++        if (raw < 10) {
++            raw = 10;
++        }
++        if (raw > 5000) {
++            raw = 5000;
++        }
++        return raw;
++    }();
++    return value;
++}
++
++static void verathos_cuda_tail_stage(
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * dst,
++        int64_t graph_seq,
++        int64_t intra_graph_index,
++        int64_t manifest_index) {
++    if (!verathos_cuda_tail_ring_on() || verathos_cuda_selected_dump_pending()) {
++        return;
++    }
++    if (src1->ne[1] != 1 || !verathos_cuda_is_decode_candidate(src0, src1, dst)) {
++        return;
++    }
++    // The final-logit dst is a declared graph output, so its buffer survives
++    // the rest of the graph; anything else may be reused mid-graph and would
++    // be stale by the post-graph copy.
++    if ((dst->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
++        return;
++    }
++    if (dst->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
++        return;
++    }
++    if (!ggml_is_contiguous(dst) || !ggml_is_contiguous(src1)) {
++        return;
++    }
++    verathos_cuda_tail_staging.push_back(verathos_cuda_tail_pending{
++        src0, src1, dst, graph_seq, intra_graph_index, manifest_index,
++    });
++}
++
++static bool verathos_cuda_tail_write_blob(const std::string & path, const void * data, size_t nbytes) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(data), (std::streamsize) nbytes);
++    return bool(out);
++}
++
++static void verathos_cuda_tail_flush_pool(verathos_cuda_tail_pool & pool, const std::string & dir) {
++    if (pool.count == 0) {
++        return;
++    }
++    const size_t slots = pool.slots.size();
++    const size_t first = (pool.head + slots - pool.count) % slots;
++    const int64_t flush_ns = verathos_cuda_unix_ns();
++    int64_t seq = 0;
++    const int64_t total = (int64_t) pool.count;
++    for (size_t i = 0; i < pool.count; ++i) {
++        verathos_cuda_tail_slot & slot = pool.slots[(first + i) % slots];
++        if (!slot.valid) {
++            continue;
++        }
++        slot.valid = false;
++        if (slot.ready != nullptr) {
++            cudaEventSynchronize(slot.ready);
++        }
++        std::ostringstream prefix;
++        prefix << dir << "/trace-" << slot.ns << "-cuda" << slot.device
++               << "-op" << slot.manifest_index;
++        const std::string src1_path = prefix.str() + "-src1.f32";
++        const std::string dst_path = prefix.str() + "-dst.f32";
++        const std::string json_path = prefix.str() + ".json";
++        if (!verathos_cuda_tail_write_blob(src1_path, slot.src1_host, slot.src1_nbytes) ||
++            !verathos_cuda_tail_write_blob(dst_path, slot.dst_host, slot.dst_nbytes)) {
++            continue;
++        }
++        std::ofstream meta(json_path);
++        if (!meta) {
++            continue;
++        }
++        meta << "{\n";
++        meta << "  \"version\": 1,\n";
++        meta << "  \"created_unix_ns\": " << slot.ns << ",\n";
++        meta << "  \"manifest_index\": " << slot.manifest_index << ",\n";
++        meta << "  \"graph_seq\": " << slot.graph_seq << ",\n";
++        meta << "  \"intra_graph_index\": " << slot.intra_graph_index << ",\n";
++        meta << "  \"tail_ring\": 1,\n";
++        meta << "  \"tail_flush_ns\": " << flush_ns << ",\n";
++        meta << "  \"tail_seq\": " << seq << ",\n";
++        meta << "  \"tail_total\": " << total << ",\n";
++        meta << "  \"graph_id\": \"cuda" << slot.device << "-mul-mat-" << slot.manifest_index << "\",\n";
++        meta << "  \"op_index\": " << slot.manifest_index << ",\n";
++        meta << "  \"op_type\": \"GGML_OP_MUL_MAT\",\n";
++        meta << "  \"tensor_name\": \"" << verathos_cuda_json_escape(slot.src0_name.c_str()) << "\",\n";
++        meta << "  \"src0_name\": \"" << verathos_cuda_json_escape(slot.src0_name.c_str()) << "\",\n";
++        meta << "  \"src1_name\": \"" << verathos_cuda_json_escape(slot.src1_name.c_str()) << "\",\n";
++        meta << "  \"dst_name\": \"" << verathos_cuda_json_escape(slot.dst_name.c_str()) << "\",\n";
++        meta << "  \"src0_shape\": [" << slot.src0_ne[0] << "," << slot.src0_ne[1] << ",1,1],\n";
++        meta << "  \"src1_shape\": [" << slot.src1_ne[0] << "," << slot.src1_ne[1] << ",1,1],\n";
++        meta << "  \"dst_shape\": [" << slot.dst_ne[0] << "," << slot.dst_ne[1] << ",1,1],\n";
++        meta << "  \"src0_raw_type\": \"" << ggml_type_name(slot.src0_type) << "\",\n";
++        meta << "  \"src1_f32\": \"" << verathos_cuda_filename(src1_path) << "\",\n";
++        meta << "  \"dst_f32\": \"" << verathos_cuda_filename(dst_path) << "\",\n";
++        meta << "  \"source_types\": {\"src0\": \"" << ggml_type_name(slot.src0_type)
++             << "\", \"src1\": \"f32\", \"dst\": \"f32\"},\n";
++        meta << "  \"backend\": \"llama_cpp_cuda\",\n";
++        meta << "  \"device\": \"CUDA" << slot.device << "\"\n";
++        meta << "}\n";
++        seq++;
++    }
++    pool.head = 0;
++    pool.count = 0;
++}
++
++static void verathos_cuda_tail_thread_main() {
++    // Every drain (here and the rotation path in commit) runs UNDER the ring
++    // mutex: the write is ~20 MB to page cache while generation is idle, and
++    // holding the lock is what makes pool rotation race-free.
++    for (;;) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(15));
++        const char * dir = verathos_cuda_trace_dir();
++        if (dir == nullptr || dir[0] == '\0') {
++            continue;
++        }
++        {
++            // Reply-end signal from the server: flush without waiting
++            // out the idle timer. A stale stamp from a previous run
++            // triggers at most one harmless early flush.
++            std::ifstream signal_in(std::string(dir) + "/.tail-flush");
++            long long stamp = 0;
++            if (signal_in && (signal_in >> stamp) && stamp != 0 &&
++                stamp != verathos_cuda_tail_signal_seen) {
++                verathos_cuda_tail_signal_seen = stamp;
++                verathos_cuda_tail_flush_asap.store(true);
++            }
++        }
++        std::lock_guard<std::mutex> lock(verathos_cuda_tail_mutex);
++        // A rotated-out pool holds a COMPLETE generation tail whose audit
++        // may already be polling for the files: drain it first.
++        verathos_cuda_tail_pool & inactive = verathos_cuda_tail_pools[verathos_cuda_tail_active_pool ^ 1];
++        if (inactive.count > 0) {
++            verathos_cuda_tail_flush_pool(inactive, dir);
++            verathos_cuda_tail_flush_asap.store(false);
++            continue;
++        }
++        const int64_t last = verathos_cuda_tail_last_insert_ns.load();
++        const bool asap = verathos_cuda_tail_flush_asap.load();
++        if (last == 0 && !asap) {
++            continue;
++        }
++        const int64_t idle_ns = verathos_cuda_unix_ns() - last;
++        if (!asap && idle_ns < verathos_cuda_tail_ring_flush_ms() * 1000000) {
++            continue;
++        }
++        verathos_cuda_tail_pool & active = verathos_cuda_tail_pools[verathos_cuda_tail_active_pool];
++        verathos_cuda_tail_flush_asap.store(false);
++        verathos_cuda_tail_last_insert_ns.store(0);
++        if (active.count > 0) {
++            verathos_cuda_tail_flush_pool(active, dir);
++        }
++    }
++}
++
++static void verathos_cuda_tail_commit(ggml_backend_cuda_context & ctx) {
++    const bool prefill_shaped = verathos_cuda_graph_max_src1_rows > 1;
++    if (verathos_cuda_tail_staging.empty() && !prefill_shaped) {
++        return;
++    }
++    static std::once_flag thread_once;
++    std::call_once(thread_once, [] {
++        std::thread(verathos_cuda_tail_thread_main).detach();
++    });
++    std::lock_guard<std::mutex> lock(verathos_cuda_tail_mutex);
++    if (prefill_shaped &&
++        verathos_cuda_tail_pools[verathos_cuda_tail_active_pool].count > 0) {
++        // A prefill-shaped graph while the ring holds entries means a new
++        // request started: rotate so the finished generation flushes as one
++        // group and this request's own instances start a fresh one. If the
++        // other pool still holds an undrained group (flush thread lagged),
++        // drain it here — once per request start, off the decode path.
++        verathos_cuda_tail_pool & other = verathos_cuda_tail_pools[verathos_cuda_tail_active_pool ^ 1];
++        if (other.count > 0) {
++            const char * dir = verathos_cuda_trace_dir();
++            if (dir != nullptr && dir[0] != '\0') {
++                verathos_cuda_tail_flush_pool(other, dir);
++            } else {
++                other.head = 0;
++                other.count = 0;
++            }
++        }
++        verathos_cuda_tail_active_pool ^= 1;
++        verathos_cuda_tail_flush_asap.store(true);
++        verathos_cuda_tail_last_insert_ns.store(0);
++    }
++    if (verathos_cuda_tail_staging.empty()) {
++        return;
++    }
++    verathos_cuda_tail_pool & pool = verathos_cuda_tail_pools[verathos_cuda_tail_active_pool];
++    if (pool.slots.empty()) {
++        pool.slots.resize((size_t) verathos_cuda_tail_ring_slots());
++    }
++    for (const verathos_cuda_tail_pending & pending : verathos_cuda_tail_staging) {
++        verathos_cuda_tail_slot & slot = pool.slots[pool.head];
++        const size_t src1_nbytes = ggml_nbytes(pending.src1);
++        const size_t dst_nbytes = ggml_nbytes(pending.dst);
++        if (slot.src1_capacity < src1_nbytes) {
++            if (slot.src1_host != nullptr) {
++                cudaFreeHost(slot.src1_host);
++                slot.src1_host = nullptr;
++                slot.src1_capacity = 0;
++            }
++            if (cudaMallocHost(&slot.src1_host, src1_nbytes) != cudaSuccess) {
++                slot.src1_host = nullptr;
++                continue;
++            }
++            slot.src1_capacity = src1_nbytes;
++        }
++        if (slot.dst_capacity < dst_nbytes) {
++            if (slot.dst_host != nullptr) {
++                cudaFreeHost(slot.dst_host);
++                slot.dst_host = nullptr;
++                slot.dst_capacity = 0;
++            }
++            if (cudaMallocHost(&slot.dst_host, dst_nbytes) != cudaSuccess) {
++                slot.dst_host = nullptr;
++                slot.dst_capacity = 0;
++                continue;
++            }
++            slot.dst_capacity = dst_nbytes;
++        }
++        if (slot.ready == nullptr &&
++            cudaEventCreateWithFlags(&slot.ready, cudaEventDisableTiming) != cudaSuccess) {
++            slot.ready = nullptr;
++            continue;
++        }
++        if (cudaMemcpyAsync(slot.src1_host, pending.src1->data, src1_nbytes,
++                            cudaMemcpyDeviceToHost, ctx.stream()) != cudaSuccess ||
++            cudaMemcpyAsync(slot.dst_host, pending.dst->data, dst_nbytes,
++                            cudaMemcpyDeviceToHost, ctx.stream()) != cudaSuccess) {
++            continue;
++        }
++        cudaEventRecord(slot.ready, ctx.stream());
++        slot.src1_nbytes = src1_nbytes;
++        slot.dst_nbytes = dst_nbytes;
++        slot.ns = verathos_cuda_unix_ns();
++        slot.graph_seq = pending.graph_seq;
++        slot.intra_graph_index = pending.intra_graph_index;
++        slot.manifest_index = pending.manifest_index;
++        slot.device = ctx.device;
++        slot.src0_ne[0] = pending.src0->ne[0];
++        slot.src0_ne[1] = pending.src0->ne[1];
++        slot.src1_ne[0] = pending.src1->ne[0];
++        slot.src1_ne[1] = pending.src1->ne[1];
++        slot.dst_ne[0] = pending.dst->ne[0];
++        slot.dst_ne[1] = pending.dst->ne[1];
++        slot.src0_type = (ggml_type) pending.src0->type;
++        slot.src0_name = pending.src0->name;
++        slot.src1_name = pending.src1->name;
++        slot.dst_name = pending.dst->name;
++        slot.valid = true;
++        pool.head = (pool.head + 1) % pool.slots.size();
++        if (pool.count < pool.slots.size()) {
++            pool.count++;
++        }
++        verathos_cuda_tail_last_insert_ns.store(slot.ns);
++    }
++    verathos_cuda_tail_staging.clear();
++}
++
++static void verathos_cuda_try_dump_mul_mat_trace(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * dst) {
++    if (!verathos_cuda_trace_enabled()) {
++        return;
++    }
++    const char * dir = verathos_cuda_trace_dir();
++    if (dir == nullptr || dir[0] == '\0' || src0 == nullptr || src1 == nullptr || dst == nullptr) {
++        return;
++    }
++    if (dst->op != GGML_OP_MUL_MAT) {
++        return;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        dst->ne[2]  != 1 || dst->ne[3]  != 1) {
++        return;
++    }
++    if (src0->ne[0] != src1->ne[0] ||
++        dst->ne[0]  != src0->ne[1] ||
++        dst->ne[1]  != src1->ne[1]) {
++        return;
++    }
++
++    // Intra-graph index counts every dim-valid MUL_MAT regardless of size
++    // eligibility, so it stays stable across batch row counts.
++    const int64_t intra_graph_index = verathos_cuda_intra_graph_index++;
++    verathos_cuda_graph_dim_valid_ops++;
++    if (src1->ne[1] > verathos_cuda_graph_max_src1_rows) {
++        verathos_cuda_graph_max_src1_rows = src1->ne[1];
++    }
++
++    const int64_t now_ns = verathos_cuda_unix_ns();
++    const int64_t manifest_index = ++verathos_cuda_manifest_sequence;
++    const int64_t total_elems = ggml_nelements(src0) + ggml_nelements(src1) + ggml_nelements(dst);
++    static const int64_t max_elems = verathos_cuda_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    const bool dump_eligible =
++        verathos_cuda_is_decode_candidate(src0, src1, dst) ||
++        !(max_elems > 0 && total_elems > max_elems);
++    // v3 manifests commit a COMPLETE challenge space: every dim-valid op
++    // gets a row (slot-view leaves and beacon selection need the full
++    // universe; witnesses for undumped ops regenerate on demand from the
++    // committed weights). The size cap keeps bounding only the heavy
++    // serve-time candidate DUMPS below, never the rows. Legacy formats
++    // keep the old behavior: no row for oversized ops.
++    if (!dump_eligible && !verathos_cuda_manifest_v3()) {
++        return;
++    }
++    verathos_cuda_write_manifest_entry(
++            dir, now_ns, manifest_index, ctx.device, /*proof_eligible=*/true,
++            verathos_cuda_graph_sequence, intra_graph_index, src0, src1, dst);
++    verathos_cuda_graph_written_rows++;
++    verathos_cuda_tail_stage(
++            src0, src1, dst,
++            verathos_cuda_graph_sequence, intra_graph_index, manifest_index);
++    // Same capture stop as the MUL_MAT_ID hook: the dump below does D2H
++    // copies + a stream sync, illegal while this thread records a CUDA
++    // graph. The selected-op second pass bypasses every budget check, so
++    // without this it can fire mid-capture and abort the process.
++    if (verathos_cuda_in_graph_capture) {
++        return;
++    }
++    const bool selected_op_dump = !verathos_cuda_selected_ops.empty() &&
++        verathos_cuda_should_dump_selected_op(verathos_cuda_graph_sequence, intra_graph_index);
++    if (!selected_op_dump && !verathos_cuda_selected_ops.empty()) {
++        return;
++    }
++    if (!selected_op_dump && !verathos_cuda_should_dump_manifest_index(manifest_index)) {
++        return;
++    }
++    // The size cap bounds only the opportunistic serve-time candidate
++    // dumps. An ARMED window (selected ops or selected manifest indexes)
++    // must witness whatever op the beacon picked, whatever its size; a
++    // single audited instance is a few KB of activations (src0 skipped).
++    const bool armed_dump =
++        selected_op_dump || !verathos_cuda_selected_manifest_indexes.empty();
++    if (!armed_dump && !dump_eligible) {
++        return;
++    }
++    const int64_t sequence = ++verathos_cuda_trace_sequence;
++
++    static const bool skip_src0_dump = verathos_cuda_env_bool("VERATHOS_GGML_TRACE_SKIP_SRC0_DUMP", false);
++    std::vector<uint8_t> src0_raw;
++    std::vector<uint8_t> src1_raw;
++    std::vector<uint8_t> dst_raw;
++    if ((!skip_src0_dump && !verathos_cuda_tensor_raw_to_host(ctx, src0, src0_raw)) ||
++        !verathos_cuda_tensor_raw_to_host(ctx, src1, src1_raw) ||
++        !verathos_cuda_tensor_raw_to_host(ctx, dst, dst_raw)) {
++        return;
++    }
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++
++    std::vector<float> src0_f32;
++    std::vector<float> src1_f32;
++    std::vector<float> dst_f32;
++    if ((!skip_src0_dump && !verathos_cuda_raw_to_f32(src0, src0_raw, src0_f32)) ||
++        !verathos_cuda_raw_to_f32(src1, src1_raw, src1_f32) ||
++        !verathos_cuda_raw_to_f32(dst, dst_raw, dst_f32)) {
++        return;
++    }
++
++    std::ostringstream prefix;
++    prefix << dir << "/trace-" << now_ns << "-cuda" << ctx.device << "-op" << manifest_index;
++    const std::string src0_path = prefix.str() + "-src0.f32";
++    const std::string src0_raw_path = prefix.str() + "-src0.raw";
++    const std::string src1_path = prefix.str() + "-src1.f32";
++    const std::string dst_path  = prefix.str() + "-dst.f32";
++    const std::string json_path = prefix.str() + ".json";
++    if ((!skip_src0_dump && !verathos_cuda_write_f32(src0_path, src0_f32)) ||
++        (!skip_src0_dump && !verathos_cuda_write_raw(src0_raw_path, src0_raw)) ||
++        !verathos_cuda_write_f32(src1_path, src1_f32) ||
++        !verathos_cuda_write_f32(dst_path, dst_f32)) {
++        return;
++    }
++
++    std::ofstream meta(json_path);
++    if (!meta) {
++        return;
++    }
++    meta << "{\n";
++    meta << "  \"version\": 1,\n";
++    meta << "  \"created_unix_ns\": " << now_ns << ",\n";
++    meta << "  \"manifest_index\": " << manifest_index << ",\n";
++    meta << "  \"graph_seq\": " << verathos_cuda_graph_sequence << ",\n";
++    meta << "  \"intra_graph_index\": " << intra_graph_index << ",\n";
++    meta << "  \"graph_id\": \"cuda" << ctx.device << "-mul-mat-" << manifest_index << "\",\n";
++    meta << "  \"op_index\": " << manifest_index << ",\n";
++    meta << "  \"op_type\": \"GGML_OP_MUL_MAT\",\n";
++    meta << "  \"tensor_name\": \"" << verathos_cuda_json_escape(src0->name) << "\",\n";
++    meta << "  \"src0_name\": \"" << verathos_cuda_json_escape(src0->name) << "\",\n";
++    meta << "  \"src1_name\": \"" << verathos_cuda_json_escape(src1->name) << "\",\n";
++    meta << "  \"dst_name\": \"" << verathos_cuda_json_escape(dst->name) << "\",\n";
++    meta << "  \"src0_shape\": [" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "],\n";
++    meta << "  \"src1_shape\": [" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3] << "],\n";
++    meta << "  \"dst_shape\": [" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << "],\n";
++    if (!skip_src0_dump) {
++        meta << "  \"src0_f32\": \"" << verathos_cuda_filename(src0_path) << "\",\n";
++        meta << "  \"src0_raw\": \"" << verathos_cuda_filename(src0_raw_path) << "\",\n";
++    }
++    meta << "  \"src0_raw_type\": \"" << ggml_type_name((ggml_type) src0->type) << "\",\n";
++    meta << "  \"src1_f32\": \"" << verathos_cuda_filename(src1_path) << "\",\n";
++    meta << "  \"dst_f32\": \"" << verathos_cuda_filename(dst_path) << "\",\n";
++    meta << "  \"source_types\": {\"src0\": \"" << ggml_type_name((ggml_type) src0->type)
++         << "\", \"src1\": \"" << ggml_type_name((ggml_type) src1->type)
++         << "\", \"dst\": \"" << ggml_type_name((ggml_type) dst->type) << "\"},\n";
++    meta << "  \"backend\": \"llama_cpp_cuda\",\n";
++    meta << "  \"device\": \"CUDA" << ctx.device << "\"\n";
++    meta << "}\n";
++}
++
+ #define GGML_LOG_WARN_ONCE(str) \
+     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+ 
+@@ -1659,6 +2866,14 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+     }
+ }
+ 
++// Verathos proof capture: these fusions swallow MUL_MAT / MUL_MAT_ID nodes,
++// which bypasses ggml_cuda_mul_mat where the per-op manifest rows and
++// selected witness dumps are produced. They stay disabled only while the
++// capture window has trace work; every other fusion (rms_norm+mul, rope+
++// set_rows, topk-moe routing) touches no captured op and keeps running,
++// which is where most of the fused-kernel throughput lives.
++static bool verathos_cuda_capture_work_pending();
++
+ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                           const ggml_tensor * ffn_gate,
+                                           const ggml_tensor * glu,
+@@ -1666,6 +2881,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                           const ggml_tensor * ffn_gate_bias = nullptr,
+                                           const ggml_tensor * ffn_up_scale = nullptr,
+                                           const ggml_tensor * ffn_gate_scale = nullptr) {
++    if (verathos_cuda_capture_work_pending()) {
++        return false;
++    }
+     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
+     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
+ 
+@@ -1754,6 +2972,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+ }
+ 
+ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
++    if (verathos_cuda_capture_work_pending()) {
++        return false;
++    }
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+@@ -1781,6 +3002,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+ }
+ 
+ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
++    if (verathos_cuda_capture_work_pending()) {
++        return false;
++    }
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+@@ -1809,7 +3033,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_q;
+ }
+ 
+-static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++static void ggml_cuda_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int32_t hint = ggml_get_op_params_i32(dst, 1);
+@@ -1896,7 +3120,16 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+     return true;
+ }
+ 
+-static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    // Verathos proof capture: upstream's dispatch early-returns from many
++    // paths, so the trace hook lives in this wrapper where it runs after
++    // EVERY compute path. No capture armed => one cheap branch inside.
++    ggml_cuda_mul_mat_impl(ctx, src0, src1, dst);
++    verathos_cuda_try_dump_mul_mat_trace(ctx, src0, src1, dst);
++}
++
++
++static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+     const ggml_tensor * ids  = dst->src[2];
+@@ -2053,6 +3286,171 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++static void verathos_cuda_try_dump_mul_mat_id_trace(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
++
++static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    // Verathos proof capture for MoE expert GEMMs. Wrapper for the same
++    // reason as ggml_cuda_mul_mat: the dispatch early-returns, and the hook
++    // must observe every computed op. Costs one branch when capture is off.
++    ggml_cuda_mul_mat_id_impl(ctx, dst);
++    verathos_cuda_try_dump_mul_mat_id_trace(ctx, dst);
++}
++
++static void verathos_cuda_try_dump_mul_mat_id_trace(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
++    // MoE expert GEMM witness: proves ONE routed (expert, token) pair per
++    // sampled op. The expert's weight plane is committed per-plane in the
++    // GGUF manifest, so the dump carries only the routed activation column,
++    // the produced output column, and the expert index (a few KB).
++    if (!verathos_cuda_trace_enabled()) {
++        return;
++    }
++    const char * dir = verathos_cuda_trace_dir();
++    if (dir == nullptr || dir[0] == '\0' || dst == nullptr) {
++        return;
++    }
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    const ggml_tensor * ids  = dst->src[2];
++    if (src0 == nullptr || src1 == nullptr || ids == nullptr || dst->op != GGML_OP_MUL_MAT_ID) {
++        return;
++    }
++    // v1 scope: decode-shaped ops only (a handful of routed tokens), f32
++    // activations, 3-D expert weights. Prefill expert ops stay untraced
++    // until the batched variant lands.
++    const int64_t n_experts = src0->ne[2];
++    if (n_experts <= 1 || src0->ne[3] != 1 || src1->type != GGML_TYPE_F32 ||
++        dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
++        return;
++    }
++    if (src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1]) {
++        return;
++    }
++    // Prefill only: decode runs under CUDA graph capture where the dump's
++    // synchronizing copies are illegal. Prefill is eager and proves the same
++    // (committed) expert weights, so decode capture is unnecessary.
++    if (dst->ne[2] <= 1) {
++        return;
++    }
++
++    const int64_t intra_graph_index = verathos_cuda_intra_graph_index++;
++    verathos_cuda_graph_dim_valid_ops++;
++    const int64_t now_ns = verathos_cuda_unix_ns();
++    const int64_t manifest_index = ++verathos_cuda_manifest_sequence;
++    verathos_cuda_write_manifest_entry(
++            dir, now_ns, manifest_index, ctx.device, /*proof_eligible=*/true,
++            verathos_cuda_graph_sequence, intra_graph_index, src0, src1, dst);
++    verathos_cuda_graph_written_rows++;
++    // Manifest rows above are host-only file writes (capture-safe, keeps the
++    // candidate numbering identical across passes). Everything below copies
++    // device memory / syncs the stream, which aborts during graph capture —
++    // and burning the dump budget on a capture pass starves eager passes of
++    // expert witnesses. Full stop here while recording.
++    if (verathos_cuda_in_graph_capture) {
++        return;
++    }
++    // Expert ops get a DEDICATED per-capture dump budget: they live deep in
++    // every layer's FFN, past the point where the dense (attention) dump
++    // sampling is exhausted, so sharing that budget captured zero experts.
++    // A small budget of routed-pair witnesses is enough for the verifier to
++    // challenge expert GEMMs. Selected-op second pass still honored.
++    const bool selected_op_dump = !verathos_cuda_selected_ops.empty() &&
++        verathos_cuda_should_dump_selected_op(verathos_cuda_graph_sequence, intra_graph_index);
++    // Replay arming by MANIFEST INDEX (the witness-replay path): a beacon-
++    // selected expert op is re-captured exactly like a dense op. Without
++    // this the replay re-dumped only dense ops, so a selected MUL_MAT_ID
++    // could never produce its witness ("was not captured as a proof
++    // witness"). When armed, dump ONLY the selected indexes (mirror the
++    // dense hook's should_dump_manifest_index semantics).
++    bool manifest_selected_dump = false;
++    if (!verathos_cuda_selected_manifest_indexes.empty()) {
++        for (int64_t sel : verathos_cuda_selected_manifest_indexes) {
++            if (sel == manifest_index) {
++                manifest_selected_dump = true;
++                break;
++            }
++        }
++        if (!manifest_selected_dump && !selected_op_dump) {
++            return;
++        }
++    }
++    if (!selected_op_dump && !manifest_selected_dump) {
++        static int64_t verathos_mmid_budget = -1;
++        if (verathos_mmid_budget < 0) {
++            const char * b = std::getenv("VERATHOS_GGML_MMID_DUMP_BUDGET");
++            verathos_mmid_budget = b ? std::max(0L, atol(b)) : 8;
++        }
++        if (verathos_cuda_mmid_dumped >= verathos_mmid_budget) {
++            return;
++        }
++        verathos_cuda_mmid_dumped++;
++    }
++
++    // The heavy dump needs synchronizing device->host copies, which are
++    // ILLEGAL while a CUDA graph is being captured (decode). The dense path
++    // dumps only during the eager prefill pass for the same reason; skip
++    // when capturing and let the prefill invocation carry the witness.
++    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
++    if (cudaStreamIsCapturing(ctx.stream(), &cap_status) != cudaSuccess ||
++        cap_status != cudaStreamCaptureStatusNone) {
++        return;
++    }
++    // Routed pair (slot 0, token 0): expert id from ids[0,0], activation
++    // column src1[:,0,0], output column dst[:,0,0].
++    int32_t expert_id = -1;
++    ggml_cuda_set_device(ctx.device);
++    CUDA_CHECK(cudaMemcpyAsync(&expert_id, ids->data, sizeof(int32_t), cudaMemcpyDeviceToHost, ctx.stream()));
++    const int64_t k_dim = src0->ne[0];
++    const int64_t n_dim = src0->ne[1];
++    std::vector<float> x(k_dim);
++    std::vector<float> y(n_dim);
++    CUDA_CHECK(cudaMemcpyAsync(x.data(), src1->data, sizeof(float) * k_dim, cudaMemcpyDeviceToHost, ctx.stream()));
++    CUDA_CHECK(cudaMemcpyAsync(y.data(), dst->data, sizeof(float) * n_dim, cudaMemcpyDeviceToHost, ctx.stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    if (expert_id < 0 || expert_id >= n_experts) {
++        return;
++    }
++
++    std::ostringstream prefix;
++    prefix << dir << "/trace-" << now_ns << "-cuda" << ctx.device << "-op" << manifest_index;
++    const std::string src1_path = prefix.str() + "-src1.f32";
++    const std::string dst_path  = prefix.str() + "-dst.f32";
++    const std::string json_path = prefix.str() + ".json";
++    if (!verathos_cuda_write_f32(src1_path, x) || !verathos_cuda_write_f32(dst_path, y)) {
++        return;
++    }
++    std::ofstream meta(json_path);
++    if (!meta) {
++        return;
++    }
++    meta << "{\n";
++    meta << "  \"version\": 1,\n";
++    meta << "  \"created_unix_ns\": " << now_ns << ",\n";
++    meta << "  \"manifest_index\": " << manifest_index << ",\n";
++    meta << "  \"graph_seq\": " << verathos_cuda_graph_sequence << ",\n";
++    meta << "  \"intra_graph_index\": " << intra_graph_index << ",\n";
++    meta << "  \"graph_id\": \"cuda" << ctx.device << "-mul-mat-" << manifest_index << "\",\n";
++    meta << "  \"op_index\": " << manifest_index << ",\n";
++    meta << "  \"op_type\": \"GGML_OP_MUL_MAT_ID\",\n";
++    meta << "  \"expert_index\": " << expert_id << ",\n";
++    meta << "  \"tensor_name\": \"" << verathos_cuda_json_escape(src0->name) << "\",\n";
++    meta << "  \"src0_name\": \"" << verathos_cuda_json_escape(src0->name) << "\",\n";
++    meta << "  \"src1_name\": \"" << verathos_cuda_json_escape(src1->name) << "\",\n";
++    meta << "  \"dst_name\": \"" << verathos_cuda_json_escape(dst->name) << "\",\n";
++    meta << "  \"src0_shape\": [" << k_dim << "," << n_dim << ",1,1],\n";
++    meta << "  \"src1_shape\": [" << k_dim << ",1,1,1],\n";
++    meta << "  \"dst_shape\": [" << n_dim << ",1,1,1],\n";
++    meta << "  \"src0_expert_shape\": [" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "],\n";
++    meta << "  \"src1_f32\": \"" << verathos_cuda_filename(src1_path) << "\",\n";
++    meta << "  \"dst_f32\": \"" << verathos_cuda_filename(dst_path) << "\",\n";
++    meta << "  \"src0_raw_type\": \"" << ggml_type_name((ggml_type) src0->type) << "\",\n";
++    meta << "  \"source_types\": {\"src0\": \"" << ggml_type_name((ggml_type) src0->type)
++         << "\", \"src1\": \"f32\", \"dst\": \"f32\"},\n";
++    meta << "  \"backend\": \"llama_cpp_cuda\",\n";
++    meta << "  \"device\": \"CUDA" << ctx.device << "\"\n";
++    meta << "}\n";
++}
++
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+@@ -4186,6 +5584,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             }
+ 
+             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
++            verathos_cuda_in_graph_capture = false;
+             graph_evaluated_or_captured = true; // CUDA graph has been captured
+ 
+             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+@@ -4231,10 +5630,110 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ }
+ #endif // USE_CUDA_GRAPH
+ 
++// Verathos proof capture: CUDA graph REPLAY executes the recorded kernels
++// without running any op function, so a replayed decode step produced zero
++// manifest rows and the decode audit starved ("decode audit could not find
++// enough final-logit ops"). The replayed work is exactly cgraph->nodes, so
++// the rows are reconstructed here at graph level with the same per-node
++// filters and the same counter increments as the op hooks, keeping candidate
++// numbering identical across eager, capture, and replay passes. Host-only
++// file writes; witness dumps still come from the eager selected-dump replay
++// window, which disables graph use entirely. Must run ONLY on a pure replay
++// pass (use_cuda_graph && !cuda_graph_update_required): on eager and capture
++// passes the op hooks already emitted these rows.
++static void verathos_cuda_emit_replay_manifest_rows(int device, const ggml_cgraph * cgraph) {
++    if (!verathos_cuda_trace_enabled()) {
++        return;
++    }
++    const char * dir = verathos_cuda_trace_dir();
++    if (dir == nullptr || dir[0] == '\0' || cgraph == nullptr) {
++        return;
++    }
++    static const int64_t max_elems = verathos_cuda_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * dst = cgraph->nodes[i];
++        if (dst == nullptr || ggml_cuda_is_view_or_noop(dst) ||
++            (dst->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            continue;
++        }
++        if (dst->op == GGML_OP_MUL_MAT) {
++            const ggml_tensor * src0 = dst->src[0];
++            const ggml_tensor * src1 = dst->src[1];
++            if (src0 == nullptr || src1 == nullptr) {
++                continue;
++            }
++            if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++                src1->ne[2] != 1 || src1->ne[3] != 1 ||
++                dst->ne[2]  != 1 || dst->ne[3]  != 1) {
++                continue;
++            }
++            if (src0->ne[0] != src1->ne[0] ||
++                dst->ne[0]  != src0->ne[1] ||
++                dst->ne[1]  != src1->ne[1]) {
++                continue;
++            }
++            const int64_t intra_graph_index = verathos_cuda_intra_graph_index++;
++            verathos_cuda_graph_dim_valid_ops++;
++            if (src1->ne[1] > verathos_cuda_graph_max_src1_rows) {
++                verathos_cuda_graph_max_src1_rows = src1->ne[1];
++            }
++            const int64_t now_ns = verathos_cuda_unix_ns();
++            const int64_t manifest_index = ++verathos_cuda_manifest_sequence;
++            const int64_t total_elems = ggml_nelements(src0) + ggml_nelements(src1) + ggml_nelements(dst);
++            // Same row policy as the op hook: v3 rows for every dim-valid
++            // op, size-capped rows for legacy formats. Replay never dumps.
++            const bool dump_eligible =
++                verathos_cuda_is_decode_candidate(src0, src1, dst) ||
++                !(max_elems > 0 && total_elems > max_elems);
++            if (!dump_eligible && !verathos_cuda_manifest_v3()) {
++                continue;
++            }
++            verathos_cuda_write_manifest_entry(
++                    dir, now_ns, manifest_index, device, /*proof_eligible=*/true,
++                    verathos_cuda_graph_sequence, intra_graph_index, src0, src1, dst);
++            verathos_cuda_graph_written_rows++;
++            verathos_cuda_tail_stage(
++                    src0, src1, dst,
++                    verathos_cuda_graph_sequence, intra_graph_index, manifest_index);
++            continue;
++        }
++        if (dst->op == GGML_OP_MUL_MAT_ID) {
++            const ggml_tensor * src0 = dst->src[0];
++            const ggml_tensor * src1 = dst->src[1];
++            const ggml_tensor * ids  = dst->src[2];
++            if (src0 == nullptr || src1 == nullptr || ids == nullptr) {
++                continue;
++            }
++            const int64_t n_experts = src0->ne[2];
++            if (n_experts <= 1 || src0->ne[3] != 1 || src1->type != GGML_TYPE_F32 ||
++                dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
++                continue;
++            }
++            if (src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1]) {
++                continue;
++            }
++            // Decode-shaped expert ops are skipped before counting in the op
++            // hook as well; only prefill-shaped ops enter the numbering.
++            if (dst->ne[2] <= 1) {
++                continue;
++            }
++            const int64_t intra_graph_index = verathos_cuda_intra_graph_index++;
++            verathos_cuda_graph_dim_valid_ops++;
++            const int64_t now_ns = verathos_cuda_unix_ns();
++            const int64_t manifest_index = ++verathos_cuda_manifest_sequence;
++            verathos_cuda_write_manifest_entry(
++                    dir, now_ns, manifest_index, device, /*proof_eligible=*/true,
++                    verathos_cuda_graph_sequence, intra_graph_index, src0, src1, dst);
++            verathos_cuda_graph_written_rows++;
++        }
++    }
++}
++
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
++    verathos_cuda_prepare_trace_for_graph();
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+@@ -4246,7 +5745,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    // Verathos: an armed selected-dump window (exclusive audit replay) needs
++    // per-op execution. CUDA graph replay runs no capture hooks, so a
++    // replayed decode step yields no witness instance and the audit starves.
++    // The window gate must sit BEFORE the warmup/update bookkeeping, never
++    // after it: ggml_cuda_graph_update_required() refreshes graph->uid and
++    // graph->node_props as a side effect, and the warmup branch can set
++    // warmup_complete while scheduling a capture for this very pass. A
++    // post-bookkeeping veto of use_cuda_graph (the previous shape of this
++    // guard) suppressed that promised capture while the bookkeeping had
++    // already recorded the current properties as captured, so the first
++    // disarmed pass replayed the PREVIOUS instance as if it were current.
++    // When the graph geometry moved across the window (a large co-batched
++    // prefill re-reserves the compute pool and relocates graph
++    // allocations) the stale instance's recorded device pointers reference
++    // freed memory and the server aborts with CUDA illegal memory access
++    // at the next stream sync (observed from common_sampler_sample on a
++    // 142k-token canary prefill co-batched with live serves). Skipping the
++    // bookkeeping keeps uid/node_props/instance exactly as the last
++    // disarmed pass left them: the next disarmed pass re-checks properties
++    // against a consistent snapshot and recaptures if anything changed.
++    // The audit window still executes eagerly: use_cuda_graph stays false.
++    if (graph->is_enabled() && !verathos_cuda_selected_dump_pending()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+@@ -4273,6 +5793,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+             }
+         }
+     }
++
+ #endif // USE_CUDA_GRAPH
+ 
+     if (use_cuda_graph && cuda_graph_update_required) {
+@@ -4283,9 +5804,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+         }
+ 
+         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
++        verathos_cuda_in_graph_capture = true;
+     }
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
++    if (use_cuda_graph && !cuda_graph_update_required) {
++        verathos_cuda_emit_replay_manifest_rows(cuda_ctx->device, cgraph);
++    }
++    verathos_cuda_tail_commit(*cuda_ctx);
++    verathos_cuda_write_graph_marker(cuda_ctx->device);
++    if (verathos_cuda_manifest_stream.is_open()) {
++        verathos_cuda_flush_manifest_buffer();
++        verathos_cuda_manifest_stream.flush();
++    }
+ 
+     return GGML_STATUS_SUCCESS;
+ }
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index e9de0d0..00d763d 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -17,6 +17,14 @@
+ #include <fstream>
+ #include <filesystem>
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <sstream>
++#if !defined(_WIN32)
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ 
+ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+@@ -26,6 +34,630 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+ namespace fs = std::filesystem;
+ 
++static const char * verathos_trace_dir() {
++    static const char * value = std::getenv("VERATHOS_GGML_TRACE_DIR");
++    return value;
++}
++
++static bool verathos_rpc_graph_trace_enabled() {
++    const char * raw = std::getenv("VERATHOS_GGML_RPC_GRAPH_TRACE");
++    return raw != nullptr && std::string(raw) == "1";
++}
++
++static std::string verathos_rpc_capture_token;
++static int64_t verathos_rpc_dumped_total = 0;
++
++// Capture is armed per request via the shared enable file (same contract as
++// the CUDA hook): dump only while the file exists, and reset the cumulative
++// budget when the window token changes so each request dumps at most
++// VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE candidate witnesses in total.
++static bool verathos_rpc_capture_window_active() {
++    const char * enable_file = std::getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file == nullptr || enable_file[0] == '\0') {
++        return true;
++    }
++    std::ifstream in(enable_file);
++    if (!in) {
++        return false;
++    }
++    std::string token;
++    std::getline(in, token);
++    if (token.empty()) {
++        token = "present";
++    }
++    if (token != verathos_rpc_capture_token) {
++        verathos_rpc_capture_token = token;
++        verathos_rpc_dumped_total = 0;
++    }
++    return true;
++}
++
++static int64_t verathos_env_i64(const char * name, int64_t fallback) {
++    const char * raw = std::getenv(name);
++    if (!raw || raw[0] == '\0') {
++        return fallback;
++    }
++    try {
++        return std::stoll(raw);
++    } catch (...) {
++        return fallback;
++    }
++}
++
++static bool verathos_env_bool(const char * name, bool fallback) {
++    const char * raw = std::getenv(name);
++    if (!raw || raw[0] == '\0') {
++        return fallback;
++    }
++    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' ||
++           raw[0] == 'y' || raw[0] == 'Y';
++}
++
++static int64_t verathos_unix_ns() {
++    using namespace std::chrono;
++    return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
++}
++
++static bool verathos_tensor_raw(const ggml_tensor * tensor, std::vector<uint8_t> & raw) {
++    if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr) {
++        return false;
++    }
++    if (!ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    if (ggml_nelements(tensor) <= 0) {
++        return false;
++    }
++    const size_t nbytes = ggml_nbytes(tensor);
++    if (nbytes == 0) {
++        return false;
++    }
++    raw.resize(nbytes);
++    ggml_backend_tensor_get(tensor, raw.data(), 0, nbytes);
++    return true;
++}
++
++static bool verathos_raw_to_f32(
++        const ggml_tensor * tensor,
++        const std::vector<uint8_t> & raw,
++        std::vector<float> & out) {
++    if (tensor == nullptr || raw.empty()) {
++        return false;
++    }
++    const int64_t n = ggml_nelements(tensor);
++    if (n <= 0) {
++        return false;
++    }
++    out.resize(n);
++    if (tensor->type == GGML_TYPE_F32) {
++        if (raw.size() != sizeof(float) * (size_t) n) {
++            return false;
++        }
++        memcpy(out.data(), raw.data(), raw.size());
++        return true;
++    }
++    const ggml_type_traits * traits = ggml_get_type_traits((ggml_type) tensor->type);
++    if (traits == nullptr || traits->to_float == nullptr) {
++        return false;
++    }
++    traits->to_float(raw.data(), out.data(), n);
++    return true;
++}
++
++static bool verathos_tensor_to_f32(const ggml_tensor * tensor, std::vector<float> & out) {
++    std::vector<uint8_t> raw;
++    return verathos_tensor_raw(tensor, raw) && verathos_raw_to_f32(tensor, raw, out);
++}
++
++static bool verathos_write_f32(const fs::path & path, const std::vector<float> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size() * sizeof(float));
++    return bool(out);
++}
++
++static bool verathos_write_raw(const fs::path & path, const std::vector<uint8_t> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size());
++    return bool(out);
++}
++
++static std::string verathos_json_escape(const char * raw) {
++    std::ostringstream out;
++    for (const char * p = raw ? raw : ""; *p; ++p) {
++        switch (*p) {
++            case '\\': out << "\\\\"; break;
++            case '"': out << "\\\""; break;
++            case '\n': out << "\\n"; break;
++            case '\r': out << "\\r"; break;
++            case '\t': out << "\\t"; break;
++            default: out << *p; break;
++        }
++    }
++    return out.str();
++}
++
++// ---------------------------------------------------------------------------
++// Verathos stage-boundary activation chain (VERATHOS_GGML_BOUNDARY_V1).
++//
++// Each pipeline stage runs in its own verathos-rpc-server process.  Without a
++// commitment to what crossed the RPC edge, every stage proves an isolated
++// statement over an activation of its own choosing, so a coordinator can run
++// one cheap stage, fabricate a plausible hidden state, and have the remaining
++// stages prove honest arithmetic on the fabrication.
++//
++// The hook keeps one running SHA-256 per direction over the payload bytes of
++// set_tensor (activations handed in) and get_tensor (activations handed back).
++// The coordinator forwards the bytes it read from stage k straight into stage
++// k+1, so an honest pipeline produces
++// output_boundary_root(k) == input_boundary_root(k+1).  The verifier requires
++// exactly that.
++//
++// The bytes are already in host RAM at both hooks, so this costs no extra
++// copies and no GPU synchronisation.  A boundary carries n_embd floats per
++// token, 8 KiB/token at F32 for the shipped 2048-wide model, which is under
++// half a percent of a typical request against generation time.
++//
++// Off unless VERATHOS_GGML_BOUNDARY_CAPTURE=1.  It has not been validated
++// against a live multi-box pipeline yet, and until it has, the byte streams
++// lining up on both sides of the edge is a design claim rather than a
++// measured one.
++// ---------------------------------------------------------------------------
++
++struct verathos_sha256 {
++    uint32_t state[8];
++    uint64_t bitlen;
++    uint8_t  buf[64];
++    size_t   buflen;
++};
++
++static const uint32_t VERATHOS_SHA256_K[64] = {
++    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u,
++    0x923f82a4u, 0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
++    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u, 0xe49b69c1u, 0xefbe4786u,
++    0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
++    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u,
++    0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
++    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u, 0xa2bfe8a1u, 0xa81a664bu,
++    0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
++    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au,
++    0x5b9cca4fu, 0x682e6ff3u, 0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
++    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
++};
++
++static inline uint32_t verathos_ror32(uint32_t value, uint32_t bits) {
++    return (value >> bits) | (value << (32 - bits));
++}
++
++static void verathos_sha256_init(verathos_sha256 & ctx) {
++    ctx.state[0] = 0x6a09e667u; ctx.state[1] = 0xbb67ae85u;
++    ctx.state[2] = 0x3c6ef372u; ctx.state[3] = 0xa54ff53au;
++    ctx.state[4] = 0x510e527fu; ctx.state[5] = 0x9b05688cu;
++    ctx.state[6] = 0x1f83d9abu; ctx.state[7] = 0x5be0cd19u;
++    ctx.bitlen = 0;
++    ctx.buflen = 0;
++}
++
++static void verathos_sha256_block(verathos_sha256 & ctx, const uint8_t * block) {
++    uint32_t w[64];
++    for (int i = 0; i < 16; ++i) {
++        w[i] = ((uint32_t) block[i * 4 + 0] << 24) |
++               ((uint32_t) block[i * 4 + 1] << 16) |
++               ((uint32_t) block[i * 4 + 2] <<  8) |
++               ((uint32_t) block[i * 4 + 3]);
++    }
++    for (int i = 16; i < 64; ++i) {
++        const uint32_t s0 = verathos_ror32(w[i - 15], 7) ^ verathos_ror32(w[i - 15], 18) ^ (w[i - 15] >> 3);
++        const uint32_t s1 = verathos_ror32(w[i - 2], 17) ^ verathos_ror32(w[i - 2], 19) ^ (w[i - 2] >> 10);
++        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++    }
++    uint32_t a = ctx.state[0], b = ctx.state[1], c = ctx.state[2], d = ctx.state[3];
++    uint32_t e = ctx.state[4], f = ctx.state[5], g = ctx.state[6], h = ctx.state[7];
++    for (int i = 0; i < 64; ++i) {
++        const uint32_t s1 = verathos_ror32(e, 6) ^ verathos_ror32(e, 11) ^ verathos_ror32(e, 25);
++        const uint32_t ch = (e & f) ^ ((~e) & g);
++        const uint32_t t1 = h + s1 + ch + VERATHOS_SHA256_K[i] + w[i];
++        const uint32_t s0 = verathos_ror32(a, 2) ^ verathos_ror32(a, 13) ^ verathos_ror32(a, 22);
++        const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
++        const uint32_t t2 = s0 + maj;
++        h = g; g = f; f = e; e = d + t1;
++        d = c; c = b; b = a; a = t1 + t2;
++    }
++    ctx.state[0] += a; ctx.state[1] += b; ctx.state[2] += c; ctx.state[3] += d;
++    ctx.state[4] += e; ctx.state[5] += f; ctx.state[6] += g; ctx.state[7] += h;
++}
++
++static void verathos_sha256_update(verathos_sha256 & ctx, const void * data, size_t len) {
++    const uint8_t * bytes = (const uint8_t *) data;
++    ctx.bitlen += (uint64_t) len * 8;
++    while (len > 0) {
++        const size_t take = std::min(len, sizeof(ctx.buf) - ctx.buflen);
++        memcpy(ctx.buf + ctx.buflen, bytes, take);
++        ctx.buflen += take;
++        bytes += take;
++        len -= take;
++        if (ctx.buflen == sizeof(ctx.buf)) {
++            verathos_sha256_block(ctx, ctx.buf);
++            ctx.buflen = 0;
++        }
++    }
++}
++
++// Finalises a copy, so the running context can keep absorbing afterwards.
++static std::string verathos_sha256_hex(const verathos_sha256 & running) {
++    verathos_sha256 ctx = running;
++    const uint64_t bitlen = ctx.bitlen;
++    const uint8_t pad = 0x80;
++    verathos_sha256_update(ctx, &pad, 1);
++    const uint8_t zero = 0x00;
++    while (ctx.buflen != 56) {
++        verathos_sha256_update(ctx, &zero, 1);
++    }
++    uint8_t tail[8];
++    for (int i = 0; i < 8; ++i) {
++        tail[i] = (uint8_t) (bitlen >> (56 - i * 8));
++    }
++    memcpy(ctx.buf + ctx.buflen, tail, 8);
++    verathos_sha256_block(ctx, ctx.buf);
++    static const char * digits = "0123456789abcdef";
++    std::string out;
++    out.reserve(64);
++    for (int i = 0; i < 8; ++i) {
++        for (int shift = 24; shift >= 0; shift -= 8) {
++            const uint8_t byte = (uint8_t) (ctx.state[i] >> shift);
++            out.push_back(digits[byte >> 4]);
++            out.push_back(digits[byte & 0x0f]);
++        }
++    }
++    return out;
++}
++
++static bool verathos_boundary_capture_enabled() {
++    static const bool value = [] {
++        const char * raw = std::getenv("VERATHOS_GGML_BOUNDARY_CAPTURE");
++        return raw != nullptr && raw[0] == '1';
++    }();
++    return value;
++}
++
++static verathos_sha256 verathos_boundary_in;
++static verathos_sha256 verathos_boundary_out;
++static uint64_t verathos_boundary_in_bytes = 0;
++static uint64_t verathos_boundary_out_bytes = 0;
++static std::string verathos_boundary_token;
++static bool verathos_boundary_started = false;
++
++// The enable file's contents identify the request window, exactly as the
++// existing candidate-witness budget uses it.  A new token starts a new chain,
++// so a boundary root always covers one request and never bleeds across.
++#if defined(__APPLE__)
++#define verathos_st_mtim st_mtimespec
++#else
++#define verathos_st_mtim st_mtim
++#endif
++static bool verathos_boundary_window(std::string & token) {
++    const char * enable_file = std::getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file == nullptr || enable_file[0] == '\0') {
++        // No window means no capture, deliberately.  Absorbing whenever the
++        // hook happens to be enabled swallows the model weight upload, which
++        // arrives through the same set_tensor path at load time and is orders
++        // of magnitude larger than any activation handoff.  Measured on a live
++        // two-worker 4090 mesh: 289 MB of weights against 240 KB of
++        // activations, which made the two stages' roots disagree for a reason
++        // that had nothing to do with the pipeline.
++        return false;
++    }
++#if !defined(_WIN32)
++    // This runs on every tensor crossing the RPC edge; re-reading the enable
++    // file each time cost real decode throughput on a live 4090 mesh.  A
++    // stat() is an order of magnitude cheaper than open+read+close, and the
++    // token only changes when the arming side rewrites the file, which stat
++    // observes via inode/size/mtime.
++    static struct {
++        bool valid;
++        dev_t dev;
++        ino_t ino;
++        off_t size;
++        struct timespec mtim;
++        std::string token;
++    } cache = {};
++    struct stat st;
++    if (::stat(enable_file, &st) != 0) {
++        cache.valid = false;
++        return false;
++    }
++    if (cache.valid && st.st_dev == cache.dev && st.st_ino == cache.ino &&
++        st.st_size == cache.size &&
++        st.verathos_st_mtim.tv_sec == cache.mtim.tv_sec &&
++        st.verathos_st_mtim.tv_nsec == cache.mtim.tv_nsec) {
++        token = cache.token;
++        return true;
++    }
++#endif
++    std::ifstream in(enable_file);
++    if (!in) {
++        return false;
++    }
++    std::getline(in, token);
++    if (token.empty()) {
++        token = "present";
++    }
++#if !defined(_WIN32)
++    cache.valid = true;
++    cache.dev = st.st_dev;
++    cache.ino = st.st_ino;
++    cache.size = st.st_size;
++    cache.mtim = st.verathos_st_mtim;
++    cache.token = token;
++#endif
++    return true;
++}
++
++// The inter-stage handoff is one tensor: the last layer output the upstream
++// stage produced, which the scheduler hands to the next stage under the same
++// source name.  Measured on a live two-stage 4090 mesh, stage 0 emitted
++// "l_out-9" and stage 1 received "RPC0[127.0.0.1:50051]#l_out-9#0" at
++// identical sizes.
++//
++// "embd" is the same slot for the head of the pipeline: the first stage has
++// no upstream "l_out-", it receives the embedding rows instead, and unlike
++// "attn_inp_kq_mask" and the "leaf_N" position/rope tensors (which go to
++// every stage alike) "embd" is sent only to the stage that owns layer 0.
++// Absorbing it anchors the chain to the embedding actually fed in, so the
++// chain runs from the model input to the last handoff with no open head.
++// Hashing whole directions instead swept in the broadcast tensors and made
++// the two sides disagree for reasons that had nothing to do with the
++// pipeline.
++static bool verathos_is_stage_boundary_tensor(const char * raw_name) {
++    std::string name(raw_name ? raw_name : "");
++    // Inbound tensors arrive wrapped as RPC<dev>[<addr>]#<source>#<n>.
++    const size_t first = name.find('#');
++    if (first != std::string::npos) {
++        const size_t last = name.rfind('#');
++        if (last > first) {
++            name = name.substr(first + 1, last - first - 1);
++        }
++    }
++    return name.rfind("l_out-", 0) == 0 || name == "embd";
++}
++
++// Returns true when the boundary state advanced, i.e. the caller must
++// refresh the on-disk row.  Most transfers crossing the edge are broadcast
++// graph inputs that never match; rewriting the row for those cost real
++// decode throughput for no information.
++static bool verathos_boundary_absorb(
++        const void * data, size_t size, bool inbound,
++        const char * name = "") {
++    if (!verathos_boundary_capture_enabled() || data == nullptr || size == 0) {
++        return false;
++    }
++    // The NAME filter is what keeps the model weight upload out of the chain
++    // (weights arrive as blk.N.*.weight / output.weight and never match), so
++    // it must run FIRST and unconditionally.  Gating absorption on an open
++    // capture window instead dropped real handoffs: measured on a live
++    // two-stage mesh, 4 of 25 boundary crossings landed while the window was
++    // closed, and because the row file holds only the latest chain state the
++    // verifier then discarded it as stale and failed the request closed
++    // ("float recompute was skipped by a stage that committed no input
++    // activation boundary"), intermittently, on about one request in ten.
++    if (!verathos_is_stage_boundary_tensor(name)) {
++        return false;
++    }
++    // The window token SEGMENTS chains, it does not gate them: a new token
++    // starts a fresh per-request chain, and a closed window keeps extending
++    // the current one rather than dropping the crossing on the floor.
++    std::string token;
++    const bool have_token = verathos_boundary_window(token);
++    if (!verathos_boundary_started || (have_token && token != verathos_boundary_token)) {
++        verathos_sha256_init(verathos_boundary_in);
++        verathos_sha256_init(verathos_boundary_out);
++        verathos_boundary_in_bytes = 0;
++        verathos_boundary_out_bytes = 0;
++        if (have_token) {
++            verathos_boundary_token = token;
++        }
++        verathos_boundary_started = true;
++    }
++    if (inbound) {
++        verathos_sha256_update(verathos_boundary_in, data, size);
++        verathos_boundary_in_bytes += size;
++    } else {
++        verathos_sha256_update(verathos_boundary_out, data, size);
++        verathos_boundary_out_bytes += size;
++    }
++    return true;
++}
++
++// Written next to the op manifest so the coordinator reads both from one
++// place.  Emitted after every absorb that advanced the state (the RPC server
++// has no request boundary of its own), over a persistent descriptor: an
++// open/truncate/write/close cycle per emitted row cost measurable decode
++// throughput on a live 4090 mesh.
++static void verathos_boundary_emit(void) {
++    if (!verathos_boundary_capture_enabled() || !verathos_boundary_started) {
++        return;
++    }
++    const char * dir_raw = verathos_trace_dir();
++    if (dir_raw == nullptr || dir_raw[0] == '\0') {
++        return;
++    }
++    std::string line;
++    line.reserve(320);
++    line += "{\"row\":\"VERATHOS_GGML_BOUNDARY_V1\"";
++    line += ",\"created_unix_ns\":" + std::to_string(verathos_unix_ns());
++    line += ",\"capture_token\":\"" + verathos_json_escape(verathos_boundary_token.c_str()) + "\"";
++    line += ",\"input_boundary_root\":\"" + verathos_sha256_hex(verathos_boundary_in) + "\"";
++    line += ",\"output_boundary_root\":\"" + verathos_sha256_hex(verathos_boundary_out) + "\"";
++    line += ",\"input_bytes\":" + std::to_string(verathos_boundary_in_bytes);
++    line += ",\"output_bytes\":" + std::to_string(verathos_boundary_out_bytes);
++    line += "}\n";
++#if !defined(_WIN32)
++    static int boundary_fd = -1;
++    static std::string boundary_fd_path;
++    const std::string path = (fs::path(dir_raw) / "boundary.jsonl").string();
++    if (boundary_fd < 0 || boundary_fd_path != path) {
++        if (boundary_fd >= 0) {
++            ::close(boundary_fd);
++        }
++        std::error_code ec;
++        fs::create_directories(fs::path(dir_raw), ec);
++        if (ec) {
++            return;
++        }
++        boundary_fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
++        if (boundary_fd < 0) {
++            return;
++        }
++        boundary_fd_path = path;
++    }
++    if (::pwrite(boundary_fd, line.data(), line.size(), 0) != (ssize_t) line.size()) {
++        return;
++    }
++    (void) ::ftruncate(boundary_fd, (off_t) line.size());
++#else
++    std::error_code ec;
++    fs::create_directories(fs::path(dir_raw), ec);
++    if (ec) {
++        return;
++    }
++    const fs::path path = fs::path(dir_raw) / "boundary.jsonl";
++    std::ofstream out(path, std::ios::trunc);
++    if (!out) {
++        return;
++    }
++    out << line;
++#endif
++}
++
++static void verathos_try_dump_mul_mat_trace(
++        uint32_t device,
++        const ggml_cgraph * graph,
++        int64_t graph_sequence) {
++    if (!verathos_rpc_graph_trace_enabled()) {
++        return;
++    }
++    const char * dir_raw = verathos_trace_dir();
++    if (!dir_raw || dir_raw[0] == '\0') {
++        return;
++    }
++    const int64_t max_ops = verathos_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_GRAPH", 1);
++    if (max_ops <= 0) {
++        return;
++    }
++    if (!verathos_rpc_capture_window_active()) {
++        return;
++    }
++    const int64_t max_total = verathos_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE", 8);
++    if (max_total > 0 && verathos_rpc_dumped_total >= max_total) {
++        return;
++    }
++    const int64_t max_elems = verathos_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    fs::path dir(dir_raw);
++    std::error_code ec;
++    fs::create_directories(dir, ec);
++    if (ec) {
++        GGML_LOG_ERROR("[verathos] failed to create GGML trace dir: %s\n", dir.string().c_str());
++        return;
++    }
++
++    int64_t dumped = 0;
++    for (int i = 0; i < graph->n_nodes && dumped < max_ops; ++i) {
++        const ggml_tensor * node = graph->nodes[i];
++        if (node == nullptr || node->op != GGML_OP_MUL_MAT) {
++            continue;
++        }
++        const ggml_tensor * src0 = node->src[0];
++        const ggml_tensor * src1 = node->src[1];
++        if (src0 == nullptr || src1 == nullptr) {
++            continue;
++        }
++        if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++            src1->ne[2] != 1 || src1->ne[3] != 1 ||
++            node->ne[2] != 1 || node->ne[3] != 1) {
++            continue;
++        }
++        if (src0->ne[0] != src1->ne[0] ||
++            node->ne[0] != src0->ne[1] ||
++            node->ne[1] != src1->ne[1]) {
++            continue;
++        }
++        const int64_t total_elems =
++            ggml_nelements(src0) + ggml_nelements(src1) + ggml_nelements(node);
++        if (max_elems > 0 && total_elems > max_elems) {
++            continue;
++        }
++
++        const bool skip_src0_dump = verathos_env_bool("VERATHOS_GGML_TRACE_SKIP_SRC0_DUMP", false);
++        std::vector<float> src0_f32;
++        std::vector<float> src1_f32;
++        std::vector<float> dst_f32;
++        std::vector<uint8_t> src0_raw;
++        if ((!skip_src0_dump && !verathos_tensor_raw(src0, src0_raw)) ||
++            (!skip_src0_dump && !verathos_raw_to_f32(src0, src0_raw, src0_f32)) ||
++            !verathos_tensor_to_f32(src1, src1_f32) ||
++            !verathos_tensor_to_f32(node, dst_f32)) {
++            continue;
++        }
++
++        const int64_t now_ns = verathos_unix_ns();
++        std::ostringstream prefix;
++        prefix << "trace-" << now_ns << "-dev" << device << "-g" << graph_sequence
++               << "-op" << i;
++        fs::path src0_path = dir / (prefix.str() + "-src0.f32");
++        fs::path src0_raw_path = dir / (prefix.str() + "-src0.raw");
++        fs::path src1_path = dir / (prefix.str() + "-src1.f32");
++        fs::path dst_path = dir / (prefix.str() + "-dst.f32");
++        fs::path json_path = dir / (prefix.str() + ".json");
++        if ((!skip_src0_dump && !verathos_write_f32(src0_path, src0_f32)) ||
++            (!skip_src0_dump && !verathos_write_raw(src0_raw_path, src0_raw)) ||
++            !verathos_write_f32(src1_path, src1_f32) ||
++            !verathos_write_f32(dst_path, dst_f32)) {
++            continue;
++        }
++
++        std::ofstream meta(json_path);
++        if (!meta) {
++            continue;
++        }
++        meta << "{\n";
++        meta << "  \"version\": 1,\n";
++        meta << "  \"created_unix_ns\": " << now_ns << ",\n";
++        meta << "  \"graph_id\": \"rpc-dev" << device << "-graph" << graph_sequence << "\",\n";
++        meta << "  \"op_index\": " << i << ",\n";
++        meta << "  \"op_type\": \"GGML_OP_MUL_MAT\",\n";
++        meta << "  \"tensor_name\": \"" << verathos_json_escape(src0->name) << "\",\n";
++        meta << "  \"src0_name\": \"" << verathos_json_escape(src0->name) << "\",\n";
++        meta << "  \"src1_name\": \"" << verathos_json_escape(src1->name) << "\",\n";
++        meta << "  \"dst_name\": \"" << verathos_json_escape(node->name) << "\",\n";
++        meta << "  \"src0_shape\": [" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "],\n";
++        meta << "  \"src1_shape\": [" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3] << "],\n";
++        meta << "  \"dst_shape\": [" << node->ne[0] << "," << node->ne[1] << "," << node->ne[2] << "," << node->ne[3] << "],\n";
++        if (!skip_src0_dump) {
++            meta << "  \"src0_f32\": \"" << src0_path.filename().string() << "\",\n";
++            meta << "  \"src0_raw\": \"" << src0_raw_path.filename().string() << "\",\n";
++        }
++        meta << "  \"src0_raw_type\": \"" << ggml_type_name((ggml_type) src0->type) << "\",\n";
++        meta << "  \"src1_f32\": \"" << src1_path.filename().string() << "\",\n";
++        meta << "  \"dst_f32\": \"" << dst_path.filename().string() << "\",\n";
++        meta << "  \"source_types\": {\"src0\": \"" << ggml_type_name((ggml_type) src0->type)
++             << "\", \"src1\": \"" << ggml_type_name((ggml_type) src1->type)
++             << "\", \"dst\": \"" << ggml_type_name((ggml_type) node->type) << "\"},\n";
++        meta << "  \"backend\": \"llama_cpp_rpc\",\n";
++        meta << "  \"device\": \"RPC" << device << "\"\n";
++        meta << "}\n";
++        dumped++;
++        verathos_rpc_dumped_total++;
++        if (max_total > 0 && verathos_rpc_dumped_total >= max_total) {
++            break;
++        }
++    }
++}
++
+ // macro for nicer error messages on server crash
+ #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+ 
+@@ -70,8 +702,8 @@ enum rpc_cmd {
+     RPC_CMD_GET_ALLOC_SIZE,
+     RPC_CMD_HELLO,
+     RPC_CMD_DEVICE_COUNT,
+-    RPC_CMD_GRAPH_RECOMPUTE,
+     RPC_CMD_MEMSET_TENSOR,
++    RPC_CMD_GRAPH_RECOMPUTE,
+     RPC_CMD_COUNT,
+ };
+ 
+@@ -1156,6 +1788,9 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+     }
+     ggml_backend_tensor_set(tensor, data, offset, size);
++    if (verathos_boundary_absorb(data, size, /*inbound =*/ true, tensor->name)) {
++        verathos_boundary_emit();
++    }
+     return true;
+ }
+ 
+@@ -1288,6 +1923,10 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
+ 
+     response.resize(request.size, 0);
+     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
++    if (verathos_boundary_absorb(
++            response.data(), response.size(), /*inbound =*/ false, tensor->name)) {
++        verathos_boundary_emit();
++    }
+     return true;
+ }
+ 
+@@ -1452,8 +2091,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+             return false;
+         }
+     }
++    static int64_t verathos_graph_sequence = 0;
++    const int64_t graph_sequence = ++verathos_graph_sequence;
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    verathos_try_dump_mul_mat_trace(device, graph, graph_sequence);
+     stored_graphs[device].graph = graph;
+     return true;
+ }
+@@ -1468,8 +2110,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+     }
+     ggml_cgraph * graph = stored_graphs[device].graph;
+     LOG_DBG("[%s] device: %u\n", __func__, device);
++    static int64_t verathos_recompute_sequence = 1000000000;
++    const int64_t graph_sequence = ++verathos_recompute_sequence;
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    verathos_try_dump_mul_mat_trace(device, graph, graph_sequence);
+     return true;
+ }
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8b2ae72..c2fd01b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -12,6 +12,112 @@
+ #include "fit.h"
+ #include "llama.h"
+ #include "log.h"
++
++// Verathos proof sidecar extension: per-decode batch composition records.
++// One line per llama_decode batch view while trace capture is enabled, so
++// per-request slot views can be derived from contiguous split_simple ubatch
++// slices. See VERATHOS_LLAMA_BATCH_V1 in verallm/mesh/ggml_proof.py.
++#include <chrono>
++#include <fstream>
++
++static int64_t verathos_server_decode_seq = 0;
++
++static void verathos_server_write_batch_record(
++        llama_context * lctx,
++        const llama_batch & batch_view) {
++    // Runs once per ubatch, i.e. once per decoded token: the original
++    // getenv + open/read + open/append/close cycle here cost measurable
++    // decode throughput on a live 4090 mesh. Env is fixed at spawn; the
++    // enable token only changes when the arming side rewrites the file
++    // (observed via stat), and the output stream persists per path.
++    static const char * dir = std::getenv("VERATHOS_GGML_TRACE_DIR");
++    if (dir == nullptr || dir[0] == '\0') {
++        return;
++    }
++    static const char * enable_file = std::getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file == nullptr || enable_file[0] == '\0') {
++        return;
++    }
++    static struct {
++        bool valid;
++        long long size;
++        long long mtime_ns;
++        std::string token;
++    } cache = {};
++    {
++        namespace fs = std::filesystem;
++        std::error_code ec;
++        const auto status_size = fs::file_size(enable_file, ec);
++        if (ec) {
++            cache.valid = false;
++            return;
++        }
++        const auto mtime = fs::last_write_time(enable_file, ec);
++        if (ec) {
++            cache.valid = false;
++            return;
++        }
++        const long long mtime_ns =
++            (long long) mtime.time_since_epoch().count();
++        if (!cache.valid || cache.size != (long long) status_size ||
++            cache.mtime_ns != mtime_ns) {
++            std::ifstream enable(enable_file, std::ios::binary);
++            if (!enable) {
++                cache.valid = false;
++                return;
++            }
++            std::getline(enable, cache.token);
++            cache.size = (long long) status_size;
++            cache.mtime_ns = mtime_ns;
++            cache.valid = true;
++        }
++    }
++    const std::string & token = cache.token;
++    std::string digits;
++    for (char ch : token) {
++        if (ch < '0' || ch > '9' || digits.size() >= 64) {
++            break;
++        }
++        digits.push_back(ch);
++    }
++    const std::string path = std::string(dir) + "/batches" +
++        (digits.empty() ? std::string("") : "-" + digits) + ".vbatch";
++    static std::ofstream out;
++    static std::string out_path;
++    if (!out.is_open() || out_path != path) {
++        if (out.is_open()) {
++            out.close();
++        }
++        out.clear();
++        out.open(path, std::ios::app);
++        if (!out) {
++            return;
++        }
++        out_path = path;
++    }
++    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::system_clock::now().time_since_epoch()).count();
++    out << "VERATHOS_LLAMA_BATCH_V1";
++    out << "\t" << now_ns;
++    out << "\t" << ++verathos_server_decode_seq;
++    out << "\t" << llama_n_ubatch(lctx);
++    out << "\t" << batch_view.n_tokens;
++    out << "\t";
++    for (int32_t j = 0; j < batch_view.n_tokens; ++j) {
++        if (j > 0) {
++            out << ",";
++        }
++        const llama_seq_id seq_id =
++            (batch_view.n_seq_id != nullptr && batch_view.n_seq_id[j] > 0 &&
++             batch_view.seq_id != nullptr && batch_view.seq_id[j] != nullptr)
++            ? batch_view.seq_id[j][0]
++            : 0;
++        out << seq_id << ":" << batch_view.pos[j] << ":"
++            << ((batch_view.logits != nullptr && batch_view.logits[j]) ? 1 : 0);
++    }
++    out << "\n";
++    out.flush();
++}
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "mtmd.h"
+@@ -521,6 +627,21 @@ struct server_slot {
+ 
+             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+ 
++            // Verathos: a finished generation is the tail ring's flush
++            // moment. The trace dir doubles as the signal channel so the
++            // backend's flush thread (possibly another process) reacts
++            // within one poll tick instead of waiting out its idle timer.
++            {
++                static const char * verathos_trace_dir = std::getenv("VERATHOS_GGML_TRACE_DIR");
++                if (verathos_trace_dir != nullptr && verathos_trace_dir[0] != '\0') {
++                    std::ofstream verathos_signal_out(
++                        std::string(verathos_trace_dir) + "/.tail-flush", std::ios::trunc);
++                    if (verathos_signal_out) {
++                        verathos_signal_out << (long long) ggml_time_us();
++                    }
++                }
++            }
++
+             t_last_used        =  ggml_time_us();
+             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
+ 
+@@ -2091,6 +2212,7 @@ private:
+             res->content = tkn.text_to_send;
+             res->tokens  = { tkn.tok };
+         }
++        res->return_tokens = slot.task->params.return_tokens;
+ 
+         res->n_decoded             = slot.n_decoded;
+         res->n_prompt_tokens       = slot.task->n_tokens();
+@@ -3405,6 +3527,73 @@ private:
+                             }
+                         }
+ 
++                        // Verathos: proof-capture witnesses come from the eager
++                        // prefill; a (near-)full prompt-cache hit leaves the capture
++                        // window empty because the batch-1 re-eval runs under
++                        // CUDA-graph replay, which the capture hooks never see.
++                        // Re-evaluate a minimum tail of the prompt so every serve
++                        // yields witnesses. Uniform for every request; configured
++                        // once per process from the environment.
++                        {
++                            static const int verathos_min_eager_tail = [] {
++                                const char * trace_dir = std::getenv("VERATHOS_GGML_TRACE_DIR");
++                                if (trace_dir == nullptr || trace_dir[0] == '\0') {
++                                    return 0;
++                                }
++                                const char * raw = std::getenv("VERATHOS_MIN_EAGER_PROMPT_TAIL");
++                                if (raw == nullptr || raw[0] == '\0') {
++                                    return 32;
++                                }
++                                return std::max(0, atoi(raw));
++                            }();
++                            const int n_past_target = verathos_min_eager_tail > 0
++                                ? std::max(0, slot.task->n_tokens() - verathos_min_eager_tail)
++                                : n_past;
++                            if (n_past_target < n_past) {
++                                // The clamp must land on a position the memory can
++                                // actually roll back to: attention-only contexts
++                                // (PART) roll back anywhere, recurrent/hybrid
++                                // contexts (RS, e.g. Qwen3.6's SSM layers) at most
++                                // llama_n_rs_seq() positions, anything else not at
++                                // all. Clamping past that bound makes the seq_rm
++                                // below abort and kills the whole server.
++                                const llama_pos p_mem_end = slot.prompt.tokens.pos_next();
++                                const bool reachable =
++                                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
++                                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
++                                     p_mem_end - n_past_target <= (llama_pos) llama_n_rs_seq(ctx_tgt));
++                                if (reachable) {
++                                    n_past = n_past_target;
++                                } else {
++                                    // Recurrent state cannot seek backwards:
++                                    // restore the newest checkpoint at or before the target
++                                    // so the eager tail replays a bounded window
++                                    // instead of the whole prompt. Generation
++                                    // keeps a rolling checkpoint near the
++                                    // sequence end for exactly this restore.
++                                    auto best = slot.prompt.checkpoints.rend();
++                                    for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
++                                        if ((int) it->n_tokens <= n_past_target) {
++                                            best = it;
++                                            break;
++                                        }
++                                    }
++                                    if (best != slot.prompt.checkpoints.rend()) {
++                                        best->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                                        best->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                                        common_speculative_set_state(spec.get(), slot.id, best->data_spec);
++                                        n_past = (int) best->n_tokens;
++                                    } else {
++                                        // Full re-evaluation; drop checkpoints like the
++                                        // upstream reset path so no stale recurrent
++                                        // state is restored on a later request.
++                                        n_past = 0;
++                                        slot.prompt.checkpoints.clear();
++                                    }
++                                }
++                            }
++                        }
++
+                         // [TAG_PROMPT_LOGITS]
+                         if (n_past == slot.task->n_tokens() && n_past > 0) {
+                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+@@ -3661,6 +3850,8 @@ private:
+             }
+         }
+ 
++        verathos_server_write_batch_record(ctx_tgt, batch_view);
++
+         const int ret = llama_decode(ctx_tgt, batch_view);
+ 
+         metrics.on_decoded(slots);
+@@ -3864,6 +4055,53 @@ private:
+                 return;
+             }
+ 
++            // Verathos: keep a rolling recurrent-state checkpoint near the
++            // sequence end during generation. Audit probes replay bounded
++            // prefixes of the just-served sequence; without a trailing
++            // checkpoint a recurrent/hybrid context must replay from the
++            // prompt boundary (or from zero), which scales with the
++            // completion instead of the audit window.
++            {
++                static const int verathos_decode_ckpt_stride = [] {
++                    const char * trace_dir = std::getenv("VERATHOS_GGML_TRACE_DIR");
++                    if (trace_dir == nullptr || trace_dir[0] == '\0') {
++                        return 0;
++                    }
++                    const char * raw = std::getenv("VERATHOS_DECODE_CHECKPOINT_STRIDE");
++                    if (raw == nullptr || raw[0] == '\0') {
++                        return 128;
++                    }
++                    return std::max(0, atoi(raw));
++                }();
++                if (verathos_decode_ckpt_stride > 0 &&
++                    params_base.n_ctx_checkpoints > 0 &&
++                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
++                    slot.n_decoded % verathos_decode_ckpt_stride == 0) {
++                    // Keep at most the two newest decode checkpoints of this
++                    // task: the audit target sits within one stride of the
++                    // end, so older ones only crowd out prompt checkpoints.
++                    const int64_t n_prompt = slot.task->n_tokens();
++                    int64_t newest = -1;
++                    for (const auto & cur : slot.prompt.checkpoints) {
++                        if (cur.id_task == slot.task->id && cur.n_tokens > n_prompt) {
++                            newest = std::max(newest, cur.n_tokens);
++                        }
++                    }
++                    for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
++                        if (it->id_task == slot.task->id && it->n_tokens > n_prompt && it->n_tokens != newest) {
++                            it = slot.prompt.checkpoints.erase(it);
++                        } else {
++                            ++it;
++                        }
++                    }
++                    const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
++                    const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
++                    if (ckpt_pos_min >= 0) {
++                        create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
++                    }
++                }
++            }
++
+             slot.print_timings_tg();
+         });
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 1ee6775..138a148 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -428,6 +428,15 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
+         {"id", oaicompat_cmpl_id}
+     };
+ 
++    // Verathos proof sidecar extension: expose sampled token ids without
++    // forcing logprob calculation when the request already enabled return_tokens.
++    if (!stream && !tokens.empty()) {
++        res["choices"][0]["verathos_generated_tokens"] = tokens;
++    }
++    if (!stream) {
++        res["choices"][0]["verathos_slot_id"] = id_slot;
++    }
++
+     // extra fields for debugging purposes
+     if (verbose) {
+         res["__verbose"] = to_json_non_oaicompat();
+@@ -464,6 +473,15 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
+         };
+     }
+ 
++    // Verathos proof sidecar extension: expose sampled token ids without
++    // forcing logprob calculation when the request already enabled return_tokens.
++    if (!stream && !tokens.empty()) {
++        choice["verathos_generated_tokens"] = tokens;
++    }
++    if (!stream) {
++        choice["verathos_slot_id"] = id_slot;
++    }
++
+     std::time_t t = std::time(0);
+ 
+     json res = json {
+@@ -518,6 +536,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
+                 {"finish_reason", finish_reason},
+                 {"index", index},
+                 {"delta", json::object()},
++                // Verathos proof sidecar extension: bind the serving slot so
++                // mesh receipts can attribute co-batched graphs per request.
++                {"verathos_slot_id", id_slot},
+             },
+         })},
+         {"created",            t},
+@@ -1132,6 +1153,10 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
+     if (is_progress) {
+         res.push_back({"prompt_progress", progress.to_json()});
+     }
++    // Verathos: same streaming token-id extension as the chat route.
++    if (return_tokens && !tokens.empty()) {
++        res.push_back({"tokens", tokens});
++    }
+ 
+     return res;
+ }
+@@ -1186,6 +1211,14 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
+         if (is_progress) {
+             last_json.push_back({"prompt_progress", progress.to_json()});
+         }
++        // Verathos: emit the sampled token ids when the request asked for
++        // them. The OpenAI chat route has no standard carrier while
++        // streaming, and requesting logprobs purely for the ids makes the
++        // server sort the full vocab per generated token. Top-level
++        // extension field, same family as "timings".
++        if (return_tokens && !tokens.empty()) {
++            last_json.push_back({"tokens", tokens});
++        }
+     }
+ 
+     return deltas;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 6275ec7..7e5ccdf 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -421,6 +421,7 @@ struct server_task_result_cmpl_partial : server_task_result {
+     int32_t n_prompt_tokens_cache;
+ 
+     bool post_sampling_probs;
++    bool return_tokens = false;
+     bool is_progress = false;
+     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
+                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884

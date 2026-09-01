@@ -10,5 +10,8 @@
   "proof_v3_artifact_base_urls": [
     "https://verathos.ai/gleipnir/testnet/"
   ],
+  "mesh_manifest_base_urls": [
+    "https://verathos.ai/gleipnir/testnet/"
+  ],
   "mock": false
 }

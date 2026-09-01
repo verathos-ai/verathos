@@ -93,6 +93,13 @@ class InferenceCommitment:
     # Canonical proof-v2 metadata. This contains the authenticated manifest
     # digest and the complete pre-challenge X commitment set.
     proof_v2_commitment: bytes = b""
+    # Distributed GGUF mesh binding. These fields are empty for the
+    # existing vLLM path and included in the transcript only when set.
+    mesh_spec_hash: bytes = b""
+    stage_assignment_hash: bytes = b""
+    stage_boundary_roots: List[bytes] = field(default_factory=list)
+    stage_receipt_root: bytes = b""
+    mesh_proof_receipt_root: bytes = b""
     timestamp: float = field(default_factory=time.time)
 
     @classmethod
@@ -166,6 +173,23 @@ class InferenceCommitment:
             parts.append(b"PROOF_V2_COMMITMENT")
             parts.append(struct.pack("<I", len(self.proof_v2_commitment)))
             parts.append(self.proof_v2_commitment)
+        # V7 extension: distributed GGUF mesh binding.
+        if (
+            self.mesh_spec_hash
+            or self.stage_assignment_hash
+            or self.stage_boundary_roots
+            or self.stage_receipt_root
+        ):
+            parts.append(b"MESH_V1")
+            parts.append(self.mesh_spec_hash)
+            parts.append(self.stage_assignment_hash)
+            parts.append(struct.pack("<I", len(self.stage_boundary_roots)))
+            for root in self.stage_boundary_roots:
+                parts.append(root)
+            parts.append(self.stage_receipt_root)
+        if self.mesh_proof_receipt_root:
+            parts.append(b"MESH_PROOF_RECEIPT_ROOT_V1")
+            parts.append(self.mesh_proof_receipt_root)
         return b"".join(parts)
 
     @staticmethod

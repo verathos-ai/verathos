@@ -1,0 +1,316 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index d380577..87bf0cf 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -17,6 +17,9 @@
+ #include <fstream>
+ #include <filesystem>
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <sstream>
+ 
+ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+@@ -26,6 +29,238 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+ namespace fs = std::filesystem;
+ 
++static const char * verathos_trace_dir() {
++    return std::getenv("VERATHOS_GGML_TRACE_DIR");
++}
++
++static bool verathos_rpc_graph_trace_enabled() {
++    const char * raw = std::getenv("VERATHOS_GGML_RPC_GRAPH_TRACE");
++    return raw != nullptr && std::string(raw) == "1";
++}
++
++static std::string verathos_rpc_capture_token;
++static int64_t verathos_rpc_dumped_total = 0;
++
++// Capture is armed per request via the shared enable file (same contract as
++// the CUDA hook): dump only while the file exists, and reset the cumulative
++// budget when the window token changes so each request dumps at most
++// VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE candidate witnesses in total.
++static bool verathos_rpc_capture_window_active() {
++    const char * enable_file = std::getenv("VERATHOS_GGML_TRACE_ENABLE_FILE");
++    if (enable_file == nullptr || enable_file[0] == '\0') {
++        return true;
++    }
++    std::ifstream in(enable_file);
++    if (!in) {
++        return false;
++    }
++    std::string token;
++    std::getline(in, token);
++    if (token.empty()) {
++        token = "present";
++    }
++    if (token != verathos_rpc_capture_token) {
++        verathos_rpc_capture_token = token;
++        verathos_rpc_dumped_total = 0;
++    }
++    return true;
++}
++
++static int64_t verathos_env_i64(const char * name, int64_t fallback) {
++    const char * raw = std::getenv(name);
++    if (!raw || raw[0] == '\0') {
++        return fallback;
++    }
++    try {
++        return std::stoll(raw);
++    } catch (...) {
++        return fallback;
++    }
++}
++
++static bool verathos_env_bool(const char * name, bool fallback) {
++    const char * raw = std::getenv(name);
++    if (!raw || raw[0] == '\0') {
++        return fallback;
++    }
++    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' ||
++           raw[0] == 'y' || raw[0] == 'Y';
++}
++
++static int64_t verathos_unix_ns() {
++    using namespace std::chrono;
++    return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
++}
++
++static bool verathos_tensor_raw(const ggml_tensor * tensor, std::vector<uint8_t> & raw) {
++    if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr) {
++        return false;
++    }
++    if (!ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    if (ggml_nelements(tensor) <= 0) {
++        return false;
++    }
++    const size_t nbytes = ggml_nbytes(tensor);
++    if (nbytes == 0) {
++        return false;
++    }
++    raw.resize(nbytes);
++    ggml_backend_tensor_get(tensor, raw.data(), 0, nbytes);
++    return true;
++}
++
++static bool verathos_raw_to_f32(
++        const ggml_tensor * tensor,
++        const std::vector<uint8_t> & raw,
++        std::vector<float> & out) {
++    if (tensor == nullptr || raw.empty()) {
++        return false;
++    }
++    const int64_t n = ggml_nelements(tensor);
++    if (n <= 0) {
++        return false;
++    }
++    out.resize(n);
++    if (tensor->type == GGML_TYPE_F32) {
++        if (raw.size() != sizeof(float) * (size_t) n) {
++            return false;
++        }
++        memcpy(out.data(), raw.data(), raw.size());
++        return true;
++    }
++    const ggml_type_traits * traits = ggml_get_type_traits((ggml_type) tensor->type);
++    if (traits == nullptr || traits->to_float == nullptr) {
++        return false;
++    }
++    traits->to_float(raw.data(), out.data(), n);
++    return true;
++}
++
++static bool verathos_tensor_to_f32(const ggml_tensor * tensor, std::vector<float> & out) {
++    std::vector<uint8_t> raw;
++    return verathos_tensor_raw(tensor, raw) && verathos_raw_to_f32(tensor, raw, out);
++}
++
++static bool verathos_write_f32(const fs::path & path, const std::vector<float> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size() * sizeof(float));
++    return bool(out);
++}
++
++static bool verathos_write_raw(const fs::path & path, const std::vector<uint8_t> & values) {
++    std::ofstream out(path, std::ios::binary);
++    if (!out) {
++        return false;
++    }
++    out.write(reinterpret_cast<const char *>(values.data()), values.size());
++    return bool(out);
++}
++
++static std::string verathos_json_escape(const char * raw) {
++    std::ostringstream out;
++    for (const char * p = raw ? raw : ""; *p; ++p) {
++        switch (*p) {
++            case '\\': out << "\\\\"; break;
++            case '"': out << "\\\""; break;
++            case '\n': out << "\\n"; break;
++            case '\r': out << "\\r"; break;
++            case '\t': out << "\\t"; break;
++            default: out << *p; break;
++        }
++    }
++    return out.str();
++}
++
++static void verathos_try_dump_mul_mat_trace(
++        uint32_t device,
++        const ggml_cgraph * graph,
++        int64_t graph_sequence) {
++    if (!verathos_rpc_graph_trace_enabled()) {
++        return;
++    }
++    const char * dir_raw = verathos_trace_dir();
++    if (!dir_raw || dir_raw[0] == '\0') {
++        return;
++    }
++    const int64_t max_ops = verathos_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_GRAPH", 1);
++    if (max_ops <= 0) {
++        return;
++    }
++    if (!verathos_rpc_capture_window_active()) {
++        return;
++    }
++    const int64_t max_total = verathos_env_i64("VERATHOS_GGML_TRACE_MAX_OPS_PER_CAPTURE", 8);
++    if (max_total > 0 && verathos_rpc_dumped_total >= max_total) {
++        return;
++    }
++    const int64_t max_elems = verathos_env_i64("VERATHOS_GGML_TRACE_MAX_ELEMS", 262144);
++    fs::path dir(dir_raw);
++    std::error_code ec;
++    fs::create_directories(dir, ec);
++    if (ec) {
++        GGML_LOG_ERROR("[verathos] failed to create GGML trace dir: %s\n", dir.string().c_str());
++        return;
++    }
++
++    int64_t dumped = 0;
++    for (int i = 0; i < graph->n_nodes && dumped < max_ops; ++i) {
++        const ggml_tensor * node = graph->nodes[i];
++        if (node == nullptr || node->op != GGML_OP_MUL_MAT) {
++            continue;
++        }
++        const ggml_tensor * src0 = node->src[0];
++        const ggml_tensor * src1 = node->src[1];
++        if (src0 == nullptr || src1 == nullptr) {
++            continue;
++        }
++        if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
++            src1->ne[2] != 1 || src1->ne[3] != 1 ||
++            node->ne[2] != 1 || node->ne[3] != 1) {
++            continue;
++        }
++        if (src0->ne[0] != src1->ne[0] ||
++            node->ne[0] != src0->ne[1] ||
++            node->ne[1] != src1->ne[1]) {
++            continue;
++        }
++        const int64_t total_elems =
++            ggml_nelements(src0) + ggml_nelements(src1) + ggml_nelements(node);
++        if (max_elems > 0 && total_elems > max_elems) {
++            continue;
++        }
++
++        const bool skip_src0_dump = verathos_env_bool("VERATHOS_GGML_TRACE_SKIP_SRC0_DUMP", false);
++        std::vector<float> src0_f32;
++        std::vector<float> src1_f32;
++        std::vector<float> dst_f32;
++        std::vector<uint8_t> src0_raw;
++        if ((!skip_src0_dump && !verathos_tensor_raw(src0, src0_raw)) ||
++            (!skip_src0_dump && !verathos_raw_to_f32(src0, src0_raw, src0_f32)) ||
++            !verathos_tensor_to_f32(src1, src1_f32) ||
++            !verathos_tensor_to_f32(node, dst_f32)) {
++            continue;
++        }
++
++        const int64_t now_ns = verathos_unix_ns();
++        std::ostringstream prefix;
++        prefix << "trace-" << now_ns << "-dev" << device << "-g" << graph_sequence
++               << "-op" << i;
++        fs::path src0_path = dir / (prefix.str() + "-src0.f32");
++        fs::path src0_raw_path = dir / (prefix.str() + "-src0.raw");
++        fs::path src1_path = dir / (prefix.str() + "-src1.f32");
++        fs::path dst_path = dir / (prefix.str() + "-dst.f32");
++        fs::path json_path = dir / (prefix.str() + ".json");
++        if ((!skip_src0_dump && !verathos_write_f32(src0_path, src0_f32)) ||
++            (!skip_src0_dump && !verathos_write_raw(src0_raw_path, src0_raw)) ||
++            !verathos_write_f32(src1_path, src1_f32) ||
++            !verathos_write_f32(dst_path, dst_f32)) {
++            continue;
++        }
++
++        std::ofstream meta(json_path);
++        if (!meta) {
++            continue;
++        }
++        meta << "{\n";
++        meta << "  \"version\": 1,\n";
++        meta << "  \"created_unix_ns\": " << now_ns << ",\n";
++        meta << "  \"graph_id\": \"rpc-dev" << device << "-graph" << graph_sequence << "\",\n";
++        meta << "  \"op_index\": " << i << ",\n";
++        meta << "  \"op_type\": \"GGML_OP_MUL_MAT\",\n";
++        meta << "  \"tensor_name\": \"" << verathos_json_escape(src0->name) << "\",\n";
++        meta << "  \"src0_name\": \"" << verathos_json_escape(src0->name) << "\",\n";
++        meta << "  \"src1_name\": \"" << verathos_json_escape(src1->name) << "\",\n";
++        meta << "  \"dst_name\": \"" << verathos_json_escape(node->name) << "\",\n";
++        meta << "  \"src0_shape\": [" << src0->ne[0] << "," << src0->ne[1] << "," << src0->ne[2] << "," << src0->ne[3] << "],\n";
++        meta << "  \"src1_shape\": [" << src1->ne[0] << "," << src1->ne[1] << "," << src1->ne[2] << "," << src1->ne[3] << "],\n";
++        meta << "  \"dst_shape\": [" << node->ne[0] << "," << node->ne[1] << "," << node->ne[2] << "," << node->ne[3] << "],\n";
++        if (!skip_src0_dump) {
++            meta << "  \"src0_f32\": \"" << src0_path.filename().string() << "\",\n";
++            meta << "  \"src0_raw\": \"" << src0_raw_path.filename().string() << "\",\n";
++        }
++        meta << "  \"src0_raw_type\": \"" << ggml_type_name((ggml_type) src0->type) << "\",\n";
++        meta << "  \"src1_f32\": \"" << src1_path.filename().string() << "\",\n";
++        meta << "  \"dst_f32\": \"" << dst_path.filename().string() << "\",\n";
++        meta << "  \"source_types\": {\"src0\": \"" << ggml_type_name((ggml_type) src0->type)
++             << "\", \"src1\": \"" << ggml_type_name((ggml_type) src1->type)
++             << "\", \"dst\": \"" << ggml_type_name((ggml_type) node->type) << "\"},\n";
++        meta << "  \"backend\": \"llama_cpp_rpc\",\n";
++        meta << "  \"device\": \"RPC" << device << "\"\n";
++        meta << "}\n";
++        dumped++;
++        verathos_rpc_dumped_total++;
++        if (max_total > 0 && verathos_rpc_dumped_total >= max_total) {
++            break;
++        }
++    }
++}
++
+ // macro for nicer error messages on server crash
+ #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+ 
+@@ -1384,8 +1619,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+             return false;
+         }
+     }
++    static int64_t verathos_graph_sequence = 0;
++    const int64_t graph_sequence = ++verathos_graph_sequence;
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    verathos_try_dump_mul_mat_trace(device, graph, graph_sequence);
+     stored_graphs[device].graph = graph;
+     return true;
+ }
+@@ -1400,8 +1638,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+     }
+     ggml_cgraph * graph = stored_graphs[device].graph;
+     LOG_DBG("[%s] device: %u\n", __func__, device);
++    static int64_t verathos_recompute_sequence = 1000000000;
++    const int64_t graph_sequence = ++verathos_recompute_sequence;
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    verathos_try_dump_mul_mat_trace(device, graph, graph_sequence);
+     return true;
+ }
+ 

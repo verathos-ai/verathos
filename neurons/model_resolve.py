@@ -75,6 +75,25 @@ def _filter_capacity_recommendations(recs, on_chain_models: Optional[Iterable[st
     ]
 
 
+def _on_chain_models_above_tier(on_chain_set: set, tier) -> list:
+    """Registered checkpoints the catalog knows but that need a larger GPU.
+
+    Lets the empty-intersection error distinguish "nothing usable is
+    registered" from "registered models exist but this GPU is too small".
+    """
+    from verallm.registry.models import ALL_MODELS
+
+    gaps = {}
+    for entry in ALL_MODELS:
+        for tc in entry.tier_configs:
+            cp = str(tc.checkpoint).lower()
+            if cp in on_chain_set and tc.tier > tier:
+                prev = gaps.get(cp)
+                if prev is None or tc.tier.value < prev[1]:
+                    gaps[cp] = (str(tc.checkpoint), tc.tier.value)
+    return sorted(f"{name} (needs >= {vram} GB)" for name, vram in gaps.values())
+
+
 def _capacity_eligible_recommendations_from_ranked(
     recs,
     *,
@@ -375,12 +394,22 @@ def resolve_model_config(
                         _addr = _cc.get("model_registry_address", "unknown")
                     except Exception:
                         _addr = "unknown"
+                    tier_gaps = _on_chain_models_above_tier(on_chain_set, tier)
+                    if tier_gaps:
+                        gap_hint = (
+                            f" | This GPU ({gpu_info['vram_gb']} GB, tier {tier.name}) "
+                            "is below the minimum for every registered model it could "
+                            f"otherwise serve: {tier_gaps}"
+                        )
+                    else:
+                        gap_hint = ""
                     bt.logging.error(
-                        "No recommended models are registered on-chain. "
-                        "Miners can only serve models that the subnet owner has "
-                        "registered on the ModelRegistry contract. "
+                        "None of the models registered on-chain are recommended "
+                        "for this GPU tier. Miners can only serve models that the "
+                        "subnet owner has registered on the ModelRegistry contract. "
                         f"ModelRegistry: {_addr} | "
                         f"Registered models: {sorted(on_chain_set) if on_chain_set else '(none)'}"
+                        f"{gap_hint}"
                     )
                     sys.exit(1)
 

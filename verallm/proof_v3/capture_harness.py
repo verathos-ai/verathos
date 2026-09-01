@@ -317,6 +317,7 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
     response_stamp_records = []
     split_economic_keys = set()
     root_wrappers, seen_root_wrappers = [], set()
+    root_finalizer_wrappers, seen_root_finalizer_wrappers = [], set()
     split_alias_wrappers, seen_split_alias_wrappers = [], set()
     runtime_root_only_keys = set()
     for L in layers:
@@ -340,6 +341,17 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
                 "proof_capture_root_buffers",
                 None,
             )
+            root_finalizer_source = getattr(
+                m,
+                "proof_capture_root_finalizer",
+                None,
+            )
+            if (
+                root_finalizer_source is not None
+                and id(m) not in seen_root_finalizer_wrappers
+            ):
+                seen_root_finalizer_wrappers.add(id(m))
+                root_finalizer_wrappers.append(m)
             if (
                 root_buffer_source is not None
                 and id(m) not in seen_root_wrappers
@@ -428,7 +440,7 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
             tr.register_execution_anchor_root_history(*root_histories[0])
         root_finalizers = tuple(
             item
-            for wrapper in root_wrappers
+            for wrapper in root_finalizer_wrappers
             for finalizer_source in (
                 getattr(wrapper, "proof_capture_root_finalizer", None),
             )

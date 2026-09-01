@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass, field
 from typing import List
 
+from neurons.runtime import is_mesh_quant
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,11 @@ class ActiveMiner:
     tee_model_weight_hash: str = ""  # hex
     enclave_public_key: str = ""  # hex, 32-byte X25519 public key
 
+    # Runtime family — derived from the quant prefix (see neurons/runtime.py).
+    # Mesh endpoints use the inline GGML proof path: every response carries a
+    # base proof and the separate decode audit follows the signed mesh policy.
+    mesh_enabled: bool = False
+
     # Hardware metadata (populated from miner /health during identity verification)
     gpu_name: str = ""
     gpu_count: int = 0
@@ -40,6 +47,12 @@ class ActiveMiner:
     compute_capability: str = ""
     gpu_uuids: List[str] = field(default_factory=list)
     proof_protocol_versions: List[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # The on-chain quant marker is authoritative.  Preserve an explicit
+        # true flag, but never let fallback reconstruction silently turn a
+        # GGUF mesh into a vLLM endpoint because an older cache omitted it.
+        self.mesh_enabled = bool(self.mesh_enabled) or is_mesh_quant(self.quant)
 
 
 def discover_active_miners(
@@ -128,6 +141,7 @@ def _collect_active(
             model_index=i,
             expires_at=int(getattr(m, "expires_at", 0) or 0),
             registered_at=max(0, int(getattr(m, "expires_at", 0) or 0) - 24 * 3600),
+            mesh_enabled=is_mesh_quant(m.quant),
         )
         # Enrich with TEE capability (best-effort, don't block discovery)
         try:

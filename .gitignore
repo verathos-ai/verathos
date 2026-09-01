@@ -13,6 +13,10 @@ __pycache__/
 dist/*
 # But keep pre-built zkllm wheels shipped in public repo
 !dist/*.whl
+# Prebuilt native PCS commitment library, one per platform, installed into
+# zkllm/crypto/ by scripts/join_pool.sh (same pattern as the zkllm wheels).
+!dist/pcs/
+!dist/pcs/**
 build/
 eggs/
 .eggs/
@@ -21,6 +25,7 @@ eggs/
 
 # Virtual environments
 .venv/
+.venv-mesh/
 .venv-vllm/
 .venv-vllm-016/
 .venv-vllm-*/

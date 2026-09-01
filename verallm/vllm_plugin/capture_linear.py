@@ -70,6 +70,42 @@ class _RuntimeRootBinding:
     history_attribute: str | None = None
 
 
+def _deduplicate_decoder_boundary_root_bindings(
+    bindings: tuple[_RuntimeRootBinding, ...],
+) -> tuple[
+    tuple[_RuntimeRootBinding, ...],
+    dict[str, str],
+]:
+    """Share reducer slots for exact runtime tensor aliases."""
+
+    by_stage = {item.stage_id: item for item in bindings}
+    aliases: dict[str, str] = {}
+    retained = []
+    for item in bindings:
+        layer_text, separator, suffix = item.stage_id.partition(".")
+        source = None
+        if (
+            separator
+            and suffix == "residual_in"
+            and layer_text.startswith("l")
+            and layer_text[1:].isdigit()
+        ):
+            layer = int(layer_text[1:])
+            if layer > 0:
+                candidate = by_stage.get(f"l{layer - 1}.residual_out")
+                if (
+                    candidate is not None
+                    and candidate.row_width == item.row_width
+                    and candidate.dtype == item.dtype
+                ):
+                    source = candidate.stage_id
+        if source is None:
+            retained.append(item)
+        else:
+            aliases[item.stage_id] = source
+    return tuple(retained), aliases
+
+
 def dense_execution_projection_specs(
     layer: nn.Module,
 ) -> tuple[DenseProjectionCaptureSpec, ...]:
@@ -430,6 +466,8 @@ class CaptureLinearWrapper(nn.Module):
                 source,
                 lane_bytes,
             )
+        elif source.shape[0] <= staging.shape[0]:
+            torch.ops.verallm.activation_row_stage(staging, source)
         elif (
             suffix in self._capture_root_retention_indices
             and self._capture_root_retained_values is not None
@@ -903,6 +941,8 @@ class CaptureDecoderLayerWrapper(nn.Module):
         ):
             self.register_buffer(name, None, persistent=False)
         self._capture_root_retention_indices: dict[str, int] = {}
+        self._capture_root_alias_sources: dict[str, str] = {}
+        self._defer_runtime_root_finalization = False
 
     def __getattr__(self, name: str):
         try:
@@ -949,7 +989,7 @@ class CaptureDecoderLayerWrapper(nn.Module):
         buffer: torch.Tensor | None,
         staging: torch.Tensor | None,
     ) -> None:
-        if buffer is None:
+        if buffer is None or suffix in self._capture_root_alias_sources:
             return
         from verallm.proof_v3.execution_anchor import (
             execution_anchor_lane_bytes_v3,
@@ -964,6 +1004,8 @@ class CaptureDecoderLayerWrapper(nn.Module):
                 value,
                 lane_bytes,
             )
+        elif value.shape[0] <= staging.shape[0]:
+            torch.ops.verallm.activation_row_stage(staging, value)
         elif (
             suffix in self._capture_root_retention_indices
             and self._capture_root_retained_values is not None
@@ -1107,6 +1149,14 @@ class CaptureDecoderLayerWrapper(nn.Module):
         self._capture_root_retention_slots = slots
         self._capture_root_retention_indices[suffix] = int(stage_index)
 
+    def _install_runtime_root_alias(
+        self,
+        *,
+        suffix: str,
+        source_stage_id: str,
+    ) -> None:
+        self._capture_root_alias_sources[str(suffix)] = str(source_stage_id)
+
     def proof_capture_root_retention(self):
         return tuple(
             (
@@ -1119,6 +1169,49 @@ class CaptureDecoderLayerWrapper(nn.Module):
             for suffix, stage_index in sorted(
                 self._capture_root_retention_indices.items()
             )
+        )
+
+    def proof_capture_root_finalizer(self):
+        """Expose the shared dense-root reducer at the post-step boundary."""
+
+        return (
+            (self._finalize_runtime_roots_after_graph,)
+            if self._defer_runtime_root_finalization
+            else ()
+        )
+
+    def _finalize_runtime_roots_after_graph(self, row_count: int) -> None:
+        """Hash graph-staged dense rows after compiled execution completes."""
+
+        destination = self._capture_root_batch_destination
+        scratch = self._capture_root_batch_scratch
+        staging = self._capture_root_batch_staging
+        widths = self._capture_root_batch_widths
+        if (
+            not self._defer_runtime_root_finalization
+            or isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count <= 0
+            or not all(
+                isinstance(item, torch.Tensor)
+                for item in (destination, scratch, staging, widths)
+            )
+            or row_count > int(destination.shape[1])
+        ):
+            raise RuntimeError(
+                "qualified dense post-graph root finalization is malformed"
+            )
+        # Larger prefill batches were reduced directly at each stage because
+        # they do not fit the bounded decode arena. There is nothing to batch
+        # at the post-step boundary in that case.
+        if row_count > int(staging.shape[1]):
+            return
+        torch.ops.verallm.activation_staged_row_roots(
+            destination,
+            scratch,
+            staging,
+            widths,
+            destination[0, :row_count],
         )
 
     @staticmethod
@@ -1187,11 +1280,17 @@ class CaptureDecoderLayerWrapper(nn.Module):
                     residual_after_attention
                 )
             return result
-        residual_in = (
-            hidden_states
-            if residual is None
-            else hidden_states + residual
+        residual_in_required = (
+            self._capture_residual_in_buf is not None
+            or "residual_in" not in self._capture_root_alias_sources
         )
+        residual_in = None
+        if residual_in_required:
+            residual_in = (
+                hidden_states
+                if residual is None
+                else hidden_states + residual
+            )
         result = self.original(*args, **kwargs)
         if not isinstance(result, tuple) or len(result) < 2:
             raise TypeError("captured decoder layer must return hidden and residual")
@@ -1202,14 +1301,16 @@ class CaptureDecoderLayerWrapper(nn.Module):
         ):
             raise TypeError("captured decoder layer returned non-tensor state")
         residual_out = hidden_out + residual_after_attention
-        capture_residual_in = self._canonical_capture_value(
-            residual_in,
-            (
-                self._capture_residual_in_buf
-                if self._capture_residual_in_buf is not None
-                else self._capture_residual_in_root_stage_buf
-            ),
-        )
+        capture_residual_in = None
+        if residual_in is not None:
+            capture_residual_in = self._canonical_capture_value(
+                residual_in,
+                (
+                    self._capture_residual_in_buf
+                    if self._capture_residual_in_buf is not None
+                    else self._capture_residual_in_root_stage_buf
+                ),
+            )
         capture_residual_after_attention = self._canonical_capture_value(
             residual_after_attention,
             (
@@ -1226,12 +1327,13 @@ class CaptureDecoderLayerWrapper(nn.Module):
                 else self._capture_residual_out_root_stage_buf
             ),
         )
-        self._capture_roots(
-            capture_residual_in,
-            "residual_in",
-            self._capture_residual_in_root_buf,
-            self._capture_residual_in_root_stage_buf,
-        )
+        if capture_residual_in is not None:
+            self._capture_roots(
+                capture_residual_in,
+                "residual_in",
+                self._capture_residual_in_root_buf,
+                self._capture_residual_in_root_stage_buf,
+            )
         self._capture_roots(
             capture_residual_after_attention,
             "residual_after_attention",
@@ -1244,8 +1346,12 @@ class CaptureDecoderLayerWrapper(nn.Module):
             self._capture_residual_out_root_buf,
             self._capture_residual_out_root_stage_buf,
         )
-        self._capture_response_stamp(capture_residual_in)
-        if self._capture_root_batch_destination is not None:
+        if capture_residual_in is not None:
+            self._capture_response_stamp(capture_residual_in)
+        if (
+            self._capture_root_batch_destination is not None
+            and not self._defer_runtime_root_finalization
+        ):
             torch.ops.verallm.activation_staged_row_roots(
                 self._capture_root_batch_destination,
                 self._capture_root_batch_scratch,
@@ -1253,11 +1359,12 @@ class CaptureDecoderLayerWrapper(nn.Module):
                 self._capture_root_batch_widths,
                 capture_residual_out,
             )
-        self._capture(
-            capture_residual_in,
-            19,
-            self._capture_residual_in_buf,
-        )
+        if capture_residual_in is not None:
+            self._capture(
+                capture_residual_in,
+                19,
+                self._capture_residual_in_buf,
+            )
         self._capture(
             capture_residual_after_attention,
             20,
@@ -1375,6 +1482,10 @@ def enable_batched_runtime_root_capture_v3(
         )
         return 0
 
+    logical_bindings = bindings
+    bindings, boundary_aliases = _deduplicate_decoder_boundary_root_bindings(
+        logical_bindings
+    )
     root_tensors = tuple(
         getattr(item.owner, item.root_attribute)
         for item in bindings
@@ -1503,16 +1614,35 @@ def enable_batched_runtime_root_capture_v3(
         dtype=torch.int32,
         device=device,
     )
-    for index, item in enumerate(bindings):
+    slot_by_stage = {
+        item.stage_id: index for index, item in enumerate(bindings)
+    }
+    for item in logical_bindings:
+        source_stage = boundary_aliases.get(item.stage_id, item.stage_id)
+        index = slot_by_stage[source_stage]
         setattr(item.owner, item.root_attribute, destination[index])
         setattr(item.owner, item.staging_attribute, staging[index])
+        if source_stage != item.stage_id:
+            suffix = item.stage_id.split(".", 1)[1]
+            if isinstance(item.owner, CaptureDecoderLayerWrapper):
+                item.owner._install_runtime_root_alias(
+                    suffix=suffix,
+                    source_stage_id=source_stage,
+                )
+            else:
+                raise RuntimeError(
+                    "runtime root alias source is malformed"
+                )
 
     finalizer._capture_root_batch_destination = destination
     finalizer._capture_root_batch_scratch = scratch
     finalizer._capture_root_batch_staging = staging
     finalizer._capture_root_batch_widths = row_widths
+    finalizer._defer_runtime_root_finalization = True
     logger.info(
-        "Batched %d runtime root stage(s) across at most %d decode row(s)",
+        "Batched %d runtime root stage(s) in %d reducer slot(s) across at "
+        "most %d decode row(s)",
+        len(logical_bindings),
         len(bindings),
         max_decode_rows,
     )
@@ -1530,7 +1660,7 @@ def enable_batched_runtime_root_capture_v3(
             root_capacity,
             int(retained_values.shape[2]),
         )
-    return len(bindings)
+    return len(logical_bindings)
 
 
 class CaptureLMHeadWrapper(nn.Module):

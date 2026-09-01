@@ -622,6 +622,89 @@ def _set_server_arg(server_args: list[str], flag: str, value: str) -> list[str]:
     return out
 
 
+def _add_server_flag(server_args: list[str], flag: str) -> list[str]:
+    return list(server_args) if flag in server_args else [*server_args, flag]
+
+
+def _remove_server_arg(server_args: list[str], flag: str) -> list[str]:
+    """Remove every ``flag value`` pair from forwarded server arguments."""
+
+    out: list[str] = []
+    skip = False
+    for arg in server_args:
+        if skip:
+            skip = False
+            continue
+        if arg == flag:
+            skip = True
+            continue
+        out.append(arg)
+    return out
+
+
+def _configure_mesh_security_args(
+    *,
+    args,
+    server_args: list[str],
+    evm_address: str,
+    evm_private_key: str,
+) -> list[str]:
+    """Forward miner identity and fail-closed validator auth to mesh serve.
+
+    Wallet-backed serving derives the EVM key inside the child from the same
+    hotkey it uses for receipt signing.  Never duplicate that secret into the
+    subprocess argument vector.  Direct-key development mode has no wallet to
+    derive from and therefore retains the explicit key pair.
+    """
+
+    from verallm.api.validator_auth import DEFAULT_VALIDATORS_PATH
+
+    configured = _set_server_arg(server_args, "--server-role", "coordinator")
+    wallet_backed = bool(getattr(args, "wallet", None))
+    if wallet_backed:
+        configured = _set_server_arg(
+            configured,
+            "--wallet-name",
+            str(args.wallet),
+        )
+        configured = _set_server_arg(
+            configured,
+            "--wallet-hotkey",
+            str(args.hotkey),
+        )
+        configured = _remove_server_arg(configured, "--evm-private-key")
+    if evm_address:
+        configured = _set_server_arg(configured, "--evm-address", evm_address)
+    if evm_private_key and not wallet_backed:
+        configured = _set_server_arg(
+            configured,
+            "--evm-private-key",
+            evm_private_key,
+        )
+
+    # Wallet mode has a metagraph and therefore always protects public mesh
+    # inference routes with the same allowlist as the vLLM server.  Explicit
+    # --validator-auth remains available for controlled non-wallet setups.
+    validator_auth = wallet_backed or (
+        "--validator-auth" in configured
+    )
+    if validator_auth:
+        configured = _add_server_flag(configured, "--validator-auth")
+        configured = _add_server_flag(configured, "--require-validator-nonce")
+        configured = _set_server_arg(
+            configured,
+            "--validator-allowlist-path",
+            os.environ.get("VERATHOS_VALIDATORS_PATH", DEFAULT_VALIDATORS_PATH),
+        )
+    return configured
+
+
+def _validator_allowlist_refresh_enabled(args) -> bool:
+    """Wallet-backed vLLM and mesh miners both maintain the allowlist."""
+
+    return bool(getattr(args, "wallet", None))
+
+
 def _forward_proof_v2_artifacts(
     server_args: list[str],
     *,
@@ -1113,6 +1196,11 @@ class MinerNeuron:
     _AWQ_GEMM_HINT_EXIT = 43
 
     def _server_cmd(self, server_args: list[str]) -> list[str]:
+        if getattr(self, "mesh_dir", None):
+            # GGUF-mesh runtime: supervise the mesh coordinator instead of
+            # the vLLM server. server_args are `mesh serve` arguments.
+            return [sys.executable, "-m", "neurons.cli", "mesh", "serve",
+                    "--mesh", self.mesh_dir] + server_args
         return [sys.executable, "-m", "verallm.api.server"] + server_args
 
     @staticmethod
@@ -2313,6 +2401,14 @@ def parse_args():
     auth.add_argument("--private-key", default=None,
                       help="EVM private key (Anvil — skips bittensor wallet)")
 
+    # Mesh runtime (GGUF mesh coordinator instead of the vLLM server)
+    mesh_group = parser.add_argument_group("mesh")
+    mesh_group.add_argument("--mesh-dir", default=None,
+                            help="Path to a mesh directory created by 'verathos mesh create'. "
+                                 "Runs the GGUF-mesh coordinator instead of the vLLM server; "
+                                 "requires explicit --model-id. Arguments after -- are "
+                                 "forwarded to 'mesh serve'.")
+
     # Model selection (auto or explicit, with cascading fallback)
     add_model_args(parser)
 
@@ -2616,12 +2712,24 @@ def _clear_stale_compile_caches(
     return True
 
 
+def _should_clear_stale_compile_caches(args) -> bool:
+    """Only the vLLM runtime owns torch/triton compilation caches.
+
+    A GGUF mesh coordinator neither consumes nor owns those directories.  In
+    particular, it must not delete shared-host cache paths as a side effect of
+    starting an isolated mesh process.
+    """
+
+    return not bool(getattr(args, "mesh_dir", None))
+
+
 def main():
     from neurons.log import setup_neuron_logging, print_banner
 
     args, server_args = parse_args()
     setup_neuron_logging(args)
-    _clear_stale_compile_caches()
+    if _should_clear_stale_compile_caches(args):
+        _clear_stale_compile_caches()
 
     # The updater executing the first v1 -> v3 fast-forward is still the old
     # in-memory module and cannot install a newly introduced CUDA wheel.  The
@@ -2650,17 +2758,52 @@ def main():
     if getattr(args, "capacity_audit", False):
         config.capacity_audit_enabled = True
 
+    # ── Mesh runtime mode ────────────────────────────────────────
+    mesh_mode = bool(getattr(args, "mesh_dir", None))
+    if mesh_mode:
+        if getattr(args, "auto", False):
+            bt.logging.error("--auto is not supported with --mesh-dir; pass --model-id explicitly")
+            sys.exit(1)
+        if not args.model_id:
+            bt.logging.error("--mesh-dir requires an explicit --model-id (the on-chain mesh model id)")
+            sys.exit(1)
+        if args.tee_enabled:
+            bt.logging.error("--tee-enabled is not supported with --mesh-dir")
+            sys.exit(1)
+        if getattr(config, "capacity_audit_enabled", False):
+            bt.logging.error(
+                "--capacity-audit is not supported with --mesh-dir "
+                "(mesh endpoints are excluded from the vLLM capacity gate)"
+            )
+            sys.exit(1)
+
     # Resolve model configuration (auto or explicit)
-    resolved = resolve_model_config(
-        model_id=args.model_id,
-        quant=args.quant,
-        max_context_len=args.max_context_len,
-        auto=args.auto,
-        category=args.category,
-        chain_config=resolved_chain_path,
-        subtensor_network=args.subtensor_network,
-        capacity_audit_required=bool(getattr(config, "capacity_audit_enabled", False)),
-    )
+    if mesh_mode:
+        # Mesh runtime: the model is a GGUF package registered on-chain under
+        # its own model id; vLLM registry auto-selection does not apply. The
+        # quant string carries the runtime family (gguf_mesh_* prefix).
+        from types import SimpleNamespace
+
+        from neurons.runtime import normalize_mesh_quant
+
+        if args.max_context_len is None:
+            bt.logging.warning("--max-context-len not set for mesh runtime — registering 8192")
+        resolved = SimpleNamespace(
+            model_id=args.model_id,
+            quant=normalize_mesh_quant(args.quant),
+            max_context_len=int(args.max_context_len or 8192),
+        )
+    else:
+        resolved = resolve_model_config(
+            model_id=args.model_id,
+            quant=args.quant,
+            max_context_len=args.max_context_len,
+            auto=args.auto,
+            category=args.category,
+            chain_config=resolved_chain_path,
+            subtensor_network=args.subtensor_network,
+            capacity_audit_required=bool(getattr(config, "capacity_audit_enabled", False)),
+        )
     bt.logging.info(f"Model config: {resolved.model_id} quant={resolved.quant} ctx={resolved.max_context_len}")
 
     try:
@@ -2860,6 +3003,16 @@ def main():
 
     neuron.setup(private_key=args.private_key)
 
+    # ── Endpoint scheme posture ──
+    # Fail before any model load: an http endpoint on mainnet registers a
+    # miner the public proxy will never route.
+    from verallm.chain.config import validate_registration_endpoint_scheme
+    try:
+        validate_registration_endpoint_scheme(args.endpoint, chain_config.chain_id)
+    except ValueError as exc:
+        bt.logging.error(str(exc))
+        sys.exit(1)
+
     # ── Startup banner ──
     network = args.subtensor_network or ("testnet" if chain_config.chain_id == 945 else "mainnet")
     print_banner(
@@ -2878,30 +3031,45 @@ def main():
         auto_update="enabled" if args.auto_update else "disabled",
     )
 
-    # Build server args: always ensure --model and --quant are present
-    if "--model" not in server_args and "--model-id" not in server_args:
-        server_args = [
-            "--model", resolved.model_id,
-            "--quant", resolved.quant,
-        ] + server_args
+    if mesh_mode:
+        # Mesh coordinator invocation: bind the public coordinator and pass
+        # the serving hotkey/EVM identity plus validator authentication.
+        neuron.mesh_dir = args.mesh_dir
+        if "--host" not in server_args:
+            server_args = ["--host", "0.0.0.0"] + server_args
+        if "--port" not in server_args:
+            server_args = server_args + ["--port", "9338"]
+        server_args = _configure_mesh_security_args(
+            args=args,
+            server_args=server_args,
+            evm_address=neuron.evm_addr,
+            evm_private_key=neuron.evm_pk,
+        )
+    else:
+        # Build server args: always ensure --model and --quant are present
+        if "--model" not in server_args and "--model-id" not in server_args:
+            server_args = [
+                "--model", resolved.model_id,
+                "--quant", resolved.quant,
+            ] + server_args
 
-    # Pass EVM identity to server for anti-hijacking (receipt validation + identity challenge)
-    if neuron.evm_addr:
-        server_args.extend(["--evm-address", neuron.evm_addr])
-    if neuron.evm_pk:
-        server_args.extend(["--evm-private-key", neuron.evm_pk])
+        # Pass EVM identity to server for anti-hijacking (receipt validation + identity challenge)
+        if neuron.evm_addr:
+            server_args.extend(["--evm-address", neuron.evm_addr])
+        if neuron.evm_pk:
+            server_args.extend(["--evm-private-key", neuron.evm_pk])
 
-    # Forward log level to server subprocess
-    if getattr(args, "logging.trace", False):
-        server_args.extend(["--log-level", "debug"])  # server has no trace, use debug
-    elif getattr(args, "logging.debug", False):
-        server_args.extend(["--log-level", "debug"])
+        # Forward log level to server subprocess
+        if getattr(args, "logging.trace", False):
+            server_args.extend(["--log-level", "debug"])  # server has no trace, use debug
+        elif getattr(args, "logging.debug", False):
+            server_args.extend(["--log-level", "debug"])
 
-    # Forward chain config and resolved RPC URL so server can self-check roots
-    if args.chain_config and "--chain-config" not in server_args:
-        server_args.extend(["--chain-config", args.chain_config])
-    if chain_config.rpc_url and "--evm-rpc-url" not in server_args:
-        server_args.extend(["--evm-rpc-url", chain_config.rpc_url])
+        # Forward chain config and resolved RPC URL so server can self-check roots
+        if args.chain_config and "--chain-config" not in server_args:
+            server_args.extend(["--chain-config", args.chain_config])
+        if chain_config.rpc_url and "--evm-rpc-url" not in server_args:
+            server_args.extend(["--evm-rpc-url", chain_config.rpc_url])
 
     server_args = _forward_proof_v2_artifacts(
         server_args,
@@ -2958,9 +3126,9 @@ def main():
         except Exception as exc:
             bt.logging.warning(f"Could not clear stale capacity audit state: {exc}")
 
-    # Write validator allowlist before starting server to avoid open-access window.
-    # Only in wallet mode — Anvil mode has no metagraph.
-    if args.wallet:
+    # Write the validator allowlist before either server starts, avoiding an
+    # open-access window. Private-key/Anvil mode has no metagraph to refresh.
+    if _validator_allowlist_refresh_enabled(args):
         try:
             neuron._refresh_validator_allowlist()
         except Exception as e:
@@ -3005,24 +3173,30 @@ def main():
     # that isn't reachable from inside the container. Parse the server's actual
     # port from server_args (mirrors the server's own --port default of 8000).
     local_health_url = f"http://localhost:{_extract_server_port(server_args)}"
-    neuron.wait_for_health(local_health_url, server_args=server_args)
+    # In mesh mode, pass server_args=None: the vLLM Mamba/AWQ exit-code retry
+    # paths do not apply to the mesh coordinator subprocess.
+    neuron.wait_for_health(local_health_url, server_args=None if mesh_mode else server_args)
 
     # Start background refresh loop (periodic updates)
-    if args.wallet:
+    if _validator_allowlist_refresh_enabled(args):
         neuron.start_validator_refresh(interval=300.0)
 
-    # Use actual KV pool from the running server instead of the registry estimate.
-    # After vLLM loads: real capacity = min(kv_pool_tokens, max_model_len).
-    actual_context = neuron.query_actual_max_context(local_health_url)
-    if actual_context is not None:
-        if actual_context != resolved.max_context_len:
-            bt.logging.info(f"On-chain max_context: {actual_context} (actual from vLLM, was {resolved.max_context_len} from registry)")
-        else:
-            bt.logging.info(f"On-chain max_context: {actual_context} (matches registry)")
-        reg_context = actual_context
-    else:
-        bt.logging.warning(f"Could not query actual context from server — using registry value {resolved.max_context_len}")
+    if mesh_mode:
+        # No vLLM KV pool to query — register the declared context length.
         reg_context = resolved.max_context_len
+    else:
+        # Use actual KV pool from the running server instead of the registry estimate.
+        # After vLLM loads: real capacity = min(kv_pool_tokens, max_model_len).
+        actual_context = neuron.query_actual_max_context(local_health_url)
+        if actual_context is not None:
+            if actual_context != resolved.max_context_len:
+                bt.logging.info(f"On-chain max_context: {actual_context} (actual from vLLM, was {resolved.max_context_len} from registry)")
+            else:
+                bt.logging.info(f"On-chain max_context: {actual_context} (matches registry)")
+            reg_context = actual_context
+        else:
+            bt.logging.warning(f"Could not query actual context from server — using registry value {resolved.max_context_len}")
+            reg_context = resolved.max_context_len
 
     if getattr(config, "capacity_audit_enabled", False):
         if on_chain_models is None:

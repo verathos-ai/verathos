@@ -98,6 +98,13 @@ class SubnetConfigClient:
         "16d3898c5e5da85792e8f0229f6544dd41a53713cbfc84c4f84fc3b1050d9b64"
     )
 
+    # Pre-computed key: keccak256("mesh_enabled"). Mainnet validators and
+    # proxies require this owner-controlled flag before admitting the mesh
+    # lane. The unset/default value is deliberately false.
+    MESH_ENABLED_KEY = bytes.fromhex(
+        "2b72e7d9a147d8592974ae227b68e786717ecf8fe2aeece4961936afe98321f6"
+    )
+
     def is_tee_enabled_on_subnet(self) -> bool:
         """Check if TEE is enabled on this subnet (cached 5min).
 
@@ -105,6 +112,11 @@ class SubnetConfigClient:
         The subnet owner sets this to true when TEE is ready for production.
         """
         return self.get_feature_flag(self.TEE_ENABLED_KEY)
+
+    def is_mesh_enabled_on_subnet(self) -> bool:
+        """Return the owner-controlled mesh admission flag (cached 5min)."""
+
+        return self.get_feature_flag(self.MESH_ENABLED_KEY)
 
     # ── Feature flags ───────────────────────────────────────────
 

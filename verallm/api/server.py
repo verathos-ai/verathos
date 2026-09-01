@@ -6584,7 +6584,12 @@ def startup(args):
                             )
                         root_finalizers = tuple(
                             item
-                            for wrapper in root_wrappers
+                            # The shared dense reducer is owned by the final
+                            # decoder wrapper, which may not own a root slice
+                            # when only projection/attention stages are signed.
+                            # Finalizer discovery is therefore independent of
+                            # root-buffer ownership.
+                            for wrapper in capture_wrappers
                             for finalizer_source in (
                                 getattr(
                                     wrapper,

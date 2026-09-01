@@ -1,0 +1,75 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 00d763de0..3cef6620b 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1322,12 +1322,46 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors,
+     tensors.push_back(serialize_tensor(tensor));
+ }
+ 
+-static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
+-    uint32_t n_nodes = cgraph->n_nodes;
++// A pure view node whose storage lives on ANOTHER server (or on the host)
++// cannot be materialized remotely: its data pointer is meaningless there and
++// the member rejects the graph at create_node ("invalid data ptr"). Such
++// nodes are dead weight in this split anyway - views execute nowhere, and
++// consumers on the owning server receive them through src recursion. The
++// scheduler leaves them in the split range because it skips view ops when
++// choosing split boundaries (deepseek4 CSA state views at layer boundaries
++// are the live case).
++static bool rpc_node_is_foreign_view(const std::shared_ptr<socket_t> & sock, const ggml_tensor * node) {
++    const bool is_view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
++        node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
++    if (!is_view_op) {
++        return false;
++    }
++    const ggml_tensor * base = node->view_src ? node->view_src : node;
++    ggml_backend_buffer_t buf = base->buffer;
++    if (buf == nullptr) {
++        return false;
++    }
++    if (!ggml_backend_buffer_is_rpc(buf)) {
++        return true;
++    }
++    ggml_backend_rpc_buffer_context * buf_ctx = (ggml_backend_rpc_buffer_context *)buf->context;
++    return buf_ctx->sock.get() != sock.get();
++}
++
++static void serialize_graph(uint32_t device, const std::shared_ptr<socket_t> & sock, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
++    std::vector<ggml_tensor *> nodes;
++    nodes.reserve(cgraph->n_nodes);
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        if (rpc_node_is_foreign_view(sock, cgraph->nodes[i])) {
++            continue;
++        }
++        nodes.push_back(cgraph->nodes[i]);
++    }
++    uint32_t n_nodes = nodes.size();
+     std::vector<rpc_tensor> tensors;
+     std::unordered_set<ggml_tensor*> visited;
+     for (uint32_t i = 0; i < n_nodes; i++) {
+-        add_tensor(cgraph->nodes[i], tensors, visited);
++        add_tensor(nodes[i], tensors, visited);
+     }
+     // serialization format:
+     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+@@ -1340,7 +1374,7 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
+     memcpy(dest, &n_nodes, sizeof(n_nodes));
+     dest += sizeof(n_nodes);
+     for (uint32_t i = 0; i < n_nodes; i++) {
+-        memcpy(dest + i * sizeof(uint64_t), &cgraph->nodes[i], sizeof(uint64_t));
++        memcpy(dest + i * sizeof(uint64_t), &nodes[i], sizeof(uint64_t));
+     }
+     dest += n_nodes * sizeof(uint64_t);
+     memcpy(dest, &n_tensors, sizeof(n_tensors));
+@@ -1364,9 +1398,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+         RPC_STATUS_ASSERT(status);
+     } else {
+         rpc_dev_ctx->last_graph_uid = cgraph->uid;
+-        std::vector<uint8_t> input;
+-        serialize_graph(rpc_ctx->device, cgraph, input);
+         auto sock = get_socket(rpc_ctx->endpoint);
++        std::vector<uint8_t> input;
++        serialize_graph(rpc_ctx->device, sock, cgraph, input);
+         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+         RPC_STATUS_ASSERT(status);
+     }

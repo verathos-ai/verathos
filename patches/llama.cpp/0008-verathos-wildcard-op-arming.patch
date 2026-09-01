@@ -1,0 +1,91 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 14f854b22..050e90c1f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -571,10 +571,18 @@ static void verathos_cuda_parse_selected_ops(const std::string & token) {
+         while (pos < token.size() && (token[pos] == ' ' || token[pos] == '\t' || token[pos] == ',')) {
+             ++pos;
+         }
+-        if (pos >= token.size() || token[pos] < '0' || token[pos] > '9') {
++        // '*' as the graph ordinal arms the intra for EVERY graph in the
++        // window (ord-agnostic). Real replay graph ordinals drift from the
++        // committed layout whenever the scheduler splits a pass into extra
++        // subgraphs (rpc view-boundary splits, hyper-connection islands),
++        // so exact ord:intra pairs miss the very instances the audit needs.
++        bool wildcard_graph = false;
++        if (pos < token.size() && token[pos] == '*') {
++            wildcard_graph = true;
++        } else if (pos >= token.size() || token[pos] < '0' || token[pos] > '9') {
+             break;
+         }
+-        size_t end = pos;
++        size_t end = wildcard_graph ? pos + 1 : pos;
+         while (end < token.size() && token[end] >= '0' && token[end] <= '9') {
+             ++end;
+         }
+@@ -583,10 +591,14 @@ static void verathos_cuda_parse_selected_ops(const std::string & token) {
+         }
+         int64_t graph_value = 0;
+         int64_t intra_value = 0;
+-        try {
+-            graph_value = std::stoll(token.substr(pos, end - pos));
+-        } catch (...) {
+-            break;
++        if (wildcard_graph) {
++            graph_value = -1;
++        } else {
++            try {
++                graph_value = std::stoll(token.substr(pos, end - pos));
++            } catch (...) {
++                break;
++            }
+         }
+         pos = end + 1;
+         end = pos;
+@@ -615,6 +627,26 @@ static bool verathos_cuda_should_dump_selected_op(int64_t graph_sequence, int64_
+     return false;
+ }
+ 
++// Wildcard-armed dump decision: exact ord:intra pairs dump any shape;
++// '*'-armed intras dump only small-row instances (decode steps and
++// per-token structure) so an armed window cannot be made to dump whole
++// prefill activations for every graph.
++static bool verathos_cuda_should_dump_selected_op_rows(
++        int64_t graph_sequence, int64_t intra_index, int64_t src1_rows) {
++    for (const auto & item : verathos_cuda_selected_ops) {
++        if (item.second != intra_index) {
++            continue;
++        }
++        if (item.first == graph_sequence) {
++            return true;
++        }
++        if (item.first < 0 && src1_rows <= 8) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static bool verathos_cuda_should_dump_manifest_index(int64_t manifest_index) {
+     if (!verathos_cuda_selected_manifest_indexes.empty()) {
+         for (int64_t selected : verathos_cuda_selected_manifest_indexes) {
+@@ -1533,7 +1565,8 @@ static void verathos_cuda_try_dump_mul_mat_trace(
+     // that the verifier checks against. It also keeps two experts of one 3-D
+     // MoE tensor in separate streams rather than merged into one.
+     const bool selected_op_dump = !verathos_cuda_selected_ops.empty() &&
+-        verathos_cuda_should_dump_selected_op(verathos_cuda_graph_sequence, intra_graph_index);
++        verathos_cuda_should_dump_selected_op_rows(
++            verathos_cuda_graph_sequence, intra_graph_index, src1->ne[1]);
+     const bool anchor_instance_selected =
+         selected_op_dump ||
+         verathos_cuda_should_dump_manifest_index(manifest_index);
+@@ -3700,7 +3733,8 @@ static void verathos_cuda_try_dump_mul_mat_id_trace(ggml_backend_cuda_context &
+     // A small budget of routed-pair witnesses is enough for the verifier to
+     // challenge expert GEMMs. Selected-op second pass still honored.
+     const bool selected_op_dump = !verathos_cuda_selected_ops.empty() &&
+-        verathos_cuda_should_dump_selected_op(verathos_cuda_graph_sequence, intra_graph_index);
++        verathos_cuda_should_dump_selected_op_rows(
++            verathos_cuda_graph_sequence, intra_graph_index, src1->ne[1]);
+     // Replay arming by MANIFEST INDEX (the witness-replay path): a beacon-
+     // selected expert op is re-captured exactly like a dense op. Without
+     // this the replay re-dumped only dense ops, so a selected MUL_MAT_ID

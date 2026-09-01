@@ -37,12 +37,11 @@ resolve_miner_runtime_stack() {
     if [ "$gpu_sm" -lt 89 ]; then
         printf '%s\n' 'ampere-cu128|0.19.1|2.10.0+cu128|12.8|cu128'
     elif [ "$driver_major" -ge 580 ]; then
-        # vLLM 0.20.2's published binary is CUDA 13-linked, on EVERY
-        # sm_89+ arch - an Ada card forced onto cu128 torch imports vLLM
-        # against a libcudart.so.13 that a clean image does not have and
-        # dies in a pointless source rebuild (live 2026-08-18, RTX 4090
-        # on driver 595). Any sm_89+ host with a CUDA 13-capable driver
-        # gets the coherent CUDA 13 stack.
+        # vLLM 0.20.2's published binary is CUDA 13-linked on every sm_89+
+        # architecture. Pairing it with cu128 torch requires a CUDA 13 runtime
+        # that a clean CUDA 12.8 image does not provide and cannot be repaired
+        # by rebuilding the local package. Any sm_89+ host with a CUDA
+        # 13-capable driver therefore gets the coherent CUDA 13 stack.
         printf '%s\n' 'hopper-blackwell-cu130|0.20.2|2.11.0+cu130|13.0|cu130'
     else
         # sm_89+ on a pre-CUDA-13 driver cannot run vLLM 0.20.2's binary
@@ -576,8 +575,28 @@ warm_hopper_gdn_kernel() {
         return 1
     fi
 
+    local gdn_nvlib gdn_lib_path
+    # The final link must see the SAME toolchain's runtime libraries the
+    # pip-shipped nvcc compiled against, or it dies on
+    # "cannot find -lcudart".
+    gdn_lib_path=""
+    for gdn_nvlib in "$VENV_DIR"/lib/python*/site-packages/nvidia/*/lib; do
+        [ -d "$gdn_nvlib" ] && gdn_lib_path="$gdn_nvlib:$gdn_lib_path"
+    done
+    # A killed build leaves a lock file that every later module load
+    # waits on forever. With no live build process the lock is garbage.
+    if ! pgrep -x ninja >/dev/null 2>&1 && ! pgrep -f "flashinfer" >/dev/null 2>&1; then
+        rm -f "$HOME"/.cache/flashinfer/*/*/cached_ops/tmp/*.lock 2>/dev/null || true
+    fi
+    # A cold cache legitimately needs tens of minutes at bounded
+    # parallelism; a warm cache loads in seconds. The timeout guards a
+    # hang, not the build.
     echo "  Warming the FlashInfer H100 GDN kernel (MAX_JOBS=$GDN_JOBS, ${MEM_GB:-unknown}GB RAM)..."
-    if ! timeout 1200 env MAX_JOBS="$GDN_JOBS" "$PYTHON" - <<'PY'
+    if ! timeout "${VERATHOS_GDN_WARMUP_TIMEOUT_S:-2700}" env \
+        MAX_JOBS="$GDN_JOBS" \
+        LIBRARY_PATH="${gdn_lib_path}${LIBRARY_PATH:-}" \
+        LD_LIBRARY_PATH="${gdn_lib_path}${LD_LIBRARY_PATH:-}" \
+        "$PYTHON" - <<'PY'
 import torch
 from flashinfer.gdn_prefill import get_gdn_prefill_module
 
@@ -1314,7 +1333,7 @@ PY
         $PYTHON -m pip install --no-build-isolation --no-cache-dir "gptqmodel>=0.9,<6.0" 2>&1 | tail -10 || {
             echo "  WARNING: gptqmodel install failed — GPTQ models will not be available."
             echo "  (Non-fatal; AWQ/fp16/fp8 models still work. Retry manually if needed:"
-            echo "   VERATHOS_INSTALL_GPTQMODEL=1 bash scripts/public_overlay/setup_miner.sh)"
+            echo "   VERATHOS_INSTALL_GPTQMODEL=1 bash scripts/setup_miner.sh)"
         }
         # Restore deps that gptqmodel upgraded beyond vLLM's constraints.
         # gptqmodel works fine at runtime with these pinned versions.
@@ -1393,8 +1412,8 @@ except Exception as e:
     # verify with "Python version mismatch" even though the wheel install
     # is fine.  Wipe ALL source-tree .so AND .so.torch* alternates here —
     # the wheel install in site-packages is the authoritative source.
-    # Public deploys won't have these (gitignored + excluded by
-    # sync_to_public.sh), but private-repo rsyncs can carry them along.
+    # Release checkouts don't ship these, but manual rsyncs of a dev tree
+    # can carry stray copies along.
     if [ -d "${REPO_DIR}/zkllm/cuda" ]; then
         find "${REPO_DIR}/zkllm/cuda" -maxdepth 1 \( \
             -name "zkllm_native.cpython-*.so" -o \

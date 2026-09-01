@@ -1,0 +1,51 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 87bb2b2c8..14f854b22 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3671,12 +3671,12 @@ static void verathos_cuda_try_dump_mul_mat_id_trace(ggml_backend_cuda_context &
+     if (src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1]) {
+         return;
+     }
+-    // Prefill only: decode runs under CUDA graph capture where the dump's
+-    // synchronizing copies are illegal. Prefill is eager and proves the same
+-    // (committed) expert weights, so decode capture is unnecessary.
+-    if (dst->ne[2] <= 1) {
+-        return;
+-    }
++    // Decode-shaped expert ops MUST enter the intra numbering: skipping them
++    // shifted the intra index of every later op between prefill and decode
++    // graphs on MoE models, so armed slot-view indexes never matched a decode
++    // instance ("no single-row decode instance captured"). They are counted
++    // like any dim-valid op; heavy dumps below stay armed-window-only.
++    const bool verathos_mmid_decode_shaped = dst->ne[2] <= 1;
+ 
+     const int64_t intra_graph_index = verathos_cuda_intra_graph_index++;
+     verathos_cuda_graph_dim_valid_ops++;
+@@ -3719,6 +3719,12 @@ static void verathos_cuda_try_dump_mul_mat_id_trace(ggml_backend_cuda_context &
+             return;
+         }
+     }
++    if (verathos_mmid_decode_shaped && !selected_op_dump && !manifest_selected_dump) {
++        // Unarmed decode-shaped instances keep the pre-fix behavior: rows
++        // only, no witness dump (decode normally replays a CUDA graph and
++        // never reaches this hook anyway).
++        return;
++    }
+     if (!selected_op_dump && !manifest_selected_dump) {
+         static int64_t verathos_mmid_budget = -1;
+         if (verathos_mmid_budget < 0) {
+@@ -6058,11 +6064,9 @@ static void verathos_cuda_emit_replay_manifest_rows(int device, const ggml_cgrap
+             if (src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1]) {
+                 continue;
+             }
+-            // Decode-shaped expert ops are skipped before counting in the op
+-            // hook as well; only prefill-shaped ops enter the numbering.
+-            if (dst->ne[2] <= 1) {
+-                continue;
+-            }
++            // Decode-shaped expert ops enter the numbering exactly like the
++            // op hook counts them (intra parity between prefill and decode
++            // graphs is what slot-view arming relies on).
+             const int64_t intra_graph_index = verathos_cuda_intra_graph_index++;
+             verathos_cuda_graph_dim_valid_ops++;
+             const int64_t now_ns = verathos_cuda_unix_ns();

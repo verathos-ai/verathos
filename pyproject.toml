@@ -26,6 +26,10 @@ dependencies = [
     "torch>=2.0",
     "numpy>=1.24",
     "blake3>=0.3",
+    # 0.19+ required: 0.18's grouped-row dequant is broken under numpy 2.x
+    # (segfault / "axis remapping" on 3-D MoE expert tensors). Needed by the
+    # GGUF mesh manifest/verification path (verallm/mesh).
+    "gguf>=0.19",
     "zstandard>=0.22,<1",
     # zkllm is installed from the local dist/ wheel (not on PyPI).
     # Run: pip install dist/zkllm-*.whl (setup_miner.sh does this automatically)
@@ -50,6 +54,18 @@ training = [
 quantization = [
     "bitsandbytes>=0.42",
     "gptqmodel>=0.9",
+]
+test = [
+    # Everything the exported test subset needs on a fresh box:
+    #   pip install -e ".[test]" && python -m pytest tests/...
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "anyio>=4",
+    "eth-account>=0.10",
+    "httpx>=0.27",
+    "bittensor>=10,<11",
+    "transformers>=4.30",
+    "web3>=6",
 ]
 hashing = [
     # blake3 is now a core dependency — this extra is kept for backwards

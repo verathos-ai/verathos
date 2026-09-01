@@ -54,6 +54,13 @@ class ChainConfig:
     proof_v3_artifact_base_urls: tuple[str, ...] = ()
     proof_v3_artifact_cache_dir: str = ""
 
+    # Content-addressed mesh tensor-manifest distribution (same style and,
+    # by default, the same hosting directory as the GLEIPNIR artifact
+    # store: the two stores use different index filenames, so they coexist
+    # under one base URL). Discovery metadata only; every download is
+    # verified against the on-chain committed tensor manifest root.
+    mesh_manifest_base_urls: tuple = ()
+
     # EVM private key for signing transactions (hex string, no 0x prefix)
     evm_private_key: str = ""
 
@@ -109,6 +116,16 @@ class ChainConfig:
         _validate_address(self.validator_registry_address, "validator_registry_address")
         _validate_address(self.checkpoint_registry_address, "checkpoint_registry_address")
         _validate_address(self.subnet_config_address, "subnet_config_address")
+        urls = self.mesh_manifest_base_urls
+        if isinstance(urls, str):
+            raise ValueError("mesh_manifest_base_urls must be a list of URLs")
+        urls = tuple(str(url).strip().rstrip("/") for url in (urls or ()))
+        for url in urls:
+            if not url.startswith(("https://", "http://")):
+                raise ValueError(
+                    f"mesh_manifest_base_urls entries must be http(s): {url!r}"
+                )
+        object.__setattr__(self, "mesh_manifest_base_urls", urls)
 
     def require_addresses(self) -> None:
         """Raise if contract addresses are not configured.
@@ -276,3 +293,28 @@ class ChainConfig:
             data = json.load(f)
         data.update(overrides)
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+MAINNET_CHAIN_ID = 964
+
+
+def validate_registration_endpoint_scheme(endpoint: str, chain_id: object) -> None:
+    """Refuse plain-http registration endpoints on mainnet.
+
+    The public mainnet proxy only routes https endpoints, so an http
+    registration produces a miner the validators score but no user can
+    ever reach — an invisible-to-traffic state the operator cannot
+    diagnose from their side. Refusing at registration keeps that state
+    unrepresentable. Test networks keep accepting http: their fleets run
+    inside trusted rigs and endpoint TLS adds nothing to the proofs.
+    """
+    try:
+        is_mainnet = int(chain_id) == MAINNET_CHAIN_ID
+    except (TypeError, ValueError):
+        is_mainnet = False
+    if is_mainnet and not str(endpoint or "").strip().lower().startswith("https://"):
+        raise ValueError(
+            "mainnet registration requires an https:// endpoint "
+            f"(got {endpoint!r}): front the miner with TLS "
+            "(scripts/setup_https.sh) and register the https URL"
+        )

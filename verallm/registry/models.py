@@ -22,6 +22,7 @@ Usage::
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 
@@ -828,11 +829,11 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
     # ----------------------------------------------------------------
     # GPT-oss — OpenAI open-weight MoE models (Apache 2.0)
     # ----------------------------------------------------------------
-    #
+
     # Both ship with native MXFP4 quantization (MoE experts 4.25 bits,
     # attention/norms in bf16).  AWQ-w4a16 community quants also
     # available for the 120b for wider hardware compatibility.
-    #
+
 
     ModelEntry(
         id="gpt-oss-20b",
@@ -914,11 +915,11 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
     # ----------------------------------------------------------------
     # Ministral 3 — Mistral dense edge models (Apache 2.0)
     # ----------------------------------------------------------------
-    #
+
     # Ship natively in FP8 format.  All variants have vision (image)
     # capabilities.  Reasoning variants also available on HuggingFace
     # (Ministral-3-{8,14}B-Reasoning-2512).
-    #
+
 
     ModelEntry(
         id="ministral-3-8b",
@@ -1437,13 +1438,13 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
     # ================================================================
     # Qwen3.5 — Multimodal MoE/Dense with GDN hybrid attention
     # ================================================================
-    #
+
     # All Qwen3.5 models are natively multimodal (text + image + video)
     # with Gated Delta Networks (GDN) hybrid attention — 3:1 ratio of
     # linear attention (O(1) KV per layer) to standard attention.
     # This reduces real KV cache to ~1/4 of standard transformers,
     # so context estimates below are conservative (vLLM day-0 support).
-    #
+
 
     ModelEntry(
         id="qwen3.5-35b-a3b",
@@ -1740,12 +1741,12 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
     # ================================================================
     # Gemma 4 — Google's best open models (Apache 2.0)
     # ================================================================
-    #
+
     # Four sizes: E2B (2B), E4B (4B), 26B A4B MoE, 31B Dense.
     # Hybrid attention: sliding window (1024 tokens) + global attention.
     # Multimodal (text + image + video).  Released April 2, 2026.
     # Requires vLLM >= 0.19.0.
-    #
+
 
     ModelEntry(
         id="gemma-4-26b-a4b",
@@ -1835,12 +1836,12 @@ ALL_MODELS: tuple[ModelEntry, ...] = (
     # ================================================================
     # Qwen3.6 — Improved MoE/Dense with GDN hybrid attention
     # ================================================================
-    #
+
     # Successor to Qwen3.5.  Same GDN hybrid attention architecture
     # (3:1 linear-to-standard ratio), but with improved training —
     # benchmarks ~3-5% above Qwen3.5 counterparts across the board.
     # Multimodal (text + image + video).  Requires vLLM >= 0.19.0.
-    #
+
 
     ModelEntry(
         id="qwen3.6-35b-a3b",
@@ -2773,3 +2774,629 @@ def get_presets_grouped(
     for p in presets:
         groups.setdefault(p.category, []).append(p)
     return groups
+
+
+# ---------------------------------------------------------------------------
+# Mesh GGUF catalogue
+#
+# Every model the subnet owner registers on the mesh ModelSpec MUST have an
+# entry here (scripts/REGISTER_NEW_MODEL.md): the on-chain spec carries
+# verification anchors only, so the DOWNLOAD SOURCE and the SCORE FACTS live
+# in this catalogue. It is network-independent — the same catalogue serves
+# testnet and mainnet; the chain only decides which entries are active.
+# A ModelSpec-registered model missing here is a catalogue bug and surfaces
+# as exactly that in the operator tooling.
+
+# Quality penalty per GGUF scheme (1.0 = lossless), anchored to the
+# validator-aligned QUANT_QUALITY table above: q8_0 sits at the int8
+# anchor (0.95), q4_k_m at the int4 anchor (0.90) — the values the
+# validator actually pays on — with the rest of the ladder interpolated
+# from measured perplexity degradation of llama.cpp quants.
+GGUF_QUANT_QUALITY: dict[str, float] = {
+    # unsloth UD "XL" dynamic composites keep attention/dense layers at
+    # higher precision than their base class, so each sits a step above
+    # the plain quant of the same name.
+    "q8_k_xl": 0.96,
+    "q4_k_xl": 0.91,
+    "q3_k_xl": 0.85,
+    "q2_k_xl": 0.72,
+    "q8_0": 0.95,
+    "q6_k": 0.93,
+    "q5_k_m": 0.92, "q5_k_s": 0.91, "q5_0": 0.90, "q5_1": 0.90,
+    "q4_k_m": 0.90, "q4_k_s": 0.89, "iq4_nl": 0.89, "iq4_xs": 0.88,
+    "q4_0": 0.87, "q4_1": 0.87,
+    "q3_k_l": 0.83, "q3_k_m": 0.82, "iq3_m": 0.81, "q3_k_s": 0.80,
+    "iq3_xs": 0.79, "iq3_xxs": 0.77,
+    "q2_k": 0.68, "iq2_m": 0.64, "iq2_xs": 0.60, "iq2_xxs": 0.56,
+    "iq1_m": 0.45, "iq1_s": 0.40,
+}
+
+
+def gguf_quant_quality(scheme: str) -> float:
+    return GGUF_QUANT_QUALITY.get(str(scheme).strip().lower(), 0.80)
+
+
+@dataclass(frozen=True)
+class MeshQuantVariant:
+    """One registered quant of a mesh model: its on-chain id and files.
+
+    Different quants are physically different GGUF files, so the file
+    names and byte size are per-variant; everything else (source repo,
+    quality facts) lives once on the model entry.
+    """
+
+    mesh_model_id: str
+    gguf_scheme: str
+    hf_files: tuple[str, ...]
+    model_bytes: int
+    hf_repo: str = ""  # override only when this quant lives in another repo
+    # Layer count override (0 = inherit the entry's). Quants of one family
+    # can be cut from different base builds with different layer counts,
+    # and the chain-bound launch refuses a mesh whose local GGUF layer
+    # count differs from the registered spec, so the catalogue must carry
+    # the per-file truth.
+    layers: int = 0
+    # Owner-built tensor-manifest root (hex). When set, a driver fetching
+    # this model DOWNLOADS the manifest from the gleipnir store instead of
+    # rebuilding it locally — a rebuild on any miner is always a bug
+    # (broken fetch path); it also wedged outright on a box whose native
+    # hasher deadlocks.
+    tensor_manifest_root: str = ""
+
+
+@dataclass(frozen=True)
+class MeshModelEntry:
+    """Catalogue facts for one mesh model, shared across its quants.
+
+    ``registry_model_id`` links the quality facts (params, generation
+    quality, context) to the main vLLM catalogue above; mesh-only models
+    carry explicit overrides instead. Deliberately NOT a ModelEntry so
+    mesh models can never leak into vLLM miner auto-selection.
+    """
+
+    hf_repo: str
+    layers: int
+    quants: tuple[MeshQuantVariant, ...]
+    registry_model_id: str = ""
+    quality_params_b: float = 0.0
+    generation_quality: float = 1.0
+    # Packaged fallback chat template (filename under
+    # verallm/registry/chat_templates/) for families whose base repo
+    # tokenizer ships none - the GGUF metadata is authoritative and this
+    # is a committed copy of it.
+    chat_template_asset: str = ""
+    native_context_len: int = 32_768
+    # Largest context the SERVING RUNTIME provably handles for this family
+    # (0 = the native length). The KV auto-fit measures MEMORY, not
+    # correctness: a runtime bug past a position threshold produces
+    # degenerate output that light proofs happily verify, and a mesh
+    # registered at the memory fit would fail every full-context canary.
+    # Deploys pin the
+    # launch and refuse to register beyond this cap.
+    serving_context_cap: int = 0
+    # Where a TOKENIZER for this family loads from. GGUF repos embed the
+    # tokenizer in the model file and usually ship no tokenizer.json, so
+    # validator-side canary prompt construction (which tokenizes with
+    # AutoTokenizer, never downloads model weights) needs the base model
+    # repo. Same vocab as the GGUF-embedded tokenizer by construction.
+    tokenizer_hf_repo: str = ""
+    # Superseded by a newer release: still resolvable (running meshes,
+    # fetches, scoring) but never offered for new launches.
+    retired: bool = False
+
+
+MESH_MODELS: tuple[MeshModelEntry, ...] = (
+    MeshModelEntry(
+        hf_repo="Qwen/Qwen2.5-7B-Instruct-GGUF",
+        tokenizer_hf_repo="Qwen/Qwen2.5-7B-Instruct",
+        layers=28,
+        registry_model_id="qwen2.5-7b-instruct",
+        # Superseded by qwen3.5-9b and removed from the chain registry; kept so
+        # running meshes and old receipts keep resolving, never offered
+        # for new launches.
+        retired=True,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="qwen2.5-7b-q4-k-m",
+                gguf_scheme="q4_k_m",
+                hf_files=(
+                    "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+                    "qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf",
+                ),
+                model_bytes=4_683_073_632,
+                tensor_manifest_root="aa9bcf7880df991d438db213015edf46d3844836afdc7de776154f53caaf8861",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        hf_repo="unsloth/Qwen3.6-27B-GGUF",
+        tokenizer_hf_repo="Qwen/Qwen3.6-27B",
+        layers=64,
+        registry_model_id="qwen3.6-27b",
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="qwen3.6-27b-q4-k-m",
+                gguf_scheme="q4_k_m",
+                hf_files=("Qwen3.6-27B-Q4_K_M.gguf",),
+                model_bytes=16_817_244_384,
+                tensor_manifest_root="b646e1e7ded3fdbf37cbe476017187b7aedea9874369f89534e255be763ea12b",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        # Qwen3.8-27B: dense 27B successor of Qwen3.6-27B on the same
+        # qwen35 GGUF architecture (48 GDN linear layers + 16 full-attn,
+        # supported at the pinned llama.cpp base, no bump needed). KV is
+        # cheap on the hybrid arch (~64 KiB/token: 16 full-attn layers x
+        # 4 KV heads x 256 dim), so context is probe-gated per box, not
+        # memory-capped here. Two rungs per the qwen3.5-9b convention:
+        # UD-Q4_K_XL primary (Dynamic-V3 quality in the 4090 footprint),
+        # plain Q6_K quality rung (q6_k_xl has no GGUF_QUANT_QUALITY
+        # entry and would misprice at the 0.80 default). Keep f16 KV:
+        # quantized KV is broken on qwen35 hybrid upstream; no YaRN flags
+        # (rope-scale 4 crashes near 520k prefill upstream); MTP decode
+        # stays off (open CUDA lockups upstream).
+        hf_repo="unsloth/Qwen3.8-27B-GGUF",
+        tokenizer_hf_repo="Qwen/Qwen3.8-27B",
+        layers=65,
+        registry_model_id="qwen3.8-27b",
+        native_context_len=262_144,
+        # No logical vLLM catalogue entry yet, so the dense-equivalent
+        # params ride here explicitly (the ornith/glm mesh-only pattern).
+        quality_params_b=27.0,
+        # Newer generation than qwen3.6 (1.10) and ornith-1.0 (1.0).
+        # 1.15 matches main's logical catalogue entry (302e23a4, test-
+        # asserted "bounded quality premium"), so scoring is identical
+        # before and after the main merge resolves this via get_model().
+        generation_quality=1.15,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="qwen3.8-27b-q4-k-m",
+                gguf_scheme="q4_k_m",
+                hf_files=("Qwen3.8-27B-UD-Q4_K_M.gguf",),
+                model_bytes=16_464_440_224,
+                # The dynamic-quant build is cut from a 64-layer base while
+                # the family's other quants keep 65.
+                layers=64,
+                tensor_manifest_root="de3d2acd111777f93044ca384eb09e89a4118115494a5cd6f0f734b2d2d80359",
+            ),
+            MeshQuantVariant(
+                mesh_model_id="qwen3.8-27b-q4-k-xl",
+                gguf_scheme="q4_k_xl",
+                hf_files=("Qwen3.8-27B-UD-Q4_K_XL.gguf",),
+                model_bytes=17_923_394_624,
+                tensor_manifest_root="d079844f338dde253369fb768c24a3fb5cbf610e6323432e1a2bd8f7a514f529",
+            ),
+            MeshQuantVariant(
+                mesh_model_id="qwen3.8-27b-q6-k",
+                gguf_scheme="q6_k",
+                hf_files=("Qwen3.8-27B-Q6_K.gguf",),
+                model_bytes=22_884_408_288,
+                tensor_manifest_root="2e606f6e8e30af3b020017a5cb8423f0b92937bb8940558be17c5dda43c48cd1",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        # Community uncensored finetune of Qwen3.8-27B: identical
+        # architecture (65 layers, same tokenizer), different weights, so
+        # it is its own family with its own tensor roots. Serving mirrors
+        # the base entry's constraints (quantized-KV broken upstream, no
+        # YaRN flags, MTP decode off).
+        hf_repo="JonathanColetti/Qwen3.8-27B-Uncensored-GGUF",
+        tokenizer_hf_repo="Qwen/Qwen3.8-27B",
+        layers=65,
+        registry_model_id="qwen3.8-27b-uncensored",
+        native_context_len=262_144,
+        quality_params_b=27.0,
+        # Community fine-tune of qwen3.8: a 0.05 notch under the official
+        # base (mirrors main's abliterated pattern), still above ornith.
+        generation_quality=1.10,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="qwen3.8-27b-uncensored-q4-k-m",
+                gguf_scheme="q4_k_m",
+                hf_files=("Qwen3.8-27B-Uncensored-Q4_K_M.gguf",),
+                model_bytes=16_810_714_528,
+                tensor_manifest_root="dd4f8ff536844cb75fbab40b1f4c688478096b9ba6aa02374e13f35aaef13fdc",
+            ),
+            MeshQuantVariant(
+                mesh_model_id="qwen3.8-27b-uncensored-q6-k",
+                gguf_scheme="q6_k",
+                hf_files=("Qwen3.8-27B-Uncensored-Q6_K.gguf",),
+                model_bytes=22_430_999_968,
+                tensor_manifest_root="141915c0335f2d8633ddf24c1922d48d555038504d29d7c9eb715c392987d4d2",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        hf_repo="unsloth/Qwen3.6-35B-A3B-GGUF",
+        tokenizer_hf_repo="Qwen/Qwen3.6-35B-A3B",
+        layers=40,
+        registry_model_id="qwen3.6-35b-a3b",
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="qwen3.6-35b-a3b-q4-k-m",
+                gguf_scheme="q4_k_m",
+                hf_files=("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",),
+                model_bytes=22_134_528_992,
+                tensor_manifest_root="6ab0dac8b2365a423c3a106b73658a49332001a1c01848bdcda692fa807104a1",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        # Testnet fast-test model replacing qwen2.5-7b: same architecture
+        # generation as the production Qwen3.x models so test results
+        # transfer, small enough for 16GB-VRAM boxes. Two rungs on purpose:
+        # the UD-Q4_K_XL matches the glm-5.2 production quant convention,
+        # the plain Q6_K is the calibrated higher-quality rung (the UD
+        # Q6_K_XL is deliberately NOT used: q6_k_xl has no entry in
+        # GGUF_QUANT_QUALITY and would misprice at the 0.80 default).
+        hf_repo="unsloth/Qwen3.5-9B-GGUF",
+        tokenizer_hf_repo="Qwen/Qwen3.5-9B",
+        layers=32,
+        registry_model_id="qwen3.5-9b",
+        native_context_len=262_144,
+        # No static cap: the deploy pipeline's full-window probes gate the
+        # real serving context per worker, which is the only honest limit.
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="qwen3.5-9b-q4-k-xl",
+                gguf_scheme="q4_k_xl",
+                hf_files=("Qwen3.5-9B-UD-Q4_K_XL.gguf",),
+                model_bytes=5_966_095_584,
+                tensor_manifest_root="1c5e58cd73931772b9a05a13791fd319d22ed080b1e75b4db912703200ddb947",
+            ),
+            MeshQuantVariant(
+                mesh_model_id="qwen3.5-9b-q6-k",
+                gguf_scheme="q6_k",
+                hf_files=("Qwen3.5-9B-Q6_K.gguf",),
+                model_bytes=7_458_301_152,
+                tensor_manifest_root="f4f9fe3410c5ab05de69af0fe51dd110ae1f61746b945a22792e5d501ccc9fdd",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        hf_repo="ornith-ai/Ornith-1.5-35B-A3B-GGUF",
+        tokenizer_hf_repo="ornith-ai/Ornith-1.5-35B-A3B",
+        layers=40,
+        # Mesh-only: DeepReinforce's Ornith-1.5 (2026-08-19, MIT), successor
+        # to Ornith-1.0 on the same qwen35moe arch (35B MoE / 3B active).
+        # The GGUF carries one trailing NextN/MTP block (blk.40, 20 tensors)
+        # which the runtime excludes from the main 40-layer stack. Quality
+        # kept at parity with Ornith 1.0 pending benchmark calibration.
+        quality_params_b=32.0,
+        native_context_len=262_144,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="ornith-1.5-35b-q4-k-m",
+                gguf_scheme="q4_k_m",
+                hf_files=("Ornith-1.5-35B-Q4_K_M.gguf",),
+                model_bytes=21_713_463_040,
+                tensor_manifest_root="4b0cecafbf3c9c3b0cdd287b322d2500359fb8e2ad8454ca71cd04ec9adae5a4",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        hf_repo="ornith-ai/Ornith-1.0-35B-GGUF",
+        tokenizer_hf_repo="ornith-ai/Ornith-1.0-35B",
+        layers=40,
+        # Mesh-only: DeepReinforce's agentic-coding reasoning model
+        # (2026-06-25, MIT), 35B MoE / ~3B active on the qwen3.5-MoE
+        # architecture (llama.cpp qwen35moe; 256 experts, top-8). The
+        # most-downloaded trending GGUF at onboarding time. Positioned
+        # by its own benchmarks as "better than 31B dense": dense-
+        # equivalent estimate pending our benchmark calibration.
+        quality_params_b=32.0,
+        native_context_len=262_144,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="ornith-1.0-35b-q4-k-m",
+                gguf_scheme="q4_k_m",
+                hf_files=("ornith-1.0-35b-Q4_K_M.gguf",),
+                model_bytes=21_166_757_760,
+                tensor_manifest_root="127bb54a3de81032c79c805668c732597d0a5c4565340534d6922d1e72edab22",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        hf_repo="unsloth/GLM-5.2-GGUF",
+        tokenizer_hf_repo="zai-org/GLM-5.2",
+        layers=79,
+        # Mesh-only: Zhipu's GLM-5.2 (llama.cpp arch glm-dsa; 256 experts
+        # top-8 plus 1 shared, 3 leading dense blocks). ~744B total on the
+        # GGUF's own 256x22B size label, so the dense-equivalent below is
+        # an estimate in the same spirit as the Flash entry and is pending
+        # our benchmark calibration.
+        quality_params_b=120.0,
+        # Owner-judged frontier-class boost, mirroring the Flash entry;
+        # revisit both together once benchmarks land.
+        generation_quality=1.5,
+        native_context_len=1_048_576,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="glm-5.2-iq2-m",
+                gguf_scheme="iq2_m",
+                hf_files=(
+                    "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00001-of-00006.gguf",
+                    "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00002-of-00006.gguf",
+                    "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00003-of-00006.gguf",
+                    "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00004-of-00006.gguf",
+                    "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00005-of-00006.gguf",
+                    "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00006-of-00006.gguf",
+                ),
+                model_bytes=238_577_580_768,
+                tensor_manifest_root="655f166d7fe2e3539ee607cf53f433aa153c33d486e977baca02d4b1d59a2a7a",
+            ),
+            MeshQuantVariant(
+                mesh_model_id="glm-5.2-q3-k-xl",
+                gguf_scheme="q3_k_xl",
+                hf_files=(
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00001-of-00009.gguf",
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00002-of-00009.gguf",
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00003-of-00009.gguf",
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00004-of-00009.gguf",
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00005-of-00009.gguf",
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00006-of-00009.gguf",
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00007-of-00009.gguf",
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00008-of-00009.gguf",
+                    "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00009-of-00009.gguf",
+                ),
+                model_bytes=342_965_972_096,
+                tensor_manifest_root="52c83e9813b307b3485bd45aa645458874e211fb726cf29cc797205efbfb82e3",
+            ),
+            MeshQuantVariant(
+                mesh_model_id="glm-5.2-q4-k-xl",
+                gguf_scheme="q4_k_xl",
+                hf_files=(
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00001-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00002-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00003-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00004-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00005-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00006-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00007-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00008-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00009-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00010-of-00011.gguf",
+                    "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00011-of-00011.gguf",
+                ),
+                model_bytes=467_289_111_904,
+                tensor_manifest_root="0b4debcb0230b7ea6f59ce0b5ca196a6e57ef236a2ee5adb9a11e38e81d989e7",
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        hf_repo="unsloth/DeepSeek-V4-Flash-0731-GGUF",
+        tokenizer_hf_repo="deepseek-ai/DeepSeek-V4-Flash-0731",
+        # The base repo's tokenizer_config ships NO chat template (the
+        # authoritative template lives only in the GGUF metadata), so
+        # template consumers that never download the GGUF fall back to
+        # this packaged copy of the GGUF's own template.
+        chat_template_asset="deepseek-v4-flash-0731.jinja",
+        layers=43,
+        # Mesh-only: no vLLM catalogue entry. 162B MoE, ~14B active;
+        # dense-equivalent estimate pending benchmark calibration.
+        quality_params_b=45.0,
+        # Owner-judged quality boost: frontier-class output
+        # the params heuristic undersells; revisit with benchmarks.
+        generation_quality=1.5,
+        native_context_len=131_072,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="deepseek-v4-flash-0731-iq1-m",
+                gguf_scheme="iq1_m",
+                hf_files=(
+                    "UD-IQ1_M/DeepSeek-V4-Flash-0731-UD-IQ1_M-00001-of-00003.gguf",
+                    "UD-IQ1_M/DeepSeek-V4-Flash-0731-UD-IQ1_M-00002-of-00003.gguf",
+                    "UD-IQ1_M/DeepSeek-V4-Flash-0731-UD-IQ1_M-00003-of-00003.gguf",
+                ),
+                model_bytes=86_901_313_952,
+            ),
+            MeshQuantVariant(
+                mesh_model_id="deepseek-v4-flash-0731-q2-k-xl",
+                gguf_scheme="q2_k_xl",
+                hf_files=(
+                    "UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf",
+                    "UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf",
+                    "UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf",
+                ),
+                model_bytes=96_832_508_352,
+                tensor_manifest_root="f0cc75b069e590e73b7e2043aa008ace9f1696ec8e0b3928efc5540661144b86",
+            ),
+            MeshQuantVariant(
+                mesh_model_id="deepseek-v4-flash-0731-q3-k-xl",
+                gguf_scheme="q3_k_xl",
+                hf_files=(
+                    "UD-Q3_K_XL/DeepSeek-V4-Flash-0731-UD-Q3_K_XL-00001-of-00004.gguf",
+                    "UD-Q3_K_XL/DeepSeek-V4-Flash-0731-UD-Q3_K_XL-00002-of-00004.gguf",
+                    "UD-Q3_K_XL/DeepSeek-V4-Flash-0731-UD-Q3_K_XL-00003-of-00004.gguf",
+                    "UD-Q3_K_XL/DeepSeek-V4-Flash-0731-UD-Q3_K_XL-00004-of-00004.gguf",
+                ),
+                model_bytes=128_206_729_792,
+                tensor_manifest_root="bc49dd7a5e83461359a2ff496ba890cc67d7aa585b58f401aa4fb57e5fbe2d69",
+            ),
+            MeshQuantVariant(
+                mesh_model_id="deepseek-v4-flash-0731-q8-k-xl",
+                gguf_scheme="q8_k_xl",
+                hf_files=(
+                    "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+                    "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00002-of-00005.gguf",
+                    "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf",
+                    "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00004-of-00005.gguf",
+                    "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00005-of-00005.gguf",
+                ),
+                model_bytes=161_869_615_520,
+            ),
+        ),
+    ),
+    MeshModelEntry(
+        hf_repo="unsloth/DeepSeek-V4-Flash-GGUF",
+        tokenizer_hf_repo="deepseek-ai/DeepSeek-V4-Flash",
+        layers=43,
+        # Superseded by the 0731 release above; kept so running meshes,
+        # fetches, and scores of the old id keep resolving.
+        retired=True,
+        quality_params_b=45.0,
+        generation_quality=1.5,
+        native_context_len=131_072,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="deepseek-v4-flash-iq3-xxs",
+                gguf_scheme="iq3_xxs",
+                # unsloth nests each quant in a subfolder; hf_files are
+                # repo-relative paths, preserved locally by hf_hub_download.
+                hf_files=(
+                    "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf",
+                    "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00002-of-00004.gguf",
+                    "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00003-of-00004.gguf",
+                    "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00004-of-00004.gguf",
+                ),
+                model_bytes=102_999_887_616,
+                tensor_manifest_root="55197e36627de1ea56235102a991b070b2a09639146dd9ea00b5a1d74060064e",
+            ),
+        ),
+    ),
+)
+
+# Flat lookup by on-chain mesh model id: (model entry, quant variant).
+MESH_GGUF_MODELS: dict[str, tuple[MeshModelEntry, MeshQuantVariant]] = {
+    variant.mesh_model_id: (entry, variant)
+    for entry in MESH_MODELS
+    for variant in entry.quants
+}
+
+
+def mesh_model_source(
+    mesh_model_id: str,
+) -> tuple[str, tuple[str, ...], int, int] | None:
+    """(hf_repo, hf_files, model_bytes, layers) for a registered mesh id."""
+
+    found = MESH_GGUF_MODELS.get(str(mesh_model_id))
+    if found is None:
+        return None
+    entry, variant = found
+    return (
+        variant.hf_repo or entry.hf_repo,
+        variant.hf_files,
+        variant.model_bytes,
+        variant.layers or entry.layers,
+    )
+
+
+def mesh_model_serving_context_cap(mesh_model_id: str) -> int:
+    """Largest context the serving runtime provably handles (0 = uncapped).
+
+    Deploys pin the measurement launch to this and refuse to register
+    beyond it: the KV auto-fit measures memory, not correctness, and a
+    runtime bug past a position threshold serves degenerate output that
+    only the decode audit catches (see MeshModelEntry.serving_context_cap).
+    """
+
+    found = MESH_GGUF_MODELS.get(str(mesh_model_id))
+    if found is None:
+        return 0
+    entry, _variant = found
+    return max(0, int(entry.serving_context_cap))
+
+
+def mesh_model_manifest_root(mesh_model_id: str) -> str:
+    """Owner-built tensor-manifest root for a registered mesh id ('' = none).
+
+    A non-empty root lets a fetching driver download the manifest from the
+    gleipnir store instead of rebuilding it locally (a rebuild on any miner
+    is always a broken fetch path).
+    """
+
+    found = MESH_GGUF_MODELS.get(str(mesh_model_id))
+    if found is None:
+        return ""
+    _entry, variant = found
+    return str(getattr(variant, "tensor_manifest_root", "") or "")
+
+
+def mesh_tokenizer_source(mesh_model_id: str) -> str | None:
+    """Tokenizer repo for a registered mesh id (family base repo when set).
+
+    GGUF repos embed the tokenizer inside the model file and usually ship
+    no tokenizer.json, so tokenizer consumers that never download model
+    weights (validator canary prompt construction, input commitments,
+    tokenizer drift hashing) must load from the family's base model repo
+    instead of the mesh model id (observed: v3 full-context canary
+    preparation failed with "glm-5.2-iq2-m is not a valid model
+    identifier" because AutoTokenizer got the mesh id verbatim).
+    """
+
+    found = MESH_GGUF_MODELS.get(str(mesh_model_id))
+    if found is None:
+        return None
+    entry, variant = found
+    return entry.tokenizer_hf_repo or variant.hf_repo or entry.hf_repo
+
+
+def mesh_chat_template_fallback(mesh_model_id: str) -> str | None:
+    """Packaged chat template for a mesh id whose HF tokenizer has none.
+
+    The GGUF metadata is the authoritative template for a mesh serve;
+    tokenizer consumers that never download the GGUF (validator canary
+    prompt construction and sizing) read this committed copy instead.
+    Returns None when the family needs no fallback.
+    """
+
+    found = MESH_GGUF_MODELS.get(str(mesh_model_id))
+    if found is None:
+        return None
+    entry, _variant = found
+    asset = str(getattr(entry, "chat_template_asset", "") or "")
+    if not asset:
+        return None
+    import os
+
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "chat_templates", asset
+    )
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def mesh_model_base_score(
+    mesh_model_id: str, *, scored_context_len: int | None = None
+) -> float | None:
+    """Base earning weight of a mesh model, from THIS catalogue only.
+
+    The exact utility shape the recommender and validator share:
+    log2(quality_params)^1.3 x log2(ctx/1K) x quant quality x generation
+    quality. Context is scored at the advertised value; pass
+    ``scored_context_len`` when a mesh's measured context is known,
+    otherwise the model's native context stands in (the auto-fit can only
+    ever measure at or below it). Returns None for models missing from the
+    catalogue — the caller surfaces that as the catalogue bug it is, never
+    as an invented number.
+    """
+
+    found = MESH_GGUF_MODELS.get(str(mesh_model_id))
+    if found is None:
+        return None
+    entry, variant = found
+    quality_params = entry.quality_params_b
+    generation_quality = entry.generation_quality
+    native_ctx = entry.native_context_len
+    if entry.registry_model_id:
+        model = get_model(entry.registry_model_id)
+        if model is not None:
+            quality_params = (
+                model.moe_dense_equivalent
+                if model.moe_dense_equivalent > 0
+                else model.active_params_b
+            )
+            generation_quality = model.generation_quality
+            native_ctx = model.native_context_len or native_ctx
+    if quality_params <= 0:
+        return None
+    quality = math.log2(max(quality_params, 1.0)) ** 1.3
+    ctx = int(scored_context_len or native_ctx or 32_768)
+    return (
+        quality
+        * math.log2(max(ctx / 1024, 1))
+        * gguf_quant_quality(variant.gguf_scheme)
+        * generation_quality
+    )

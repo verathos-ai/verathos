@@ -1,0 +1,79 @@
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 8d611e5..6c39a9e 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -419,16 +419,28 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
+         {"created",            t},
+         {"model",              oaicompat_model},
+         {"system_fingerprint", std::string(llama_build_info())},
+         {"object",             "text_completion"},
+         {"usage",              usage_json_oaicompat()},
+         {"id", oaicompat_cmpl_id}
+     };
+ 
++
++    // Verathos proof sidecar extension: expose sampled token ids without
++    // forcing logprob calculation when the request already enabled return_tokens.
++    if (!stream && !tokens.empty()) {
++        res["choices"][0]["verathos_generated_tokens"] = tokens;
++    }
++    // Bind the serving slot unconditionally: this result is the final
++    // payload of BOTH the non-streamed /v1/completions response and the
++    // last chunk of its stream, and mesh receipts need the slot id on
++    // every completion path to attribute co-batched graphs per request.
++    res["choices"][0]["verathos_slot_id"] = id_slot;
++
+     // extra fields for debugging purposes
+     if (verbose) {
+         res["__verbose"] = to_json_non_oaicompat();
+     }
+     if (timings.prompt_n >= 0) {
+         res.push_back({"timings", timings.to_json()});
+     }
+ 
+@@ -455,16 +467,25 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
+     };
+ 
+     if (!stream && probs_output.size() > 0) {
+         choice["logprobs"] = json{
+             {"content", completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs)},
+         };
+     }
+ 
++    // Verathos proof sidecar extension: expose sampled token ids without
++    // forcing logprob calculation when the request already enabled return_tokens.
++    if (!stream && !tokens.empty()) {
++        choice["verathos_generated_tokens"] = tokens;
++    }
++    if (!stream) {
++        choice["verathos_slot_id"] = id_slot;
++    }
++
+     std::time_t t = std::time(0);
+ 
+     json res = json {
+         {"choices",            json::array({choice})},
+         {"created",            t},
+         {"model",              oaicompat_model},
+         {"system_fingerprint", std::string(llama_build_info())},
+         {"object",             "chat.completion"},
+@@ -509,16 +530,19 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
+     }
+ 
+     deltas.push_back({
+         {"choices", json::array({
+             json {
+                 {"finish_reason", finish_reason},
+                 {"index", index},
+                 {"delta", json::object()},
++                // Verathos proof sidecar extension: bind the serving slot so
++                // mesh receipts can attribute co-batched graphs per request.
++                {"verathos_slot_id", id_slot},
+             },
+         })},
+         {"created",            t},
+         {"id",                 oaicompat_cmpl_id},
+         {"model",              oaicompat_model},
+         {"system_fingerprint", std::string(llama_build_info())},
+         {"object",             "chat.completion.chunk"},
+     });
