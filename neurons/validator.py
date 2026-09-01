@@ -7582,6 +7582,20 @@ class ValidatorNeuron:
                     try:
                         self._set_weights(_weights)
                         self._last_weights = _weights
+                        # Weight submission runs off the block thread. Publish
+                        # the successful vector immediately so a later safe
+                        # restart can restore it even when no unrelated
+                        # receipt, audit or discovery event happens to trigger
+                        # another shared-state write first.
+                        # A state-publication error must never resubmit an
+                        # already accepted on-chain weight transaction.
+                        try:
+                            self._write_shared_state()
+                        except Exception as exc:
+                            bt.logging.warning(
+                                "Weights were submitted, but publishing the "
+                                f"shared-state vector failed: {exc}"
+                            )
                         return
                     except Exception as exc:
                         if attempt == 3:
