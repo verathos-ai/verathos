@@ -1639,6 +1639,12 @@ def test_finalized_postcommit_replay_expires_with_original_origin_deadline(
     validator_key = authenticated_postcommit_coordinator["validator_key"]
     snapshot_hash = snapshot.snapshot_hash_hex()
     timestamp = int(time.time())
+    # Bind phase-one storage to the same origin instant used by this test.
+    # Deriving expiry from an earlier integer timestamp is racy under the full
+    # suite: if request preparation crosses the next wall-clock second, the
+    # worker correctly stores a later deadline and timestamp + TTL + 1 has not
+    # actually expired it yet.
+    monkeypatch.setattr(mesh_worker.time, "time", lambda: float(timestamp))
     request_id = "cc" * 32
     challenge_nonce = "cd" * 32
     inference_request = _request(
