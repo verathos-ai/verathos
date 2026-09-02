@@ -52,6 +52,7 @@ from neurons.capacity_audit_combined import (
 )
 from neurons.capacity_audit_discovery import CapacityAuditEndpointResolver
 from neurons.discovery import ActiveMiner
+from neurons.subtensor_connection import close_owned_subtensor
 from neurons.subnet_runtime_config import (
     RuntimeSubnetConfigClient,
     apply_runtime_config_to_neuron_config,
@@ -498,14 +499,7 @@ class CapacityAuditMinerWorker:
 
     @staticmethod
     def _close_subtensor(subtensor) -> None:
-        for obj in (subtensor, getattr(subtensor, "substrate", None)):
-            close = getattr(obj, "close", None)
-            if close is None:
-                continue
-            try:
-                close()
-            except Exception:
-                pass
+        close_owned_subtensor(subtensor)
 
     def _block_stream_watchdog_s(self) -> float:
         raw = os.getenv("VERATHOS_BLOCK_STREAM_WATCHDOG_S", "30")

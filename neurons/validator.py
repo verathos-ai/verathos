@@ -19041,14 +19041,9 @@ class ValidatorNeuron:
 
     @staticmethod
     def _close_subtensor(subtensor_obj) -> None:
-        for obj in (subtensor_obj, getattr(subtensor_obj, "substrate", None)):
-            close = getattr(obj, "close", None)
-            if close is None:
-                continue
-            try:
-                close()
-            except Exception:
-                pass
+        from neurons.subtensor_connection import close_owned_subtensor
+
+        close_owned_subtensor(subtensor_obj)
 
     @staticmethod
     def _head_hash_arg(raw_hash: object, hash_bytes: bytes) -> str:

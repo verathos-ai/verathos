@@ -926,14 +926,9 @@ class MeshCapacityAuditWorker:
 
     @staticmethod
     def _close_subtensor(subtensor) -> None:
-        for obj in (subtensor, getattr(subtensor, "substrate", None)):
-            close = getattr(obj, "close", None)
-            if close is None:
-                continue
-            try:
-                close()
-            except Exception:
-                pass
+        from neurons.subtensor_connection import close_owned_subtensor
+
+        close_owned_subtensor(subtensor)
 
     @staticmethod
     def _coerce_block_hash(raw: object) -> Optional[bytes]:
@@ -1537,12 +1532,20 @@ class MeshCapacityAuditWorker:
                     if subtensor is None:
                         subtensor = self._subtensor()
                     current = self._get_current_head(subtensor)
+                    if current <= 0:
+                        self._close_subtensor(subtensor)
+                        subtensor = None
+                        if self._stop_event.wait(0.5):
+                            return
+                        continue
                     if current >= window.audit_block:
                         audit_hash = self._get_block_hash(
                             subtensor, window.audit_block
                         )
                         if audit_hash is not None:
                             break
+                        self._close_subtensor(subtensor)
+                        subtensor = None
                 except Exception:
                     self._close_subtensor(subtensor)
                     subtensor = None

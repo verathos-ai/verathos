@@ -12,6 +12,8 @@ import struct
 import threading
 import time
 
+from neurons.subtensor_connection import close_owned_subtensor
+
 
 STATE_STRUCT = struct.Struct("<QQQQI4xQ")
 STATE_SIZE = STATE_STRUCT.size
@@ -65,13 +67,7 @@ class _StateWriter:
 
 
 def _close_subtensor(subtensor_obj) -> None:
-    for obj in (subtensor_obj, getattr(subtensor_obj, "substrate", None)):
-        close = getattr(obj, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
+    close_owned_subtensor(subtensor_obj)
 
 
 def run(

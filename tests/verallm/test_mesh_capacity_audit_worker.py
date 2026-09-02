@@ -362,6 +362,51 @@ def test_start_publishes_roster_file_for_the_serve_route(
         worker.stop()
 
 
+def test_start_waiter_reconnects_zero_head_before_release(
+    tmp_path, monkeypatch
+):
+    """A stale short-lived RPC object must not consume the complete start window."""
+
+    worker = _worker(tmp_path)
+    worker._running = True
+    worker.runtime_cfg = __import__(
+        "neurons.capacity_audit", fromlist=["CapacityAuditRuntimeConfig"]
+    ).CapacityAuditRuntimeConfig()
+    window = _window((worker.local_gpus[0],))
+    prepared = object()
+    stale = object()
+    fresh = object()
+    connections = iter((stale, fresh))
+    closed = []
+    released = []
+
+    monkeypatch.setattr(
+        worker,
+        "_prepare_gpu_audit",
+        lambda *args, **kwargs: prepared,
+    )
+    monkeypatch.setattr(worker, "_subtensor", lambda: next(connections))
+    monkeypatch.setattr(
+        worker,
+        "_get_current_head",
+        lambda connection: 0 if connection is stale else window.audit_block,
+    )
+    monkeypatch.setattr(worker, "_get_block_hash", lambda *args: b"x" * 32)
+    monkeypatch.setattr(worker, "_close_subtensor", closed.append)
+    monkeypatch.setattr(
+        worker,
+        "_run_window",
+        lambda selected, block_hash, items, lease, connection: released.append(
+            (selected, block_hash, items, connection)
+        ),
+    )
+
+    worker._await_and_run_window(window)
+
+    assert stale in closed
+    assert released == [(window, b"x" * 32, [prepared], fresh)]
+
+
 #: Stub holder child: holds nothing, speaks just enough protocol for the
 #: parent's spawn wait. Real holders allocate VRAM, which test machines
 #: may not have.
