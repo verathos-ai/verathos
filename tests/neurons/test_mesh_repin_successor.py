@@ -23,12 +23,42 @@ def _neuron(monkeypatch, fresh_entries, epoch_miners=None):
     neuron._validator_hotkey_ss58 = "5Validator"
     neuron._validator_private_key = b"\x01" * 32
     neuron._shared_state_writes = 0
+    neuron._enrichment_calls = 0
+    neuron._admission_calls = []
 
     def _write():
         neuron._shared_state_writes += 1
 
+    def _enrich(miners):
+        neuron._enrichment_calls += 1
+        for miner in miners:
+            miner.hotkey_ss58 = "5Miner"
+
+    def _retain(miners, *, epoch_number):
+        neuron._admission_calls.append(("hotkey", epoch_number))
+        return [m for m in miners if getattr(m, "hotkey_ss58", "")]
+
+    def _policy(name):
+        def _apply(miners, *, epoch_number, preserve_existing=False):
+            neuron._admission_calls.append(
+                (name, epoch_number, preserve_existing)
+            )
+            return list(miners)
+
+        return _apply
+
     neuron._write_shared_state = _write
-    neuron._mesh_snapshot_trust_anchors = lambda miner, epoch: object()
+    neuron._enrich_miners_from_metagraph = _enrich
+    neuron._retain_epoch_miners_with_authenticated_hotkeys = _retain
+    neuron._apply_authenticated_mesh_policy = _policy("mesh")
+    neuron._apply_mainnet_endpoint_policy = _policy("endpoint")
+    neuron._apply_mainnet_mesh_backend_policy = _policy("backend")
+
+    def _anchors(miner, epoch):
+        assert miner.hotkey_ss58 == "5Miner"
+        return object()
+
+    neuron._mesh_snapshot_trust_anchors = _anchors
     monkeypatch.setattr(
         "neurons.validator.discover_active_miners",
         lambda mc, mdl: list(fresh_entries),
@@ -64,6 +94,13 @@ def test_dead_slot_adopts_successor(monkeypatch):
         "pinned": successor.endpoint
     }
     assert neuron._shared_state_writes == 1
+    assert neuron._enrichment_calls == 1
+    assert neuron._admission_calls == [
+        ("hotkey", 43286),
+        ("mesh", 43286, True),
+        ("endpoint", 43286, True),
+        ("backend", 43286, True),
+    ]
 
 
 def test_adoption_is_capped_per_slot_epoch(monkeypatch):

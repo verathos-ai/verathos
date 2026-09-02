@@ -10769,6 +10769,7 @@ class ValidatorNeuron:
         miners: Sequence[ActiveMiner],
         *,
         epoch_number: int,
+        preserve_existing: bool = False,
     ) -> list[ActiveMiner]:
         """Exclude non-CUDA mainnet mesh rosters before any routable publish."""
 
@@ -10781,14 +10782,23 @@ class ValidatorNeuron:
             for key, reason in reasons.items()
             if str(reason).startswith(_MESH_MAINNET_BACKEND_REASON_PREFIX)
         }
-        if old_backend_keys:
+        evaluated_keys = {
+            self._miner_model_key(miner.address, miner.model_index)
+            for miner in miners
+        }
+        cleared_backend_keys = (
+            old_backend_keys & evaluated_keys
+            if preserve_existing
+            else old_backend_keys
+        )
+        if cleared_backend_keys:
             excluded = [
                 miner
                 for miner in excluded
                 if self._miner_model_key(miner.address, miner.model_index)
-                not in old_backend_keys
+                not in cleared_backend_keys
             ]
-            for key in old_backend_keys:
+            for key in cleared_backend_keys:
                 reasons.pop(key, None)
 
         if not _is_verathos_mainnet(
@@ -12474,14 +12484,43 @@ class ValidatorNeuron:
             (m.address.lower(), int(m.model_index))
             for m in (getattr(self, "_epoch_miners", None) or [])
         }
+        # Registry discovery deliberately contains no SS58 identity. Epoch
+        # setup enriches and authenticates those entries before any endpoint
+        # is admitted; the mid-epoch successor path must do exactly the same.
+        # Without this, an entry excluded for a transient snapshot failure can
+        # never self-heal: every rediscovery reaches the trust-anchor builder
+        # with an empty coordinator hotkey. Apply the normal admission policy
+        # here as well so a re-pin cannot bypass mainnet mesh, endpoint, or
+        # CUDA-backend gates.
+        fresh = [
+            cand
+            for cand in fresh
+            if cand.address.lower() == str(address).lower()
+            and (cand.address.lower(), int(cand.model_index)) not in current
+            and _is_mesh_runtime(cand)
+        ]
+        self._enrich_miners_from_metagraph(fresh)
+        fresh = self._retain_epoch_miners_with_authenticated_hotkeys(
+            fresh,
+            epoch_number=epoch_number,
+        )
+        fresh = self._apply_authenticated_mesh_policy(
+            fresh,
+            epoch_number=epoch_number,
+            preserve_existing=True,
+        )
+        fresh = self._apply_mainnet_endpoint_policy(
+            fresh,
+            epoch_number=epoch_number,
+            preserve_existing=True,
+        )
+        fresh = self._apply_mainnet_mesh_backend_policy(
+            fresh,
+            epoch_number=epoch_number,
+            preserve_existing=True,
+        )
         adopted = False
         for cand in fresh:
-            if cand.address.lower() != str(address).lower():
-                continue
-            if (cand.address.lower(), int(cand.model_index)) in current:
-                continue
-            if not _is_mesh_runtime(cand):
-                continue
             try:
                 anchors = self._mesh_snapshot_trust_anchors(
                     cand, epoch_number
