@@ -257,12 +257,14 @@ def wired(monkeypatch):
     monkeypatch.setattr(
         registration_module,
         "plan_mesh_registration",
-        lambda cfg, target, signer: LifecyclePlan(
+        lambda cfg, target, signer, **kwargs: LifecyclePlan(
             action="append", predicted_index=0, reason="fresh"
         ),
     )
 
-    def fake_register(cfg, target, *, private_key, expected_index=None):
+    def fake_register(
+        cfg, target, *, private_key, expected_index=None, **kwargs
+    ):
         chain_calls.append("registerModel")
         return registration_module.RegistrationOutcome(
             action="append",
@@ -325,6 +327,48 @@ def test_happy_path_measures_gates_then_registers(wired):
         "/v1/pool/register-model"
     )
     assert "/v1/pool/registration-state" in routes
+
+
+def test_deploy_threads_stored_registration_to_plan_and_write(
+    wired, monkeypatch
+):
+    previous = {"model_id": MODEL_ID, "index": 7}
+    seen: list[tuple[str, object]] = []
+
+    def plan(cfg, target, signer, *, previous_registration=None):
+        seen.append(("plan", previous_registration))
+        return LifecyclePlan(
+            action="update-endpoint", predicted_index=0, reason="replacement"
+        )
+
+    def register(
+        cfg,
+        target,
+        *,
+        private_key,
+        expected_index=None,
+        previous_registration=None,
+    ):
+        seen.append(("register", previous_registration))
+        return registration_module.RegistrationOutcome(
+            action="update-endpoint",
+            index=0,
+            tx_hash="0x" + "ab" * 32,
+            expires_at=int(time.time()) + 86_400,
+        )
+
+    monkeypatch.setattr(registration_module, "plan_mesh_registration", plan)
+    monkeypatch.setattr(registration_module, "register_mesh_endpoint", register)
+    pool = _FakePool()
+    report = run_deploy(
+        _config(previous_registration=previous),
+        call=pool,
+        out=lambda _line: None,
+        sleep=lambda _s: None,
+    )
+
+    assert not report.failed
+    assert seen == [("plan", previous), ("register", previous)]
 
 
 def test_mainnet_deploy_refuses_non_cuda_before_launch_or_chain_write(wired):
@@ -695,6 +739,59 @@ def test_index_mismatch_stops_the_mesh(wired, monkeypatch):
     # The chain-bound relaunch (m-test2) is stopped, after the measurement
     # mesh (m-test1) was replaced.
     assert pool.stopped == ["m-test1", "m-test2"]
+
+
+def test_endpoint_update_runtime_failure_stops_the_replacement_mesh(
+    wired, monkeypatch
+):
+    previous = {"model_id": MODEL_ID, "index": 0}
+
+    def refuse(
+        cfg,
+        target,
+        *,
+        private_key,
+        expected_index=None,
+        previous_registration=None,
+    ):
+        assert previous_registration is previous
+        raise RuntimeError("deactivate after updateEndpoint timed out")
+
+    monkeypatch.setattr(registration_module, "register_mesh_endpoint", refuse)
+    pool = _FakePool()
+    report = run_deploy(
+        _config(previous_registration=previous),
+        call=pool,
+        out=lambda _line: None,
+        sleep=lambda _s: None,
+    )
+
+    assert report.failed
+    assert pool.stopped == ["m-test1", "m-test2"]
+
+
+def test_registration_state_failure_requires_idempotent_redeploy(
+    wired,
+):
+    pool = _FakePool()
+
+    def call(route, body):
+        if route == "/v1/pool/registration-state":
+            raise RuntimeError("manager write unavailable")
+        return pool(route, body)
+
+    report = run_deploy(
+        _config(), call=call, out=lambda _line: None, sleep=lambda _s: None
+    )
+
+    assert report.failed
+    assert report.stages[-1]["name"] == "renewal-state"
+    assert "re-run the same `verathos mesh deploy`" in report.stages[-1][
+        "detail"
+    ]
+    # The verified chain-bound mesh remains serving; the command fails so the
+    # operator must rerun and persist renewal state rather than editing state.
+    assert pool.stopped == ["m-test1"]
 
 
 def test_dev_pool_refused(wired):

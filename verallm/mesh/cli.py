@@ -3708,6 +3708,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     call = _pool_client(args)
     _default_signer_from_pool(args, call)
     private_key, hotkey_seed, hotkey_ss58 = _deploy_credentials(args)
+    previous_registration = _stored_registration(call, str(args.model_id))
     config = DeployConfig(
         model_id=args.model_id,
         endpoint=args.endpoint,
@@ -3739,6 +3740,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         assume_yes=args.yes,
         force=args.force,
         dry_run=args.dry_run,
+        previous_registration=previous_registration,
     )
 
     def confirm(message: str) -> bool:

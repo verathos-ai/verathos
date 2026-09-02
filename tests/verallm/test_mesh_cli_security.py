@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 
 import pytest
 
@@ -475,6 +476,80 @@ def test_pool_register_model_cli_forwards_exact_context_limit(monkeypatch):
 
     assert captured["path"] == "/v1/pool/register-model"
     assert captured["body"]["max_context_len"] == 32_768
+
+
+def test_deploy_cli_forwards_model_specific_stored_registration(monkeypatch):
+    from verallm.chain.config import ChainConfig
+    import verallm.mesh.deploy as mesh_deploy
+
+    previous = {
+        "model_id": "qwen-test-q4",
+        "endpoint": "https://old.example:9443",
+        "index": 7,
+    }
+    captured: dict[str, object] = {}
+
+    def call(path, body):
+        assert path == "/v1/pool/registration-state"
+        assert body == {}
+        return {"registrations": {"qwen-test-q4": previous}}
+
+    monkeypatch.setattr(ChainConfig, "resolve_config_path", lambda *a: "test.json")
+    monkeypatch.setattr(
+        ChainConfig,
+        "from_json",
+        lambda _path: SimpleNamespace(chain_id=945, netuid=405),
+    )
+    monkeypatch.setattr(mesh_cli, "_pool_client", lambda _args: call)
+    monkeypatch.setattr(
+        mesh_cli, "_default_signer_from_pool", lambda _args, _call: None
+    )
+    monkeypatch.setattr(
+        mesh_cli,
+        "_deploy_credentials",
+        lambda _args: ("0x" + "11" * 32, b"\x05" * 32, "5Hotkey"),
+    )
+
+    def run_deploy(config, **kwargs):
+        captured["config"] = config
+        return SimpleNamespace(failed=False, to_dict=lambda: {})
+
+    monkeypatch.setattr(mesh_deploy, "run_deploy", run_deploy)
+    monkeypatch.setattr(
+        mesh_cli.os,
+        "_exit",
+        lambda code: (_ for _ in ()).throw(SystemExit(code)),
+    )
+    args = argparse.Namespace(
+        chain_config="test.json",
+        subtensor_network="test",
+        subtensor_chain_endpoint="",
+        endpoint="https://new.example:9443",
+        model_id="qwen-test-q4",
+        uid=2,
+        max_context_len=None,
+        validator_budget_s=None,
+        workers="",
+        driver="",
+        hf_repo="",
+        hf_files="",
+        model_bytes=0,
+        probe_samples=1,
+        hard_samples=0,
+        min_tok_s=1.0,
+        no_full_context_probe=True,
+        full_context_budget_s=10.0,
+        yes=True,
+        force=False,
+        dry_run=True,
+        json=False,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        mesh_cli.cmd_deploy(args)
+
+    assert exc.value.code == 0
+    assert captured["config"].previous_registration == previous
 
 
 def _pinned_token(pin: str):

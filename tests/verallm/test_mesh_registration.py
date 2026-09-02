@@ -10,6 +10,7 @@ import verallm.mesh.registration as registration
 from verallm.chain.miner_lifecycle import LifecycleRefusal
 from verallm.mesh.registration import (
     MeshChainAnchors,
+    _plan_mesh_registration_from_entries,
     build_registration_target,
     ensure_evm_registered,
     load_mesh_registration_state,
@@ -65,6 +66,8 @@ class _FakeMinerRegistry:
         self.entries = entries
         self.register_calls = []
         self.renew_calls = []
+        self.update_endpoint_calls = []
+        self.deactivate_calls = []
 
     def get_miner_models(self, address):
         return list(self.entries)
@@ -76,6 +79,16 @@ class _FakeMinerRegistry:
 
     def renew_model(self, index, private_key=None):
         self.renew_calls.append(index)
+        return "0x" + "cd" * 32
+
+    def update_endpoint(self, index, endpoint, private_key=None):
+        self.update_endpoint_calls.append((index, endpoint))
+        self.entries[index].endpoint = endpoint
+        return "0x" + "ef" * 32
+
+    def deactivate_model(self, index, private_key=None):
+        self.deactivate_calls.append(index)
+        self.entries[index].active = False
         return "0x" + "cd" * 32
 
 
@@ -134,6 +147,219 @@ def test_unapproved_model_fails_closed(monkeypatch):
 def _anchors(monkeypatch):
     _wire(monkeypatch, spec=_spec(), miner=_FakeMinerRegistry([]))
     return resolve_mesh_chain_anchors(None, MODEL_ID, max_context_len=32_768)
+
+
+def _registration_state(target, *, index=0):
+    return {
+        "version": 1,
+        "model_id": target.model_id,
+        "endpoint": target.endpoint,
+        "quant": target.quant,
+        "max_context_len": target.max_context_len,
+        "model_spec_ref": bytes(target.model_spec_ref).hex(),
+        "index": index,
+        "mesh_key": "m-old",
+        "expires_at": int(time.time()) + 86_400,
+    }
+
+
+def test_replacement_plan_preserves_only_the_exact_stored_slot(monkeypatch):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors, endpoint="https://new.example:9443"
+    )
+    entries = [_entry(previous)]
+
+    ordinary = _plan_mesh_registration_from_entries(entries, target)
+    assert ordinary.action == "append"
+    assert ordinary.predicted_index == 1
+
+    replacement = _plan_mesh_registration_from_entries(
+        entries, target, _registration_state(previous)
+    )
+    assert replacement.action == "update-endpoint"
+    assert replacement.predicted_index == 0
+
+
+def test_replacement_plan_refuses_an_existing_target_at_another_slot(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors, endpoint="https://new.example:9443"
+    )
+    historical = _entry(target, active=False)
+
+    with pytest.raises(LifecycleRefusal, match="not the pool's stored index"):
+        _plan_mesh_registration_from_entries(
+            [_entry(previous), historical],
+            target,
+            _registration_state(previous),
+        )
+
+
+def test_replacement_plan_recovers_an_endpoint_update_at_the_stored_slot(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors, endpoint="https://new.example:9443"
+    )
+
+    recovered = _plan_mesh_registration_from_entries(
+        [_entry(target)], target, _registration_state(previous)
+    )
+
+    assert recovered.action == "reuse-active"
+    assert recovered.predicted_index == 0
+
+
+def test_replacement_plan_recovers_a_completed_context_refresh(monkeypatch):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors,
+        endpoint="https://new.example:9443",
+        max_context_len=65_536,
+    )
+
+    recovered = _plan_mesh_registration_from_entries(
+        [_entry(target)], target, _registration_state(previous)
+    )
+
+    assert recovered.action == "reuse-active"
+    assert recovered.predicted_index == 0
+
+
+@pytest.mark.parametrize(
+    "mutation, match",
+    [
+        ({"index": 2}, "outside"),
+        ({"endpoint": "https://not-chain.example:9443"}, "no longer matches"),
+        ({"model_spec_ref": "00" * 32}, "no longer matches"),
+        ({"max_context_len": 8192}, "no longer matches"),
+    ],
+)
+def test_replacement_plan_refuses_stale_stored_state(
+    monkeypatch, mutation, match
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors, endpoint="https://new.example:9443"
+    )
+    state = _registration_state(previous)
+    state.update(mutation)
+    with pytest.raises(LifecycleRefusal, match=match):
+        _plan_mesh_registration_from_entries([_entry(previous)], target, state)
+
+
+def test_register_replacement_updates_endpoint_without_appending(monkeypatch):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors, endpoint="https://new.example:9443"
+    )
+    miner = _FakeMinerRegistry([_entry(previous)])
+    _wire(monkeypatch, spec=_spec(), miner=miner)
+
+    outcome = register_mesh_endpoint(
+        None,
+        target,
+        private_key=PRIVATE_KEY,
+        expected_index=0,
+        previous_registration=_registration_state(previous),
+    )
+
+    assert outcome.action == "update-endpoint"
+    assert outcome.index == 0
+    assert outcome.tx_hash == "0x" + "ef" * 32
+    assert miner.update_endpoint_calls == [(0, target.endpoint)]
+    assert miner.register_calls == []
+    assert len(miner.entries) == 1
+
+
+def test_register_replacement_converts_endpoint_tx_failure_to_safe_refusal(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors, endpoint="https://new.example:9443"
+    )
+    miner = _FakeMinerRegistry([_entry(previous)])
+
+    def fail_update(*args, **kwargs):
+        raise RuntimeError("rpc timeout")
+
+    miner.update_endpoint = fail_update
+    _wire(monkeypatch, spec=_spec(), miner=miner)
+
+    with pytest.raises(LifecycleRefusal, match="outcome is unknown.*stop serving"):
+        register_mesh_endpoint(
+            None,
+            target,
+            private_key=PRIVATE_KEY,
+            expected_index=0,
+            previous_registration=_registration_state(previous),
+        )
+
+    assert miner.register_calls == []
+
+
+def test_register_replacement_refreshes_changed_context_at_same_index(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors,
+        endpoint="https://new.example:9443",
+        max_context_len=65_536,
+    )
+    miner = _FakeMinerRegistry([_entry(previous)])
+
+    def register_model(*args, **kwargs):
+        miner.register_calls.append(args[0])
+        miner.entries[0] = _entry(target)
+        return "0x" + "ab" * 32
+
+    miner.register_model = register_model
+    _wire(monkeypatch, spec=_spec(), miner=miner)
+
+    outcome = register_mesh_endpoint(
+        None,
+        target,
+        private_key=PRIVATE_KEY,
+        expected_index=0,
+        previous_registration=_registration_state(previous),
+    )
+
+    assert outcome.action == "update-endpoint+refresh"
+    assert outcome.index == 0
+    assert miner.update_endpoint_calls == [(0, target.endpoint)]
+    assert miner.deactivate_calls == [0]
+    assert miner.register_calls == [MODEL_ID]
+    assert len(miner.entries) == 1
 
 
 def test_register_appends_and_verifies_index(monkeypatch):

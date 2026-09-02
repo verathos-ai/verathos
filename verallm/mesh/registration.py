@@ -26,6 +26,8 @@ from verallm.chain.miner_lifecycle import (
     LifecycleRefusal,
     MESH_QUANT_PREFIX,
     RegistrationTarget,
+    configuration_matches,
+    is_live,
     plan_registration,
     plan_renewal,
     resolve_registered_index,
@@ -209,14 +211,126 @@ def resolve_uid_for_hotkey(
     return int(hotkeys.index(hotkey_ss58))
 
 
+def _plan_mesh_registration_from_entries(
+    entries,
+    target: RegistrationTarget,
+    previous_registration: Mapping[str, Any] | None = None,
+) -> LifecyclePlan:
+    """Plan a first deploy or a pool-owned endpoint replacement.
+
+    ``registerModel`` identifies a slot by ``(model, endpoint, quant)``.  A
+    replacement host necessarily changes the endpoint, so the generic planner
+    quite correctly calls it an append.  A pool manager, however, persists the
+    exact registration it previously committed.  When that stored full tuple
+    still matches the entry at its recorded index, it is an unambiguous
+    replacement intent and ``updateEndpoint`` can preserve the index and its
+    score history.
+
+    The stored record is never trusted on its own: a missing, moved, or changed
+    chain tuple fails closed.  A second pool run by the same operator has no
+    matching local record and therefore retains the ordinary append behavior.
+    """
+
+    ordinary = plan_registration(entries, target)
+    if previous_registration is None:
+        return ordinary
+
+    try:
+        previous = registration_target_from_state(previous_registration)
+        previous_index = int(previous_registration["index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LifecycleRefusal(
+            "stored pool registration is malformed; refusing endpoint "
+            "replacement"
+        ) from exc
+
+    if previous.model_id != target.model_id or previous.quant != target.quant:
+        raise LifecycleRefusal(
+            "stored pool registration does not identify the requested "
+            "model and quantization; refusing endpoint replacement"
+        )
+    if previous_index < 0 or previous_index >= len(entries):
+        raise LifecycleRefusal(
+            f"stored pool registration index {previous_index} is outside "
+            "the current MinerRegistry entries; refusing endpoint replacement"
+        )
+
+    entry = entries[previous_index]
+    after_endpoint_update = RegistrationTarget(
+        model_id=previous.model_id,
+        endpoint=target.endpoint,
+        model_spec_ref=previous.model_spec_ref,
+        quant=previous.quant,
+        max_context_len=previous.max_context_len,
+    )
+    if configuration_matches(entry, target) or configuration_matches(
+        entry, after_endpoint_update
+    ):
+        # Recovery after updateEndpoint, or its following metadata refresh,
+        # committed but deploy did not persist the new registration state.
+        # Continue only when the ordinary planner resolves the requested tuple
+        # at the same index.
+        if ordinary.predicted_index != previous_index:
+            raise LifecycleRefusal(
+                f"requested endpoint resolves at index "
+                f"{ordinary.predicted_index}, not the pool's stored index "
+                f"{previous_index}; refusing ambiguous replacement recovery"
+            )
+        return ordinary
+
+    if not configuration_matches(entry, previous):
+        raise LifecycleRefusal(
+            f"MinerRegistry entry {previous_index} no longer matches the "
+            "pool's stored model, endpoint, quant, ModelSpec reference, and "
+            "context; refusing to update an ambiguous slot"
+        )
+    if ordinary.action != "append":
+        raise LifecycleRefusal(
+            f"requested endpoint already resolves at index "
+            f"{ordinary.predicted_index}, not the pool's stored index "
+            f"{previous_index}; refusing to move this pool onto another slot"
+        )
+
+    metadata_changed = (
+        bytes(previous.model_spec_ref) != bytes(target.model_spec_ref)
+        or int(previous.max_context_len) != int(target.max_context_len)
+        or not is_live(entry, int(time.time()))
+    )
+    return LifecyclePlan(
+        action=(
+            "update-endpoint-refresh"
+            if metadata_changed
+            else "update-endpoint"
+        ),
+        predicted_index=previous_index,
+        reason=(
+            f"pool registration proves index {previous_index} owns the prior "
+            "full tuple; updateEndpoint preserves that slot"
+            + (
+                " and registerModel refreshes its metadata/lease"
+                if metadata_changed
+                else ""
+            )
+        ),
+    )
+
+
 def plan_mesh_registration(
-    chain_config, target: RegistrationTarget, signer_address: str
+    chain_config,
+    target: RegistrationTarget,
+    signer_address: str,
+    *,
+    previous_registration: Mapping[str, Any] | None = None,
 ) -> LifecyclePlan:
     """Read-only preflight; the predicted index is what launch binds to."""
     entries = _miner_registry_client(chain_config).get_miner_models(
         signer_address
     )
-    return plan_registration(entries, target)
+    return _plan_mesh_registration_from_entries(
+        entries,
+        target,
+        previous_registration,
+    )
 
 
 def register_mesh_endpoint(
@@ -225,6 +339,7 @@ def register_mesh_endpoint(
     *,
     private_key: str,
     expected_index: int | None = None,
+    previous_registration: Mapping[str, Any] | None = None,
 ) -> RegistrationOutcome:
     """Send registerModel and verify the resulting slot.
 
@@ -242,14 +357,61 @@ def register_mesh_endpoint(
 
     signer_address = Account.from_key(private_key).address
     client = _miner_registry_client(chain_config)
-    plan = plan_registration(client.get_miner_models(signer_address), target)
+    plan = _plan_mesh_registration_from_entries(
+        client.get_miner_models(signer_address),
+        target,
+        previous_registration,
+    )
+    endpoint_update_tx = ""
+    if plan.action in ("update-endpoint", "update-endpoint-refresh"):
+        try:
+            endpoint_update_tx = client.update_endpoint(
+                plan.predicted_index,
+                target.endpoint,
+                private_key=private_key,
+            )
+        except Exception as exc:
+            raise LifecycleRefusal(
+                f"updateEndpoint for index {plan.predicted_index} failed or "
+                "its transaction outcome is unknown; stop serving and "
+                "re-read the registry before retrying"
+            ) from exc
+        # Re-read from a fresh client.  The normal lifecycle planner can now
+        # see the target endpoint and safely completes any metadata refresh or
+        # interrupted replacement reactivation at the same index.
+        try:
+            client = _miner_registry_client(chain_config)
+            entries = client.get_miner_models(signer_address)
+        except Exception as exc:
+            raise LifecycleRefusal(
+                f"updateEndpoint was submitted for index "
+                f"{plan.predicted_index}, but fresh registry verification "
+                "failed; transaction outcome is unverified, so stop serving "
+                "and re-read the registry before retrying"
+            ) from exc
+        followup = plan_registration(entries, target)
+        if (
+            followup.predicted_index != plan.predicted_index
+            or followup.action == "append"
+        ):
+            raise LifecycleRefusal(
+                f"updateEndpoint sent for index {plan.predicted_index} but "
+                "fresh registry state did not resolve the requested tuple at "
+                "that index; stop serving and inspect the transaction before "
+                "retrying"
+            )
+        replacement_action = "update-endpoint"
+        plan = followup
+    else:
+        replacement_action = ""
+
     if plan.action == "reuse-active":
         index = plan.predicted_index
         entry = client.get_miner_models(signer_address)[index]
         outcome = RegistrationOutcome(
-            action=plan.action,
+            action=replacement_action or plan.action,
             index=index,
-            tx_hash="",
+            tx_hash=endpoint_update_tx,
             expires_at=int(entry.expires_at),
         )
     else:
@@ -292,7 +454,11 @@ def register_mesh_endpoint(
         entries = fresh.get_miner_models(signer_address)
         index = resolve_registered_index(entries, target)
         outcome = RegistrationOutcome(
-            action=plan.action,
+            action=(
+                f"{replacement_action}+{plan.action}"
+                if replacement_action
+                else plan.action
+            ),
             index=index,
             tx_hash=tx_hash,
             expires_at=int(entries[index].expires_at),

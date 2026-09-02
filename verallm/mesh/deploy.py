@@ -170,6 +170,10 @@ class DeployConfig:
     assume_yes: bool = False
     force: bool = False
     dry_run: bool = False
+    # Exact registration previously committed by this pool manager.  It is
+    # used only to prove an unambiguous endpoint replacement at the same chain
+    # index; chain state is re-read and must match the complete stored tuple.
+    previous_registration: Mapping[str, Any] | None = None
     launch_wait_s: float = DEFAULT_LAUNCH_WAIT_S
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S
 
@@ -1131,8 +1135,13 @@ def run_deploy(
     )
     out("[chain] planning the registration slot (reading existing entries)...")
     try:
+        plan_kwargs = (
+            {"previous_registration": config.previous_registration}
+            if config.previous_registration is not None
+            else {}
+        )
         plan = registration_module.plan_mesh_registration(
-            config.chain_config, target, signer_address
+            config.chain_config, target, signer_address, **plan_kwargs
         )
     except LifecycleRefusal as exc:
         return fail("index-prediction", str(exc))
@@ -1272,16 +1281,24 @@ def run_deploy(
 
     # 14. Register on MinerRegistry, index-guarded.
     try:
+        registration_kwargs = (
+            {"previous_registration": config.previous_registration}
+            if config.previous_registration is not None
+            else {}
+        )
         outcome = registration_module.register_mesh_endpoint(
             config.chain_config,
             target,
             private_key=config.private_key,
             expected_index=plan.predicted_index,
+            **registration_kwargs,
         )
-    except LifecycleRefusal as exc:
-        # An index mismatch means the running mesh's signed snapshots bind
-        # the wrong model_index; a mesh serving under a wrong index would
-        # fail every canary, so stop it.
+    except Exception as exc:
+        # Any registry-write or verification failure leaves the chain-bound
+        # launch unconfirmed. This includes ambiguous RPC outcomes after an
+        # endpoint update or refresh, not only explicit lifecycle refusals.
+        # A mesh serving against unverified chain state would fail canaries or
+        # renew a stale registration, so always stop it.
         try:
             call("/v1/pool/stop", {"mesh_key": mesh_key})
         except (RuntimeError, OSError):
@@ -1317,13 +1334,16 @@ def run_deploy(
             },
         )
         report.stage("renewal-state", "ok", "pool manager renews the lease")
-    except (RuntimeError, OSError) as exc:
+    except Exception as exc:
+        report.failed = True
         report.stage(
             "renewal-state",
             "failed",
-            f"{exc}; renew manually with `verathos mesh renew` before the "
-            "24h lease expires",
+            f"{exc}; re-run the same `verathos mesh deploy` command to "
+            "verify the chain tuple and persist automatic renewal state",
         )
-        out(f"[renewal] WARNING: {exc}")
-    _notify_deploy_stage("done")
+        out(
+            f"[renewal] FAILED: {exc}; re-run the same mesh deploy command"
+        )
+    _notify_deploy_stage("failed" if report.failed else "done")
     return report
