@@ -12,7 +12,6 @@ from pathlib import Path
 
 from verallm.proof_v3.errors import ProofV3Error
 
-
 CATALOG_VALIDATION_RECEIPT_ABI_V3 = (
     "verathos.proof_v3.catalog_validation_receipt.v1"
 )
@@ -34,15 +33,23 @@ _RECEIPT_FIELDS = frozenset(
 
 
 def default_catalog_validation_cache_dir_v3() -> Path:
+    """Return the role-independent protected cache for deep-validation receipts.
+
+    Validators, proxies, and miners may intentionally use separate
+    ``VERALLM_DATA_DIR`` trees.  Deep projection-catalog validation is bound to
+    the exact catalog SHA-256, signed manifest digest, and validator revision,
+    so repeating it once per role provides no additional security.  Keep the
+    receipts under the account-wide Verathos state directory instead.  The
+    explicit environment override remains available for installations whose
+    roles do not share a home directory.
+    """
+
     configured = os.environ.get(
         "VERATHOS_PROOF_V3_VALIDATION_CACHE_DIR"
     )
     if configured:
         return Path(configured).expanduser()
-    data_dir = Path(
-        os.environ.get("VERALLM_DATA_DIR", "~/.verathos")
-    ).expanduser()
-    return data_dir / "proof_v3_catalog_validation"
+    return Path.home() / ".verathos" / "proof_v3_catalog_validation"
 
 
 def _sha256_file(path: Path) -> tuple[int, bytes]:
@@ -138,6 +145,60 @@ def _receipt_matches(path: Path, expected: dict[str, object]) -> bool:
     )
 
 
+def _publish_receipt(
+    path: Path,
+    expected: dict[str, object],
+) -> bool:
+    directory = path.parent
+    temporary: Path | None = None
+    descriptor: int | None = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if hasattr(os, "geteuid"):
+            directory_stat = directory.stat()
+            if (
+                directory_stat.st_uid != os.geteuid()
+                or directory_stat.st_mode & 0o022
+            ):
+                return False
+        descriptor, raw = tempfile.mkstemp(
+            prefix=".validating-",
+            suffix=".json",
+            dir=directory,
+        )
+        temporary = Path(raw)
+        os.fchmod(descriptor, 0o600)
+        encoded = (
+            json.dumps(
+                expected,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = None
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _receipt_path(
     cache_dir: Path,
     *,
@@ -220,48 +281,9 @@ class CatalogValidationContextV3:
             catalog_size=self.catalog_size,
             catalog_sha256=self.catalog_sha256,
         )
-        directory = self.receipt_path.parent
-        temporary: Path | None = None
-        try:
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if hasattr(os, "geteuid"):
-                directory_stat = directory.stat()
-                if (
-                    directory_stat.st_uid != os.geteuid()
-                    or directory_stat.st_mode & 0o022
-                ):
-                    return
-            fd, raw = tempfile.mkstemp(
-                prefix=".validating-",
-                suffix=".json",
-                dir=directory,
-            )
-            temporary = Path(raw)
-            os.fchmod(fd, 0o600)
-            encoded = (
-                json.dumps(
-                    expected,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                + b"\n"
-            )
-            with os.fdopen(fd, "wb", closefd=True) as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.receipt_path)
-            temporary = None
-        except OSError:
-            # The receipt is an optimization only. Deep validation has
-            # already succeeded, so a read-only cache must not break startup.
-            return
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
+        # The receipt is an optimization only. Deep validation has already
+        # succeeded, so a read-only cache must not break startup.
+        _publish_receipt(self.receipt_path, expected)
 
 
 def load_weight_catalog_with_validation_cache_v3(
@@ -269,6 +291,7 @@ def load_weight_catalog_with_validation_cache_v3(
     catalog_path,
     verified_manifest,
     cache_dir=None,
+    fallback_cache_dirs=(),
 ):
     """Load a catalog, reusing only an exact protected validation receipt."""
 
@@ -295,6 +318,33 @@ def load_weight_catalog_with_validation_cache_v3(
         catalog_sha256=catalog_sha256,
     )
     cache_hit = _receipt_matches(receipt_path, expected)
+    if not cache_hit:
+        for raw_fallback in fallback_cache_dirs:
+            try:
+                fallback_directory = Path(raw_fallback).expanduser()
+                same_directory = (
+                    fallback_directory.resolve() == directory.resolve()
+                )
+            except (OSError, RuntimeError, TypeError):
+                # A legacy cache is an optional optimization and must never
+                # prevent full validation from the primary artifact source.
+                continue
+            if same_directory:
+                continue
+            fallback_path = _receipt_path(
+                fallback_directory,
+                manifest_digest=manifest_digest,
+                catalog_sha256=catalog_sha256,
+            )
+            if not _receipt_matches(fallback_path, expected):
+                continue
+            # Promote a previously authenticated per-role receipt into the
+            # shared cache. If the shared location is read-only, using the
+            # exact protected fallback receipt is still safe and fast.
+            if not _publish_receipt(receipt_path, expected):
+                receipt_path = fallback_path
+            cache_hit = True
+            break
     context = CatalogValidationContextV3._create(
         model_id=model_id,
         manifest_digest=manifest_digest,

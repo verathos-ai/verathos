@@ -139,6 +139,7 @@ def load_qualified_proof_v3_catalog(
     model_registry_client,
     tokenizer_digest_resolver: Callable[[str], bytes] | None = None,
     validation_cache_dir=None,
+    validation_cache_fallback_dirs=(),
 ) -> dict[str, QualifiedEconomicProofV3Release]:
     """Load exact model releases against current chain-selected authorities."""
 
@@ -248,6 +249,7 @@ def load_qualified_proof_v3_catalog(
                 ),
                 verified_manifest=verified_projection_manifest,
                 cache_dir=validation_cache_dir,
+                fallback_cache_dirs=validation_cache_fallback_dirs,
             )
             logger.info(
                 "Proof-v3 projection catalog validation receipt for %s: %s",

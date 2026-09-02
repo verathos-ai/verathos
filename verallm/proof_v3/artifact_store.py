@@ -8,15 +8,15 @@ on-chain ModelSpec, signed execution profile, and exact catalog commitments by
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
-import unicodedata
 
 from verallm.proof_v2.artifact_store import (
     ProofV2ArtifactStoreError,
@@ -27,11 +27,11 @@ from verallm.proof_v2.artifact_store import (
     _sha256_file,
     normalize_proof_v2_artifact_base_urls,
 )
+from verallm.proof_v3.canary_policy import MAX_CANARY_POLICY_DOCUMENT_BYTES
 from verallm.proof_v3.catalog import (
     MAX_PALLAS_CATALOG_BYTES_V3,
     MAX_QUALIFIED_ARTIFACT_BYTES_V3,
 )
-from verallm.proof_v3.canary_policy import MAX_CANARY_POLICY_DOCUMENT_BYTES
 from verallm.proof_v3.document import MAX_EXECUTION_PROFILE_DOCUMENT_BYTES
 from verallm.proof_v3.economic_lm_head_catalog_fold import (
     MAX_LM_HEAD_CATALOG_ARTIFACT_BYTES_V3,
@@ -43,8 +43,6 @@ from verallm.proof_v3.economic_release_catalog import (
     load_qualified_proof_v3_catalog,
     proof_v3_release_artifact_paths,
 )
-from verallm.proof_v3.errors import ProofV3Error
-
 
 PROOF_V3_ARTIFACT_INDEX_SCHEMA_V1 = "verathos-proof-v3-artifact-index-v1"
 PROOF_V3_ARTIFACT_INDEX_SCHEMA = "verathos-proof-v3-artifact-index-v2"
@@ -872,7 +870,9 @@ def resolve_remote_proof_v3_releases(
                 (descriptor_path,),
                 model_registry_client=model_registry_client,
                 tokenizer_digest_resolver=tokenizer_digest_resolver,
-                validation_cache_dir=cache / "catalog_validation",
+                validation_cache_fallback_dirs=(
+                    cache / "catalog_validation",
+                ),
             )[model_id]
             releases[model_id] = ResolvedProofV3Release(
                 model_id=model_id,
