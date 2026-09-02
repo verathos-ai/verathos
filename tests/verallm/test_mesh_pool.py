@@ -5258,6 +5258,135 @@ def _register_with_binding(manager, model_id="glm-5.2-iq2-m", index=40):
     )
 
 
+def test_deploy_measurement_recalibrates_without_mutating_durable_binding(
+    tmp_path, monkeypatch
+):
+    """A replacement measurement is unbound; its final relaunch is not."""
+
+    manager = _subnet_manager(tmp_path)
+    _register_with_binding(manager)
+    model_id = "glm-5.2-iq2-m"
+    manager.state["model_registry"][model_id]["chain_committed"] = True
+    manager.state["mesh_registrations"] = {
+        model_id: {
+            "model_id": model_id,
+            "index": 40,
+            "mesh_key": "m-durable",
+            "mesh_id": "mesh-durable",
+            "endpoint": "https://old.example:9443",
+            "quant": "gguf_mesh_iq2_m",
+            "max_context_len": 98_304,
+            "model_spec_ref": "dd" * 32,
+            "expires_at": int(time.time()) + 86_400,
+            "suspended_by_operator": True,
+        }
+    }
+    manager.state["workers"] = {
+        "w-driver": {
+            "status": "idle",
+            "mesh": "",
+            "last_seen_unix": int(time.time()),
+            "capability": {
+                "gpu_name": "test",
+                "vram_gb": 320,
+                "free_disk_gb": 1000,
+                "subnet_driver_ready": True,
+                "rpc_device": "CUDA0",
+            },
+            "catalog": [
+                {
+                    "model_id": model_id,
+                    "layers": 79,
+                    "model_bytes": 1_000_000,
+                }
+            ],
+            "endpoints": {
+                "rpc": "w-driver:50052",
+                "proof": "http://w-driver:9402",
+                "mesh": "http://w-driver:9500",
+            },
+            "rtt_ms": {},
+            "peer_rtt_ms": {},
+            "commands": [],
+            "command_inflight": None,
+        }
+    }
+    manager._save()
+    admin = {"management_secret": manager.state["management_secret"]}
+    monkeypatch.setattr(
+        manager,
+        "_auth_worker",
+        lambda body, **_kwargs: (str(body.get("worker_id", "")), ""),
+    )
+
+    measured = manager.handle_launch(
+        {
+            **admin,
+            "model_id": model_id,
+            "workers": ["w-driver"],
+            "driver": "w-driver",
+            "_deploy_measurement_unbound": True,
+        }
+    )
+    measured_mesh = manager.state["meshes"][measured["mesh_key"]]
+    assert "model_index" not in measured_mesh
+    assert "max_context_len" not in measured_mesh
+    assert "resume_mesh_id" not in measured_mesh
+    durable = manager.state["mesh_registrations"][model_id]
+    assert durable["mesh_key"] == "m-durable"
+    assert durable["mesh_id"] == "mesh-durable"
+    assert durable["suspended_by_operator"] is True
+
+    command = manager.handle_heartbeat({"worker_id": "w-driver"})["command"]
+    assert "model_index" not in command
+    assert "max_context_len" not in command
+    manager.handle_report(
+        _command_report(
+            command,
+            worker_id="w-driver",
+            event="drive_ready",
+            mesh_id="mesh-measurement",
+            join_token="vtmesh_measurement",
+            coordinator_endpoint="http://w-driver:9500",
+            measured_ctx_budget=262_144,
+        )
+    )
+    assert measured_mesh["measured_ctx_budget"] == 262_144
+    assert manager.state["model_registry"][model_id][
+        "measured_ctx_budget"
+    ] == 262_144
+    assert manager.state["mesh_registrations"][model_id]["mesh_id"] == (
+        "mesh-durable"
+    )
+
+    manager.handle_stop({**admin, "mesh_key": measured["mesh_key"]})
+    stop_command = manager.handle_heartbeat({"worker_id": "w-driver"})[
+        "command"
+    ]
+    manager.handle_report(
+        _command_report(
+            stop_command,
+            worker_id="w-driver",
+            event="stopped",
+        )
+    )
+    final = manager.handle_launch(
+        {
+            **admin,
+            "model_id": model_id,
+            "workers": ["w-driver"],
+            "driver": "w-driver",
+        }
+    )
+    final_mesh = manager.state["meshes"][final["mesh_key"]]
+    assert final_mesh["model_index"] == 40
+    assert final_mesh["max_context_len"] == 98_304
+    assert final_mesh["resume_mesh_id"] == "mesh-durable"
+    assert "suspended_by_operator" not in manager.state[
+        "mesh_registrations"
+    ][model_id]
+
+
 def test_unconfirmed_chain_binding_is_purged_at_launch(tmp_path):
     """An aborted deploy's predicted binding is NOT a chain contract.
 

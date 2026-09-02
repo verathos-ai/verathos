@@ -1752,6 +1752,12 @@ class PoolManager:
                     self.state["meshes"].pop(mesh_key, None)
                 migrated = True
         self.lock = threading.Lock()
+        # Chain renewal runs outside the manager lock.  Deploy can suspend a
+        # model's renewals persistently, then wait for this in-memory claim to
+        # drain before deactivating its slot for recalibration.  This closes
+        # the only race in which an already-started renewModel could
+        # reactivate the old contract after deploy took it offline.
+        self._lease_renewals_inflight: set[str] = set()
         if migrated:
             self._save()
         admin_token = MeshPoolToken(
@@ -4815,6 +4821,12 @@ class PoolManager:
                     type(measured_ctx_budget) is int
                     and 1 <= measured_ctx_budget < 2**32
                 ):
+                    # Bind deploy calibration to this exact mesh generation.
+                    # The model-level copy remains a compatibility/status
+                    # summary, but replacement deploys must consume this
+                    # per-mesh value so stale measurements from prior hardware
+                    # cannot be reused.
+                    mesh["measured_ctx_budget"] = int(measured_ctx_budget)
                     registry = self.state.setdefault("model_registry", {})
                     model_entry = registry.setdefault(
                         str(mesh.get("model_id", "") or ""), {}
@@ -4891,7 +4903,7 @@ class PoolManager:
                     ready_registration = (
                         self.state.get("mesh_registrations") or {}
                     ).get(str(mesh.get("model_id", "") or ""))
-                    if isinstance(ready_registration, dict):
+                    if isinstance(ready_registration, dict) and mesh_chain_bound:
                         ready_registration["mesh_id"] = mesh_id
                     if verification_snapshot_hash:
                         mesh["verification_snapshot_hash"] = (
@@ -5638,6 +5650,13 @@ class PoolManager:
     def handle_launch(self, body: dict[str, Any]) -> dict[str, Any]:
         self._auth_manage(body)
         auto_relaunch = bool(body.get("_auto_relaunch"))
+        deploy_measurement_unbound = bool(
+            body.get("_deploy_measurement_unbound")
+        )
+        if auto_relaunch and deploy_measurement_unbound:
+            raise ValueError(
+                "automatic relaunch cannot request an unbound deploy measurement"
+            )
         if not self.serving_mode:
             raise ValueError(
                 "pool serving mode is unconfigured; recreate it explicitly as dev or subnet"
@@ -5723,7 +5742,10 @@ class PoolManager:
                         "measured_ctx_budget",
                     ):
                         model_registration.pop(field_name, None)
-            chain_bound = model_registration.get("model_index") is not None
+            chain_bound = (
+                model_registration.get("model_index") is not None
+                and not deploy_measurement_unbound
+            )
             if chain_bound:
                 for field_name in (
                     "model_package_hash",
@@ -6049,10 +6071,16 @@ class PoolManager:
             }
             model_binding = (
                 {"model_index": int(model_registration["model_index"])}
-                if model_registration.get("model_index") is not None
+                if (
+                    model_registration.get("model_index") is not None
+                    and not deploy_measurement_unbound
+                )
                 else {}
             )
-            if model_registration.get("max_context_len") is not None:
+            if (
+                not deploy_measurement_unbound
+                and model_registration.get("max_context_len") is not None
+            ):
                 model_binding["max_context_len"] = _require_max_context_len(
                     model_registration["max_context_len"]
                 )
@@ -6137,7 +6165,7 @@ class PoolManager:
                 ).get(model_id)
                 if isinstance(launched_registration, dict):
                     launched_registration["mesh_key"] = mesh_key
-            if not auto_relaunch:
+            if not auto_relaunch and not deploy_measurement_unbound:
                 # An explicit launch lifts any operator suspension: the
                 # operator has re-stated that this model should serve, so
                 # auto-relaunch may guard it again. An automatic launch must
@@ -6929,6 +6957,31 @@ class PoolManager:
         registration = body.get("registration")
         with self.lock:
             registrations = self._registrations_locked()
+            if "suspend_renewal" in body:
+                model_id = str(body.get("model_id", "") or "")
+                if not model_id:
+                    raise ValueError("model_id is required to suspend renewal")
+                current = registrations.get(model_id)
+                if not isinstance(current, dict):
+                    raise ValueError(
+                        f"no stored registration for {model_id}; cannot "
+                        "coordinate renewal suspension"
+                    )
+                current["renewal_suspended"] = bool(body["suspend_renewal"])
+                registrations[model_id] = current
+                self.state["mesh_registrations"] = registrations
+                renewal_in_progress = (
+                    model_id in self._lease_renewals_inflight
+                )
+                self._save()
+                return {
+                    "status": "ok",
+                    "registration": dict(current),
+                    "registrations": {
+                        key: dict(value) for key, value in registrations.items()
+                    },
+                    "renewal_in_progress": renewal_in_progress,
+                }
             if body.get("clear"):
                 # `mesh retire` deactivated the entry on chain; a stored
                 # registration would keep the lease renewer resurrecting it.

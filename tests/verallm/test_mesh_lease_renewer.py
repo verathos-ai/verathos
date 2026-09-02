@@ -1,6 +1,7 @@
 """Pool manager lease renewer: window-driven, serving-gated, fail-lapse."""
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -80,6 +81,91 @@ def test_renews_only_inside_window(monkeypatch, tmp_path):
     assert stored["expires_at"] > time.time() + LEASE_RENEW_WINDOW_S
 
 
+def test_suspended_registration_is_never_renewed(monkeypatch, tmp_path):
+    manager = _manager(tmp_path)
+    outcomes: list = []
+    _wire_renew(monkeypatch, outcomes)
+    manager.state["meshes"]["m-1"] = {"status": "serving"}
+    registration = _registration(3600)
+    registration["renewal_suspended"] = True
+    manager.state["mesh_registrations"] = {
+        "qwen2.5-7b-q4-k-m": registration
+    }
+
+    assert (
+        renew_lease_if_due(manager, chain_config=None, private_key=PRIVATE_KEY)
+        is None
+    )
+    assert outcomes == []
+
+
+def test_deploy_suspension_waits_out_inflight_renewal(
+    monkeypatch, tmp_path
+):
+    manager = _manager(tmp_path)
+    model_id = "qwen2.5-7b-q4-k-m"
+    manager.state["meshes"]["m-1"] = {"status": "serving"}
+    manager.state["mesh_registrations"] = {
+        model_id: _registration(3600)
+    }
+    started = threading.Event()
+    release = threading.Event()
+    outcomes: list[RegistrationOutcome] = []
+
+    def slow_renew(chain_config, target, index, *, private_key):
+        started.set()
+        assert release.wait(5.0)
+        outcome = RegistrationOutcome(
+            action="renew",
+            index=index,
+            tx_hash="0x" + "cd" * 32,
+            expires_at=int(time.time()) + 86_400,
+        )
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(registration_module, "renew_once", slow_renew)
+    thread = threading.Thread(
+        target=renew_lease_if_due,
+        kwargs={
+            "manager": manager,
+            "chain_config": None,
+            "private_key": PRIVATE_KEY,
+        },
+    )
+    thread.start()
+    assert started.wait(5.0)
+
+    secret = manager.state["management_secret"]
+    response = manager.handle_registration_state(
+        {
+            "management_secret": secret,
+            "model_id": model_id,
+            "suspend_renewal": True,
+        }
+    )
+    assert response["renewal_in_progress"] is True
+    assert response["registration"]["renewal_suspended"] is True
+
+    release.set()
+    thread.join(5.0)
+    assert not thread.is_alive()
+    response = manager.handle_registration_state(
+        {
+            "management_secret": secret,
+            "model_id": model_id,
+            "suspend_renewal": True,
+        }
+    )
+    assert response["renewal_in_progress"] is False
+    assert len(outcomes) == 1
+    assert (
+        renew_lease_if_due(manager, chain_config=None, private_key=PRIVATE_KEY)
+        is None
+    )
+    assert len(outcomes) == 1
+
+
 def test_dead_mesh_lets_the_lease_lapse(monkeypatch, tmp_path):
     manager = _manager(tmp_path)
     outcomes: list = []
@@ -154,6 +240,21 @@ def test_registration_state_route_round_trip(tmp_path):
     # Read-only call returns the stored value.
     read = manager.handle_registration_state({"management_secret": secret})
     assert read["registration"]["index"] == 0
+    suspended = manager.handle_registration_state(
+        {
+            "management_secret": secret,
+            "model_id": "qwen2.5-7b-q4-k-m",
+            "suspend_renewal": True,
+        }
+    )
+    assert suspended["registration"]["renewal_suspended"] is True
+    # A successful final registration-state write replaces the provisional
+    # record and is the only normal path that clears the suspension.
+    manager.handle_registration_state(
+        {"management_secret": secret, "registration": _registration(3600)}
+    )
+    read = manager.handle_registration_state({"management_secret": secret})
+    assert "renewal_suspended" not in read["registration"]
     # Incomplete payloads are refused.
     with pytest.raises(ValueError, match="missing"):
         manager.handle_registration_state(

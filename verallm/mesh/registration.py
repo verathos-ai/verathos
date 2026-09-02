@@ -363,7 +363,27 @@ def register_mesh_endpoint(
         previous_registration,
     )
     endpoint_update_tx = ""
+    slot_deactivated = False
     if plan.action in ("update-endpoint", "update-endpoint-refresh"):
+        # A replacement that also changes the registered context must never
+        # expose the new endpoint under the old active contract, even for one
+        # block.  Take the slot offline first; updateEndpoint is valid for an
+        # inactive entry, and registerModel then reactivates the same tuple and
+        # index with the newly measured metadata.  A topology-only endpoint
+        # move keeps the existing atomic endpoint-first path.
+        if plan.action == "update-endpoint-refresh":
+            try:
+                client.deactivate_model(
+                    plan.predicted_index, private_key=private_key
+                )
+                slot_deactivated = True
+            except Exception as exc:
+                raise LifecycleRefusal(
+                    f"deactivateModel for replacement slot "
+                    f"{plan.predicted_index} failed or its transaction "
+                    "outcome is unknown; stop serving and re-read the "
+                    "registry before retrying"
+                ) from exc
         try:
             endpoint_update_tx = client.update_endpoint(
                 plan.predicted_index,
@@ -371,10 +391,16 @@ def register_mesh_endpoint(
                 private_key=private_key,
             )
         except Exception as exc:
+            detail = (
+                f"; slot {plan.predicted_index} was deactivated first and "
+                "remains OFF CHAIN until replacement registration completes"
+                if slot_deactivated
+                else ""
+            )
             raise LifecycleRefusal(
                 f"updateEndpoint for index {plan.predicted_index} failed or "
                 "its transaction outcome is unknown; stop serving and "
-                "re-read the registry before retrying"
+                f"re-read the registry before retrying{detail}"
             ) from exc
         # Re-read from a fresh client.  The normal lifecycle planner can now
         # see the target endpoint and safely completes any metadata refresh or
@@ -415,7 +441,7 @@ def register_mesh_endpoint(
             expires_at=int(entry.expires_at),
         )
     else:
-        if plan.action == "refresh":
+        if plan.action == "refresh" and not slot_deactivated:
             # An active slot whose contract changed (re-measured context,
             # re-anchored spec): registerModel reverts on an active
             # duplicate but reactivates a deactivated matching tuple IN
@@ -434,7 +460,7 @@ def register_mesh_endpoint(
                 private_key=private_key,
             )
         except Exception as exc:
-            if plan.action == "refresh":
+            if plan.action == "refresh" or slot_deactivated:
                 # Non-atomic by contract design: the slot is now
                 # DEACTIVATED and validators drop it until re-registered.
                 # Re-running deploy/registration reactivates the same
@@ -455,7 +481,9 @@ def register_mesh_endpoint(
         index = resolve_registered_index(entries, target)
         outcome = RegistrationOutcome(
             action=(
-                f"{replacement_action}+{plan.action}"
+                "update-endpoint+refresh"
+                if replacement_action and slot_deactivated
+                else f"{replacement_action}+{plan.action}"
                 if replacement_action
                 else plan.action
             ),
@@ -470,6 +498,95 @@ def register_mesh_endpoint(
             "are wrong. Stop the mesh and re-run deploy."
         )
     return outcome
+
+
+def deactivate_mesh_endpoint_for_recalibration(
+    chain_config,
+    previous_registration: Mapping[str, Any],
+    *,
+    private_key: str,
+    expected_endpoint: str,
+) -> RegistrationOutcome:
+    """Take one exact same-endpoint slot offline before live calibration.
+
+    A replacement that keeps the public endpoint cannot expose its unbound
+    measurement runtime while the chain still advertises the old context at
+    that URL.  This guard authenticates the complete persisted tuple against
+    fresh chain state, deactivates only that exact index, and verifies the
+    inactive readback before deploy stops the old runtime.  Re-running it is
+    idempotent when the exact slot is already inactive.
+    """
+    from eth_account import Account
+
+    try:
+        previous = registration_target_from_state(previous_registration)
+        index = int(previous_registration["index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LifecycleRefusal(
+            "stored pool registration is malformed; refusing recalibration"
+        ) from exc
+    if previous.endpoint != str(expected_endpoint):
+        raise LifecycleRefusal(
+            "same-endpoint recalibration guard received a different endpoint; "
+            "refusing to deactivate an unrelated slot"
+        )
+
+    signer_address = Account.from_key(private_key).address
+    spec = _model_registry_client(chain_config).get_model_spec(previous.model_id)
+    validate_mesh_model_registry_eligibility(previous, spec)
+    client = _miner_registry_client(chain_config)
+    try:
+        entries = client.get_miner_models(signer_address)
+    except Exception as exc:
+        raise LifecycleRefusal(
+            "could not read the registry before same-endpoint recalibration; "
+            "the serving runtime was not stopped"
+        ) from exc
+    if index < 0 or index >= len(entries):
+        raise LifecycleRefusal(
+            f"stored pool registration index {index} is outside the current "
+            "MinerRegistry entries; refusing recalibration"
+        )
+    entry = entries[index]
+    if not configuration_matches(entry, previous):
+        raise LifecycleRefusal(
+            f"MinerRegistry entry {index} no longer matches the pool's stored "
+            "model, endpoint, quant, ModelSpec reference, and context; "
+            "refusing recalibration"
+        )
+
+    tx_hash = ""
+    if bool(entry.active):
+        try:
+            tx_hash = client.deactivate_model(index, private_key=private_key)
+        except Exception as exc:
+            raise LifecycleRefusal(
+                f"deactivateModel for same-endpoint replacement slot {index} "
+                "failed or its transaction outcome is unknown; keep the "
+                "runtime serving and re-read the registry before retrying"
+            ) from exc
+
+    try:
+        fresh_entries = _miner_registry_client(chain_config).get_miner_models(
+            signer_address
+        )
+        fresh = fresh_entries[index]
+    except Exception as exc:
+        raise LifecycleRefusal(
+            f"could not verify inactive readback for replacement slot {index}; "
+            "do not expose a calibration runtime until chain state is known"
+        ) from exc
+    if not configuration_matches(fresh, previous) or bool(fresh.active):
+        raise LifecycleRefusal(
+            f"replacement slot {index} did not read back as the exact inactive "
+            "stored tuple; do not expose a calibration runtime"
+        )
+    return RegistrationOutcome(
+        action="deactivate-for-recalibration" if tx_hash else "already-inactive",
+        index=index,
+        tx_hash=tx_hash,
+        expires_at=int(fresh.expires_at),
+    )
 
 
 def renew_once(
@@ -655,6 +772,8 @@ def renew_lease_if_due(
     }
     last_outcome: RegistrationOutcome | None = None
     for model_id, state in registrations.items():
+        if bool(state.get("renewal_suspended")):
+            continue
         mesh = meshes.get(model_id) or {}
         if mesh.get("status") != "serving":
             # A relaunch mints a NEW mesh_key while the stored registration
@@ -712,15 +831,31 @@ def renew_lease_if_due(
             > LEASE_RENEW_WINDOW_S
         ):
             continue
-        target = registration_target_from_state(state)
-        outcome = renew_once(
-            chain_config, target, int(state["index"]), private_key=private_key
-        )
         with manager.lock:
             stored = manager._registrations_locked().get(model_id)
-            if isinstance(stored, dict):
-                stored["expires_at"] = outcome.expires_at
-                manager._save()
+            if (
+                not isinstance(stored, dict)
+                or bool(stored.get("renewal_suspended"))
+                or model_id in manager._lease_renewals_inflight
+            ):
+                continue
+            manager._lease_renewals_inflight.add(model_id)
+        try:
+            target = registration_target_from_state(state)
+            outcome = renew_once(
+                chain_config,
+                target,
+                int(state["index"]),
+                private_key=private_key,
+            )
+            with manager.lock:
+                stored = manager._registrations_locked().get(model_id)
+                if isinstance(stored, dict):
+                    stored["expires_at"] = outcome.expires_at
+                    manager._save()
+        finally:
+            with manager.lock:
+                manager._lease_renewals_inflight.discard(model_id)
         logger.info(
             "lease renewed for %s at index %d until %d (tx %s)",
             model_id,

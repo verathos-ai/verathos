@@ -12,6 +12,7 @@ from verallm.mesh.registration import (
     MeshChainAnchors,
     _plan_mesh_registration_from_entries,
     build_registration_target,
+    deactivate_mesh_endpoint_for_recalibration,
     ensure_evm_registered,
     load_mesh_registration_state,
     register_mesh_endpoint,
@@ -68,12 +69,14 @@ class _FakeMinerRegistry:
         self.renew_calls = []
         self.update_endpoint_calls = []
         self.deactivate_calls = []
+        self.call_order = []
 
     def get_miner_models(self, address):
         return list(self.entries)
 
     def register_model(self, model_id, endpoint, model_spec_ref, quant,
                        max_context_len, private_key=None):
+        self.call_order.append("register")
         self.register_calls.append(model_id)
         return "0x" + "ab" * 32
 
@@ -82,11 +85,13 @@ class _FakeMinerRegistry:
         return "0x" + "cd" * 32
 
     def update_endpoint(self, index, endpoint, private_key=None):
+        self.call_order.append("update-endpoint")
         self.update_endpoint_calls.append((index, endpoint))
         self.entries[index].endpoint = endpoint
         return "0x" + "ef" * 32
 
     def deactivate_model(self, index, private_key=None):
+        self.call_order.append("deactivate")
         self.deactivate_calls.append(index)
         self.entries[index].active = False
         return "0x" + "cd" * 32
@@ -339,6 +344,7 @@ def test_register_replacement_refreshes_changed_context_at_same_index(
     miner = _FakeMinerRegistry([_entry(previous)])
 
     def register_model(*args, **kwargs):
+        miner.call_order.append("register")
         miner.register_calls.append(args[0])
         miner.entries[0] = _entry(target)
         return "0x" + "ab" * 32
@@ -359,7 +365,140 @@ def test_register_replacement_refreshes_changed_context_at_same_index(
     assert miner.update_endpoint_calls == [(0, target.endpoint)]
     assert miner.deactivate_calls == [0]
     assert miner.register_calls == [MODEL_ID]
+    assert miner.call_order == ["deactivate", "update-endpoint", "register"]
     assert len(miner.entries) == 1
+
+
+def test_replacement_context_update_failure_leaves_slot_off_chain(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://old.example:9443"
+    )
+    target = build_registration_target(
+        anchors=anchors,
+        endpoint="https://new.example:9443",
+        max_context_len=65_536,
+    )
+    miner = _FakeMinerRegistry([_entry(previous)])
+
+    def fail_update(*args, **kwargs):
+        miner.call_order.append("update-endpoint")
+        raise RuntimeError("rpc timeout")
+
+    miner.update_endpoint = fail_update
+    _wire(monkeypatch, spec=_spec(), miner=miner)
+
+    with pytest.raises(
+        LifecycleRefusal,
+        match=r"slot 0 was deactivated first and remains OFF CHAIN",
+    ):
+        register_mesh_endpoint(
+            None,
+            target,
+            private_key=PRIVATE_KEY,
+            expected_index=0,
+            previous_registration=_registration_state(previous),
+        )
+
+    assert miner.entries[0].active is False
+    assert miner.call_order == ["deactivate", "update-endpoint"]
+    assert miner.register_calls == []
+
+
+def test_same_endpoint_recalibration_deactivates_exact_stored_slot(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://same.example:9443"
+    )
+    miner = _FakeMinerRegistry([_entry(previous)])
+    _wire(monkeypatch, spec=_spec(), miner=miner)
+
+    outcome = deactivate_mesh_endpoint_for_recalibration(
+        None,
+        _registration_state(previous),
+        private_key=PRIVATE_KEY,
+        expected_endpoint=previous.endpoint,
+    )
+
+    assert outcome.action == "deactivate-for-recalibration"
+    assert outcome.index == 0
+    assert miner.deactivate_calls == [0]
+    assert miner.entries[0].active is False
+
+
+def test_same_endpoint_recalibration_refuses_stale_tuple_without_deactivation(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://same.example:9443"
+    )
+    stale = _entry(previous)
+    stale.max_context_len = 8192
+    miner = _FakeMinerRegistry([stale])
+    _wire(monkeypatch, spec=_spec(), miner=miner)
+
+    with pytest.raises(LifecycleRefusal, match="no longer matches"):
+        deactivate_mesh_endpoint_for_recalibration(
+            None,
+            _registration_state(previous),
+            private_key=PRIVATE_KEY,
+            expected_endpoint=previous.endpoint,
+        )
+
+    assert miner.deactivate_calls == []
+    assert miner.entries[0].active is True
+
+
+def test_same_endpoint_recalibration_is_idempotent_when_already_inactive(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://same.example:9443"
+    )
+    miner = _FakeMinerRegistry([_entry(previous, active=False)])
+    _wire(monkeypatch, spec=_spec(), miner=miner)
+
+    outcome = deactivate_mesh_endpoint_for_recalibration(
+        None,
+        _registration_state(previous),
+        private_key=PRIVATE_KEY,
+        expected_endpoint=previous.endpoint,
+    )
+
+    assert outcome.action == "already-inactive"
+    assert miner.deactivate_calls == []
+
+
+def test_same_endpoint_recalibration_deactivation_failure_is_fail_closed(
+    monkeypatch,
+):
+    anchors = _anchors(monkeypatch)
+    previous = build_registration_target(
+        anchors=anchors, endpoint="https://same.example:9443"
+    )
+    miner = _FakeMinerRegistry([_entry(previous)])
+
+    def fail_deactivate(*_args, **_kwargs):
+        raise RuntimeError("rpc timeout")
+
+    miner.deactivate_model = fail_deactivate
+    _wire(monkeypatch, spec=_spec(), miner=miner)
+
+    with pytest.raises(LifecycleRefusal, match="outcome is unknown"):
+        deactivate_mesh_endpoint_for_recalibration(
+            None,
+            _registration_state(previous),
+            private_key=PRIVATE_KEY,
+            expected_endpoint=previous.endpoint,
+        )
+
+    assert miner.entries[0].active is True
 
 
 def test_register_appends_and_verifies_index(monkeypatch):

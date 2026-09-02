@@ -58,6 +58,7 @@ class _FakePool:
         self.registered_model: dict | None = None
         self.stopped: list[str] = []
         self.serving_mode = "subnet"
+        self.renewal_suspended = False
 
     def __call__(self, route: str, body: dict) -> dict:
         self.calls.append((route, dict(body)))
@@ -134,6 +135,7 @@ class _FakePool:
             chain_bound = bool(
                 self.registered_model is not None
                 and self.registered_model.get("model_index") is not None
+                and not body.get("_deploy_measurement_unbound")
             )
             self.meshes = {
                 mesh_key: {
@@ -142,11 +144,17 @@ class _FakePool:
                     "members": ["pod-gpu0", "pod-gpu1"],
                     "status": "serving",
                     "routing_ready": True,
+                    "measured_ctx_budget": MEASURED,
                     **(
                         {
                             "verification_snapshot_hash": SNAPSHOT,
                             "model_index": int(
                                 self.registered_model["model_index"]
+                            ),
+                            "max_context_len": int(
+                                self.registered_model.get(
+                                    "max_context_len", 0
+                                )
                             ),
                             # The real pool surfaces the chain anchors on
                             # every chain-bound mesh; deploy compares them
@@ -199,6 +207,26 @@ class _FakePool:
                 "total_s": 1.0,
             }
         if route == "/v1/pool/registration-state":
+            if "suspend_renewal" in body:
+                self.renewal_suspended = bool(body["suspend_renewal"])
+                return {
+                    "status": "ok",
+                    "registration": {
+                        "model_id": MODEL_ID,
+                        "renewal_suspended": self.renewal_suspended,
+                    },
+                    "registrations": {
+                        MODEL_ID: {
+                            "model_id": MODEL_ID,
+                            "renewal_suspended": self.renewal_suspended,
+                        }
+                    },
+                    "renewal_in_progress": False,
+                }
+            if body.get("registration") is not None:
+                self.renewal_suspended = bool(
+                    body["registration"].get("renewal_suspended")
+                )
             return {"status": "ok", "registration": body.get("registration")}
         raise AssertionError(f"unexpected route {route}")
 
@@ -1079,16 +1107,10 @@ def test_deploy_clears_a_dead_mesh_before_launching(wired):
     assert wired == ["registerEvm", "registerModel"]
 
 
-def test_stock_endpoint_replacement_preserves_registered_context(
+def test_stock_endpoint_replacement_recalibrates_registered_context(
     wired, monkeypatch
 ):
-    """Default replacement must not probe beyond its chain-bound runtime.
-
-    The running mesh was launched at the stored registration's context. Its
-    advertised KV fit can be larger, but topology-only replacement bypasses
-    derivation and certifies the exact stored value before the same-index
-    endpoint update.
-    """
+    """Index reuse never pins a replacement host to the old context."""
 
     pool = _FakePool()
     pool.launch_count = 1
@@ -1103,21 +1125,50 @@ def test_stock_endpoint_replacement_preserves_registered_context(
             "model_index": 0,
         }
     }
-    gated_contexts: list[tuple[int, bool]] = []
+    pool.registered_model = {
+        "model_id": MODEL_ID,
+        "model_index": 0,
+        "max_context_len": 16_384,
+        "model_package_hash": "01" * 32,
+        "model_tensor_manifest_root": "02" * 32,
+        "tokenizer_hash": "03" * 32,
+        "quantization_scheme": "gguf_q4_k_m",
+    }
+    gated_contexts: list[int] = []
 
     def gate(**kwargs):
         config = kwargs["config"]
-        gated_contexts.append((config.max_context_len, config.full_context))
+        gated_contexts.append(config.max_context_len)
         return _passing_gate()
 
     monkeypatch.setattr(deploy_module, "run_probe_gate", gate)
 
+    planned_contexts: list[int] = []
+
+    def plan(_cfg, target, _signer, **_kwargs):
+        planned_contexts.append(target.max_context_len)
+        return LifecyclePlan(
+            action="update-endpoint-refresh",
+            predicted_index=0,
+            reason="same-index replacement with refreshed context",
+        )
+
+    def register(_cfg, target, **_kwargs):
+        assert target.max_context_len == MEASURED_ROUNDED
+        return registration_module.RegistrationOutcome(
+            action="update-endpoint",
+            index=0,
+            tx_hash="0x" + "ab" * 32,
+            expires_at=int(time.time()) + 86_400,
+        )
+
+    monkeypatch.setattr(registration_module, "plan_mesh_registration", plan)
+    monkeypatch.setattr(registration_module, "register_mesh_endpoint", register)
+
     previous = {
         "model_id": MODEL_ID,
-        # Deliberately not 1,024-aligned.  The normal timing derivation rounds
-        # contexts down, but a topology-only replacement must retain the exact
-        # value already registered on chain.
-        "max_context_len": 119_500,
+        "max_context_len": 16_384,
+        "endpoint": "https://old.example:9443",
         "index": 0,
     }
     report = run_deploy(
@@ -1128,10 +1179,360 @@ def test_stock_endpoint_replacement_preserves_registered_context(
     )
 
     assert not report.failed
-    assert gated_contexts == [(119_500, True)]
+    assert pool.stopped[0] == "m-existing"
+    measurement_launch = next(
+        body
+        for route, body in pool.calls
+        if route == "/v1/pool/launch"
+        and body.get("_deploy_measurement_unbound")
+    )
+    assert measurement_launch["_deploy_measurement_unbound"] is True
+    assert gated_contexts == [MEASURED_ROUNDED]
     assert report.measured_ctx_budget == MEASURED
-    assert report.registered_context_len == 119_500
-    assert pool.registered_model["max_context_len"] == 119_500
+    assert report.registered_context_len == MEASURED_ROUNDED
+    assert planned_contexts == [MEASURED_ROUNDED]
+    assert pool.registered_model["max_context_len"] == MEASURED_ROUNDED
+    final_mesh = next(iter(pool.meshes.values()))
+    assert final_mesh["model_index"] == 0
+    assert final_mesh["max_context_len"] == MEASURED_ROUNDED
+
+
+def test_same_endpoint_replacement_deactivates_before_stopping_runtime(
+    wired, monkeypatch
+):
+    pool = _FakePool()
+    pool.launch_count = 1
+    pool.meshes = {
+        "m-existing": {
+            "model_id": MODEL_ID,
+            "driver": "pod-gpu0",
+            "members": ["pod-gpu0", "pod-gpu1"],
+            "status": "serving",
+            "routing_ready": True,
+            "verification_snapshot_hash": SNAPSHOT,
+            "model_index": 0,
+        }
+    }
+    pool.registered_model = {
+        "model_id": MODEL_ID,
+        "model_index": 0,
+        "max_context_len": 16_384,
+        "model_package_hash": "01" * 32,
+        "model_tensor_manifest_root": "02" * 32,
+        "tokenizer_hash": "03" * 32,
+        "quantization_scheme": "gguf_q4_k_m",
+    }
+    ordering: list[str] = []
+
+    def deactivate(*_args, **_kwargs):
+        assert pool.stopped == []
+        ordering.append("deactivate-chain-slot")
+        return registration_module.RegistrationOutcome(
+            action="deactivate-for-recalibration",
+            index=0,
+            tx_hash="0x" + "cd" * 32,
+            expires_at=int(time.time()) + 86_400,
+        )
+
+    original = pool.__call__
+
+    def call(route, body):
+        if route == "/v1/pool/stop":
+            ordering.append("stop-runtime")
+        return original(route, body)
+
+    monkeypatch.setattr(
+        registration_module,
+        "deactivate_mesh_endpoint_for_recalibration",
+        deactivate,
+    )
+    previous = {
+        "model_id": MODEL_ID,
+        "max_context_len": 16_384,
+        "endpoint": "https://mesh.example:9443",
+        "index": 0,
+    }
+
+    report = run_deploy(
+        _config(previous_registration=previous),
+        call=call,
+        out=lambda _line: None,
+        sleep=lambda _seconds: None,
+    )
+
+    assert not report.failed
+    assert ordering[:2] == ["deactivate-chain-slot", "stop-runtime"]
+    assert any(
+        stage["name"] == "measurement-slot" and stage["status"] == "ok"
+        for stage in report.stages
+    )
+
+
+def test_same_endpoint_replacement_without_mesh_deactivates_before_launch(
+    wired, monkeypatch
+):
+    pool = _FakePool()
+    pool.registered_model = {
+        "model_id": MODEL_ID,
+        "model_index": 0,
+        "max_context_len": 16_384,
+        "model_package_hash": "01" * 32,
+        "model_tensor_manifest_root": "02" * 32,
+        "tokenizer_hash": "03" * 32,
+        "quantization_scheme": "gguf_q4_k_m",
+    }
+    ordering: list[str] = []
+
+    def deactivate(*_args, **_kwargs):
+        assert pool.launch_count == 0
+        ordering.append("deactivate-chain-slot")
+        return registration_module.RegistrationOutcome(
+            action="deactivate-for-recalibration",
+            index=0,
+            tx_hash="0x" + "cd" * 32,
+            expires_at=int(time.time()) + 86_400,
+        )
+
+    original = pool.__call__
+
+    def call(route, body):
+        if route == "/v1/pool/launch":
+            ordering.append("launch-runtime")
+        return original(route, body)
+
+    monkeypatch.setattr(
+        registration_module,
+        "deactivate_mesh_endpoint_for_recalibration",
+        deactivate,
+    )
+    previous = {
+        "model_id": MODEL_ID,
+        "max_context_len": 16_384,
+        "endpoint": "https://mesh.example:9443",
+        "index": 0,
+    }
+
+    report = run_deploy(
+        _config(previous_registration=previous),
+        call=call,
+        out=lambda _line: None,
+        sleep=lambda _seconds: None,
+    )
+
+    assert not report.failed
+    assert ordering[:2] == ["deactivate-chain-slot", "launch-runtime"]
+    assert pool.stopped == ["m-test1"]
+
+
+def test_replacement_refuses_manager_without_renewal_suspension(
+    wired,
+):
+    class LegacyPool(_FakePool):
+        def __call__(self, route, body):
+            if (
+                route == "/v1/pool/registration-state"
+                and "suspend_renewal" in body
+            ):
+                # A rolled-back manager can echo a flag persisted by newer
+                # code while not implementing the in-flight coordination.
+                return {
+                    "status": "ok",
+                    "registrations": {
+                        MODEL_ID: {
+                            "model_id": MODEL_ID,
+                            "renewal_suspended": True,
+                        }
+                    },
+                }
+            return super().__call__(route, body)
+
+    pool = LegacyPool()
+    pool.meshes = {
+        "m-existing": {
+            "model_id": MODEL_ID,
+            "driver": "pod-gpu0",
+            "members": ["pod-gpu0", "pod-gpu1"],
+            "status": "serving",
+            "routing_ready": True,
+            "verification_snapshot_hash": SNAPSHOT,
+            "model_index": 0,
+        }
+    }
+    previous = {
+        "model_id": MODEL_ID,
+        "max_context_len": 16_384,
+        "endpoint": "https://old.example:9443",
+        "index": 0,
+    }
+
+    report = run_deploy(
+        _config(previous_registration=previous),
+        call=pool,
+        out=lambda _line: None,
+        sleep=lambda _seconds: None,
+    )
+
+    assert report.failed
+    assert (
+        "did not prove lease-renewal quiescence"
+        in report.stages[-1]["detail"]
+    )
+    assert pool.stopped == []
+    assert pool.launch_count == 0
+
+
+def test_replacement_refuses_manager_that_inherits_chain_binding(
+    wired, monkeypatch
+):
+    class LegacyPool(_FakePool):
+        def __call__(self, route, body):
+            if route == "/v1/pool/launch":
+                body = dict(body)
+                body.pop("_deploy_measurement_unbound", None)
+            return super().__call__(route, body)
+
+    pool = LegacyPool()
+    pool.launch_count = 1
+    pool.registered_model = {
+        "model_id": MODEL_ID,
+        "model_index": 0,
+        "max_context_len": 16_384,
+        "model_package_hash": "01" * 32,
+        "model_tensor_manifest_root": "02" * 32,
+        "tokenizer_hash": "03" * 32,
+        "quantization_scheme": "gguf_q4_k_m",
+    }
+    pool.meshes = {
+        "m-existing": {
+            "model_id": MODEL_ID,
+            "driver": "pod-gpu0",
+            "members": ["pod-gpu0", "pod-gpu1"],
+            "status": "serving",
+            "routing_ready": True,
+            "verification_snapshot_hash": SNAPSHOT,
+            "model_index": 0,
+        }
+    }
+    monkeypatch.setattr(
+        deploy_module, "run_probe_gate", lambda **_kwargs: _passing_gate()
+    )
+
+    report = run_deploy(
+        _config(
+            previous_registration={
+                "model_id": MODEL_ID,
+                "endpoint": "https://old.example:9443",
+                "max_context_len": 16_384,
+                "index": 0,
+            }
+        ),
+        call=pool,
+        out=lambda _line: None,
+        confirm=lambda _message: True,
+        sleep=lambda _seconds: None,
+    )
+
+    assert report.failed
+    assert any(
+        stage["name"] == "measurement"
+        and "did not honor" in stage["detail"]
+        for stage in report.stages
+    )
+    assert len(pool.stopped) == 2
+
+
+def test_replacement_refuses_stale_model_level_measurement(wired, monkeypatch):
+    class MissingFreshMeasurementPool(_FakePool):
+        def __call__(self, route, body):
+            response = super().__call__(route, body)
+            if route == "/v1/pool/status":
+                for mesh in response.get("meshes", {}).values():
+                    mesh.pop("measured_ctx_budget", None)
+            return response
+
+    pool = MissingFreshMeasurementPool()
+    pool.launch_count = 1
+    pool.registered_model = {
+        "model_id": MODEL_ID,
+        "model_index": 0,
+        "max_context_len": 16_384,
+        "measured_ctx_budget": 98_304,
+        "model_package_hash": "01" * 32,
+        "model_tensor_manifest_root": "02" * 32,
+        "tokenizer_hash": "03" * 32,
+        "quantization_scheme": "gguf_q4_k_m",
+    }
+    pool.meshes = {
+        "m-existing": {
+            "model_id": MODEL_ID,
+            "driver": "pod-gpu0",
+            "members": ["pod-gpu0", "pod-gpu1"],
+            "status": "serving",
+            "routing_ready": True,
+            "verification_snapshot_hash": SNAPSHOT,
+            "model_index": 0,
+        }
+    }
+    monkeypatch.setattr(
+        deploy_module, "run_probe_gate", lambda **_kwargs: _passing_gate()
+    )
+
+    report = run_deploy(
+        _config(
+            previous_registration={
+                "model_id": MODEL_ID,
+                "endpoint": "https://old.example:9443",
+                "max_context_len": 16_384,
+                "index": 0,
+            }
+        ),
+        call=pool,
+        out=lambda _line: None,
+        confirm=lambda _message: True,
+        sleep=lambda _seconds: None,
+    )
+
+    assert report.failed
+    assert any(
+        stage["name"] == "measurement"
+        and "fresh per-mesh" in stage["detail"]
+        for stage in report.stages
+    )
+
+
+def test_replacement_decline_keeps_registered_mesh_serving(wired):
+    pool = _FakePool()
+    pool.launch_count = 1
+    pool.meshes = {
+        "m-existing": {
+            "model_id": MODEL_ID,
+            "driver": "pod-gpu0",
+            "members": ["pod-gpu0", "pod-gpu1"],
+            "status": "serving",
+            "routing_ready": True,
+            "verification_snapshot_hash": SNAPSHOT,
+            "model_index": 0,
+        }
+    }
+    previous = {
+        "model_id": MODEL_ID,
+        "max_context_len": 16_384,
+        "endpoint": "https://old.example:9443",
+        "index": 0,
+    }
+
+    report = run_deploy(
+        _config(previous_registration=previous, assume_yes=False),
+        call=pool,
+        out=lambda _line: None,
+        confirm=lambda _message: False,
+        sleep=lambda _s: None,
+    )
+
+    assert report.failed
+    assert pool.stopped == []
+    assert pool.meshes["m-existing"]["status"] == "serving"
+    assert not any(route == "/v1/pool/launch" for route, _ in pool.calls)
 
 
 def test_serving_context_cap_pins_launch_and_clamps_registration(

@@ -282,7 +282,25 @@ def mesh_already_bound(
     )
 
 
-def _measured_ctx(status: Mapping[str, Any], model_id: str) -> int:
+def _measured_ctx(
+    status: Mapping[str, Any],
+    model_id: str,
+    *,
+    mesh_key: str = "",
+    allow_model_fallback: bool = True,
+) -> int:
+    if mesh_key:
+        mesh = dict((status.get("meshes") or {}).get(mesh_key) or {})
+        try:
+            measured = max(
+                0, int(mesh.get("measured_ctx_budget", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            measured = 0
+        if measured > 0:
+            return measured
+        if not allow_model_fallback:
+            return 0
     entry = dict((status.get("models") or {}).get(model_id) or {})
     try:
         return max(0, int(entry.get("measured_ctx_budget", 0) or 0))
@@ -542,41 +560,22 @@ def run_deploy(
     from verallm.registry.models import mesh_model_serving_context_cap
 
     serving_cap = mesh_model_serving_context_cap(config.model_id)
-    preserved_registration_context = 0
-    # A stock endpoint replacement should preserve the context already bound
-    # to the pool's chain slot.  The reused chain-bound runtime was launched
-    # at that context, so probing beyond it is not a re-measurement: the
-    # runtime correctly rejects the oversized request before the endpoint can
-    # be updated.  An explicit --max-context-len remains the opt-in path for a
-    # separately measured metadata change; the registration planner later
-    # re-reads chain state and validates the complete stored tuple before any
-    # write.
-    if config.max_context_len is None and isinstance(
-        config.previous_registration, Mapping
-    ):
-        try:
-            previous_model = str(config.previous_registration["model_id"])
-            previous_context = int(
-                config.previous_registration["max_context_len"]
-            )
-        except (KeyError, TypeError, ValueError):
-            previous_model, previous_context = "", 0
-        if previous_model == config.model_id and previous_context > 0:
-            if serving_cap > 0 and previous_context > serving_cap:
-                return fail(
-                    "context",
-                    f"existing registration context {previous_context} exceeds "
-                    f"the catalogue serving cap {serving_cap}; default endpoint "
-                    "replacement cannot silently change chain metadata. Pass an "
-                    "explicit --max-context-len only after separately qualifying "
-                    "the metadata change.",
-                )
-            preserved_registration_context = previous_context
-            serving_cap = previous_context
-            out(
-                f"[context] existing pool registration preserves context "
-                f"{preserved_registration_context} during endpoint replacement"
-            )
+    # `mesh deploy` is the calibration boundary.  A stored registration only
+    # proves which chain index this pool may update; it never supplies the
+    # replacement hardware's serving capacity.  Re-measure automatically on
+    # every default deploy so a stronger replacement may advertise more and a
+    # weaker one cannot inherit an unsafe contract.  Lease renewal does not
+    # run this path.
+    replacement_recalibration = (
+        isinstance(config.previous_registration, Mapping)
+        and str(config.previous_registration.get("model_id", ""))
+        == config.model_id
+    )
+    same_endpoint_recalibration = (
+        replacement_recalibration
+        and str(config.previous_registration.get("endpoint", ""))
+        == config.endpoint
+    )
     if serving_cap > 0:
         if (
             config.max_context_len is not None
@@ -679,10 +678,118 @@ def run_deploy(
         out("[dry-run] preflight complete; no launch, no transactions")
         return report
 
-    # 6. Measurement: reuse a serving mesh for this model, else launch it
-    # UNREGISTERED (operator lane only, no chain slot claimed) so the KV
-    # auto-fit measures the real context budget.
+    # 6. Measurement: reuse a serving mesh for a first registration.  A
+    # replacement deploy must instead stop the chain-bound instance and launch
+    # an UNREGISTERED measurement instance on the selected hardware.  The
+    # stored registration remains only as authorization to update the same
+    # index after the fresh gate passes.
     mesh_status = str(mesh.get("status", "")) if mesh else ""
+    launch_confirmed = False
+    if replacement_recalibration:
+        if confirm is not None and not config.assume_yes:
+            verb = "Stop and recalibrate" if mesh else "Recalibrate"
+            if not confirm(
+                f"{verb} {config.model_id} on "
+                f"{','.join(placement['workers'])} "
+                f"(driver {placement.get('driver')})?"
+            ):
+                report.stage(
+                    "measurement", "aborted", "operator declined calibration"
+                )
+                report.failed = True
+                return report
+            launch_confirmed = True
+        # Persistently suspend lease renewal before any chain deactivation or
+        # runtime stop, then wait out a renewal already in flight.  The final
+        # successful registration-state write replaces this stored record and
+        # therefore clears the suspension.  A failed deploy keeps renewal
+        # suspended, which is the safe state for an inactive/unknown slot.
+        renewal_deadline = clock() + min(
+            max(config.poll_interval_s * 6, 30.0), 300.0
+        )
+        while True:
+            try:
+                suspension = call(
+                    "/v1/pool/registration-state",
+                    {
+                        "model_id": config.model_id,
+                        "suspend_renewal": True,
+                    },
+                )
+            except (RuntimeError, OSError, ValueError) as exc:
+                return fail(
+                    "measurement",
+                    f"could not suspend lease renewal before replacement: {exc}",
+                )
+            registrations = suspension.get("registrations") or {}
+            stored = registrations.get(config.model_id) or {}
+            renewal_in_progress = suspension.get("renewal_in_progress")
+            if type(renewal_in_progress) is not bool:
+                return fail(
+                    "measurement",
+                    "pool manager did not prove lease-renewal quiescence; "
+                    "update the manager before recalibrating",
+                )
+            if not bool(stored.get("renewal_suspended")):
+                return fail(
+                    "measurement",
+                    "pool manager did not confirm persistent lease-renewal "
+                    "suspension; update the manager before recalibrating",
+                )
+            if not renewal_in_progress:
+                break
+            if clock() >= renewal_deadline:
+                return fail(
+                    "measurement",
+                    "an in-flight lease renewal did not quiesce before the "
+                    "replacement calibration deadline",
+                )
+            out("[measure] waiting for an in-flight lease renewal to finish")
+            sleep(max(config.poll_interval_s, 0.1))
+        report.stage(
+            "measurement-renewal",
+            "ok",
+            "lease renewal suspended and no renewal transaction is in flight",
+        )
+        if same_endpoint_recalibration:
+            out(
+                "[measure] taking the exact same-endpoint registration "
+                "offline before exposing an unbound calibration runtime"
+            )
+            try:
+                inactive = (
+                    registration_module.deactivate_mesh_endpoint_for_recalibration(
+                        config.chain_config,
+                        config.previous_registration,
+                        private_key=config.private_key,
+                        expected_endpoint=config.endpoint,
+                    )
+                )
+            except LifecycleRefusal as exc:
+                return fail("measurement", str(exc))
+            report.stage(
+                "measurement-slot",
+                "ok",
+                f"{inactive.action} index={inactive.index} "
+                f"tx={inactive.tx_hash or 'none'}",
+            )
+    if replacement_recalibration and mesh:
+        old_members = [str(member) for member in (mesh.get("members") or [])]
+        out(
+            f"[measure] stopping registered mesh {mesh_key} for fresh "
+            "replacement-hardware calibration"
+        )
+        call("/v1/pool/stop", {"mesh_key": mesh_key})
+        if not wait_for_workers_idle(
+            list(
+                dict.fromkeys(
+                    old_members + [str(worker) for worker in placement["workers"]]
+                )
+            ),
+            stage="measurement",
+        ):
+            return report
+        mesh_key, mesh, mesh_status = "", {}, ""
     if mesh and mesh_status == "serving":
         report.mesh_key = mesh_key
         out(f"[measure] reusing serving mesh {mesh_key}")
@@ -719,7 +826,11 @@ def run_deploy(
             ):
                 return report
             mesh_key, mesh = "", {}
-        if confirm is not None and not config.assume_yes:
+        if (
+            confirm is not None
+            and not config.assume_yes
+            and not launch_confirmed
+        ):
             if not confirm(
                 f"Launch {config.model_id} on "
                 f"{','.join(placement['workers'])} "
@@ -736,6 +847,11 @@ def run_deploy(
                 "model_id": config.model_id,
                 "workers": list(placement["workers"]),
                 "driver": placement.get("driver", ""),
+                # Internal deploy/manager contract, not an operator flag: a
+                # replacement measurement must not inherit the old chain-bound
+                # max_context_len from pool state.  The later register/relaunch
+                # stages restore the binding at the same index.
+                "_deploy_measurement_unbound": replacement_recalibration,
                 # Chain anchors ride the launch so a driver that must fetch
                 # can pull the owner-published manifest from the store and
                 # root-verify it, instead of rebuilding it locally (that is
@@ -773,6 +889,27 @@ def run_deploy(
         if served is None:
             return report
         mesh = served
+        if replacement_recalibration and (
+            mesh.get("model_index") is not None
+            or bool(mesh.get("verification_snapshot_hash"))
+        ):
+            out(
+                "[measure] FAIL: pool manager inherited the previous chain "
+                "binding during replacement calibration; stopping it"
+            )
+            try:
+                call("/v1/pool/stop", {"mesh_key": mesh_key})
+                wait_for_workers_idle(
+                    [str(worker) for worker in placement["workers"]],
+                    stage="measurement",
+                )
+            except Exception as exc:
+                out(f"[measure] cleanup after incompatible manager failed: {exc}")
+            return fail(
+                "measurement",
+                "pool manager did not honor the unbound replacement-"
+                "measurement contract; update the manager before retrying",
+            )
     report.stage("measurement", "ok", mesh_key)
 
     # Early reachability abort: the measurement mesh has just bound the SAME
@@ -805,7 +942,18 @@ def run_deploy(
     )
 
     status = call("/v1/pool/status", {})
-    measured = _measured_ctx(status, config.model_id)
+    measured = _measured_ctx(
+        status,
+        config.model_id,
+        mesh_key=mesh_key,
+        allow_model_fallback=not replacement_recalibration,
+    )
+    if replacement_recalibration and measured <= 0:
+        return fail(
+            "measurement",
+            "replacement hardware did not report a fresh per-mesh context "
+            "measurement; refusing to reuse the previous host's value",
+        )
     report.measured_ctx_budget = measured
     if measured > 0:
         out(f"[measure] KV auto-fit measured {measured} context")
@@ -849,19 +997,6 @@ def run_deploy(
                 "honest audit. Omit the flag to register the measured value.",
             )
         registered_ctx = requested
-    elif preserved_registration_context > 0:
-        # Endpoint replacement without an explicit context override is a
-        # topology-only operation.  Preserve the exact chain-bound value: do
-        # not feed it through timing derivation, rounding, or a slower host's
-        # inferred cap.  The full probe gate below certifies this exact context
-        # under the configured budget and fails before any chain write if the
-        # replacement cannot serve it.
-        registered_ctx = preserved_registration_context
-        out(
-            f"[context] certifying existing registration context "
-            f"{registered_ctx} exactly; endpoint replacement does not alter "
-            "chain metadata"
-        )
     elif measured > 0:
         budget_s = (
             float(config.validator_budget_s)
@@ -1092,12 +1227,6 @@ def run_deploy(
     # registered context, throughput, TTFT).
     gate_config = replace(
         config.probe,
-        # A topology-only replacement may retain its existing contract only
-        # after the new endpoint certifies that exact context.  Do not allow a
-        # generic probe-skip option to weaken this replacement invariant.
-        full_context=(
-            preserved_registration_context > 0 or config.probe.full_context
-        ),
         max_context_len=registered_ctx,
         measured_ctx_budget=measured,
     )
