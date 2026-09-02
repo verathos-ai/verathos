@@ -3783,23 +3783,6 @@ class ValidatorNeuron:
             return
         now = time.time()
         active = self._capacity_audit_slot_snapshot_for_selection(selection_block)
-        canary_busy_fn = getattr(self, "_owner_canary_busy_keys", None)
-        canary_busy_slots = (
-            canary_busy_fn() if callable(canary_busy_fn) else set()
-        )
-        if canary_busy_slots:
-            before = len(active)
-            active = [
-                (slot, row)
-                for slot, row in active
-                if (slot.address_lower, int(slot.model_index))
-                not in canary_busy_slots
-            ]
-            if before != len(active):
-                bt.logging.info(
-                    f"Capacity audit: skipped {before - len(active)} "
-                    f"owner-canary-busy slot(s) at block {selection_block}"
-                )
         drained_slots = {
             (drain.address.lower(), int(drain.model_index))
             for drain in self._db.get_capacity_drains(now=now)
@@ -9672,33 +9655,6 @@ class ValidatorNeuron:
                 continue
         return out
 
-    def _owner_canary_busy_keys(self) -> Set[Tuple[str, int]]:
-        """Return endpoint slots with owner canaries already in flight.
-
-        Capacity selection and canary admission share
-        ``_capacity_audit_schedule_lock``.  Reading the exact started
-        execution set while that lock is held closes the inverse race where a
-        capacity window could be created after a canary had already entered
-        normal inference.  Queued-but-unstarted canaries are intentionally not
-        included: they observe the capacity drain and requeue before HTTP.
-        """
-
-        lock = getattr(self, "_canary_accounting_lock", None)
-
-        def _snapshot() -> Set[Tuple[str, int]]:
-            started = set(getattr(self, "_cross_epoch_canaries", set()))
-            unfinished = getattr(self, "_unfinished_canary_tests", {})
-            return {
-                self._miner_model_key(test.miner_address, test.model_index)
-                for execution_id, test in tuple(unfinished.items())
-                if execution_id in started
-            }
-
-        if lock is None:
-            return _snapshot()
-        with lock:
-            return _snapshot()
-
     def _capacity_audit_key_drained(self, key: Tuple[str, int]) -> bool:
         address, model_index = key
         return self._miner_model_key(address, model_index) in self._capacity_audit_drained_keys()
@@ -11612,10 +11568,13 @@ class ValidatorNeuron:
                 f"rescheduled={rescheduled}"
             )
 
-        # Capacity selection holds the same lock.  Therefore either its drain
-        # exists first and this canary requeues, or this canary is marked
-        # started first and the capacity scheduler excludes the endpoint.
-        # There is no interval where both sides can independently admit work.
+        # Capacity selection holds the same lock. Therefore either its drain
+        # exists first and this canary requeues, or this canary is already in
+        # flight when a later public selection installs the drain. The latter
+        # must not change the public cohort: miners and independent validators
+        # derive that cohort without access to this validator's local canary
+        # state. The lead window drains new admissions, while any genuinely
+        # overlapping verified receipt follows the timing-excuse path.
         admission_lock = getattr(self, "_capacity_audit_schedule_lock", None)
         if admission_lock is None:
             if self._requeue_capacity_audit_canary(
