@@ -542,6 +542,41 @@ def run_deploy(
     from verallm.registry.models import mesh_model_serving_context_cap
 
     serving_cap = mesh_model_serving_context_cap(config.model_id)
+    preserved_registration_context = 0
+    # A stock endpoint replacement should preserve the context already bound
+    # to the pool's chain slot.  The reused chain-bound runtime was launched
+    # at that context, so probing beyond it is not a re-measurement: the
+    # runtime correctly rejects the oversized request before the endpoint can
+    # be updated.  An explicit --max-context-len remains the opt-in path for a
+    # separately measured metadata change; the registration planner later
+    # re-reads chain state and validates the complete stored tuple before any
+    # write.
+    if config.max_context_len is None and isinstance(
+        config.previous_registration, Mapping
+    ):
+        try:
+            previous_model = str(config.previous_registration["model_id"])
+            previous_context = int(
+                config.previous_registration["max_context_len"]
+            )
+        except (KeyError, TypeError, ValueError):
+            previous_model, previous_context = "", 0
+        if previous_model == config.model_id and previous_context > 0:
+            if serving_cap > 0 and previous_context > serving_cap:
+                return fail(
+                    "context",
+                    f"existing registration context {previous_context} exceeds "
+                    f"the catalogue serving cap {serving_cap}; default endpoint "
+                    "replacement cannot silently change chain metadata. Pass an "
+                    "explicit --max-context-len only after separately qualifying "
+                    "the metadata change.",
+                )
+            preserved_registration_context = previous_context
+            serving_cap = previous_context
+            out(
+                f"[context] existing pool registration preserves context "
+                f"{preserved_registration_context} during endpoint replacement"
+            )
     if serving_cap > 0:
         if (
             config.max_context_len is not None
@@ -784,7 +819,7 @@ def run_deploy(
             f"[measure] catalogue serving cap bounds the usable context "
             f"to {measured}"
         )
-    else:
+    elif measured <= 0:
         out(
             "[measure] WARNING: no measured context budget reported; the "
             "worker may predate measurement"
@@ -814,6 +849,19 @@ def run_deploy(
                 "honest audit. Omit the flag to register the measured value.",
             )
         registered_ctx = requested
+    elif preserved_registration_context > 0:
+        # Endpoint replacement without an explicit context override is a
+        # topology-only operation.  Preserve the exact chain-bound value: do
+        # not feed it through timing derivation, rounding, or a slower host's
+        # inferred cap.  The full probe gate below certifies this exact context
+        # under the configured budget and fails before any chain write if the
+        # replacement cannot serve it.
+        registered_ctx = preserved_registration_context
+        out(
+            f"[context] certifying existing registration context "
+            f"{registered_ctx} exactly; endpoint replacement does not alter "
+            "chain metadata"
+        )
     elif measured > 0:
         budget_s = (
             float(config.validator_budget_s)
@@ -1044,6 +1092,12 @@ def run_deploy(
     # registered context, throughput, TTFT).
     gate_config = replace(
         config.probe,
+        # A topology-only replacement may retain its existing contract only
+        # after the new endpoint certifies that exact context.  Do not allow a
+        # generic probe-skip option to weaken this replacement invariant.
+        full_context=(
+            preserved_registration_context > 0 or config.probe.full_context
+        ),
         max_context_len=registered_ctx,
         measured_ctx_budget=measured,
     )

@@ -1079,6 +1079,61 @@ def test_deploy_clears_a_dead_mesh_before_launching(wired):
     assert wired == ["registerEvm", "registerModel"]
 
 
+def test_stock_endpoint_replacement_preserves_registered_context(
+    wired, monkeypatch
+):
+    """Default replacement must not probe beyond its chain-bound runtime.
+
+    The running mesh was launched at the stored registration's context. Its
+    advertised KV fit can be larger, but topology-only replacement bypasses
+    derivation and certifies the exact stored value before the same-index
+    endpoint update.
+    """
+
+    pool = _FakePool()
+    pool.launch_count = 1
+    pool.meshes = {
+        "m-existing": {
+            "model_id": MODEL_ID,
+            "driver": "pod-gpu0",
+            "members": ["pod-gpu0", "pod-gpu1"],
+            "status": "serving",
+            "routing_ready": True,
+            "verification_snapshot_hash": SNAPSHOT,
+            "model_index": 0,
+        }
+    }
+    gated_contexts: list[tuple[int, bool]] = []
+
+    def gate(**kwargs):
+        config = kwargs["config"]
+        gated_contexts.append((config.max_context_len, config.full_context))
+        return _passing_gate()
+
+    monkeypatch.setattr(deploy_module, "run_probe_gate", gate)
+
+    previous = {
+        "model_id": MODEL_ID,
+        # Deliberately not 1,024-aligned.  The normal timing derivation rounds
+        # contexts down, but a topology-only replacement must retain the exact
+        # value already registered on chain.
+        "max_context_len": 119_500,
+        "index": 0,
+    }
+    report = run_deploy(
+        _config(previous_registration=previous),
+        call=pool,
+        out=lambda _line: None,
+        sleep=lambda _s: None,
+    )
+
+    assert not report.failed
+    assert gated_contexts == [(119_500, True)]
+    assert report.measured_ctx_budget == MEASURED
+    assert report.registered_context_len == 119_500
+    assert pool.registered_model["max_context_len"] == 119_500
+
+
 def test_serving_context_cap_pins_launch_and_clamps_registration(
     wired, monkeypatch
 ):
