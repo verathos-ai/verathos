@@ -94,6 +94,59 @@ def test_refresh_raises_on_metagraph_failure(tmp_path: Path, monkeypatch):
     assert not out.exists()
 
 
+def test_refresh_closes_owned_subtensor_after_success(tmp_path: Path, monkeypatch):
+    import verallm.mesh.allowlist as allowlist
+
+    _fake_bittensor(
+        monkeypatch,
+        hotkeys=["5Owner"],
+        permits=[True],
+        stakes=[1000.0],
+    )
+    closed: list[object] = []
+    monkeypatch.setattr(
+        allowlist, "close_owned_subtensor", lambda subtensor: closed.append(subtensor)
+    )
+
+    refresh_validator_allowlist(
+        subtensor_network="test",
+        netuid=405,
+        out_path=tmp_path / "validators.json",
+    )
+
+    assert len(closed) == 1
+
+
+def test_refresh_closes_owned_subtensor_after_metagraph_failure(
+    tmp_path: Path, monkeypatch
+):
+    import verallm.mesh.allowlist as allowlist
+
+    class _Subtensor:
+        def __init__(self, network=""):
+            self.network = network
+
+        def metagraph(self, _netuid):
+            raise RuntimeError("metagraph unavailable")
+
+    monkeypatch.setitem(
+        sys.modules, "bittensor", types.SimpleNamespace(Subtensor=_Subtensor)
+    )
+    closed: list[object] = []
+    monkeypatch.setattr(
+        allowlist, "close_owned_subtensor", lambda subtensor: closed.append(subtensor)
+    )
+
+    with pytest.raises(RuntimeError, match="metagraph unavailable"):
+        refresh_validator_allowlist(
+            subtensor_network="test",
+            netuid=405,
+            out_path=tmp_path / "validators.json",
+        )
+
+    assert len(closed) == 1
+
+
 def test_refresher_retries_fast_until_the_first_success(monkeypatch, tmp_path):
     """Before the first successful write the worker cannot drive at all
     (placement reports "member only: ... allowlist is unavailable"), so a

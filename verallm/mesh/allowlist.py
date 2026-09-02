@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Iterable
 
+from neurons.subtensor_connection import close_owned_subtensor
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_ALLOWLIST_REFRESH_INTERVAL_S = 5 * 60.0
@@ -84,7 +86,10 @@ def refresh_validator_allowlist(
     subtensor = bt.Subtensor(
         network=normalize_subtensor_network(subtensor_network)
     )
-    metagraph = subtensor.metagraph(int(netuid))
+    try:
+        metagraph = subtensor.metagraph(int(netuid))
+    finally:
+        close_owned_subtensor(subtensor)
 
     min_validator_stake = 0.0
     if chain_config_path:
