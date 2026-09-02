@@ -817,6 +817,84 @@ def test_restarted_worker_adopts_effective_config_before_first_window(tmp_path):
     assert worker.runtime_cfg.enabled is False
 
 
+def test_final_receipt_preempts_pass0_signing_when_both_are_ready(
+    tmp_path, monkeypatch
+):
+    """A multi-GPU receipt burst must spend delegated-sign capacity on the
+    deadline-bearing final receipts before background pass0 delivery."""
+
+    from types import SimpleNamespace
+
+    from neurons.capacity_audit import CapacityAuditRuntimeConfig
+
+    worker = _worker(tmp_path)
+    worker.runtime_cfg = CapacityAuditRuntimeConfig()
+    gpu = worker.local_gpus[0]
+    window = _window((gpu,))
+    lease = "priority-lease"
+    out_dir = tmp_path / "priority"
+    out_dir.mkdir()
+    pass0_root = "11" * 32
+    final_root = "22" * 32
+    (out_dir / f"{lease}_pass0.json").write_text(
+        json.dumps({"root": pass0_root})
+    )
+    (out_dir / f"{lease}_final_timing.json").write_text(
+        json.dumps({"root": final_root, "pass0_root": pass0_root})
+    )
+
+    class _Proc:
+        def poll(self):
+            return None
+
+        def communicate(self, timeout=None):
+            del timeout
+            return "", ""
+
+    one = SimpleNamespace(
+        gpu=gpu,
+        proc=_Proc(),
+        out_dir=out_dir,
+        challenge_file=out_dir / f"{lease}_challenge.txt",
+    )
+    events: list[str] = []
+    pass0_published = threading.Event()
+
+    def _sign(artifact):
+        events.append(f"sign:{artifact['artifact_type']}")
+        return dict(artifact, miner_signature="00" * 65)
+
+    def _publish(artifact):
+        events.append(f"publish:{artifact['artifact_type']}")
+        if artifact["artifact_type"] == "capacity_audit_pass0_receipt":
+            pass0_published.set()
+        return 1
+
+    monkeypatch.setattr(worker, "_sign", _sign)
+    monkeypatch.setattr(worker, "_publish_receipt", _publish)
+    monkeypatch.setattr(
+        worker, "_wait_for_challenge_seed", lambda *args, **kwargs: ""
+    )
+
+    worker._collect_gpu_artifacts(
+        window,
+        one,
+        lease,
+        "slot-priority",
+        on_timing_settled=lambda: events.append("timing:settled"),
+    )
+    assert pass0_published.wait(2.0)
+    assert events[:3] == [
+        "sign:capacity_audit_final_receipt",
+        "timing:settled",
+        "publish:capacity_audit_final_receipt",
+    ]
+    assert events[3:] == [
+        "sign:capacity_audit_pass0_receipt",
+        "publish:capacity_audit_pass0_receipt",
+    ]
+
+
 def test_drain_clears_when_every_opening_settles_timing(tmp_path):
     """The drain protects the TIMED workload only: once every released
     GPU has its final timing settled, chats resume while the challenge

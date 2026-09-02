@@ -1913,14 +1913,21 @@ class MeshCapacityAuditWorker:
             return True
 
         while time.time() < deadline:
-            if not pass0_sent:
+            # The bench normally writes pass0 and final_timing together.  Give
+            # the deadline-critical final receipt first access to delegated
+            # signing when both are ready; otherwise a multi-GPU worker starts
+            # one pass0 sign per GPU before any final sign and can exhaust the
+            # receipt transport grace despite completing the timed work.
+            final_ready = not final_sent and final_path.exists()
+            if not pass0_sent and not final_ready:
                 try:
                     read_pass0_file()
                 except Exception:
                     pass
-            if not final_sent and final_path.exists():
+            if final_ready:
                 data = json.loads(final_path.read_text())
                 final_timing = data if isinstance(data, dict) else {}
+                deferred_pass0_root = ""
                 if not pass0_sent:
                     # The combined bench writes pass0 and final together, so
                     # pass0's delivery sweep must NOT delay the final: the
@@ -1946,12 +1953,7 @@ class MeshCapacityAuditWorker:
                     if pass0_root_candidate:
                         pass0_root = pass0_root_candidate
                         pass0_sent = True
-                        threading.Thread(
-                            target=publish_pass0,
-                            args=(pass0_root_candidate,),
-                            name=f"mesh-capacity-pass0-{gpu.ordinal}",
-                            daemon=True,
-                        ).start()
+                        deferred_pass0_root = pass0_root_candidate
                 final_root = self._root_hex(data.get("root") or [])
                 transcript = str(data.get("transcript_root") or "")
                 if not transcript:
@@ -1973,13 +1975,20 @@ class MeshCapacityAuditWorker:
                 if combined_commit:
                     artifact["combined"] = combined_commit
                 signed = self._sign(artifact)
+                # Timed compute is settled as soon as its final receipt exists.
+                # Signing and network delivery must not keep the serving drain
+                # active after the protected workload has finished.
+                _report_timing_settled()
                 if signed is not None:
                     self._publish_receipt(signed)
                     final_sent = True
-                # The timed compute is settled the moment the final
-                # receipt exists; the challenge wait and proof assembly
-                # below run beside resumed chat traffic.
-                _report_timing_settled()
+                if deferred_pass0_root:
+                    threading.Thread(
+                        target=publish_pass0,
+                        args=(deferred_pass0_root,),
+                        name=f"mesh-capacity-pass0-{gpu.ordinal}",
+                        daemon=True,
+                    ).start()
                 challenge_seed = self._wait_for_challenge_seed(
                     window,
                     transcript=transcript,

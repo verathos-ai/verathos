@@ -362,6 +362,22 @@ def _decay_ineligible_endpoint_ema(ema_score: float, ema_alpha: float) -> float:
     return 0.0 if decayed < 1e-6 else decayed
 
 
+_EPOCH_SCORE_MODEL_WIDTH = 30
+_EPOCH_SCORE_QUANT_WIDTH = 18
+_EPOCH_SCORE_GPU_WIDTH = 20
+
+
+def _bounded_log_cell(value: object, width: int) -> str:
+    """Return a single-line log-table cell with an exact visible width."""
+
+    if width < 1:
+        raise ValueError("log cell width must be positive")
+    text = " ".join(str(value or "").split())
+    if len(text) > width:
+        text = text[: width - 1] + "…" if width > 1 else "…"
+    return f"{text:<{width}}"
+
+
 def _decode_scoring_authority_hotkey(ss58_address: str) -> bytes:
     """Decode one exact Substrate account id or fail closed."""
 
@@ -15123,8 +15139,20 @@ class ValidatorNeuron:
             _unique_uids = len({r["uid"] for r in rows})
             bt.logging.success(f"Epoch {epoch_number} scores ({len(rows)} entries, {_unique_uids} miners):")
             bt.logging.info("")
-            bt.logging.info(f"{'UID':<5} {'Entry':<5}  {'Model':<30}  {'Quant':<5}  {'GPU':<20}  {'Score':>8}  {'EMA':>8}  {'Demand':>6}  {'Receipts':>9}")
-            bt.logging.info(f"{'─'*5} {'─'*5}  {'─'*30}  {'─'*5}  {'─'*20}  {'─'*8}  {'─'*8}  {'─'*6}  {'─'*9}")
+            bt.logging.info(
+                f"{'UID':<5} {'Entry':<5}  "
+                f"{'Model':<{_EPOCH_SCORE_MODEL_WIDTH}}  "
+                f"{'Quant':<{_EPOCH_SCORE_QUANT_WIDTH}}  "
+                f"{'GPU':<{_EPOCH_SCORE_GPU_WIDTH}}  "
+                f"{'Score':>8}  {'EMA':>8}  {'Demand':>6}  {'Receipts':>9}"
+            )
+            bt.logging.info(
+                f"{'─' * 5} {'─' * 5}  "
+                f"{'─' * _EPOCH_SCORE_MODEL_WIDTH}  "
+                f"{'─' * _EPOCH_SCORE_QUANT_WIDTH}  "
+                f"{'─' * _EPOCH_SCORE_GPU_WIDTH}  "
+                f"{'─' * 8}  {'─' * 8}  {'─' * 6}  {'─' * 9}"
+            )
             # Group by UID for total rows
             from collections import defaultdict
             _uid_scores = defaultdict(list)
@@ -15135,14 +15163,30 @@ class ValidatorNeuron:
                 for r in uid_rows:
                     status = "FAIL" if r["failed"] else ""
                     receipts = f"{r['own']}/{r['expected']}"
-                    gpu = r.get("gpu", "")[:20]
+                    model = _bounded_log_cell(
+                        r["model"], _EPOCH_SCORE_MODEL_WIDTH
+                    )
+                    quant = _bounded_log_cell(
+                        r["quant"], _EPOCH_SCORE_QUANT_WIDTH
+                    )
+                    gpu = _bounded_log_cell(
+                        r.get("gpu", ""), _EPOCH_SCORE_GPU_WIDTH
+                    )
                     bt.logging.info(
-                        f"{r['uid']:<5} {r['entry']:<5}  {r['model']:<30}  {r['quant']:<5}  {gpu:<20}  {r['score']:>8.4f}  {r['ema']:>8.4f}  {r['demand']:>5.2f}x  {receipts:>9} {status}"
+                        f"{r['uid']:<5} {r['entry']:<5}  {model}  {quant}  "
+                        f"{gpu}  {r['score']:>8.4f}  {r['ema']:>8.4f}  "
+                        f"{r['demand']:>5.2f}x  {receipts:>9} {status}"
                     )
                 if len(uid_rows) > 1:
                     total_score = sum(r["score"] for r in uid_rows)
                     total_ema = sum(r["ema"] for r in uid_rows)
-                    bt.logging.info(f"{uid_val:<5} {'':<5}  {'── total ──':<30}  {'':<5}  {'':<20}  {total_score:>8.4f}  {total_ema:>8.4f}")
+                    bt.logging.info(
+                        f"{uid_val:<5} {'':<5}  "
+                        f"{'── total ──':<{_EPOCH_SCORE_MODEL_WIDTH}}  "
+                        f"{'':<{_EPOCH_SCORE_QUANT_WIDTH}}  "
+                        f"{'':<{_EPOCH_SCORE_GPU_WIDTH}}  "
+                        f"{total_score:>8.4f}  {total_ema:>8.4f}"
+                    )
             bt.logging.info("")
 
         try:
