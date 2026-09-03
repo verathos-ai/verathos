@@ -15,7 +15,11 @@ ADDRESS = "0x" + "ab" * 20
 def _neuron(monkeypatch, fresh_entries, epoch_miners=None):
     neuron = object.__new__(ValidatorNeuron)
     neuron._epoch_miners = list(epoch_miners or [])
-    neuron._mesh_snapshot_cache = {}
+    neuron._mesh_snapshot_cache = {
+        neuron._mesh_snapshot_cache_key(ADDRESS, 52, 43286): SimpleNamespace(
+            model=SimpleNamespace(model_id="glm-5.2-iq2-m")
+        )
+    }
     neuron._mesh_snapshot_repins = {}
     neuron._miner_client = object()
     neuron._model_client = None
@@ -70,13 +74,19 @@ def _neuron(monkeypatch, fresh_entries, epoch_miners=None):
     return neuron
 
 
-def _entry(model_index, endpoint="http://198.51.100.163:20002"):
+def _entry(
+    model_index,
+    endpoint="http://198.51.100.163:20002",
+    *,
+    model_id="glm-5.2-iq2-m",
+    quant="gguf_mesh_iq2_m",
+):
     return SimpleNamespace(
         address=ADDRESS,
         model_index=model_index,
         endpoint=endpoint,
-        model_id="glm-5.2-iq2-m",
-        quant="gguf_mesh_iq2_m",
+        model_id=model_id,
+        quant=quant,
         mesh_enabled=True,
     )
 
@@ -149,6 +159,45 @@ def test_non_mesh_entries_are_ignored(monkeypatch):
         mesh_enabled=False,
     )
     neuron = _neuron(monkeypatch, [vllm_entry])
+    assert not neuron._repin_mesh_snapshot_slot(
+        ADDRESS, 52, 43286, trigger="proxy request"
+    )
+    assert neuron._epoch_miners == []
+
+
+def test_successor_from_unrelated_logical_model_is_ignored(monkeypatch):
+    unrelated = _entry(
+        57,
+        model_id="qwen3.8-27b-q4-k-m",
+        quant="gguf_mesh_q4_k_m",
+    )
+    neuron = _neuron(monkeypatch, [unrelated])
+
+    assert not neuron._repin_mesh_snapshot_slot(
+        ADDRESS, 52, 43286, trigger="proxy request"
+    )
+    assert neuron._epoch_miners == []
+
+
+def test_successor_requant_of_same_logical_model_is_adopted(monkeypatch):
+    requant = _entry(
+        58,
+        model_id="glm-5.2-q3-k-xl",
+        quant="gguf_mesh_q3_k_xl",
+    )
+    neuron = _neuron(monkeypatch, [requant])
+
+    assert neuron._repin_mesh_snapshot_slot(
+        ADDRESS, 52, 43286, trigger="proxy request"
+    )
+    assert neuron._epoch_miners == [requant]
+
+
+def test_successor_adoption_fails_closed_without_original_model(monkeypatch):
+    successor = _entry(58)
+    neuron = _neuron(monkeypatch, [successor])
+    neuron._mesh_snapshot_cache = {}
+
     assert not neuron._repin_mesh_snapshot_slot(
         ADDRESS, 52, 43286, trigger="proxy request"
     )

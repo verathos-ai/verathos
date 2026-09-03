@@ -2098,6 +2098,7 @@ class MeshCapacityAuditWorker:
         urls = self._validator_urls()
         if not urls:
             return
+        reachable = []
         unreachable = []
         for endpoint in urls:
             try:
@@ -2106,9 +2107,39 @@ class MeshCapacityAuditWorker:
                 )
                 if resp.status_code >= 500:
                     unreachable.append(f"{endpoint} (status {resp.status_code})")
+                else:
+                    reachable.append(endpoint)
             except Exception as exc:
                 unreachable.append(f"{endpoint} ({type(exc).__name__})")
         if unreachable:
+            resolver = self._endpoint_resolver
+            owner_path_reachable = bool(reachable) and any(
+                not resolver.is_non_owner_endpoint(endpoint)
+                for endpoint in reachable
+            )
+            only_non_owner_failed = all(
+                resolver.is_non_owner_endpoint(
+                    value.split(" (", 1)[0]
+                )
+                for value in unreachable
+            )
+            if owner_path_reachable or only_non_owner_failed:
+                # Validators can retain stale/retired axon routes briefly.
+                # A redundant non-owner path being down must not look like the
+                # worker is doomed to probation while its scoring-owner path
+                # is demonstrably live.
+                logger.info(
+                    "mesh capacity audit ingest ready: %d/%d validator "
+                    "path(s) reachable; %d redundant path(s) unavailable",
+                    len(reachable),
+                    len(reachable) + len(unreachable),
+                    len(unreachable),
+                )
+                logger.debug(
+                    "unavailable mesh capacity audit paths: %s",
+                    "; ".join(unreachable),
+                )
+                return
             logger.error(
                 "mesh capacity audit ingest UNREACHABLE from this worker: "
                 "%s — audit evidence cannot be delivered on this path and "

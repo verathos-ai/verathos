@@ -3728,6 +3728,77 @@ class _StubRunner:
         return {"event": "stopped"}
 
 
+def test_parent_worker_delegated_capacity_sign_retries_with_fresh_auth(
+    monkeypatch,
+    tmp_path,
+):
+    token = MeshPoolToken(
+        pool_id="pool-sign-retry",
+        manager_endpoint="http://manager.invalid",
+        pool_secret="worker-secret",
+    )
+    runner = _StubRunner()
+    from verallm.mesh.receipt_signing import ensure_stage_proof_key_file
+
+    runner._stage_proof_keypair = ensure_stage_proof_key_file(
+        tmp_path / "sign-worker-stage.seed"
+    )
+    runner._stage_proof_key_ss58 = str(
+        runner._stage_proof_keypair.ss58_address
+    )
+    stop = threading.Event()
+    sign_payloads = []
+
+    def fake_post_json(url, body, **kwargs):
+        if url.endswith("/v1/pool/join"):
+            return {"status": "joined", "worker_id": "sign-worker"}
+        if url.endswith("/v1/pool/chat-poll"):
+            stop.wait(0.01)
+            return {"status": "ok", "chat": []}
+        if url.endswith("/v1/pool/heartbeat"):
+            return {"status": "ok", "command": None, "probe": {}}
+        if url.endswith("/v1/pool/coordinator-sign"):
+            sign_payloads.append(dict(body))
+            assert kwargs["timeout"] == 3.0
+            assert kwargs["keepalive"] is True
+            assert kwargs["keepalive_fallback"] is False
+            if len(sign_payloads) == 1:
+                raise RuntimeError("HTTP 429 from manager: retry")
+            return {"status": "ok", "signature": "ab" * 65}
+        raise AssertionError(f"unexpected pool route: {url}")
+
+    monkeypatch.setattr(pool_module, "post_json", fake_post_json)
+    monkeypatch.setattr(pool_module, "_tcp_rtt_ms", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "verallm.mesh.delegated_signing.time.sleep", lambda _seconds: None
+    )
+
+    pool_worker_loop(
+        _worker_config(token, tmp_path, "sign-worker"),
+        runner=runner,
+        stop_event=stop,
+        max_beats=1,
+    )
+    response = runner._coordinator_sign_request(
+        "coordinator-sign",
+        {
+            "purpose": "capacity-audit-artifact",
+            "mesh_key": "mesh-1",
+            "artifact": {"type": "capacity_audit_final_receipt"},
+        },
+    )
+    stop.set()
+
+    assert response["status"] == "ok"
+    assert len(sign_payloads) == 2
+    assert len({body["worker_auth_nonce"] for body in sign_payloads}) == 2
+    assert all(
+        body["purpose"] == "capacity-audit-artifact"
+        for body in sign_payloads
+    )
+    assert sign_payloads[0]["artifact"] == sign_payloads[1]["artifact"]
+
+
 def _worker_config(token, tmp_path, worker_id):
     return PoolWorkerConfig(
         token=token, repo_root=tmp_path, workdir=tmp_path / worker_id,
@@ -7160,6 +7231,44 @@ class TestAutoRelaunch:
         assert mesh is not None
         assert calls == ["m1"]
         assert mesh["members"] == ["w1", "w2"]
+
+    def test_relaunch_prefers_worker_behind_registered_endpoint(self, tmp_path):
+        """A brief driver restart must not move a registration to another
+        idle same-model worker merely because the recommender lists it first.
+
+        The registered endpoint identifies the returning driver.  Placement
+        still comes from the normal recommender, so a multi-worker mesh keeps
+        every required member while selecting the returning driver.
+        """
+
+        mgr, worker_body = _manager_with_registration_and_idle_worker(tmp_path)
+        _add_idle_worker(mgr, worker_body, "w2")
+        with mgr.lock:
+            mgr.state["mesh_registrations"]["m1"]["endpoint"] = (
+                "http://w2:9500"
+            )
+            mgr._save()
+
+        calls = []
+
+        def recommend(model_id):
+            calls.append(model_id)
+            return (
+                [
+                    {"workers": ["w1"], "driver": "w1"},
+                    {"workers": ["w2", "w1"], "driver": "w2"},
+                ],
+                [],
+            )
+
+        mgr.recommend = recommend
+        mgr.handle_heartbeat({**worker_body, "worker_id": "w1"})
+
+        mesh = _wait_for_live_mesh(mgr, "m1")
+        assert mesh is not None
+        assert calls == ["m1"]
+        assert mesh["driver"] == "w2"
+        assert mesh["members"] == ["w2", "w1"]
 
     def test_delayed_relaunch_cannot_override_operator_stop(self, tmp_path):
         """Suspension may race the delayed relaunch thread. The launch must

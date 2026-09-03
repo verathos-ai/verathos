@@ -50,6 +50,8 @@ from verallm.mesh.delegated_signing import (
     CAPACITY_AUDIT_ARTIFACT_PURPOSE,
     IDENTITY_CHALLENGE_PURPOSE,
     MAX_CAPACITY_ARTIFACT_BYTES,
+    coordinator_sign_request_with_retry,
+    coordinator_sign_retry_profile,
     coordinator_sign_message,
     delegate_keypair_from_worker_request,
     identity_challenge_message,
@@ -4539,7 +4541,10 @@ class PoolManager:
     # launch), one attempt per model per cooldown window so a
     # crash-looping serve cannot be hammered.
     AUTO_RELAUNCH_COOLDOWN_S = 600.0
-    AUTO_RELAUNCH_DELAY_S = 1.0
+    # A worker restart briefly removes its old assignment before the new
+    # session has finished joining.  Give that session a small reconnect
+    # window before treating the registration as needing placement elsewhere.
+    AUTO_RELAUNCH_DELAY_S = 10.0
 
     def _maybe_auto_relaunch_registered(self, worker_id: str) -> None:
         now = time.monotonic()
@@ -4603,11 +4608,60 @@ class PoolManager:
         def _relaunch() -> None:
             time.sleep(self.AUTO_RELAUNCH_DELAY_S)
             try:
+                preferred_driver = ""
+                with self.lock:
+                    registration = self._registrations_locked().get(model_id)
+                    registered_endpoint = ""
+                    if isinstance(registration, Mapping):
+                        registered_endpoint = str(
+                            registration.get("endpoint", "") or ""
+                        ).strip()
+                    if registered_endpoint:
+                        try:
+                            registered_endpoint = normalize_endpoint(
+                                registered_endpoint
+                            )
+                        except ValueError:
+                            registered_endpoint = ""
+                    if registered_endpoint:
+                        for candidate_id, candidate in self.state[
+                            "workers"
+                        ].items():
+                            if candidate.get("status") != "idle":
+                                continue
+                            candidate_models = {
+                                str(item.get("model_id", "") or "")
+                                for item in (candidate.get("catalog") or [])
+                            }
+                            if model_id not in candidate_models:
+                                continue
+                            candidate_endpoint = str(
+                                (candidate.get("endpoints") or {}).get(
+                                    "mesh", ""
+                                )
+                                or ""
+                            ).strip()
+                            if not candidate_endpoint:
+                                continue
+                            try:
+                                candidate_endpoint = normalize_endpoint(
+                                    candidate_endpoint
+                                )
+                            except ValueError:
+                                continue
+                            if candidate_endpoint == registered_endpoint:
+                                preferred_driver = str(candidate_id)
+                                break
                 self.handle_launch(
                     {
                         "management_secret": management_secret,
                         "model_id": model_id,
                         "_auto_relaunch": True,
+                        **(
+                            {"_preferred_driver": preferred_driver}
+                            if preferred_driver
+                            else {}
+                        ),
                     }
                 )
             except Exception as exc:
@@ -5775,6 +5829,17 @@ class PoolManager:
             picks, _ = self.recommend(model_id)
             if not picks:
                 raise ValueError("no feasible worker set for this model")
+            preferred_driver = str(
+                body.get("_preferred_driver", "") or ""
+            )
+            if preferred_driver:
+                picks = sorted(
+                    picks,
+                    key=lambda pick: (
+                        str(pick.get("driver", "") or "")
+                        != preferred_driver
+                    ),
+                )
             members, driver = picks[0]["workers"], picks[0]["driver"]
         if len(set(members)) != len(members):
             raise ValueError("mesh workers must be unique")
@@ -12461,15 +12526,31 @@ def pool_worker_loop(
     def manager_call(action: str, fields: Mapping[str, Any]) -> dict[str, Any]:
         """One authenticated worker->manager call, decoded."""
 
-        return post_json(
-            f"{manager}/v1/pool/{action}",
-            worker_request(action, fields),
-            timeout=20.0,
-            # Keep-alive kills the per-call TCP+TLS handshake (measured
-            # 326ms/call from a WAN worker, ~218ms TLS); falls back to
-            # the pinned urllib opener when no context is registered.
-            keepalive=True,
-        )
+        def _attempt(timeout_s: float) -> dict[str, Any]:
+            return post_json(
+                f"{manager}/v1/pool/{action}",
+                # Rebuild on every retry so signed worker auth carries a fresh
+                # nonce/timestamp while the coordinator-sign digest is stable.
+                worker_request(action, fields),
+                timeout=timeout_s,
+                # Keep-alive kills the per-call TCP+TLS handshake (measured
+                # 326ms/call from a WAN worker, ~218ms TLS); falls back to
+                # the pinned urllib opener when no context is registered.
+                keepalive=True,
+                keepalive_fallback=False,
+            )
+
+        if action == "coordinator-sign":
+            attempts, timeout_s, delays = coordinator_sign_retry_profile(
+                fields.get("purpose")
+            )
+            return coordinator_sign_request_with_retry(
+                _attempt,
+                attempts=attempts,
+                attempt_timeout_s=timeout_s,
+                retry_delays_s=delays,
+            )
+        return _attempt(20.0)
 
     # Lets a driver that holds no coordinator wallet obtain the coordinator
     # signatures a subnet mesh owes the validator. See the module docstring

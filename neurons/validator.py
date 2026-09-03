@@ -752,6 +752,23 @@ def _is_mesh_runtime(miner: object) -> bool:
     )
 
 
+def _mesh_logical_model_identity(
+    model_id: str,
+    quant: str | None = None,
+) -> str | None:
+    """Return the immutable logical-family key for one approved mesh rung."""
+
+    profile = get_mesh_model_scoring_profile(model_id, quant)
+    if profile is None:
+        return None
+    # A mesh rung paired with a vLLM model uses the registry ID. Mesh-only
+    # quant rungs share their catalogue tokenizer/base-model identity. The
+    # exact model ID is the final fail-closed fallback for one-rung entries.
+    return str(
+        profile.logical_model_id or profile.base_model or profile.model_id
+    )
+
+
 #: Minimum total CUDA VRAM a mesh roster must declare when the chain entry
 #: advertises a serving contract (max_context_len > 0). Deliberately a
 #: conservative universal floor: the accurate per-model+quant+context floor
@@ -12486,6 +12503,40 @@ class ValidatorNeuron:
                 f"registry client"
             )
             return False
+        old_miner = next(
+            (
+                item
+                for item in (getattr(self, "_epoch_miners", None) or [])
+                if item.address.lower() == str(address).lower()
+                and int(item.model_index) == int(model_index)
+            ),
+            None,
+        )
+        old_model_id = str(getattr(old_miner, "model_id", "") or "")
+        old_quant = (
+            str(getattr(old_miner, "quant", "") or "")
+            if old_miner is not None
+            else None
+        )
+        if not old_model_id:
+            old_snapshot = (getattr(self, "_mesh_snapshot_cache", {}) or {}).get(
+                self._mesh_snapshot_cache_key(address, model_index, epoch_number)
+            )
+            old_model_id = str(
+                getattr(getattr(old_snapshot, "model", None), "model_id", "") or ""
+            )
+            old_quant = None
+        expected_model_identity = _mesh_logical_model_identity(
+            old_model_id,
+            old_quant,
+        )
+        if expected_model_identity is None:
+            bt.logging.warning(
+                f"Successor adoption ({trigger}) refused for "
+                f"{str(address)[:10]} model_index={model_index}: original "
+                "logical model identity is unavailable"
+            )
+            return False
         try:
             fresh = discover_active_miners(
                 self._miner_client, self._model_client
@@ -12514,6 +12565,8 @@ class ValidatorNeuron:
             if cand.address.lower() == str(address).lower()
             and (cand.address.lower(), int(cand.model_index)) not in current
             and _is_mesh_runtime(cand)
+            and _mesh_logical_model_identity(cand.model_id, cand.quant)
+            == expected_model_identity
         ]
         self._enrich_miners_from_metagraph(fresh)
         fresh = self._retain_epoch_miners_with_authenticated_hotkeys(

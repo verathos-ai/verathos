@@ -4837,6 +4837,10 @@ def cmd_pool_worker(args: argparse.Namespace) -> None:
         start_allowlist_refresher(allowlist_network, int(allowlist_netuid))
 
     def on_join_info(joined: dict) -> None:
+        # The stock installer waits for this exact stdout verdict. Do not rely
+        # on library INFO visibility: imported logging handlers can suppress
+        # that line even though the manager accepted the worker.
+        _print_pool_join_accepted(joined)
         # A worker started with ONLY the token learns the pool's chain
         # coordinates from the join response; explicit flags always win.
         network = str(joined.get("subtensor_network", "") or "")
@@ -4846,6 +4850,15 @@ def cmd_pool_worker(args: argparse.Namespace) -> None:
 
     print(f"pool worker joining {config.token.manager_endpoint}", flush=True)
     pool_worker_loop(config, on_join_info=on_join_info)
+
+
+def _print_pool_join_accepted(joined: dict) -> None:
+    """Emit the durable stock-installer join-success marker."""
+
+    print(
+        f"pool join accepted: worker '{str(joined.get('worker_id', '') or '')}'",
+        flush=True,
+    )
 
 
 def cmd_pool_status(args: argparse.Namespace) -> None:

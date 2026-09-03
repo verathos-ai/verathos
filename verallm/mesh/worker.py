@@ -13859,6 +13859,7 @@ def _post_json_keepalive(
     request_headers: dict[str, str],
     *,
     timeout: float,
+    fallback_on_error: bool = True,
 ) -> tuple[int, bytes] | None:
     """POST over a pooled keep-alive connection; None = caller falls back.
 
@@ -13904,15 +13905,20 @@ def _post_json_keepalive(
             raw = resp.read()
             status = int(resp.status)
             reusable = not resp.will_close
-        except Exception:
+        except Exception as exc:
             try:
                 conn.close()
             except Exception:
                 pass
             if fresh:
                 # A fresh connection failing is a real transport error -
-                # surface it through the fallback path for uniform
-                # error text and retry semantics.
+                # ordinary callers retain the urllib fallback. Deadline-
+                # sensitive delegated signing disables that duplicate network
+                # attempt and supplies its own bounded, idempotent retry loop.
+                if not fallback_on_error:
+                    raise RuntimeError(
+                        f"failed to connect to {url}: {exc}"
+                    ) from exc
                 return None
             continue  # stale idle connection; retry once on a fresh one
         if reusable:
@@ -13937,6 +13943,7 @@ def post_json(
     headers: Mapping[str, str] | None = None,
     internal_auth_secret: str | bytes = "",
     keepalive: bool = False,
+    keepalive_fallback: bool = True,
 ) -> dict[str, Any]:
     # Compact separators: proof-payload sign requests carry multi-MiB
     # element-heavy JSON, and default spaced separators inflate the wire
@@ -13965,6 +13972,7 @@ def post_json(
             body,
             request_headers,
             timeout=timeout,
+            fallback_on_error=keepalive_fallback,
         )
         if pooled is not None:
             status, raw = pooled

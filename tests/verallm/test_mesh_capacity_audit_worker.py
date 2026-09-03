@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -129,6 +130,73 @@ def _window(gpus) -> MeshAuditWindow:
         deadline_s=30.0,
         workload_spec={"capacity_matrix_dim": 8960},
     )
+
+
+def test_startup_ingest_probe_does_not_alarm_on_redundant_non_owner_path(
+    tmp_path, monkeypatch
+):
+    import verallm.mesh.capacity_audit_worker as capacity_worker_module
+
+    owner = "https://owner.example:8091"
+    follower = "https://follower.example:8093"
+    worker = _worker(tmp_path)
+    worker._endpoint_resolver = SimpleNamespace(
+        current_urls=lambda: (owner, follower),
+        is_non_owner_endpoint=lambda endpoint: endpoint == follower,
+    )
+
+    def get(url, timeout):
+        assert timeout == 8.0
+        if url.startswith(owner):
+            return SimpleNamespace(status_code=200)
+        raise TimeoutError("retired path")
+
+    monkeypatch.setattr("httpx.get", get)
+    messages = []
+    monkeypatch.setattr(
+        capacity_worker_module.logger,
+        "info",
+        lambda message, *args: messages.append(message % args),
+    )
+    monkeypatch.setattr(
+        capacity_worker_module.logger,
+        "error",
+        lambda message, *args: messages.append("ERROR: " + message % args),
+    )
+    worker._probe_ingest_reachability()
+
+    assert any("ingest ready: 1/2" in message for message in messages)
+    assert not any("ingest UNREACHABLE" in message for message in messages)
+
+
+def test_startup_ingest_probe_still_alarms_when_owner_path_is_down(
+    tmp_path, monkeypatch
+):
+    import verallm.mesh.capacity_audit_worker as capacity_worker_module
+
+    owner = "https://owner.example:8091"
+    follower = "https://follower.example:8093"
+    worker = _worker(tmp_path)
+    worker._endpoint_resolver = SimpleNamespace(
+        current_urls=lambda: (owner, follower),
+        is_non_owner_endpoint=lambda endpoint: endpoint == follower,
+    )
+
+    def get(url, timeout):
+        if url.startswith(follower):
+            return SimpleNamespace(status_code=200)
+        raise TimeoutError("owner path down")
+
+    monkeypatch.setattr("httpx.get", get)
+    messages = []
+    monkeypatch.setattr(
+        capacity_worker_module.logger,
+        "error",
+        lambda message, *args: messages.append(message % args),
+    )
+    worker._probe_ingest_reachability()
+
+    assert any("ingest UNREACHABLE" in message for message in messages)
 
 
 # ---------------------------------------------------------------------------

@@ -104,7 +104,11 @@ esac
 
 MANAGED_MARKER="$SRC/.git/verathos-mesh-managed"
 if [ ! -d "$SRC/.git" ]; then
-  git clone https://github.com/ggml-org/llama.cpp "$SRC"
+  if ! git clone https://github.com/ggml-org/llama.cpp "$SRC"; then
+    echo "initial llama.cpp clone failed; retrying with Git HTTP/1.1" >&2
+    git -c http.version=HTTP/1.1 clone \
+      https://github.com/ggml-org/llama.cpp "$SRC"
+  fi
   printf 'managed by patches/llama.cpp/build.sh\n' > "$MANAGED_MARKER"
 elif [ ! -f "$MANAGED_MARKER" ]; then
   echo "refusing to reset unmanaged llama.cpp checkout: $SRC" >&2
@@ -112,7 +116,10 @@ elif [ ! -f "$MANAGED_MARKER" ]; then
   exit 2
 fi
 cd "$SRC"
-git fetch --depth 1 origin "$BASE" 2>/dev/null || git fetch origin
+git fetch --depth 1 origin "$BASE" 2>/dev/null || \
+  git -c http.version=HTTP/1.1 fetch --depth 1 origin "$BASE" 2>/dev/null || \
+  git fetch origin || \
+  git -c http.version=HTTP/1.1 fetch origin
 git checkout -f "$BASE"
 git clean -fdx >/dev/null 2>&1 || true
 git apply --check "$PATCH" && git apply "$PATCH"

@@ -22,6 +22,8 @@ from verallm.mesh.delegated_signing import (
     IDENTITY_CHALLENGE_PURPOSE,
     ManagerDelegateKeypair,
     coordinator_delegation_from_file,
+    coordinator_sign_retry_profile,
+    coordinator_sign_request_with_retry,
     coordinator_sign_message,
     delegate_keypair_from_worker_request,
     split_coordinator_sign_message,
@@ -78,6 +80,121 @@ def test_split_rejects_non_mesh_messages():
     ):
         with pytest.raises(ValueError):
             split_coordinator_sign_message(message)
+
+
+def test_coordinator_sign_transport_retries_only_transient_failures():
+    calls: list[float] = []
+    delays: list[float] = []
+
+    def request_once(timeout_s: float):
+        calls.append(timeout_s)
+        if len(calls) == 1:
+            raise RuntimeError("HTTP 503 from manager: temporarily unavailable")
+        if len(calls) == 2:
+            raise RuntimeError("failed to connect to manager: timed out")
+        return {"signature": "ab" * 64}
+
+    response = coordinator_sign_request_with_retry(
+        request_once,
+        attempts=3,
+        attempt_timeout_s=7.0,
+        retry_delays_s=(0.1, 0.2),
+        sleep=delays.append,
+    )
+    assert response == {"signature": "ab" * 64}
+    assert calls == [7.0, 7.0, 7.0]
+    assert delays == [0.1, 0.2]
+
+
+@pytest.mark.parametrize("status", [408, 425, 429, 500, 503, 599])
+def test_coordinator_sign_transport_retries_transient_http_statuses(status):
+    calls = 0
+
+    def request_once(_timeout_s: float):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError(f"HTTP {status} from manager: transient")
+        return {"status": "ok"}
+
+    assert coordinator_sign_request_with_retry(
+        request_once,
+        attempts=2,
+        retry_delays_s=(0.0,),
+        sleep=lambda _delay: None,
+    ) == {"status": "ok"}
+    assert calls == 2
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 409, 422])
+def test_coordinator_sign_transport_does_not_retry_semantic_failures(status):
+    calls = 0
+
+    def request_once(_timeout_s: float):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(f"HTTP {status} from manager: refused")
+
+    with pytest.raises(RuntimeError, match=f"HTTP {status}"):
+        coordinator_sign_request_with_retry(
+            request_once,
+            attempts=3,
+            retry_delays_s=(0.0, 0.0),
+            sleep=lambda _delay: None,
+        )
+    assert calls == 1
+
+
+def test_deadline_sensitive_keepalive_failure_skips_duplicate_urlopen(
+    monkeypatch,
+):
+    import http.client
+
+    from verallm.mesh import worker as worker_mod
+
+    connections = []
+
+    class FailedConnection:
+        def __init__(self, *_args, **_kwargs):
+            connections.append(self)
+
+        def request(self, *_args, **_kwargs):
+            raise TimeoutError("route timed out")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_PINNED_TLS_CONTEXTS",
+        {("manager.example", 443): object()},
+    )
+    monkeypatch.setattr(worker_mod, "_KEEPALIVE_CONNS", {})
+    monkeypatch.setattr(http.client, "HTTPSConnection", FailedConnection)
+
+    with pytest.raises(RuntimeError, match="failed to connect"):
+        worker_mod._post_json_keepalive(
+            "https://manager.example/v1/pool/coordinator-sign",
+            b"{}",
+            {"Content-Type": "application/json"},
+            timeout=8.0,
+            fallback_on_error=False,
+        )
+    assert len(connections) == 1
+
+
+def test_capacity_sign_retry_profile_stays_inside_artifact_delivery_grace():
+    attempts, timeout_s, delays = coordinator_sign_retry_profile(
+        "capacity-audit-artifact"
+    )
+    assert attempts == 3
+    assert attempts * timeout_s + sum(delays) < 10.0
+
+    receipt_attempts, receipt_timeout_s, _ = coordinator_sign_retry_profile(
+        "receipt"
+    )
+    assert receipt_attempts == 3
+    assert receipt_timeout_s > timeout_s
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +421,19 @@ def test_delegation_file_round_trip(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_post_json(url, payload, timeout=0, keepalive=False):
+    def fake_post_json(
+        url,
+        payload,
+        timeout=0,
+        keepalive=False,
+        keepalive_fallback=True,
+    ):
         calls.append(url)
         assert url.endswith("/v1/pool/coordinator-sign")
         # The subprocess signs its request with the stage key like any
         # worker call; auth itself is covered by the pool token tests.
         assert payload.get("worker_auth_signature")
+        assert keepalive_fallback is False
         return manager.handle_coordinator_sign(dict(payload))
 
     monkeypatch.setattr("verallm.mesh.worker.post_json", fake_post_json)
@@ -332,6 +456,65 @@ def test_delegation_file_round_trip(tmp_path, monkeypatch):
     )
     assert recovered.lower() == expected_address.lower()
     assert len(calls) >= 2
+
+
+def test_delegation_file_rebuilds_worker_auth_for_transport_retry(
+    tmp_path, monkeypatch
+):
+    manager = _subnet_manager(tmp_path, monkeypatch)
+    _as_worker(manager, monkeypatch, "w-driver")
+    monkeypatch.setattr(
+        "verallm.mesh.receipt_signing.load_hotkey_seed",
+        lambda _w, _h, keypair=None: COORDINATOR_SEED,
+    )
+    stage_key_file = tmp_path / "stage-proof-key.seed"
+    ensure_stage_proof_key_file(stage_key_file)
+    coordinator = _coordinator_keypair()
+    delegation_file = tmp_path / "coordinator-signing.json"
+    delegation_file.write_text(
+        json.dumps(
+            {
+                "manager_endpoint": "http://127.0.0.1:59999",
+                "pool_secret": "secret",
+                "worker_id": "w-driver",
+                "worker_session_id": "a" * 64,
+                "mesh_key": "m-1",
+                "coordinator_hotkey": coordinator.ss58_address,
+                "stage_proof_key_file": str(stage_key_file),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payloads = []
+
+    def fake_post_json(
+        url,
+        payload,
+        timeout=0,
+        keepalive=False,
+        keepalive_fallback=True,
+    ):
+        payloads.append(dict(payload))
+        assert timeout == 8.0
+        assert keepalive is True
+        assert keepalive_fallback is False
+        if len(payloads) == 1:
+            raise RuntimeError(f"HTTP 503 from {url}: retry")
+        if len(payloads) == 2:
+            raise RuntimeError(f"failed to connect to {url}: timed out")
+        return manager.handle_coordinator_sign(dict(payload))
+
+    monkeypatch.setattr("verallm.mesh.worker.post_json", fake_post_json)
+    monkeypatch.setattr("verallm.mesh.delegated_signing.time.sleep", lambda _s: None)
+
+    delegation = coordinator_delegation_from_file(str(delegation_file))
+    signature = sign_receipt_hash(BODY_HASH, delegation.keypair)
+    assert verify_receipt_signature(BODY_HASH, signature, coordinator.ss58_address)
+    assert len(payloads) == 3
+    assert len({body["worker_auth_nonce"] for body in payloads}) == 3
+    assert all(body["purpose"] == "receipt" for body in payloads)
+    assert all(body["body_hash"] == BODY_HASH for body in payloads)
 
 
 # ---------------------------------------------------------------------------
