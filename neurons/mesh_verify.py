@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 import secrets
+import ssl
 import threading
 import time
 import urllib.error
@@ -228,6 +229,20 @@ def _coordinator_postcommit_url(endpoint: str) -> str:
     return _coordinator_route_url(endpoint, MESH_POSTCOMMIT_AUDIT_PATH)
 
 
+def _coordinator_tls_context(url: str) -> ssl.SSLContext | None:
+    """Match the stock mesh endpoint's private-TLS transport contract.
+
+    Coordinators may use the self-signed certificate installed by the stock
+    deployment flow. Request authenticity does not depend on that certificate:
+    the validator signs the request and verifies the coordinator-signed,
+    snapshot-bound response. HTTPS still encrypts the transport.
+    """
+
+    if urlsplit(url).scheme != "https":
+        return None
+    return ssl._create_unverified_context()  # noqa: S323
+
+
 def _default_mesh_canary_transport(
     url: str,
     body: bytes,
@@ -249,6 +264,7 @@ def _default_mesh_canary_transport(
         with urllib.request.urlopen(  # noqa: S310
             request,
             timeout=timeout,
+            context=_coordinator_tls_context(url),
         ) as response:
             payload = response.read(MAX_MESH_ARTIFACT_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
@@ -326,6 +342,7 @@ def _mesh_canary_stream_transport(
         with urllib.request.urlopen(  # noqa: S310
             request,
             timeout=timeout,
+            context=_coordinator_tls_context(url),
         ) as response:
             return _read_mesh_sse_artifact(
                 response, first_delta=_canary_first_delta(),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import ssl
 import urllib.error
 from dataclasses import replace
 
@@ -20,7 +21,9 @@ from neurons.mesh_verify import (
     MESH_CHAT_COMPLETIONS_PATH,
     MESH_POSTCOMMIT_AUDIT_PATH,
     MeshCanaryTransportError,
+    _coordinator_tls_context,
     _default_mesh_canary_transport,
+    _mesh_canary_stream_transport,
     run_mesh_canary,
 )
 from verallm.mesh.proof import mesh_validator_challenge_nonce_commitment
@@ -43,6 +46,50 @@ STAGE_KEYPAIRS = (
     Keypair.create_from_seed(("44" * 32)),
     Keypair.create_from_seed(("55" * 32)),
 )
+
+
+def test_stock_private_tls_context_is_used_by_both_active_transports(
+    monkeypatch,
+):
+    captured: list[ssl.SSLContext | None] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b"{}"
+
+    def open_request(_request, *, timeout, context):
+        assert timeout == 3.0
+        captured.append(context)
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", open_request)
+    monkeypatch.setattr(
+        "neurons.mesh_verify._read_mesh_sse_artifact",
+        lambda _response, *, first_delta: b"{}",
+    )
+
+    url = "https://coordinator.example"
+    _default_mesh_canary_transport(
+        f"{url}/v1/mesh/proof/postcommit-audit", b"{}", {}, 3.0,
+    )
+    _mesh_canary_stream_transport(
+        f"{url}/v1/chat/completions", b"{}", {}, 3.0,
+    )
+
+    assert len(captured) == 2
+    assert all(context is not None for context in captured)
+    assert all(context.verify_mode == ssl.CERT_NONE for context in captured)
+    assert all(context.check_hostname is False for context in captured)
+
+
+def test_plain_http_transport_does_not_create_tls_context():
+    assert _coordinator_tls_context("http://coordinator.example") is None
 
 
 def _coordinator(**changes) -> MeshCoordinatorIdentity:

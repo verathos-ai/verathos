@@ -67,7 +67,7 @@ class TestSnapshotRefusalClassification:
     def _transport_error(self, monkeypatch, status: int, body: dict):
         error = self._http_error(status, body)
 
-        def fake_urlopen(request, timeout=None):
+        def fake_urlopen(request, timeout=None, context=None):
             raise error
 
         monkeypatch.setattr(mv.urllib.request, "urlopen", fake_urlopen)
