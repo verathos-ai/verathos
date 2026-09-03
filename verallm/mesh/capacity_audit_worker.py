@@ -681,6 +681,13 @@ class MeshCapacityAuditWorker:
             chain_id=chain_id,
             subtensor_network=self.subtensor_network,
             epoch_blocks=360,
+            # Workers can move between testnet and mainnet while retaining
+            # ordinary local state. Never allow an authenticated cache from
+            # one chain to supply scheduling parameters on another chain.
+            subnet_config_cache_path=str(
+                self.workdir
+                / f"subnet-config-chain-{chain_id}-netuid-{self.netuid}.json"
+            ),
             subnet_config_url=self._resolve_subnet_config_url(
                 chain_id=chain_id,
                 subtensor_network=self.subtensor_network,
@@ -714,22 +721,26 @@ class MeshCapacityAuditWorker:
     ) -> str:
         """Network-scoped runtime-config URL, strongest signal first.
 
-        Priority: operator env override, manager-delivered context URL,
-        the slot's EVM chain_id (945 = bittensor testnet), then the
-        network-name mapping as the final fallback.
+        Priority: operator env override, a known slot EVM chain_id, then a
+        manager-delivered URL only for unknown chains, with the network-name
+        mapping as the final fallback. The chain slot is authoritative: stale
+        manager context must never move a mainnet worker onto testnet policy.
         """
         env_url = os.environ.get("VERATHOS_SUBNET_CONFIG_URL", "").strip()
         if env_url:
             return env_url
-        if context_url.strip():
-            return context_url.strip()
         from neurons.config import (
+            MAINNET_SUBNET_CONFIG_URL,
             TESTNET_SUBNET_CONFIG_URL,
             default_subnet_config_url,
         )
 
         if int(chain_id) == 945:
             return TESTNET_SUBNET_CONFIG_URL
+        if int(chain_id) == 964:
+            return MAINNET_SUBNET_CONFIG_URL
+        if context_url.strip():
+            return context_url.strip()
         return default_subnet_config_url(subtensor_network)
 
     # ── lifecycle ────────────────────────────────────────────────

@@ -2920,6 +2920,54 @@ def cmd_register_units(args: argparse.Namespace) -> None:
 # -- worker pool (docs/architecture/mesh_orchestration_ux.md) ---------------
 
 
+# (host, port) -> SSLContext trusted only for that private pool manager.
+# The registry is shared by token-pin, explicit CA-file, and coordinator-local
+# trust paths. The installed urllib handler consults it per request, so public
+# artifact/configuration hosts always retain the platform PKI trust store.
+_POOL_API_TLS_CONTEXTS: dict[tuple[str, int], ssl.SSLContext] = {}
+
+
+def _install_per_host_manager_tls_context(
+    endpoint: str,
+    context: ssl.SSLContext,
+) -> None:
+    """Install private TLS trust for exactly one manager host and port."""
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(str(endpoint or ""))
+    if parsed.scheme != "https" or not parsed.hostname:
+        return
+    key = (parsed.hostname, parsed.port or 443)
+    _POOL_API_TLS_CONTEXTS[key] = context
+
+    import http.client as _http_client
+    import urllib.request as _urllib_request
+
+    default_context = ssl.create_default_context()
+
+    class _ManagerPinnedHTTPSHandler(_urllib_request.HTTPSHandler):
+        def https_open(self, req):
+            from urllib.parse import urlparse as _urlparse
+
+            target = _urlparse(req.full_url)
+            pinned = _POOL_API_TLS_CONTEXTS.get(
+                (target.hostname, target.port or 443)
+            )
+            return self.do_open(
+                _http_client.HTTPSConnection,
+                req,
+                context=pinned if pinned is not None else default_context,
+            )
+
+    _urllib_request.install_opener(
+        _urllib_request.build_opener(_ManagerPinnedHTTPSHandler())
+    )
+    from verallm.mesh.worker import register_pinned_tls_context
+
+    register_pinned_tls_context(key[0], key[1], context)
+
+
 def _install_manager_tls_pin(token) -> None:
     """Trust the manager's TLS certificate via the token's pin.
 
@@ -2970,43 +3018,7 @@ def _install_manager_tls_pin(token) -> None:
     context.check_hostname = False
     context.verify_mode = ssl.CERT_REQUIRED
     context.load_verify_locations(cafile=str(pin_file))
-    import http.client as _http_client
-    import urllib.request as _urllib_request
-
-    pinned_host = parsed.hostname
-    pinned_port = port
-    default_context = ssl.create_default_context()
-
-    class _ManagerPinnedHTTPSHandler(_urllib_request.HTTPSHandler):
-        """Pin ONLY the manager's host; every other host keeps real PKI.
-
-        The first version installed the pinned context process-wide,
-        which silently broke every OTHER https fetch in the process:
-        verathos.ai's certificate obviously fails verification against a
-        rented box's self-signed manager cert, so the manifest-store
-        fetch fell back to an hour-long local rebuild without a word.
-        """
-
-        def https_open(self, req):
-            from urllib.parse import urlparse as _urlparse
-
-            target = _urlparse(req.full_url)
-            use_pinned = (
-                target.hostname == pinned_host
-                and (target.port or 443) == pinned_port
-            )
-            return self.do_open(
-                _http_client.HTTPSConnection,
-                req,
-                context=context if use_pinned else default_context,
-            )
-
-    _urllib_request.install_opener(
-        _urllib_request.build_opener(_ManagerPinnedHTTPSHandler())
-    )
-    from verallm.mesh.worker import register_pinned_tls_context
-
-    register_pinned_tls_context(pinned_host, pinned_port, context)
+    _install_per_host_manager_tls_context(token.manager_endpoint, context)
 
 
 def _pool_token_from_args(
@@ -3016,18 +3028,20 @@ def _pool_token_from_args(
 ):
     """Resolve the preferred owner-only token file or the legacy raw flag."""
 
-    manager_ca_file = str(
-        getattr(args, "manager_ca_file", "") or ""
-    ).strip()
+    manager_ca_file = str(getattr(args, "manager_ca_file", "") or "").strip()
+    manager_ca_context = None
     if manager_ca_file:
         ca_path = Path(manager_ca_file).expanduser()
         if not ca_path.is_file():
             raise SystemExit(f"--manager-ca-file is not a regular file: {ca_path}")
         try:
-            ssl.create_default_context(cafile=str(ca_path))
+            manager_ca_context = ssl.create_default_context(cafile=str(ca_path))
         except (OSError, ssl.SSLError) as exc:
             raise SystemExit(f"--manager-ca-file is not a valid CA bundle: {ca_path}") from exc
-        os.environ["SSL_CERT_FILE"] = str(ca_path.resolve())
+        # The context is already restricted to the token's exact host:port
+        # below. Private pool certificates are frequently minted for a
+        # provider address that differs from the worker's dialable hostname.
+        manager_ca_context.check_hostname = False
 
     from verallm.mesh.pool import MeshPoolToken, load_pool_token_file
 
@@ -3042,7 +3056,12 @@ def _pool_token_from_args(
                 raise ValueError(
                     f"pool token scope is {token.scope!r}; expected {required_scope!r}"
                 )
-            _install_manager_tls_pin(token)
+            if str(getattr(token, "manager_ca_sha256", "") or "").strip():
+                _install_manager_tls_pin(token)
+            elif manager_ca_context is not None:
+                _install_per_host_manager_tls_context(
+                    token.manager_endpoint, manager_ca_context
+                )
             return token
         if inline_token:
             token = MeshPoolToken.decode(inline_token)
@@ -3050,7 +3069,12 @@ def _pool_token_from_args(
                 raise ValueError(
                     f"pool token scope is {token.scope!r}; expected {required_scope!r}"
                 )
-            _install_manager_tls_pin(token)
+            if str(getattr(token, "manager_ca_sha256", "") or "").strip():
+                _install_manager_tls_pin(token)
+            elif manager_ca_context is not None:
+                _install_per_host_manager_tls_context(
+                    token.manager_endpoint, manager_ca_context
+                )
             return token
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -3074,8 +3098,8 @@ def _add_pool_token_arguments(parser: argparse.ArgumentParser) -> None:
         "--manager-ca-file",
         default="",
         help=(
-            "CA bundle for a private/self-signed HTTPS pool manager; sets "
-            "SSL_CERT_FILE before connecting"
+            "CA bundle trusted only for this private/self-signed HTTPS pool "
+            "manager"
         ),
     )
 
@@ -3189,13 +3213,6 @@ def _resolve_pool_dir(args: argparse.Namespace) -> Path | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
-# (host, port) -> SSLContext trusting that pool's own api-tls certificate.
-# A registry (not one handler per call) so trusting the advertised AND the
-# loopback endpoint accumulates instead of the second install_opener
-# replacing the first.
-_POOL_API_TLS_CONTEXTS: dict[tuple[str, int], ssl.SSLContext] = {}
-
-
 def _install_pool_api_tls_trust(endpoint: str, pool_dir: Path | None) -> None:
     """Trust the pool's own API-TLS cert for management calls to the manager.
 
@@ -3227,32 +3244,7 @@ def _install_pool_api_tls_trust(endpoint: str, pool_dir: Path | None) -> None:
     context.check_hostname = False
     context.verify_mode = ssl.CERT_REQUIRED
     context.load_verify_locations(cafile=str(cert))
-    import http.client as _http_client
-    import urllib.request as _urllib_request
-
-    _POOL_API_TLS_CONTEXTS[key] = context
-    default_context = ssl.create_default_context()
-
-    class _PoolApiPinnedHTTPSHandler(_urllib_request.HTTPSHandler):
-        def https_open(self, req):
-            from urllib.parse import urlparse as _urlparse
-
-            target = _urlparse(req.full_url)
-            pinned = _POOL_API_TLS_CONTEXTS.get(
-                (target.hostname, target.port or 443)
-            )
-            return self.do_open(
-                _http_client.HTTPSConnection,
-                req,
-                context=pinned if pinned is not None else default_context,
-            )
-
-    _urllib_request.install_opener(
-        _urllib_request.build_opener(_PoolApiPinnedHTTPSHandler())
-    )
-    from verallm.mesh.worker import register_pinned_tls_context
-
-    register_pinned_tls_context(key[0], key[1], context)
+    _install_per_host_manager_tls_context(endpoint, context)
 
 
 def _pool_client(args: argparse.Namespace):

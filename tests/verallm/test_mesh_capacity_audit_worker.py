@@ -229,12 +229,28 @@ def test_subnet_config_url_resolves_per_network(tmp_path, monkeypatch):
         tmp_path, context=mainnet_ctx, subtensor_network="finney"
     )
     assert worker.config.subnet_config_url == MAINNET_SUBNET_CONFIG_URL
+    assert worker.config.subnet_config_cache_path.endswith(
+        "subnet-config-chain-964-netuid-405.json"
+    )
 
-    # A manager-delivered context URL beats the chain_id mapping.
+    # A stale manager-delivered URL cannot override a known chain identity.
     ctx = _context()
     ctx["subnet_config_url"] = "https://example.test/config.json"
     worker = _worker(tmp_path, context=ctx)
+    assert worker.config.subnet_config_url == TESTNET_SUBNET_CONFIG_URL
+    assert worker.config.subnet_config_cache_path.endswith(
+        "subnet-config-chain-945-netuid-405.json"
+    )
+
+    # Unknown future chains may use an authenticated manager-delivered URL.
+    unknown_ctx = _context()
+    unknown_ctx["slot"] = dict(unknown_ctx["slot"], chain_id=9999)
+    unknown_ctx["subnet_config_url"] = "https://example.test/config.json"
+    worker = _worker(tmp_path, context=unknown_ctx)
     assert worker.config.subnet_config_url == "https://example.test/config.json"
+    assert worker.config.subnet_config_cache_path.endswith(
+        "subnet-config-chain-9999-netuid-405.json"
+    )
 
     # The operator env override beats everything.
     monkeypatch.setenv(

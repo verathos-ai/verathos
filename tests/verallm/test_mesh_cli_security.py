@@ -612,6 +612,49 @@ def test_manager_tls_pin_accepts_matching_certificate(tmp_path, monkeypatch):
     assert pin_file.read_text() == pem
 
 
+def test_manager_tls_context_preserves_public_pki(monkeypatch):
+    """Private manager trust must never become the public HTTPS root."""
+
+    import urllib.request as _urllib_request
+
+    private_context = SimpleNamespace(name="private")
+    default_context = SimpleNamespace(name="public-default")
+    installed = []
+    mesh_cli._POOL_API_TLS_CONTEXTS.clear()
+    monkeypatch.setattr(
+        mesh_cli.ssl, "create_default_context", lambda: default_context
+    )
+    monkeypatch.setattr(
+        _urllib_request, "install_opener", lambda opener: installed.append(opener)
+    )
+
+    mesh_cli._install_per_host_manager_tls_context(
+        "https://manager.local:9543", private_context
+    )
+
+    handler = next(
+        item
+        for item in installed[-1].handlers
+        if type(item).__name__ == "_ManagerPinnedHTTPSHandler"
+    )
+    used = []
+    monkeypatch.setattr(
+        handler,
+        "do_open",
+        lambda _connection, request, **kwargs: used.append(
+            (request.full_url, kwargs["context"])
+        ),
+    )
+    handler.https_open(SimpleNamespace(full_url="https://manager.local:9543/v1"))
+    handler.https_open(SimpleNamespace(full_url="https://api.verathos.ai/v1"))
+
+    assert used == [
+        ("https://manager.local:9543/v1", private_context),
+        ("https://api.verathos.ai/v1", default_context),
+    ]
+    mesh_cli._POOL_API_TLS_CONTEXTS.clear()
+
+
 def test_manager_tls_pin_rejects_mismatched_certificate(tmp_path, monkeypatch):
     pem = _test_cert_pem(tmp_path)
     monkeypatch.setattr(

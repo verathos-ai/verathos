@@ -7,6 +7,7 @@ import socket
 import stat
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -324,7 +325,7 @@ def test_pool_create_prints_only_owner_token_file_path(tmp_path, capsys):
     assert "vtpool_" not in output
 
 
-def test_cli_manager_ca_file_sets_ssl_cert_file(tmp_path, monkeypatch):
+def test_cli_manager_ca_file_is_scoped_to_manager_host(tmp_path, monkeypatch):
     state_dir, token = create_pool_state(
         tmp_path,
         manager_endpoint="https://manager.local:9543",
@@ -332,31 +333,36 @@ def test_cli_manager_ca_file_sets_ssl_cert_file(tmp_path, monkeypatch):
     )
     ca_path = tmp_path / "manager-ca.pem"
     ca_path.write_text("test CA")
+    context = SimpleNamespace(check_hostname=True)
     seen = {}
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", "/system/public-ca.pem")
     monkeypatch.setattr(
         mesh_cli.ssl,
         "create_default_context",
-        lambda *, cafile: seen.setdefault("cafile", cafile),
+        lambda *, cafile: (seen.setdefault("cafile", cafile), context)[1],
+    )
+    monkeypatch.setattr(
+        mesh_cli,
+        "_install_per_host_manager_tls_context",
+        lambda endpoint, tls_context: seen.update(
+            endpoint=endpoint, context=tls_context
+        )
     )
 
-    # The CLI intentionally exports SSL_CERT_FILE process-wide; monkeypatch
-    # registers nothing for an absent variable, so restore explicitly or the
-    # synthetic CA poisons every later httpx client in the test process.
-    try:
-        loaded = mesh_cli._pool_token_from_args(
-            argparse.Namespace(
-                pool_token_file=str(state_dir / POOL_TOKEN_FILE),
-                pool_token="",
-                manager_ca_file=str(ca_path),
-            )
+    loaded = mesh_cli._pool_token_from_args(
+        argparse.Namespace(
+            pool_token_file=str(state_dir / POOL_TOKEN_FILE),
+            pool_token="",
+            manager_ca_file=str(ca_path),
         )
+    )
 
-        assert loaded == token
-        assert seen["cafile"] == str(ca_path)
-        assert os.environ["SSL_CERT_FILE"] == str(ca_path.resolve())
-    finally:
-        os.environ.pop("SSL_CERT_FILE", None)
+    assert loaded == token
+    assert seen["cafile"] == str(ca_path)
+    assert seen["endpoint"] == token.manager_endpoint
+    assert seen["context"] is context
+    assert context.check_hostname is False
+    assert os.environ["SSL_CERT_FILE"] == "/system/public-ca.pem"
 
 
 def test_worker_parser_accepts_owner_token_file_and_legacy_raw_token(tmp_path):
