@@ -895,6 +895,7 @@ def _group_miners_for_identity(miners: List[ActiveMiner]) -> Dict[tuple[str, str
 # `from transformers import AutoTokenizer` previously hit a half-initialized
 # module and raised ImportError ~30% of the time on first canary burst.
 from transformers import AutoTokenizer as _AutoTokenizer
+from transformers import PretrainedConfig as _PretrainedConfig
 
 # Silence library logs that fire on every tokenizer cache miss
 # (HEAD requests to HuggingFace + verbose config dumps).  Validator
@@ -937,7 +938,17 @@ def _get_tokenizer(model_id: str):
             f"Loading tokenizer for input commitment: {model_id}"
             + (f" (source {source})" if source != model_id else "")
         )
-        tokenizer = _AutoTokenizer.from_pretrained(source, trust_remote_code=True)
+        tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
+        if source != model_id:
+            # Mesh validators only consume tokenizer artifacts here. Passing
+            # an explicit generic config prevents AutoTokenizer from parsing
+            # the base model's architecture config, which is unnecessary and
+            # can fail when a newer model publishes rope metadata unsupported
+            # by the validator's installed Transformers version. Tokenizer
+            # bytes and the packaged chat-template fallback remain unchanged
+            # and are still checked against the on-chain tokenizer hash.
+            tokenizer_kwargs["config"] = _PretrainedConfig()
+        tokenizer = _AutoTokenizer.from_pretrained(source, **tokenizer_kwargs)
         if getattr(tokenizer, "chat_template", None) is None:
             # Some base repos ship no chat template at all; the authoritative
             # template lives only in the GGUF metadata. The registry packages
@@ -12975,29 +12986,41 @@ class ValidatorNeuron:
 
             prompt = test.prompt
             prompt_token_ids: Optional[Sequence[int]] = None
-            if int(test.target_prompt_tokens or 0) > 0:
-                def _count_canary_tokens(text: str) -> int:
-                    return len(
-                        _tokenize_proof_v3_chat(
-                            test.model_id,
-                            [{"role": "user", "content": text}],
-                            enable_thinking=test.enable_thinking,
+            try:
+                if int(test.target_prompt_tokens or 0) > 0:
+                    def _count_canary_tokens(text: str) -> int:
+                        return len(
+                            _tokenize_proof_v3_chat(
+                                test.model_id,
+                                [{"role": "user", "content": text}],
+                                enable_thinking=test.enable_thinking,
+                            )
                         )
-                    )
 
-                prompt, measured_prompt_tokens = materialize_canary_prompt(
-                    test,
-                    token_counter=_count_canary_tokens,
-                )
-                prompt_token_ids = _tokenize_proof_v3_chat(
-                    test.model_id,
-                    [{"role": "user", "content": prompt}],
-                    enable_thinking=test.enable_thinking,
-                )
-                if len(prompt_token_ids) != measured_prompt_tokens:
-                    raise _ProofV3ValidatorConfigurationError(
-                        "validator tokenizer did not retain the canary tokenization"
+                    prompt, measured_prompt_tokens = materialize_canary_prompt(
+                        test,
+                        token_counter=_count_canary_tokens,
                     )
+                    prompt_token_ids = _tokenize_proof_v3_chat(
+                        test.model_id,
+                        [{"role": "user", "content": prompt}],
+                        enable_thinking=test.enable_thinking,
+                    )
+                    if len(prompt_token_ids) != measured_prompt_tokens:
+                        raise _ProofV3ValidatorConfigurationError(
+                            "validator tokenizer did not retain the canary tokenization"
+                        )
+            except _ProofV3ValidatorConfigurationError:
+                raise
+            except Exception as exc:
+                # Nothing miner-visible has started yet. Any tokenizer,
+                # template, or prompt-materialization failure is local
+                # validator indeterminacy and must neutralize this slot's
+                # planned obligations rather than become miner probation.
+                raise _ProofV3ValidatorConfigurationError(
+                    "validator canary prompt preparation failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             bt.logging.info(
                 "Canary prompt prepared for "
                 f"{test.miner_address[:10]} model_index={test.model_index} "
