@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 from dataclasses import replace
 
 import pytest
@@ -15,6 +16,7 @@ from neurons.mesh_snapshot import (
     MESH_VERIFICATION_SNAPSHOT_PATH,
     MeshSnapshotExpectations,
     MeshSnapshotTrustAnchors,
+    _default_fetch,
     discover_and_pin_mesh_verification_snapshot,
     fetch_and_pin_mesh_verification_snapshot,
 )
@@ -179,6 +181,44 @@ def _fetching(raw: bytes, captured: dict | None = None):
         return raw
 
     return fetch
+
+
+@pytest.mark.parametrize(
+    ("url", "expects_private_tls"),
+    (
+        ("https://mesh.example/v1/mesh/verification-snapshot", True),
+        ("http://mesh.example/v1/mesh/verification-snapshot", False),
+    ),
+)
+def test_default_fetch_accepts_stock_private_tls_only_for_https(
+    monkeypatch, url, expects_private_tls
+):
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b"{}"
+
+    def fake_urlopen(request, *, timeout, context):
+        captured.update(request=request, timeout=timeout, context=context)
+        return Response()
+
+    monkeypatch.setattr("neurons.mesh_snapshot.urllib.request.urlopen", fake_urlopen)
+
+    assert _default_fetch(url, {"X-Test": "signed"}, 7.5) == b"{}"
+    assert captured["timeout"] == 7.5
+    assert captured["request"].get_header("X-test") == "signed"
+    if expects_private_tls:
+        assert captured["context"].verify_mode == ssl.CERT_NONE
+        assert captured["context"].check_hostname is False
+    else:
+        assert captured["context"] is None
 
 
 def _fetch_and_pin(

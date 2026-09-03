@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -141,7 +142,23 @@ def _default_fetch(url: str, headers: Mapping[str, str], timeout: float) -> byte
         headers=dict(headers),
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+    # Stock mesh endpoints deliberately support self-signed TLS when an
+    # operator has no domain.  Transport encryption still protects the
+    # request in flight; authenticity comes from the validator-signed request
+    # and the coordinator-signed snapshot, whose exact chain/config bindings
+    # are verified below.  This must match the production endpoint gate in
+    # ``verallm.mesh.probe`` or an endpoint can pass deployment and then be
+    # excluded by every validator solely because its certificate is private.
+    context = (
+        ssl._create_unverified_context()  # noqa: S323
+        if urlsplit(url).scheme == "https"
+        else None
+    )
+    with urllib.request.urlopen(  # noqa: S310
+        request,
+        timeout=timeout,
+        context=context,
+    ) as response:
         payload = response.read(MAX_SNAPSHOT_RESPONSE_BYTES + 1)
     if len(payload) > MAX_SNAPSHOT_RESPONSE_BYTES:
         raise ValueError("mesh verification snapshot response is too large")
