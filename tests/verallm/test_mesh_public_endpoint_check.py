@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import ssl
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -57,6 +59,45 @@ def stub():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield Handler, f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    thread.join(timeout=5)
+
+
+@pytest.fixture()
+def self_signed_stub(tmp_path):
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    class Handler(_Stub):
+        pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=cert, keyfile=key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield Handler, f"https://127.0.0.1:{server.server_address[1]}"
     server.shutdown()
     thread.join(timeout=5)
 
@@ -128,6 +169,27 @@ def test_wrong_upstream_404_fails_posture(stub):
 def test_unreachable_endpoint_fails_health():
     checks = check_public_endpoint("http://127.0.0.1:1", timeout=1.0)
     assert not _by_name(checks, "public-health").passed
+
+
+def test_stock_self_signed_https_passes_transport_and_expiry(self_signed_stub):
+    _handler, endpoint = self_signed_stub
+    checks = check_public_endpoint(endpoint, timeout=5.0)
+
+    assert _by_name(checks, "public-health").passed
+    assert _by_name(checks, "validator-auth-posture /v1/chat/completions").passed
+    tls = _by_name(checks, "tls-certificate")
+    assert tls.kind == "hard"
+    assert tls.passed
+    assert "expires in" in tls.observed
+
+
+def test_self_signed_https_still_enforces_certificate_lifetime(self_signed_stub):
+    _handler, endpoint = self_signed_stub
+    checks = check_public_endpoint(endpoint, timeout=5.0, min_tls_days=3.0)
+
+    tls = _by_name(checks, "tls-certificate")
+    assert tls.kind == "hard"
+    assert not tls.passed
 
 
 def test_probe_worker_is_never_used(stub, monkeypatch):

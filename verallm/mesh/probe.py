@@ -29,6 +29,7 @@ import json
 import random
 import socket
 import ssl
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -710,10 +711,24 @@ def check_public_endpoint(
     """
     checks: list[GateCheck] = []
     endpoint = endpoint.rstrip("/")
+    # Mainnet endpoints must use TLS, but the stock setup intentionally uses
+    # a self-signed certificate when an operator has no domain.  Validator
+    # requests authenticate the application payload and use the same
+    # unverified TLS transport; the deployment gate must therefore test that
+    # real transport instead of imposing a system-CA requirement the runtime
+    # does not have.  The explicit certificate check below still requires a
+    # successful TLS handshake and sufficient remaining certificate lifetime.
+    url_context = (
+        ssl._create_unverified_context()
+        if endpoint.startswith("https://")
+        else None
+    )
 
     def _get(path: str):
         request = urllib.request.Request(endpoint + path, method="GET")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(
+            request, timeout=timeout, context=url_context
+        ) as response:
             return response.status, json.loads(response.read() or b"{}")
 
     def _request(method: str, path: str, payload: dict | None):
@@ -730,7 +745,9 @@ def check_public_endpoint(
             ),
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=timeout, context=url_context
+            ) as response:
                 return response.status, json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as exc:
             try:
@@ -819,10 +836,23 @@ def check_public_endpoint(
         host, _sep, port_text = host_port.partition(":")
         port = int(port_text or 443)
         try:
-            context = ssl.create_default_context()
+            context = ssl._create_unverified_context()
             with socket.create_connection((host, port), timeout=timeout) as sock:
                 with context.wrap_socket(sock, server_hostname=host) as tls:
-                    cert = tls.getpeercert() or {}
+                    der_cert = tls.getpeercert(binary_form=True)
+            if not der_cert:
+                raise ssl.SSLError("TLS peer returned no certificate")
+            pem_cert = ssl.DER_cert_to_PEM_cert(der_cert)
+            # CERT_NONE deliberately leaves getpeercert()'s decoded mapping
+            # empty.  Decode the certificate bytes with CPython's standard
+            # certificate helper so expiry remains a hard gate without
+            # introducing a new runtime dependency.
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".pem", encoding="ascii"
+            ) as cert_file:
+                cert_file.write(pem_cert)
+                cert_file.flush()
+                cert = ssl._ssl._test_decode_cert(cert_file.name)
             not_after = cert.get("notAfter", "")
             expires = (
                 ssl.cert_time_to_seconds(not_after) if not_after else 0.0
@@ -848,8 +878,11 @@ def check_public_endpoint(
                     kind="hard",
                     passed=False,
                     observed=str(exc)[:200],
-                    threshold="valid chain against the system store",
-                    rationale="validators connect over TLS to https endpoints",
+                    threshold="successful TLS handshake with a current certificate",
+                    rationale=(
+                        "validators require encrypted transport; request and proof "
+                        "authentication do not depend on a public certificate authority"
+                    ),
                 )
             )
     else:

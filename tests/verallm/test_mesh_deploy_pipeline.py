@@ -1007,6 +1007,56 @@ def test_unreachable_endpoint_aborts_before_the_gate(monkeypatch, wired):
     assert "registerModel" not in wired
 
 
+def test_unbound_measurement_defers_validator_auth_posture_until_relaunch(
+    monkeypatch, wired
+):
+    """An unregistered measurement has no snapshot-bound validator lane.
+
+    Its public health and TLS must pass early, but validator-auth posture is
+    only authoritative after the chain-bound relaunch.  The same endpoint is
+    checked again there and must then pass in full.
+    """
+    unbound = [
+        GateCheck(
+            name="public-health",
+            kind="hard",
+            passed=True,
+            observed="HTTP 200",
+            threshold="HTTP 200 from /health",
+            rationale="",
+        ),
+        GateCheck(
+            name="validator-auth-posture /v1/chat/completions",
+            kind="hard",
+            passed=False,
+            observed="HTTP 500 from operator lane",
+            threshold="401/403",
+            rationale="",
+        ),
+        GateCheck(
+            name="tls-certificate",
+            kind="hard",
+            passed=True,
+            observed="expires in 365 days",
+            threshold=">= 1 day",
+            rationale="",
+        ),
+    ]
+    checks = iter((unbound, []))
+    monkeypatch.setattr(
+        deploy_module,
+        "check_public_endpoint",
+        lambda endpoint, **kw: next(checks),
+    )
+
+    report = run_deploy(
+        _config(), call=_FakePool(), out=lambda _l: None, sleep=lambda _s: None
+    )
+
+    assert not report.failed
+    assert "registerModel" in wired
+
+
 def _bound_mesh(**overrides) -> dict:
     anchors = _anchors()
     mesh = {

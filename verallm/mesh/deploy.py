@@ -913,17 +913,20 @@ def run_deploy(
     report.stage("measurement", "ok", mesh_key)
 
     # Early reachability abort: the measurement mesh has just bound the SAME
-    # public port the registration will claim, so the endpoint posture is
-    # checkable NOW. Waiting for the final-verification posture check (the
-    # same check, still run - a relaunch could regress the bind) used to
-    # burn the whole gate plus the chain-bound relaunch (~30 min) before
-    # reporting a dead endpoint. Hard-fails only, same as final: an
-    # unreachable endpoint can never be forced on chain.
+    # public port the registration will claim, so health and TLS are checkable
+    # now. Validator-auth posture is not: an unregistered measurement has no
+    # model index or signed verification snapshot and deliberately runs the
+    # operator lane. Require validator-auth posture only after the chain-bound
+    # relaunch below. This still avoids spending the full probe gate on an
+    # unreachable endpoint or broken TLS listener.
     early_posture = check_public_endpoint(config.endpoint)
+    early_required = {"public-health", "tls-certificate"}
     early_failures = [
         check
         for check in early_posture
-        if check.kind == "hard" and not check.passed
+        if check.name in early_required
+        and check.kind == "hard"
+        and not check.passed
     ]
     if early_failures:
         for check in early_failures:

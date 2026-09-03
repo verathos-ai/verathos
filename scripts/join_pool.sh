@@ -738,9 +738,14 @@ PLISTEOF
   fi
   if command -v pm2 >/dev/null 2>&1; then
     pm2 delete "$name" >/dev/null 2>&1 || true
-    # pm2 keeps a deleted unit's log files; without a flush, confirm_joins
-    # reads a PREVIOUS run's join verdict after the operator fixes the flags.
+    # pm2 keeps a deleted unit's log files. `pm2 flush <name>` is not a
+    # reliable per-process truncation across PM2 releases, so clear the two
+    # exact files before launch. Otherwise confirm_joins can accept a stale
+    # success marker from an earlier run after the manager refuses this one.
     pm2 flush "$name" >/dev/null 2>&1 || true
+    mkdir -p "$HOME/.pm2/logs"
+    : > "$HOME/.pm2/logs/${name}-out.log"
+    : > "$HOME/.pm2/logs/${name}-error.log"
     # pm2 snapshots the current env (LD_LIBRARY_PATH, HF_HUB_DISABLE_XET and
     # the per-unit CUDA_VISIBLE_DEVICES below). The worker retries manager and
     # network failures internally. A fatal top-level error must stay stopped
