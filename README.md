@@ -198,6 +198,8 @@ examples/       OpenAI-compatible client examples
 - [Bittensor integration](docs/bittensor_integration.md)
 - [Economic model](docs/economic_model.md)
 - [API Reference](docs/api.md)
+- [AI agent quickstart](https://verathos.ai/skill.txt)
+- [AI-assisted miner and mesh setup](https://verathos.ai/skill-mine.txt)
 
 ## License
 
