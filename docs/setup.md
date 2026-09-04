@@ -48,7 +48,8 @@ For manual step-by-step control, follow the sections below.
 
 ### 1. Install
 
-The setup script creates a venv, installs all dependencies (vLLM, CUDA kernels, etc.), checks GPU compatibility, and builds the zkllm CUDA extension:
+The setup script creates the serving environment, installs the qualified
+runtime and prebuilt proof components, and checks GPU compatibility:
 
 ```bash
 git clone https://github.com/verathos-ai/verathos.git

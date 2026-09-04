@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "verathos"
 version = "0.1.0"
-description = "Zero-Knowledge Verified LLM Inference and Training"
+description = "Verifiable model serving for open and Bittensor-trained intelligence"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -17,7 +17,10 @@ keywords = [
     "zkp",
     "llm",
     "inference-verification",
-    "verifiable-training",
+    "bittensor",
+    "model-serving",
+    "openai-compatible",
+    "mesh-inference",
     "sumcheck",
     "verified-llm",
 ]
