@@ -366,6 +366,16 @@ def test_dead_owner_reservation_is_reaped_and_logged(caplog):
         server._admission_reap_due = 0.0
         with caplog.at_level(logging.ERROR, logger="verallm.mesh.worker"):
             snap = _await_ledger_drained(ledger)
+            # The sweep releases the ledger before emitting its diagnostic.
+            # On a busy full-suite runner the polling thread can observe the
+            # release in that narrow interval, so wait for the asynchronous
+            # log side effect instead of making the assertion timing-racy.
+            deadline = time.monotonic() + 2.0
+            while (
+                "released by sweep" not in caplog.text
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
         assert snap["in_flight_slots"] == 0
         assert snap["in_flight_tokens"] == 0
         assert "released by sweep" in caplog.text
