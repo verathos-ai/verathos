@@ -19,7 +19,11 @@ How to set up and run a Verathos miner or validator on Bittensor Subnet 96.
 
 ## Miner Setup
 
-A miner serves a single model on a single GPU with cryptographic proofs and earns emissions based on throughput, latency, and model utility (parameters, context length, quantization). To serve multiple models, run separate miner instances on separate GPUs. Multi-GPU inference for models that exceed single-GPU VRAM is on the roadmap.
+A miner contributes a qualified model endpoint and earns emissions from
+verified, useful service. Operators can run conventional vLLM endpoints or
+join CUDA workers to a coordinated GGUF mesh pool for models that benefit from
+distributed serving. The guided setup selects the applicable production flow
+and advertises only configurations accepted by current network policy.
 
 ### Quick Setup (recommended)
 
@@ -695,5 +699,7 @@ The dashboard shows miner slots (model, quant, score, health, GPU, context lengt
 ## Next Steps
 
 - **Miners**: Your miner is now earning emissions based on throughput, latency, and model utility (parameters, context length, quantization). See [Bittensor Integration](bittensor_integration.md) for scoring details.
-- **Validators**: The validator gateway is not yet publicly available. It will be released soon so every validator can run their own gateway and earn from inference revenue. See the [User Guide](user_guide.md) for the user-facing API.
+- **Validators**: A validator may run the gateway alongside validation to serve
+  OpenAI-compatible traffic from its authenticated score view. See the
+  [User Guide](user_guide.md) for the user-facing API.
 - **Users**: See the [User Guide](user_guide.md) to start making API requests via [api.verathos.ai](https://api.verathos.ai).

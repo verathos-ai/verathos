@@ -3,10 +3,10 @@
 Extends ``ChatOpenAI`` from ``langchain-openai`` with proof-verification
 metadata, model discovery, and automatic model selection.
 
-Every inference response from Verathos includes a cryptographic proof that the
-model was executed honestly (ZK sumcheck + Merkle commitments).  This module
-surfaces that proof metadata on the LangChain ``AIMessage`` so downstream
-chains can inspect and act on verification results.
+Successful inference responses from Verathos include authenticated Gleipnir
+verification metadata.  This module surfaces that metadata on the LangChain
+``AIMessage`` so downstream chains can inspect request/output binding and any
+attached hard-audit result.
 
 Example::
 
@@ -43,15 +43,15 @@ class ChatVerathos(ChatOpenAI):
     r"""Chat model for `Verathos <https://verathos.ai>`_ — verified LLM
     inference on `Bittensor <https://bittensor.com>`_.
 
-    Verathos is an OpenAI-compatible API where every response is backed by a
-    cryptographic proof (ZK sumcheck + Merkle commitments) that the declared
-    model was executed faithfully — no output substitution, no bait-and-switch.
+    Verathos is an OpenAI-compatible API where successful responses expose
+    authenticated Gleipnir verification metadata, including request/output
+    binding and any attached unpredictable execution audit.
 
     ``ChatVerathos`` extends ``ChatOpenAI`` so all standard LangChain chat-model
     features (streaming, tool calling, structured output, async, batching) work
     out of the box.  The key value-add:
 
-    * Proof-verification metadata on every ``AIMessage`` via
+    * Verification metadata on successful ``AIMessage`` objects via
       ``response_metadata``  (``proof_verified``, ``proof_details``, ``timing``)
     * ``model="auto"`` for automatic best-model selection
     * Dedicated ``list_models()`` helper for model discovery
@@ -93,7 +93,7 @@ class ChatVerathos(ChatOpenAI):
             msg = llm.invoke("Explain zero-knowledge proofs in one paragraph.")
             print(msg.content)
 
-            # Proof metadata is available on every response
+            # Verification metadata is available on successful responses
             print(msg.response_metadata["proof_verified"])   # True
             print(msg.response_metadata["timing"])           # inference/proof timing
 

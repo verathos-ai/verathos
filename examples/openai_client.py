@@ -47,7 +47,7 @@ def main():
     if not args.model:
         args.model = "auto"
 
-    # Append quant suffix if specified (e.g. "qwen3.5-9b:int4")
+    # Append a quant suffix returned by /v1/models.
     model_id = f"{args.model}:{args.quant}" if args.quant else args.model
 
     response = client.chat.completions.create(

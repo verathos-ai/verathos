@@ -70,15 +70,16 @@ Use `"auto"` to let Verathos pick the best available model, or specify one:
 model_client = OpenAIChatCompletionClient(model="auto", ...)
 
 # Specific model
-model_client = OpenAIChatCompletionClient(model="qwen3.5-9b", ...)
+model_client = OpenAIChatCompletionClient(model="MODEL_ID_FROM_V1_MODELS", ...)
 
 # Specific model + quantization
-model_client = OpenAIChatCompletionClient(model="qwen3-8b:int4", ...)
+model_client = OpenAIChatCompletionClient(model="MODEL_ID:QUANT", ...)
 ```
 
 ## What you get
 
-Every response is backed by cryptographic proofs (ZK sumcheck + Merkle commitments). Verified inference for multi-agent systems that need trustworthy outputs.
+Successful responses include authenticated Gleipnir verification metadata for
+multi-agent systems that need auditable inference.
 
 ## Getting an API key
 

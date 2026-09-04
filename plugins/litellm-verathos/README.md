@@ -2,7 +2,9 @@
 
 LiteLLM custom provider for [Verathos](https://verathos.ai) -- verified LLM inference on the Bittensor network.
 
-Every response from Verathos is backed by cryptographic proofs (ZK sumcheck + Merkle commitments) that guarantee the output was produced by the declared model. No output substitution is possible.
+Successful responses include authenticated Gleipnir verification metadata.
+Ordinary requests bind the request and output to a frozen execution commitment,
+while unpredictable validator audits check selected execution relations.
 
 ## Installation
 
@@ -35,8 +37,8 @@ Use the `verathos/` prefix followed by any model identifier:
 | Model string | What happens |
 |---|---|
 | `verathos/auto` | Verathos picks the best available model for you |
-| `verathos/Qwen/Qwen3-30B-A3B` | Routes to a specific model |
-| `verathos/meta-llama/Llama-3.3-70B-Instruct` | Routes to a specific model |
+| `verathos/<model-id>` | Routes to a model returned by `/v1/models` |
+| `verathos/<model-id>:<quant>` | Routes to a specific available quantization |
 
 To discover available models, query the Verathos API directly:
 
@@ -194,8 +196,8 @@ response = client.chat.completions.create(
 
 Traditional LLM APIs are a black box -- you have no way to verify that the provider actually ran your prompt through the model they claim. Verathos changes this:
 
-- **Verified inference**: Every response includes cryptographic proofs that the output was computed by the declared model
-- **No output substitution**: SHA256 output commitments + Fiat-Shamir binding prevent response tampering
+- **Verifiable inference**: Successful responses expose authenticated Gleipnir verification metadata
+- **Request/output binding**: Cryptographic commitments detect response substitution or tampering
 - **Decentralized**: Runs on Bittensor's incentive network -- miners compete to serve models, validators verify proofs
 - **OpenAI-compatible**: Drop-in replacement for any OpenAI-compatible client
 

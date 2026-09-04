@@ -14,7 +14,7 @@ export default {
   id: PROVIDER_ID,
   name: "Verathos Provider",
   description:
-    "Verified LLM inference on Bittensor — every response is cryptographically proven",
+    "Verifiable LLM inference on Bittensor with authenticated Gleipnir metadata",
   version: "0.1.0",
 
   register(api: any) {

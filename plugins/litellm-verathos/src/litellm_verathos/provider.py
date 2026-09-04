@@ -1,9 +1,9 @@
 """
 Verathos custom LLM provider for LiteLLM.
 
-Verathos (https://verathos.ai) provides verified LLM inference on the
-Bittensor network.  Every response can be cryptographically proven to come
-from the declared model -- no output substitution is possible.
+Verathos (https://verathos.ai) provides verifiable LLM inference on the
+Bittensor network.  Successful responses include authenticated Gleipnir
+verification metadata for request/output binding and unpredictable audits.
 
 The API is fully OpenAI-compatible, so this provider is a thin routing
 layer that:

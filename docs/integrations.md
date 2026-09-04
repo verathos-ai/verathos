@@ -12,7 +12,8 @@ api_key:  your-api-key
 model:    auto
 ```
 
-Set `model` to `"auto"` or a specific model ID (e.g. `"qwen3.5-9b"`, `"minimax-2.5"`). Use `GET /v1/models` to list what's available.
+Set `model` to `"auto"` or to an ID returned by `GET /v1/models`. Live
+discovery keeps clients independent of changes to the active model catalog.
 
 With `"auto"`, Verathos pools all nodes across all models and selects using score-weighted routing, factoring in node score, health status, and current load. On failure, retries fall through to the next-best healthy endpoint regardless of model.
 

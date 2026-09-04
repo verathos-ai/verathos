@@ -152,9 +152,16 @@ Default α = 0.2 (configurable via `--ema-alpha`). Higher = more responsive to r
 
 ### Emission burn
 
-A configurable fraction of miner emissions is burned by redirecting weight to the subnet owner's UID. This prevents over-paying miners when network utilisation is low. The burn rate is stored on-chain in `SubnetConfig.emissionBurnBps` (default: 5000 = 50%).
+A configurable share of the miner allocation can be left unallocated through
+the subnet's burn policy. At each weight-setting boundary, validators scale the
+serving-miner weights and route the unallocated share through the designated
+burn UID. Under the subnet's burn setting, that weight is accounted as
+`MinerBurned`; it is not a serving-performance reward captured by the owner
+miner.
 
-At each weight-setting boundary the validator scales all miner weights by `(1 - burn_rate)` and assigns the remaining fraction to the burn UID. The subnet owner can adjust the burn rate on-chain without requiring a code update.
+The active share is runtime policy rather than a software-release constant. It
+can be adjusted gradually as network demand and distributed serving capacity
+develop, without requiring miners or validators to install new code.
 
 ### Proof failure
 
@@ -196,12 +203,11 @@ per-request percentage for every form of substituted execution.
 
 ## Supported Models
 
-All models registered on-chain in the Verathos ModelRegistry contract are supported. The registry is managed by the subnet owner and continuously expanded. Key architectures:
-
-- **Dense**: Qwen3, Llama, Mistral, Gemma, DeepSeek distills, GPT-oss
-- **MoE**: Qwen3-30B-A3B, Qwen3.5-35B-A3B, Qwen3-235B-A22B, DeepSeek-V3, Kimi-K2, Llama-4-Maverick
-
-MoE models have expert routing verification built into the proof and handled automatically.
+The on-chain ModelRegistry identifies model variants, while authenticated
+release artifacts and subnet policy determine which of them are currently
+eligible. Qualified dense and sparse models can be served through conventional
+vLLM endpoints or coordinated GGUF mesh pools. Clients and operators should
+use live model discovery instead of relying on a static list in documentation.
 
 ```bash
 # See what models fit your GPU
@@ -213,9 +219,8 @@ python -m verallm.registry --all
 
 ## Validator Gateway
 
-> **Note:** The validator gateway is not yet publicly available. It will be released soon so every validator can run their own instance and earn from inference revenue. Currently, the official gateway runs at [api.verathos.ai](https://api.verathos.ai).
-
-Validators will be able to run a gateway, the user-facing API endpoint:
+Validators can run a gateway as the user-facing API endpoint. The public
+network gateway is available at [api.verathos.ai](https://api.verathos.ai):
 
 - **OpenAI-compatible** `/v1/chat/completions`
 - **Dual auth**: API key (prepaid credits) or x402 (USDC pay-per-request)

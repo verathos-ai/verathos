@@ -2,7 +2,9 @@
 
 LangChain integration for [Verathos](https://verathos.ai) — verified LLM inference on [Bittensor](https://bittensor.com).
 
-Every inference response from Verathos is backed by cryptographic proofs (ZK sumcheck + Merkle commitments). Your LangChain chains can verify that the declared model was executed faithfully — no output substitution, no bait-and-switch.
+Successful inference responses include authenticated Gleipnir verification
+metadata. Your LangChain chains can inspect request/output binding and the
+result of any unpredictable execution audit attached to the response.
 
 ## Installation
 
@@ -24,7 +26,7 @@ llm = ChatVerathos(model="auto")
 msg = llm.invoke("Explain zero-knowledge proofs in one paragraph.")
 print(msg.content)
 
-# Proof verification metadata is on every response
+# Verification metadata is available on successful responses
 print(msg.response_metadata["proof_verified"])  # True
 print(msg.response_metadata["timing"])          # {"inference_ms": ..., "prove_ms": ...}
 print(msg.response_metadata["proof_details"])   # {"challenged_layers": [...], ...}
@@ -75,7 +77,7 @@ llm = ChatVerathos()  # model="auto" by default
 
 ### Proof verification metadata
 
-Every response includes cryptographic proof metadata:
+Successful responses include verification metadata:
 
 ```python
 msg = llm.invoke("What is 2+2?")
@@ -219,8 +221,8 @@ Your App -> ChatVerathos -> api.verathos.ai -> Validator Proxy -> Miner (GPU)
                                               (ZK sumcheck + Merkle)
 ```
 
-Every response proves:
-- **Model integrity**: The exact declared model weights were used (Merkle commitment against on-chain root)
-- **Computation integrity**: Matrix multiplications were executed correctly (ZK sumcheck protocol)
-- **Output binding**: The returned text matches the proven computation (SHA-256 commitment)
-- **Input binding**: The prompt you sent is the prompt that was executed (embedding proof)
+Gleipnir verification covers:
+- **Model identity**: authenticated profiles bind audits to registered model artifacts
+- **Selected computation**: unpredictable hard audits verify selected execution relations
+- **Request/output binding**: ordinary responses bind the observed request and output to a frozen commitment
+- **Audit status**: applications can distinguish accepted light binding from a completed hard audit

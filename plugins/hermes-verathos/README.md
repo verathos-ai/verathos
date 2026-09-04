@@ -45,14 +45,16 @@ Use `"auto"` (default) to let Verathos pick the best available model by miner sc
 ```yaml
 model:
   default: "auto"           # best available (recommended)
-  # default: "qwen3.5-9b"  # specific model
+  # default: "MODEL_ID_FROM_V1_MODELS"  # specific model
 ```
 
 Available models: `curl https://api.verathos.ai/v1/models`
 
 ## What you get
 
-Every inference response from Verathos is backed by cryptographic proofs (ZK sumcheck + Merkle commitments). The model weights, computations, and outputs are verified — your agent can trust the response came from the exact model claimed.
+Successful inference responses include authenticated Gleipnir verification
+metadata. Ordinary requests bind the request and output to a frozen execution
+commitment, while validators run unpredictable execution audits.
 
 ## Getting an API key
 
@@ -67,12 +69,12 @@ Hermes Agent's built-in smart routing (cheap model for simple tasks, strong mode
 ```yaml
 model:
   provider: custom:verathos
-  default: "qwen3.5-9b"
+  default: "MODEL_ID_FROM_V1_MODELS"
   base_url: "https://api.verathos.ai/v1"
   api_key: "your-api-key"
 
 smart_routing:
   enabled: true
-  cheap_model: "qwen3.5-9b"
-  strong_model: "llama-3.3-70b"
+  cheap_model: "MODEL_ID_FROM_V1_MODELS"
+  strong_model: "MODEL_ID_FROM_V1_MODELS"
 ```

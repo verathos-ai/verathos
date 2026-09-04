@@ -2,7 +2,9 @@
 
 Verified LLM inference for elizaOS agents via [Verathos](https://verathos.ai) on [Bittensor](https://bittensor.com).
 
-Every inference response is backed by cryptographic proofs (ZK sumcheck + Merkle commitments) — your agent can prove it ran the exact model it claims, with no output substitution.
+Successful inference responses include authenticated Gleipnir verification
+metadata so agents can inspect request/output binding and validator audit
+status.
 
 ## Quick Start
 
