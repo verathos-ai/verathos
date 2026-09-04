@@ -10,6 +10,7 @@ Requires ``torch`` with CUDA support — imported lazily so the pure-data
 from __future__ import annotations
 
 from verallm.registry.models import VRAMTier
+from verallm.vram import normalize_vram_gb
 
 
 def detect_vram_gb(device: int = 0) -> int:
@@ -37,16 +38,7 @@ def detect_vram_gb(device: int = 0) -> int:
     total_bytes = torch.cuda.get_device_properties(device).total_memory
     raw_gb = total_bytes / (1024 ** 3)
 
-    # Common marketed VRAM sizes.  Find the smallest spec >= raw_gb * 0.95
-    # (allowing 5% tolerance for driver overhead) that is also within 25%
-    # of the raw value (to avoid mapping a 24 GB card to 32 GB).
-    _SPEC_SIZES = (16, 24, 32, 48, 80, 96, 128, 141, 192, 288)
-    for spec in _SPEC_SIZES:
-        if spec >= raw_gb * 0.95 and spec <= raw_gb * 1.25:
-            return spec
-
-    # Fallback: plain round for unusual sizes
-    return round(raw_gb)
+    return normalize_vram_gb(raw_gb)
 
 
 def detect_vram_tier(device: int = 0) -> VRAMTier:
