@@ -352,14 +352,6 @@ DEFAULT_GPU_CLASSES: tuple[CapacityGpuClass, ...] = (
         calibrated=True,
     ),
     CapacityGpuClass(
-        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-        98,
-        passes=311,
-        capacity_passes=311,
-        capacity_rounds=8,
-        calibrated=True,
-    ),
-    CapacityGpuClass(
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
         98,
         passes=393,
