@@ -39,6 +39,7 @@ from verallm.mesh.proof import (
     VERATHOS_GGUF_DECODE_AUDIT_NEAR_TIE_ABS,
     VERATHOS_GGUF_DECODE_AUDIT_NEAR_TIE_REL,
     VERATHOS_GGUF_DECODE_AUDIT_TOP_K,
+    SLOT_VIEW_PROBE_MAX_ROWS,
     LlamaGraphOpReceipt,
     mesh_binding_violation,
     mesh_boundary_chain_required,
@@ -1814,10 +1815,10 @@ def _slot_view_selected_ops(
             if ord_value not in set(committed_candidates)
         ]
         per_intra[intra] = [*committed_candidates, *probe_candidates]
-    # Name-armed entries (n:<weight name>): the C side dumps ANY small-row
-    # instance whose src0 weight matches the name, regardless of graph or
-    # intra ordinal. This is the entry that survives architectures whose op
-    # stream is length-dependent (glm-dsa's sparse-attention indexer path
+    # Name-armed entries (n:<weight name>): the C side dumps any bounded
+    # eager-tail instance whose src0 weight matches the name, regardless of
+    # graph or intra ordinal. This is the entry that survives architectures
+    # whose op stream is length-dependent (glm-dsa's sparse-attention indexer path
     # switches with KV state, shifting every intra between graph kinds), so
     # the ordinal-based entries below can never be relied on alone. Names
     # are emitted LAST: older builds' parsers stop at the first
@@ -1842,7 +1843,7 @@ def _slot_view_selected_ops(
     # into extra subgraphs (rpc view-boundary splits, deepseek4
     # hyper-connection islands), so exact ord:intra pairs alone miss the
     # decode instances the audit needs. The C side dumps wildcard matches
-    # only for small-row instances, so this stays bounded.
+    # only for bounded eager-tail instances, so this stays bounded.
     for intra in sorted(per_intra):
         op = f"*:{intra}"
         extra_chars = len(op) + (1 if selected_ops else 0)
@@ -2854,13 +2855,12 @@ def verify_slot_view_proof_payload(
     if len(src1_shape) < 2 or src1_shape[0] != leaf.k_dim:
         raise RuntimeError("slot view trace activation shape mismatch")
     # Tail-backed organic witnesses must be clean single-token decode
-    # instances. Witnesses from a teacher-forced probe window (any request
-    # with a decode audit) may instead come from the probe's final chunk,
-    # which computes a few positions in ONE small GEMM (glm-5.2 live: a
-    # 4-row output.weight instance, 2-row layer GEMMs). A decode-audit
-    # opening then selects the audited position's row and the token/top-k
-    # acceptance checks bind it; base light witnesses open no values at
-    # all, so the small row bound adds no prover freedom in either case.
+    # instances. A teacher-forced hard/decode probe may instead expose the
+    # verified runtime's bounded eager prompt tail as one GEMM (recurrent
+    # models cannot always roll their cache back to an exact single row).
+    # The ceiling is shared with native arming and the assembler. A
+    # decode-audit opening selects and binds the audited row; a hard proof
+    # verifies the complete bounded GEMM.
     probe_backed = bool(
         decode_openings
         or mesh_receipt.get("decode_audit_required", False)
@@ -2868,7 +2868,7 @@ def verify_slot_view_proof_payload(
         # solo replay window, never from the shared serve.
         or str(payload.get("proof_mode", "")) == VERATHOS_GGML_GEMM_PROOF_MODE
     )
-    max_rows = 8 if probe_backed else 1
+    max_rows = SLOT_VIEW_PROBE_MAX_ROWS if probe_backed else 1
     if not 1 <= int(src1_shape[1]) <= max_rows:
         raise RuntimeError(
             "slot view decode replay activation rows out of bounds: "
@@ -4794,7 +4794,43 @@ def find_slot_view_template_for_window(
                                 (str(entry.backend), str(entry.device))
                             ):
                                 return True
-                            if len(graph_order) >= 64:
+                            # A long prompt can emit far more than 64 prefill
+                            # sub-graphs before the first decode forward (a
+                            # 28k-token GLM request over four GPUs emitted
+                            # 220).  The old hard stop therefore returned one
+                            # device's prefill graph as the whole-model
+                            # template.  Keep scanning, but compact prefill
+                            # history to the best fallback graph so memory
+                            # remains bounded independently of prompt length.
+                            if len(graph_order) >= 64 and not any(
+                                decode_shaped_memo.get(item, False)
+                                for item in graph_order
+                            ):
+                                order_index = {
+                                    item: idx
+                                    for idx, item in enumerate(graph_order)
+                                }
+                                fallback_graph = max(
+                                    graph_order,
+                                    key=lambda item: (
+                                        bool(logit_memo.get(item, False)),
+                                        len(entries_by_graph.get(item, [])),
+                                        -int(order_index[item]),
+                                    ),
+                                )
+                                for stale_graph in tuple(graph_order):
+                                    if stale_graph == fallback_graph:
+                                        continue
+                                    entries_by_graph.pop(stale_graph, None)
+                                    seen_by_graph.pop(stale_graph, None)
+                                    decode_shaped_memo.pop(stale_graph, None)
+                                    logit_memo.pop(stale_graph, None)
+                                graph_order[:] = [fallback_graph]
+                            elif len(graph_order) >= 4096:
+                                # Once decode-shaped graphs begin, a healthy
+                                # forward repeats a device within a handful of
+                                # sub-graphs.  Bound malformed/corrupt input
+                                # without imposing any valid prompt-length cap.
                                 return True
                         graph_order.append(graph_seq)
                         entries_by_graph[graph_seq] = []

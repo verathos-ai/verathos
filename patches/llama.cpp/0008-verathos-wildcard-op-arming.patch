@@ -47,8 +47,8 @@ index 14f854b22..050e90c1f 100644
  }
  
 +// Wildcard-armed dump decision: exact ord:intra pairs dump any shape;
-+// '*'-armed intras dump only small-row instances (decode steps and
-+// per-token structure) so an armed window cannot be made to dump whole
++// '*'-armed intras dump only bounded eager-tail instances (decode steps and
++// teacher-forced proof probes) so an armed window cannot be made to dump whole
 +// prefill activations for every graph.
 +static bool verathos_cuda_should_dump_selected_op_rows(
 +        int64_t graph_sequence, int64_t intra_index, int64_t src1_rows) {
@@ -59,7 +59,7 @@ index 14f854b22..050e90c1f 100644
 +        if (item.first == graph_sequence) {
 +            return true;
 +        }
-+        if (item.first < 0 && src1_rows <= 8) {
++        if (item.first < 0 && src1_rows <= 32) {
 +            return true;
 +        }
 +    }

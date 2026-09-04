@@ -25,6 +25,11 @@ VERATHOS_GGML_GEMM_PROOF_MODE = "verathos_ggml_gemm_v1"
 VERATHOS_GGML_LIGHT_PROOF_MODE = "verathos_ggml_light_v1"
 VERATHOS_GGUF_DECODE_AUDIT_MODE = "verathos_gguf_decode_audit_v1"
 VERATHOS_GGUF_DECODE_AUDIT_TOP_K = 8
+# Teacher-forced proof probes run through the same bounded eager prompt-tail
+# path as verified serving. The native capture filters, proof assembler, and
+# verifier must share this ceiling: a recurrent model can legitimately expose
+# the whole eager tail as one GEMM instead of a one-row decode GEMM.
+SLOT_VIEW_PROBE_MAX_ROWS = 32
 # Near-tie acceptance for the f32 argmax equality check: split meshes flip
 # near-tied argmaxes between the batched serve path and the single-row f32
 # replay (different reduction orders). A served token inside the audited

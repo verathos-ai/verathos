@@ -6,8 +6,8 @@ index 12bbee10f..378618a62 100644
  static int64_t verathos_cpu_selected_ops_graph[64] = {0};
  static int64_t verathos_cpu_selected_ops_intra[64] = {0};
  static int verathos_cpu_selected_ops_count = 0;
-+// Name-armed dump filter (n:<weight name> entries): matches any small-row
-+// instance whose src0 weight carries the name, on every graph and at every
++// Name-armed dump filter (n:<weight name> entries): matches any bounded
++// eager-tail instance whose src0 weight carries the name on every graph and
 +// intra ordinal (see the CUDA hook for the rationale).
 +static char verathos_cpu_selected_names[16][96] = {{0}};
 +static int verathos_cpu_selected_names_count = 0;
@@ -55,15 +55,15 @@ index 12bbee10f..378618a62 100644
 +    return verathos_cpu_selected_ops_count > 0 || verathos_cpu_selected_names_count > 0;
 +}
 +
-+// Name-armed entries are graph- and intra-agnostic but small-row only, so
-+// an armed window cannot be made to dump whole prefill activations.
++// Name-armed entries are graph- and intra-agnostic but bounded to the eager
++// tail, so an armed window cannot be made to dump whole prefill activations.
 +static bool verathos_cpu_should_dump_selected_op_named(
 +        int64_t graph_sequence, int64_t intra_index, int64_t src1_rows,
 +        const char * src0_name) {
 +    if (verathos_cpu_should_dump_selected_op(graph_sequence, intra_index)) {
 +        return true;
 +    }
-+    if (src0_name != NULL && src1_rows <= 8) {
++    if (src0_name != NULL && src1_rows <= 32) {
 +        for (int i = 0; i < verathos_cpu_selected_names_count; ++i) {
 +            if (strcmp(verathos_cpu_selected_names[i], src0_name) == 0) {
 +                return true;
@@ -106,8 +106,8 @@ index 050e90c1f..a2d9d4776 100644
  static thread_local bool verathos_cuda_in_graph_capture = false;
  static int64_t verathos_cuda_graph_max_src1_rows = 0;
  static std::vector<std::pair<int64_t, int64_t>> verathos_cuda_selected_ops;
-+// Name-armed dump filter (n:<weight name> entries): matches any small-row
-+// instance whose src0 weight carries the name, on every graph and at every
++// Name-armed dump filter (n:<weight name> entries): matches any bounded
++// eager-tail instance whose src0 weight carries the name on every graph and
 +// intra ordinal. This is the arming that survives architectures whose op
 +// stream is length-dependent (glm-dsa sparse attention switches its indexer
 +// path with KV state, shifting intra ordinals between graph kinds).
@@ -146,7 +146,7 @@ index 050e90c1f..a2d9d4776 100644
          // window (ord-agnostic). Real replay graph ordinals drift from the
          // committed layout whenever the scheduler splits a pass into extra
 @@ -632,7 +654,8 @@ static bool verathos_cuda_should_dump_selected_op(int64_t graph_sequence, int64_
- // per-token structure) so an armed window cannot be made to dump whole
+ // teacher-forced proof probes) so an armed window cannot be made to dump whole
  // prefill activations for every graph.
  static bool verathos_cuda_should_dump_selected_op_rows(
 -        int64_t graph_sequence, int64_t intra_index, int64_t src1_rows) {
@@ -159,9 +159,9 @@ index 050e90c1f..a2d9d4776 100644
              return true;
          }
      }
-+    // Name-armed entries are graph- and intra-agnostic but small-row only,
-+    // so an armed window cannot be made to dump whole prefill activations.
-+    if (src0_name != nullptr && src1_rows <= 8) {
++    // Name-armed entries are graph- and intra-agnostic but bounded to the
++    // eager tail, so an armed window cannot dump whole prefill activations.
++    if (src0_name != nullptr && src1_rows <= 32) {
 +        for (const auto & name : verathos_cuda_selected_names) {
 +            if (name == src0_name) {
 +                return true;

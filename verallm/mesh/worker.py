@@ -43,6 +43,7 @@ from verallm.mesh.proof import (
     RECEIPT_ONLY_PROOF_MODE,
     REPLAY_SEED_MODE_CLIENT,
     REPLAY_SEED_MODE_DERIVED,
+    SLOT_VIEW_PROBE_MAX_ROWS,
     VALIDATOR_POSTCOMMIT_CHALLENGE_KIND,
     VERATHOS_GGML_GEMM_PROOF_MODE,
     VERATHOS_GGML_LIGHT_PROOF_MODE,
@@ -6335,18 +6336,19 @@ def make_worker_server(
                 ),
                 key=lambda t: int(t.graph_seq),
             )
-            # A probe window may only capture SMALL multi-row instances: the
-            # teacher-forced probe's final chunk computes a few positions in
-            # one GEMM (glm-5.2 live: a 4-row output.weight instance, 2-row
-            # layer GEMMs), so probe-backed witnesses accept up to 8 rows.
-            # Tail-backed organic witnesses stay strictly single-row.
+            # A probe window may only capture bounded multi-row instances: a
+            # recurrent model can expose the verified runtime's eager prompt
+            # tail as one GEMM. The shared ceiling matches the native filter
+            # and verifier; tail-backed organic witnesses stay single-row.
             small_rows = sorted(
                 (
                     trace
                     for trace in replay_traces
                     if trace.tensor_name == leaf_name
                     and len(trace.src1_shape) > 1
-                    and 1 <= int(trace.src1_shape[1]) <= 8
+                    and 1
+                    <= int(trace.src1_shape[1])
+                    <= SLOT_VIEW_PROBE_MAX_ROWS
                 ),
                 key=lambda t: int(t.graph_seq),
             )
@@ -8980,7 +8982,7 @@ def make_worker_server(
             """Leaf names + decode-audit needs this coordinator's window must hold.
 
             Mirrors the payload build's acceptance exactly: every LOCAL
-            selection leaf needs a small-row (1..8) instance, and every
+            selection leaf needs a bounded eager-tail instance, and every
             decode-audit leaf additionally needs a strict single-row
             instance whose logits carry the committed token (argmax or
             committed top-k). Remote members' dumps land on their own trace
@@ -9065,10 +9067,15 @@ def make_worker_server(
                     trace
                     for trace in by_name.get(name, [])
                     if len(trace.src1_shape) > 1
-                    and 1 <= int(trace.src1_shape[1]) <= 8
+                    and 1
+                    <= int(trace.src1_shape[1])
+                    <= SLOT_VIEW_PROBE_MAX_ROWS
                 ]
                 if not pool:
-                    return f"no small-row instance for {name}"
+                    return (
+                        "no bounded probe instance for "
+                        f"{name} (max rows {SLOT_VIEW_PROBE_MAX_ROWS})"
+                    )
             import numpy as np
 
             for need in audit_needs:
@@ -9076,7 +9083,9 @@ def make_worker_server(
                 for trace in by_name.get(str(need["leaf"]), []):
                     if not (
                         len(trace.src1_shape) > 1
-                        and 1 <= int(trace.src1_shape[1]) <= 8
+                        and 1
+                        <= int(trace.src1_shape[1])
+                        <= SLOT_VIEW_PROBE_MAX_ROWS
                     ):
                         continue
                     try:

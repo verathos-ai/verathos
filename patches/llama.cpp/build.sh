@@ -122,9 +122,11 @@ git fetch --depth 1 origin "$BASE" 2>/dev/null || \
   git -c http.version=HTTP/1.1 fetch origin
 git checkout -f "$BASE"
 git clean -fdx >/dev/null 2>&1 || true
-git apply --check "$PATCH" && git apply "$PATCH"
+git apply --check "$PATCH"
+git apply "$PATCH"
 for extra in ${EXTRA_PATCHES+"${EXTRA_PATCHES[@]}"}; do
-  git apply --check "$extra" && git apply "$extra"
+  git apply --check "$extra"
+  git apply "$extra"
 done
 BUILD="build-verathos-$BACKEND"
 # GGML_RPC=ON is what creates the rpc-server target at all; without it the

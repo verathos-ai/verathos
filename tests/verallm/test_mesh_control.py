@@ -9584,6 +9584,99 @@ def test_fast_slot_view_template_loader_merges_device_subgraphs(tmp_path):
     ]
 
 
+def test_fast_slot_view_template_loader_scans_past_long_multigpu_prefill(
+    tmp_path,
+):
+    """Prompt length must not cap structural discovery.
+
+    A real 28k-token GLM request produced 220 prefill sub-graphs across four
+    GPUs before its first decode forward.  The loader must compact that
+    history and still merge the later per-device decode sub-graphs.
+    """
+
+    mods = _slot_view_imports()
+    path = tmp_path / "manifest-1000.vmanifest"
+    devices = [
+        {"backend": "llama_cpp_cuda", "device": f"CUDA{idx}"}
+        for idx in range(4)
+    ]
+    rows = []
+    timestamp = 1000
+    sequence = 1
+    graph = 1
+    for _forward in range(20):
+        for device_index, device in enumerate(devices):
+            rows.append(
+                _v3_row(
+                    timestamp,
+                    sequence,
+                    f"blk.{device_index}.attn_q.weight",
+                    512,
+                    graph,
+                    0,
+                    **device,
+                )
+            )
+            timestamp += 1
+            sequence += 1
+            graph += 1
+    for device_index, device in enumerate(devices):
+        rows.append(
+            _v3_row(
+                timestamp,
+                sequence,
+                f"blk.{device_index}.attn_q.weight",
+                1,
+                graph,
+                0,
+                **device,
+            )
+        )
+        timestamp += 1
+        sequence += 1
+        if device_index == 3:
+            rows.append(
+                _v3_row(
+                    timestamp,
+                    sequence,
+                    "output.weight",
+                    1,
+                    graph,
+                    1,
+                    **device,
+                )
+            )
+            timestamp += 1
+            sequence += 1
+        graph += 1
+    # The repeated CUDA0 graph proves that the complete four-device decode
+    # forward has ended and gives the streaming loader its stop boundary.
+    rows.append(
+        _v3_row(
+            timestamp,
+            sequence,
+            "blk.0.attn_q.weight",
+            1,
+            graph,
+            0,
+            **devices[0],
+        )
+    )
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    template = mods["find_slot_view_template_for_window"](
+        tmp_path,
+        file_token="1000",
+    )
+    assert [(item["device"], item["tensor_name"]) for item in template] == [
+        ("CUDA0", "blk.0.attn_q.weight"),
+        ("CUDA1", "blk.1.attn_q.weight"),
+        ("CUDA2", "blk.2.attn_q.weight"),
+        ("CUDA3", "blk.3.attn_q.weight"),
+        ("CUDA3", "output.weight"),
+    ]
+
+
 def test_fast_slot_view_template_loader_skips_prefill_only_probe_window(tmp_path):
     """The newest manifest at request start can be a closed certification-
     probe window whose graphs are ALL prefill-shaped (observed: a
@@ -9729,6 +9822,25 @@ def test_slot_view_proof_payload_verifies_replay_binding():
     try:
         mods["verify_slot_view_proof_payload"](bad, mesh_receipt=receipt)
         raise AssertionError("expected tensor name mismatch to raise")
+    except RuntimeError:
+        pass
+
+    # A hard-tier teacher-forced probe can expose the runtime's bounded eager
+    # prompt tail as one GEMM on recurrent models. It is accepted through the
+    # shared 32-row ceiling, while anything larger remains fail-closed.
+    hard = json.loads(json.dumps(payload))
+    hard["trace"]["src1_shape"] = [leaf.k_dim, 14, 1, 1]
+    hard_receipt = {**receipt, "proof_mode": VERATHOS_GGML_GEMM_PROOF_MODE}
+    hard["proof_mode"] = VERATHOS_GGML_GEMM_PROOF_MODE
+    mods["verify_slot_view_proof_payload"](hard, mesh_receipt=hard_receipt)
+
+    too_wide = json.loads(json.dumps(hard))
+    too_wide["trace"]["src1_shape"] = [leaf.k_dim, 33, 1, 1]
+    try:
+        mods["verify_slot_view_proof_payload"](
+            too_wide, mesh_receipt=hard_receipt
+        )
+        raise AssertionError("expected over-wide hard probe to raise")
     except RuntimeError:
         pass
 

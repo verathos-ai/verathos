@@ -26,9 +26,9 @@ Upstream llama.cpp commit `e79e4bf66` (see UPSTREAM_BASE.txt).
 - `0007-verathos-rpc-foreign-view-serialization.patch` — RPC serialization of
   foreign-buffer views (multi-device split serving).
 - `0008-verathos-wildcard-op-arming.patch` — `*:intra` ord-agnostic dump
-  arming (small-row instances only).
+  arming (bounded eager-tail instances only).
 - `0009-verathos-name-keyed-op-arming.patch` — `n:<weight name>` dump arming:
-  graph- and intra-agnostic, small-row only. The identity that survives
+  graph- and intra-agnostic, bounded eager-tail only. The identity that survives
   architectures with length-dependent op streams (glm-dsa).
 - `0010-verathos-decode-priority-interleave.patch` — decode-priority batch
   interleaving in the server scheduler (see section below). Server-only C++,

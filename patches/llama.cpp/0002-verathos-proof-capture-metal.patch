@@ -479,8 +479,8 @@ index ef3c92f..8ea1a06 100644
 +}
 +
 +// Wildcard-armed dump decision, mirroring the CUDA hook: exact ord:intra
-+// pairs dump any shape; '*'-armed intras dump only small-row instances
-+// (decode steps), so a broad wildcard arming can never re-open the
++// pairs dump any shape; '*'-armed intras dump only bounded eager-tail
++// instances, so a broad wildcard arming can never re-open the
 +// dump-everything firehose on prefill graphs.
 +static bool verathos_metal_should_dump_selected_op_rows(
 +        int64_t graph_sequence, int64_t intra_index, int64_t src1_rows) {
@@ -491,7 +491,7 @@ index ef3c92f..8ea1a06 100644
 +        if (item.first == graph_sequence) {
 +            return true;
 +        }
-+        if (item.first < 0 && src1_rows <= 8) {
++        if (item.first < 0 && src1_rows <= 32) {
 +            return true;
 +        }
 +    }
