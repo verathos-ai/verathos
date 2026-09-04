@@ -11794,6 +11794,21 @@ class ValidatorNeuron:
     def _proof_v3_quant_qualified(self, miner: ActiveMiner) -> bool:
         """Check the advertised quant against the authenticated v3 release."""
 
+        # Mesh entries authenticate their exact model/quant pair through the
+        # signed verification snapshot and the curated mesh scoring profile.
+        # They intentionally do not have a vLLM proof-release entry. Sending
+        # them through the vLLM release/policy lookup below therefore turns a
+        # valid v3-only mesh runtime into an "unqualified quantization" at
+        # epoch close, even after its mesh proofs verified successfully.
+        if _is_mesh_runtime(miner):
+            return (
+                get_mesh_model_scoring_profile(
+                    str(getattr(miner, "model_id", "") or ""),
+                    str(getattr(miner, "quant", "") or ""),
+                )
+                is not None
+            )
+
         release = self._epoch_close_value(
             "_proof_v3_releases",
             {},

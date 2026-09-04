@@ -10,7 +10,13 @@ from neurons.runtime import (
     MESH_QUANT_PREFIX,
     get_mesh_model_scoring_profile,
 )
-from neurons.scoring import compute_model_base_utility
+from neurons.receipts import ServiceReceipt
+from neurons.scoring import (
+    CompositeScorer,
+    EpochOutcome,
+    compute_model_base_utility,
+)
+from neurons.subnet_runtime_config import ProofProtocolRolloutConfig
 from neurons.validator import (
     ValidatorNeuron,
     _model_scoring_entry,
@@ -109,6 +115,113 @@ def test_mesh_profile_lookup_is_exact_and_quant_checked():
     assert get_mesh_model_scoring_profile("QWEN2.5-7B-Q4-K-M", MESH_QUANT) is None
     assert get_mesh_model_scoring_profile(f" {MESH_MODEL_ID}", MESH_QUANT) is None
     assert get_mesh_model_scoring_profile("qwen2.5-7b-unapproved-q4-k-m", MESH_QUANT) is None
+
+
+def test_v3_only_mesh_quant_qualification_uses_signed_mesh_profile():
+    """Epoch close must not require a vLLM proof release for mesh entries.
+
+    The mesh verifier authenticates the exact model/quant through its pinned
+    signed snapshot.  Mainnet's v3-only rollout exposed this cross-runtime
+    boundary because the legacy protocol fallback had masked it on testnet.
+    """
+    neuron = ValidatorNeuron.__new__(ValidatorNeuron)
+    neuron._proof_v3_releases = {}
+    neuron._proof_v3_canary_policy = None
+    neuron._proof_protocol_rollout_cfg = ProofProtocolRolloutConfig((3,))
+
+    assert neuron._proof_v3_quant_qualified(_miner()) is True
+    assert neuron._proof_v3_quant_qualified(
+        _miner(quant="gguf_mesh_q5_k_m")
+    ) is False
+    assert neuron._proof_v3_quant_qualified(
+        _miner(model_id="qwen2.5-7b-unapproved-q4-k-m")
+    ) is False
+
+
+def test_v3_only_mesh_entry_receives_its_runtime_family_weight():
+    """Exercise the production failure boundary from qualification to weight.
+
+    A mesh entry has no vLLM proof release.  Under a v3-only rollout it must
+    still cross the exact mesh profile gate, produce a positive EMA from a
+    clean receipt, and consume the configured mesh-family budget.
+    """
+    mesh = _miner()
+    neuron = ValidatorNeuron.__new__(ValidatorNeuron)
+    neuron._proof_v3_releases = {}
+    neuron._proof_v3_canary_policy = None
+    neuron._proof_protocol_rollout_cfg = ProofProtocolRolloutConfig((3,))
+    neuron._model_client = SimpleNamespace(
+        get_model_list=lambda: [mesh.model_id, "qwen2.5-7b-instruct"]
+    )
+    neuron._epoch_miners = [mesh]
+    neuron.config = SimpleNamespace(
+        demand_bonus_enabled=False,
+        mesh_emission_bps=1000,
+    )
+
+    resolved = _resolve_model_scoring_runtime(
+        mesh.model_id,
+        mesh.quant,
+        mesh.max_context_len,
+    )
+    assert resolved is not None
+    model_entry, scored_context_len, scored_quant = resolved
+    receipt = ServiceReceipt(
+        miner_address=mesh.address,
+        model_id=mesh.model_id,
+        model_index=mesh.model_index,
+        epoch_number=1,
+        commitment_hash=b"\x00" * 32,
+        timestamp=1_700_000_000,
+        ttft_ms=500.0,
+        tokens_generated=32,
+        generation_time_ms=1_000.0,
+        tokens_per_sec=32.0,
+        prompt_tokens=128,
+        proof_verified=True,
+        is_canary=True,
+        validator_hotkey=b"\x01" * 32,
+    )
+    outcome = EpochOutcome(
+        miner_address=mesh.address,
+        model_id=mesh.model_id,
+        model_index=mesh.model_index,
+        uid=211,
+        own_receipts=[receipt],
+        expected_own_receipt_count=1,
+        all_receipts=[receipt],
+        scoring_receipts=[],
+        proof_tests=1,
+        proof_failures=0,
+        max_context_len=scored_context_len,
+        quant=scored_quant,
+        quant_qualified=neuron._proof_v3_quant_qualified(mesh),
+    )
+    scorer = CompositeScorer(ema_alpha=0.2)
+    epoch_score = scorer.update(
+        uid=211,
+        address=mesh.address,
+        model_index=mesh.model_index,
+        outcome=outcome,
+        active_params_b=model_entry.active_params_b,
+        moe_dense_equivalent=model_entry.moe_dense_equivalent,
+        generation_quality=model_entry.generation_quality,
+    )
+    assert epoch_score is not None and epoch_score > 0
+    assert scorer.states[211].entries[mesh.model_index].ema_score > 0
+
+    budgets = neuron._build_model_emission_budgets({})
+    weights, unallocated = scorer.get_model_bucket_weights(
+        budgets,
+        model_groups=neuron._last_model_emission_groups,
+        group_budgets=neuron._last_model_group_budgets,
+        group_shares=neuron._last_model_group_shares,
+    )
+    assert neuron._last_model_group_shares[
+        "mesh:Qwen/Qwen2.5-7B-Instruct"
+    ] == pytest.approx(0.1)
+    assert weights[211] == pytest.approx(0.1)
+    assert unallocated == pytest.approx(0.9)
 
 
 def test_mesh_scoring_runtime_scores_context_at_the_advertised_value():

@@ -155,18 +155,17 @@ DEFAULT_GPU_CLASSES: tuple[CapacityGpuClass, ...] = (
         calibrated=True,
     ),
     CapacityGpuClass(
-        # Calibrated from a live 4x concurrent audit window (model
-        # resident, drained): 311 passes took 31.4-33.3s
-        # per GPU = 101-107ms/pass. Single-GPU pace is 63.7ms/pass; this
-        # PCIe-host class drifts ~1.6x under honest 4-way simultaneous
-        # proving (unlike SXM A100 topology evidence), so the row encodes
-        # the concurrent pace: 20.0s hot target / ~105ms = 190 passes.
-        # vram_gb=96 covers the mesh roster reading (95) and the legacy 98
-        # within the +/-2 match tolerance.
+        # Calibrated on the fixed-workspace production path at 311 passes:
+        # 19.802s timed CUDA, with twelve clean public score-gate windows.
+        # A later one-off 4x slowdown is diagnostic only; capacity workloads
+        # must not be weakened from miner-local timing without an equivalent
+        # selected-length same-GPU fraud control. vram_gb=96 covers both the
+        # mesh roster reading (95) and legacy health reading (98) within the
+        # +/-2 match tolerance.
         "NVIDIA RTX PRO 6000 Blackwell Server Edition",
         96,
-        passes=190,
-        capacity_passes=190,
+        passes=311,
+        capacity_passes=311,
         capacity_rounds=8,
         calibrated=True,
     ),
