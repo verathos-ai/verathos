@@ -1199,6 +1199,26 @@ def replay_seed_for_receipt_context(receipt_context: Mapping[str, Any]) -> int |
     return derived
 
 
+def slot_template_model_layers(
+    receipt_context: Mapping[str, Any], spec: MeshSpec | None,
+) -> int:
+    """Resolve template geometry without inventing signed receipt fields."""
+    supplied = int(receipt_context.get("model_total_layers", 0))
+    if str(receipt_context.get("proof_receipt_format", "")) == "opaque_stage_v2":
+        if supplied <= 0:
+            raise RuntimeError("signed proof context requires model_total_layers")
+        if spec is not None and supplied != int(spec.total_layers):
+            raise RuntimeError("proof context model_total_layers mismatch")
+        return supplied
+    if supplied > 0:
+        if spec is not None and supplied != int(spec.total_layers):
+            raise RuntimeError("proof context model_total_layers mismatch")
+        return supplied
+    if spec is None or int(spec.total_layers) <= 0:
+        raise RuntimeError("calibration template requires local model geometry")
+    return int(spec.total_layers)
+
+
 def validate_mesh_stage_context_commitments(
     receipt_context: Mapping[str, Any],
     spec: MeshSpec,
@@ -7711,7 +7731,7 @@ def make_worker_server(
             file_token=file_token,
             layer_start=int(receipt_context.get("layer_start", 0)),
             layer_end=int(receipt_context.get("layer_end", 0)),
-            model_total_layers=int(receipt_context.get("model_total_layers", 0)),
+            model_total_layers=slot_template_model_layers(receipt_context, spec),
         )
         # The template must cover the stage's WHOLE layer span. A capture
         # window that holds only part of a forward (the launch self-test's
@@ -7739,7 +7759,7 @@ def make_worker_server(
                 file_token="",
                 layer_start=int(receipt_context.get("layer_start", 0)),
                 layer_end=int(receipt_context.get("layer_end", 0)),
-                model_total_layers=int(receipt_context.get("model_total_layers", 0)),
+                model_total_layers=slot_template_model_layers(receipt_context, spec),
             )
             if len(widened) > len(template):
                 logger.info(

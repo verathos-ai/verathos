@@ -9527,6 +9527,24 @@ def test_slot_view_template_rejects_historical_whole_model_after_split(tmp_path)
     assert len(loader(tmp_path, layer_start=0, layer_end=2, model_total_layers=2)) == 3
 
 
+def test_calibration_final_stage_template_uses_local_total_layers(tmp_path):
+    from types import SimpleNamespace
+    from verallm.mesh.worker import slot_template_model_layers
+
+    path = tmp_path / "manifest-1000.vmanifest"
+    path.write_text("\n".join([
+        _v3_row(1000, 1, "blk.1.attn_q.weight", 1, 1, 0),
+        _v3_row(1001, 2, "output.weight", 1, 1, 1),
+    ]) + "\n", encoding="utf-8")
+    loader = _slot_view_imports()["find_slot_view_template_for_window"]
+    assert loader(tmp_path, layer_start=1, layer_end=2, model_total_layers=0) == []
+    total = slot_template_model_layers(
+        {"layer_start": 1, "layer_end": 2}, SimpleNamespace(total_layers=2),
+    )
+    template = loader(tmp_path, layer_start=1, layer_end=2, model_total_layers=total)
+    assert {row["tensor_name"] for row in template} == {"blk.1.attn_q.weight", "output.weight"}
+
+
 def test_fast_slot_view_template_loader_stops_after_first_v3_graph(tmp_path):
     mods = _slot_view_imports()
     path = tmp_path / "manifest-1000.vmanifest"
