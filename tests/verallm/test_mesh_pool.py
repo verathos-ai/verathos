@@ -31,6 +31,35 @@ from verallm.mesh.worker import post_json
 from verallm.mesh.types import MeshSpec
 
 
+@pytest.mark.parametrize("owned,dead", [(True, False), (False, False), (True, True)])
+def test_rpc_readiness_checks_owned_listener_without_connecting(monkeypatch, tmp_path, owned, dead):
+    runner = object.__new__(LocalMeshRunner)
+    runner.procs = [SimpleNamespace(pid=1234, poll=lambda: 1 if dead else None)]
+    runner.config = SimpleNamespace(workdir=tmp_path)
+    monkeypatch.setattr(runner, "_assert_command_active", lambda: None)
+    monkeypatch.setattr(pool_module, "_proc_net_available", lambda: True)
+    monkeypatch.setattr(pool_module, "_listeners_on_port", lambda port: ({5678}, True))
+    monkeypatch.setattr(pool_module, "_pid_descends_from", lambda pid, roots: owned)
+    def no_connect(*args, **kwargs):
+        pytest.fail("readiness must not fill a single-client RPC accept queue")
+    monkeypatch.setattr(pool_module.socket, "create_connection", no_connect)
+    if dead:
+        with pytest.raises(RuntimeError, match="process exited"):
+            runner._wait_tcp("127.0.0.1", 20000)
+    elif not owned:
+        with pytest.raises(RuntimeError, match="not owned"):
+            runner._wait_tcp("127.0.0.1", 20000)
+    else:
+        runner._wait_tcp("127.0.0.1", 20000)
+
+
+def test_rpc_listener_parent_chain_fails_closed(monkeypatch):
+    stats = {5678: "5678 (rpc server) S 1234 0", 1234: "1234 (worker) S 1 0"}
+    monkeypatch.setattr(pool_module.Path, "read_text", lambda path: stats[int(path.parts[-2])])
+    assert pool_module._pid_descends_from(5678, {1234})
+    assert not pool_module._pid_descends_from(5678, {9999})
+
+
 @dataclass(frozen=True)
 class _PoolCredentials:
     worker: MeshPoolToken

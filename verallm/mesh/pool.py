@@ -897,6 +897,23 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _pid_descends_from(pid: int, roots: set[int]) -> bool:
+    """Attribute a Linux listener to a currently tracked process tree."""
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen:
+        if pid in roots:
+            return True
+        seen.add(pid)
+        try:
+            # comm may contain spaces/parentheses; fields after its final ')'
+            # begin with state and ppid.
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            pid = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
 def _capability_subnet_driver_ready(capability: Mapping[str, Any]) -> bool:
     """Read a worker's subnet-driver readiness advert.
 
@@ -9725,12 +9742,30 @@ class LocalMeshRunner:
         *,
         timeout: float = 60.0,
     ) -> None:
-        """Wait until one spawned RPC listener accepts a TCP connection."""
+        """Wait for the owned RPC listener without consuming its accept queue."""
 
         deadline = time.monotonic() + timeout
         last = ""
         while time.monotonic() < deadline:
             self._assert_command_active()
+            for proc in self.procs:
+                code = proc.poll()
+                if code is not None:
+                    raise RuntimeError(
+                        f"mesh process exited with code {code} while waiting "
+                        f"for tcp://{host}:{port}; check the serve logs in "
+                        f"{self.config.workdir}"
+                    )
+            if host in {"127.0.0.1", "::1", "localhost"} and _proc_net_available():
+                pids, occupied = _listeners_on_port(port)
+                if occupied:
+                    roots = {int(proc.pid) for proc in self.procs}
+                    if pids and all(_pid_descends_from(pid, roots) for pid in pids):
+                        return
+                    raise RuntimeError(f"RPC listener on tcp:{port} is not owned by this launch")
+                last = "owned RPC listener not bound yet"
+                time.sleep(0.2)
+                continue
             try:
                 with socket.create_connection((host, int(port)), timeout=2.0):
                     return
