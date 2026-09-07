@@ -12991,7 +12991,10 @@ def pool_worker_loop(
                 if (
                     _normalize_pool_serving_mode(command.get("serving_mode"))
                     == POOL_SERVING_MODE_SUBNET
+                    and command.get("model_index") is not None
                 ):
+                    # The initial deploy measures capacity before registration;
+                    # only the subsequent chain-bound launch has a snapshot.
                     if not _COMMAND_DIGEST_RE.fullmatch(
                         verification_snapshot_hash
                     ):

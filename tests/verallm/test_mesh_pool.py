@@ -3825,9 +3825,22 @@ class _BlockingValidatorRunner(_StubRunner):
         return self.snapshot_hash
 
 
+@pytest.mark.parametrize(
+    ("model_index", "snapshot_hash", "expected_event"),
+    [
+        (None, "", "serving"),
+        (0, "ab" * 32, "serving"),
+        (12, "ab" * 32, "serving"),
+        (0, "", "error"),
+        (12, "not-a-snapshot", "error"),
+    ],
+)
 def test_worker_multibox_phase_retry_continues_once_without_report_flood(
     monkeypatch,
     tmp_path,
+    model_index,
+    snapshot_hash,
+    expected_event,
 ):
     token = MeshPoolToken(
         pool_id="pool-phase-retry",
@@ -3840,11 +3853,13 @@ def test_worker_multibox_phase_retry_continues_once_without_report_flood(
             "action": "drive",
             "mesh_key": "m-phase-retry",
             "model_id": "m1",
+            "model_index": model_index,
             "member_count": 2,
             "serving_mode": "validator",
         }
     )
     runner = _BlockingValidatorRunner()
+    runner.snapshot_hash = snapshot_hash
     stop = threading.Event()
     terminal = threading.Event()
     heartbeats: list[dict[str, object]] = []
@@ -3878,7 +3893,7 @@ def test_worker_multibox_phase_retry_continues_once_without_report_flood(
                     time.sleep(0.02)
                     raise TimeoutError("lost initial phase delivery")
                 return {"status": "ok", "command_phase": "drive_ready"}
-            assert report["event"] == "serving"
+            assert report["event"] == expected_event
             terminal.set()
             return {
                 "status": "ok",
@@ -3907,7 +3922,7 @@ def test_worker_multibox_phase_retry_continues_once_without_report_flood(
     ]
     runner.release_verify.set()
     assert terminal.wait(2.0)
-    _wait(lambda: any(item.get("event") == "serving" for item in reports))
+    _wait(lambda: any(item.get("event") == expected_event for item in reports))
     journal_path = config.workdir / pool_module.POOL_WORKER_COMMAND_JOURNAL_FILE
     _wait(
         lambda: json.loads(journal_path.read_text())["commands"][
@@ -3924,8 +3939,13 @@ def test_worker_multibox_phase_retry_continues_once_without_report_flood(
         ("verify", ""),
     ]
     terminal_report = reports[-1]
-    assert terminal_report["event"] == "serving"
-    assert terminal_report["verification_snapshot_hash"] == runner.snapshot_hash
+    assert terminal_report["event"] == expected_event
+    if expected_event == "error":
+        assert "without a signed snapshot" in terminal_report["message"]
+    elif model_index is not None:
+        assert terminal_report["verification_snapshot_hash"] == runner.snapshot_hash
+    else:
+        assert "verification_snapshot_hash" not in terminal_report
     journal = json.loads(journal_path.read_text())
     assert journal["commands"][command["command_id"]]["state"] == "completed"
 
