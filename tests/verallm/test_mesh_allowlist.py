@@ -94,6 +94,38 @@ def test_refresh_raises_on_metagraph_failure(tmp_path: Path, monkeypatch):
     assert not out.exists()
 
 
+@pytest.mark.parametrize("network,expected", [
+    ("ws://node.example:9944", "http://node.example:9944"),
+    ("wss://node.example:443", "https://node.example:443"),
+    ("http://node.example:9944", "http://node.example:9944"),
+    ("https://node.example:443", "https://node.example:443"),
+    ("finney", "https://lite.chain.opentensor.ai"),
+    ("test", "https://test.chain.opentensor.ai"),
+])
+def test_registry_lookup_uses_selected_network(tmp_path, monkeypatch, network, expected):
+    from verallm.chain import validator_registry
+
+    _fake_bittensor(monkeypatch, hotkeys=["5Owner", "5LowStake"],
+                    permits=[True, True], stakes=[1000.0, 1.0])
+    config_path = tmp_path / "chain.json"
+    config_path.write_text(json.dumps({"chain_id": 964}))
+    seen = []
+
+    class Registry:
+        def __init__(self, config):
+            seen.append(config.rpc_url)
+
+        def get_min_validator_stake(self):
+            return 100 * 10**9
+
+    monkeypatch.setattr(validator_registry, "ValidatorRegistryClient", Registry)
+    out = tmp_path / "allowlist.json"
+    refresh_validator_allowlist(subtensor_network=network, netuid=405,
+                               out_path=out, chain_config_path=str(config_path))
+    assert seen == [expected]
+    assert [v["hotkey_ss58"] for v in json.loads(out.read_text())["validators"]] == ["5Owner"]
+
+
 def test_refresh_closes_owned_subtensor_after_success(tmp_path: Path, monkeypatch):
     import verallm.mesh.allowlist as allowlist
 

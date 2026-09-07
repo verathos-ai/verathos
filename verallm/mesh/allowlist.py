@@ -97,7 +97,13 @@ def refresh_validator_allowlist(
             from verallm.chain.config import ChainConfig
             from verallm.chain.validator_registry import ValidatorRegistryClient
 
-            chain_config = ChainConfig.from_json(chain_config_path)
+            network = str(subtensor_network or "").strip()
+            rpc_url = ChainConfig.resolve_rpc_url(
+                network if "://" in network else None, network,
+            )
+            chain_config = ChainConfig.from_json(
+                chain_config_path, **({"rpc_url": rpc_url} if rpc_url else {}),
+            )
             registry = ValidatorRegistryClient(chain_config)
             min_validator_stake = registry.get_min_validator_stake() / 1e9
         except Exception as exc:
