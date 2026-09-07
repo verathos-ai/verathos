@@ -10,7 +10,7 @@ from __future__ import annotations
 import bittensor as bt
 
 from neurons.version import (
-    version_str as __version__,
+    release_version_str as __version__,
     miner_version_str,
     validator_version_str,
 )
@@ -161,6 +161,7 @@ def print_banner(
     lines.append(f"│  {'Verathos · Subnet 96':<{width - 2}}│")
     _role_ver = miner_version_str if role.lower() == "miner" else validator_version_str
     lines.append(f"│  {role + ' v' + _role_ver:<{width - 2}}│")
+    lines.append(f"│  {'Code release v' + __version__:<{width - 2}}│")
     lines.append(f"├{bar}┤")
 
     # Build info rows

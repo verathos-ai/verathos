@@ -1,64 +1,28 @@
-"""Subnet version constants for on-chain weight gating and auto-update.
+"""Release identity, role update thresholds and weight specification.
 
-Three independent version numbers control update behavior:
+``release_version`` / ``release_version_str`` identify the tagged code release.
+An opt-in release advances this identity without changing role thresholds.
 
-``spec_version``
-    On-chain weight gating.  Passed as ``version_key`` to
-    ``subtensor.set_weights()``.  Must match the subnet's
-    ``weights_version`` hyperparameter or the chain **rejects** the
-    extrinsic.  From now on this is derived as
-    ``max(miner_version, validator_version)`` so any role release can set
-    weights after the subnet owner updates the on-chain version key.
+``miner_version`` and ``validator_version`` are automatic-update thresholds.
+The updater adopts newer code only when its role's remote threshold increases;
+proxies use the validator threshold. A newer release alone triggers no restart.
 
-``miner_version``
-    Miner-side code version.  The auto-updater on miners only restarts
-    when the remote ``miner_version`` is higher than the local one.
-    Bump when miner code changes (server, proofs, registration).
+``spec_version`` remains max(miner_version, validator_version) and is supplied
+as the weight version key. ``version_str`` retains its legacy spec-string
+meaning; use ``release_version_str`` to report the installed code release.
 
-``validator_version``
-    Validator/proxy-side code version.  The auto-updater on validators
-    and proxies only restarts when the remote ``validator_version`` is
-    higher.  Bump when validator, proxy, scoring, or canary code changes.
-
-This means a validator-only bug fix (bump ``validator_version``) does NOT
-force miners to restart (and vice versa).  The subnet ``weights_version`` must
-track ``spec_version``, which is always the higher role version.
-
-Encoding
---------
-Same base-1000 scheme as bittensor core::
-
-    version_key = MAJOR * 1_000_000 + MINOR * 1_000 + PATCH
-
-Examples::
-
-    0.1.0  →     1_000
-    0.2.0  →     2_000
-    1.0.0  → 1_000_000
-    1.2.3  → 1_002_003
-
-Bump workflow
--------------
-1. Choose the next monotonic formal release version, greater than every
-   published release tag and role version.
-2. Set every role changed by that release to the release version. Leave an
-   untouched role at its existing version; role-version drift is intentional
-   and prevents unnecessary restarts.
-3. The derived ``spec_version`` and formal Git tag must both equal that release
-   version. Production code releases are always tagged.
-4. Miners/validators with ``--auto-update`` pull and restart **only if their
-   role's version increased**.
-5. If either role version changed, the subnet owner must also update the
-   on-chain ``weights_version`` to the derived ``spec_version``::
-
-       subtensor.sudo_set_weights_version_key(
-           netuid=405, weights_version_key=spec_version,
-       )
+Every code release receives a monotonic matching Git tag. Advance affected
+role thresholds when automatic adoption is intended. Opt-in releases must be
+qualified for manual adoption and future automatic upgrades as well.
 """
 
-from __future__ import annotations
-
 _VERSION_BASE = 1_000
+
+# Release identity is independent of automatic-update thresholds. An opt-in
+# release advances these constants without advancing MINER_* or VALIDATOR_*.
+RELEASE_MAJOR = 0
+RELEASE_MINOR = 2
+RELEASE_PATCH = 1
 
 
 def _encode(major: int, minor: int, patch: int) -> int:
@@ -76,10 +40,14 @@ def _decode(version: int) -> tuple[int, int, int]:
     return major, minor, patch
 
 
+release_version: int = _encode(RELEASE_MAJOR, RELEASE_MINOR, RELEASE_PATCH)
+release_version_str: str = _version_str(RELEASE_MAJOR, RELEASE_MINOR, RELEASE_PATCH)
+
+
 # ── Miner version ────────────────────────────────────────────────
 #
-# Bump when miner-side code changes: server, proofs, registration,
-# heartbeat, model selection.  Only miners with --auto-update restart.
+# Advance when automatic miner adoption is required. Opt-in code releases
+# retain this threshold; only miners with --auto-update restart on an increase.
 
 MINER_MAJOR = 0
 MINER_MINOR = 2
@@ -91,9 +59,8 @@ miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 
 # ── Validator / proxy version ────────────────────────────────────
 #
-# Bump when validator or proxy code changes: canary testing, scoring,
-# weight setting, routing, credits, auth, settlement.
-# Both validators and proxies with --auto-update restart.
+# Advance when automatic validator/proxy adoption is required.
+# Opt-in code releases retain this threshold. Both roles use this comparison.
 
 VALIDATOR_MAJOR = 0
 VALIDATOR_MINOR = 2

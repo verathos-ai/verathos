@@ -131,6 +131,10 @@ COMMANDS = {
 
 
 def main() -> None:
+    if len(sys.argv) == 2 and sys.argv[1] == "--version":
+        from neurons.version import release_version_str
+        print(f"Verathos {release_version_str}")
+        return
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         cmd_help()
         sys.exit(0)
