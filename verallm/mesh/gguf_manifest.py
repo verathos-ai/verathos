@@ -1344,12 +1344,62 @@ def _proof_blob_peers() -> list[str]:
     return [p.strip().rstrip("/") for p in raw.split(",") if p.strip()]
 
 
+def _store_verified_blob_stream(
+    root: Path,
+    sha256_hex: str,
+    suffix: str,
+    stream: Any,
+    *,
+    expected_bytes: int,
+) -> Path:
+    """Publish one committed blob with bounded transfer memory.
+
+    The caller supplies the authenticated manifest size. No partial or
+    unverified file becomes visible to readers, including on interrupted I/O.
+    """
+    import tempfile
+
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256_hex):
+        raise ValueError("invalid committed blob hash")
+    if suffix not in {".raw", ".f32", ".i8"} or expected_bytes <= 0:
+        raise ValueError("invalid committed blob size or type")
+    path = _cache_blob_path(root, sha256_hex, suffix)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False
+        ) as output:
+            temporary = Path(output.name)
+            digest = hashlib.sha256()
+            remaining = int(expected_bytes)
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk or len(chunk) > min(1024 * 1024, remaining):
+                    raise RuntimeError("committed blob size mismatch")
+                output.write(chunk)
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if stream.read(1):
+                raise RuntimeError("committed blob exceeds manifest size")
+            if digest.hexdigest() != sha256_hex:
+                raise RuntimeError("committed blob hash mismatch")
+        temporary.replace(path)
+        temporary = None
+        _enforce_cache_cap(root)
+        return path
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _fetch_blob_from_peers(
     sha256_hex: str,
     suffix: str,
     *,
     max_bytes: int | None = None,
-) -> bytes | None:
+    destination_root: Path | None = None,
+) -> bytes | Path | None:
     """Fetch a content-addressed blob from mesh peers; sha-verified locally.
 
     This is what makes a GGUF-less member possible: its proof weights arrive
@@ -1387,6 +1437,13 @@ def _fetch_blob_from_peers(
                     ),
                 )
             with _urllib_request.urlopen(request, timeout=timeout_s) as resp:
+                if destination_root is not None:
+                    if max_bytes is None or max_bytes <= 0:
+                        raise ValueError("streamed blob requires manifest size")
+                    return _store_verified_blob_stream(
+                        destination_root, sha256_hex, suffix, resp,
+                        expected_bytes=max_bytes,
+                    )
                 raw = (
                     resp.read(int(max_bytes) + 1)
                     if max_bytes is not None
@@ -1899,19 +1956,49 @@ def build_proof_blob_for_committed_sha(
     verify the committed Merkle root/hash before publishing the cache blob.
 
     ``True`` means the digest is present in the manifest and a build was
-    attempted.  Callers must still require the requested cache path to exist:
-    for example, large exact-f32 tensors intentionally exceed the bounded f32
-    cache and therefore remain unavailable to file-less members.
+    attempted. Callers must still require the requested cache path to exist.
+    Large dense tensors use committed raw bytes rather than the small f32
+    cache; whole expert-bank transport is not supported by the raw path.
     """
 
     digest = str(sha256_hex).strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         return False
-    if suffix not in {".i8", ".i8.json", ".f32"}:
+    if suffix not in {".i8", ".i8.json", ".f32", ".raw"}:
         return False
 
     for record in _manifest_records(manifest):
         name = str(record.get("name", ""))
+        if suffix == ".raw" and str(record.get("raw_sha256", "")).lower() == digest:
+            # Only a challenged dense matrix, never an entire expert bank.
+            shape = [int(d) for d in record.get("shape", [])]
+            if len(shape) != 2 or any(d <= 0 for d in shape):
+                return False
+            nbytes = int(record.get("n_bytes", 0))
+            offset = int(record.get("data_offset", -1))
+            model_file = _model_file_for_manifest_record(manifest, record)
+            root = proof_weight_cache_dir()
+            if not model_file or root is None or nbytes <= 0 or offset < 0:
+                return False
+            if offset + nbytes > Path(model_file).stat().st_size:
+                raise RuntimeError("committed tensor exceeds model file")
+
+            class TensorRange:
+                def __init__(self, handle: Any) -> None:
+                    self.handle = handle
+                    self.remaining = nbytes
+
+                def read(self, size: int) -> bytes:
+                    data = self.handle.read(min(size, self.remaining))
+                    self.remaining -= len(data)
+                    return data
+
+            with open(model_file, "rb") as handle:
+                handle.seek(offset)
+                _store_verified_blob_stream(
+                    root, digest, suffix, TensorRange(handle), expected_bytes=nbytes
+                )
+            return True
         if suffix in {".i8", ".i8.json"}:
             if str(record.get("proof_i8_sha256", "")).lower() == digest:
                 # Explicit peer requests must materialize both transport
@@ -2276,6 +2363,62 @@ def proof_i8_expert_plane_from_manifest(
     return wanted
 
 
+def _exact_matrix_from_raw_peer(record: Mapping[str, Any]) -> np.ndarray:
+    """Reconstruct one dense matrix without a GGUF or retained float cache."""
+    import gguf
+
+    shape = [int(d) for d in record.get("shape", [])]
+    if len(shape) != 2 or any(d <= 0 for d in shape):
+        raise RuntimeError("exact peer fallback requires one dense matrix")
+    elements = math.prod(shape)
+    kind = gguf.GGMLQuantizationType[str(record["tensor_type"])]
+    block, encoded = gguf.GGML_QUANT_SIZES[kind]
+    nbytes = int(record.get("n_bytes", 0))
+    if elements % block or nbytes != elements // block * encoded:
+        raise RuntimeError("exact peer tensor byte geometry mismatch")
+    if int(record.get("f32_nbytes", 0)) != elements * 4:
+        raise RuntimeError("exact peer tensor float geometry mismatch")
+    sha = str(record.get("raw_sha256", ""))
+    root = proof_weight_cache_dir()
+    if root is None or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise RuntimeError("exact peer tensor cache or commitment unavailable")
+    path = _cache_blob_path(root, sha, ".raw")
+    if not path.is_file():
+        fetched = _fetch_blob_from_peers(
+            sha, ".raw", max_bytes=nbytes, destination_root=root
+        )
+        if fetched is None or not path.is_file():
+            raise RuntimeError("exact committed tensor unavailable from peers")
+    # No count-based LRU of decoded matrices: only this proof owns the result.
+    result = np.empty(elements, dtype=np.float32)
+    raw_hash, float_hash = hashlib.sha256(), hashlib.sha256()
+    chunk_bytes = max(encoded, (1024 * 1024 // encoded) * encoded)
+    offset = 0
+    with path.open("rb") as handle:
+        if os.fstat(handle.fileno()).st_size != nbytes:
+            raise RuntimeError("exact peer tensor size mismatch")
+        while offset < elements:
+            count = min(chunk_bytes, (elements - offset) // block * encoded)
+            raw = handle.read(count)
+            if len(raw) != count:
+                raise RuntimeError("exact peer tensor truncated")
+            raw_hash.update(raw)
+            decoded = np.asarray(
+                gguf.dequantize(np.frombuffer(raw, dtype=np.uint8), kind),
+                dtype=np.float32,
+            ).reshape(-1)
+            expected = count // encoded * block
+            if decoded.size != expected:
+                raise RuntimeError("exact peer decoded geometry mismatch")
+            float_hash.update(decoded.tobytes(order="C"))
+            result[offset:offset + expected] = decoded
+            offset += expected
+    if raw_hash.hexdigest() != sha or float_hash.hexdigest() != str(record.get("f32_sha256", "")):
+        path.unlink(missing_ok=True)
+        raise RuntimeError("exact peer tensor commitment mismatch")
+    return proof_f32_weight_matrix_from_gguf_f32(result, shape)
+
+
 def proof_f32_weight_matrix_from_manifest(
     manifest: Mapping[str, Any],
     tensor_name: str,
@@ -2316,6 +2459,8 @@ def proof_f32_weight_matrix_from_manifest(
             )
     model_file = _model_file_for_manifest_record(manifest, selected)
     if not model_file:
+        if use_exact:
+            return _exact_matrix_from_raw_peer(selected)
         raise RuntimeError("GGUF tensor manifest does not include model_file")
     f32_sha256 = str(selected.get("f32_sha256", ""))
     if not f32_sha256:

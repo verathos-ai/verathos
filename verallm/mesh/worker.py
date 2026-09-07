@@ -12285,7 +12285,7 @@ def make_worker_server(
                     self._send_json(503, {"error": str(exc)})
                 return
             blob_match = re.match(
-                r"^/v1/mesh/proof-blob/([0-9a-f]{64})(\.i8|\.i8\.json|\.f32)$",
+                r"^/v1/mesh/proof-blob/([0-9a-f]{64})(\.i8|\.i8\.json|\.f32|\.raw)$",
                 self.path.rstrip("/"),
             )
             if blob_match:
