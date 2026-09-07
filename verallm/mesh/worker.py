@@ -7709,6 +7709,9 @@ def make_worker_server(
             if not file_token
             else 0,
             file_token=file_token,
+            layer_start=int(receipt_context.get("layer_start", 0)),
+            layer_end=int(receipt_context.get("layer_end", 0)),
+            model_total_layers=int(receipt_context.get("model_total_layers", 0)),
         )
         # The template must cover the stage's WHOLE layer span. A capture
         # window that holds only part of a forward (the launch self-test's
@@ -7734,6 +7737,9 @@ def make_worker_server(
                 start_unix_ns=0,
                 end_unix_ns=0,
                 file_token="",
+                layer_start=int(receipt_context.get("layer_start", 0)),
+                layer_end=int(receipt_context.get("layer_end", 0)),
+                model_total_layers=int(receipt_context.get("model_total_layers", 0)),
             )
             if len(widened) > len(template):
                 logger.info(

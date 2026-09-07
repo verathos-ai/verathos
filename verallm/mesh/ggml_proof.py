@@ -4654,6 +4654,9 @@ def find_slot_view_template_for_window(
     start_unix_ns: int = 0,
     end_unix_ns: int = 0,
     file_token: str = "",
+    layer_start: int | None = None,
+    layer_end: int | None = None,
+    model_total_layers: int | None = None,
 ) -> list[dict[str, Any]]:
     """Load the model-invariant per-graph op template for slot views.
 
@@ -4664,6 +4667,28 @@ def find_slot_view_template_for_window(
     intra-index rows. This keeps the hot path bounded without dropping the LM
     head from decode-audit slot views.
     """
+
+    if (layer_start is None) != (layer_end is None):
+        raise ValueError("template stage range requires both bounds")
+    if layer_start is not None and not 0 <= layer_start < layer_end:
+        raise ValueError("invalid template stage range")
+
+    def compatible_template(entries):
+        template = slot_view_template_from_manifest_entries(entries)
+        if layer_start is not None:
+            for op in template:
+                if not _slot_view_op_is_committed_weight(op):
+                    continue
+                try:
+                    _trace_layer_index(
+                        op, layer_start=layer_start, layer_end=layer_end,
+                        model_total_layers=model_total_layers,
+                    )
+                except RuntimeError:
+                    # A historical capture may belong to a different split.
+                    # Reject the entire template, never shrink its leaf set.
+                    return []
+        return template
 
     root = Path(trace_dir)
     start_bound = (
@@ -4713,7 +4738,7 @@ def find_slot_view_template_for_window(
                 file_token=file_token,
             )
             entries = [item for item in entries if item.graph_seq >= 0]
-            return slot_view_template_from_manifest_entries(entries)
+            return compatible_template(entries)
         entries_by_graph: dict[int, list[GgmlOpManifestEntry]] = {}
         seen_by_graph: dict[int, set[int]] = {}
         graph_order: list[int] = []
@@ -4925,7 +4950,10 @@ def find_slot_view_template_for_window(
                 ):
                     merged.extend(entries_by_graph.get(graph, []))
                 if merged:
-                    return slot_view_template_from_manifest_entries(merged)
+                    template = compatible_template(merged)
+                    if template:
+                        return template
+                    continue
             else:
                 best_graph = max(
                     graph_order,
@@ -4939,9 +4967,7 @@ def find_slot_view_template_for_window(
             if entries and not fallback_template:
                 # Prefill-shaped file: keep as last resort and try the other
                 # manifest files for a real decode-shaped template first.
-                fallback_template = slot_view_template_from_manifest_entries(
-                    entries
-                )
+                fallback_template = compatible_template(entries)
     return fallback_template
 
 

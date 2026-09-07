@@ -9505,6 +9505,28 @@ def test_slot_view_decode_selection_falls_back_without_final_stage_op():
     }
 
 
+def test_slot_view_template_rejects_historical_whole_model_after_split(tmp_path):
+    mods = _slot_view_imports()
+    old = tmp_path / "manifest-1000.vmanifest"
+    old.write_text("\n".join([
+        _v3_row(1000, 1, "blk.0.attn_q.weight", 1, 1, 0),
+        _v3_row(1001, 2, "blk.1.attn_q.weight", 1, 1, 1),
+        _v3_row(1002, 3, "output.weight", 1, 1, 2),
+    ]) + "\n", encoding="utf-8")
+    current = tmp_path / "manifest-2000.vmanifest"
+    current.write_text(_v3_row(2000, 1, "blk.0.attn_q.weight", 1, 1, 0) + "\n",
+                       encoding="utf-8")
+    loader = mods["find_slot_view_template_for_window"]
+    for token in ("", "1000", "2000"):
+        template = loader(tmp_path, file_token=token, layer_start=0,
+                          layer_end=1, model_total_layers=2)
+        assert [op["tensor_name"] for op in template] == ["blk.0.attn_q.weight"]
+    current.unlink()
+    assert loader(tmp_path, layer_start=0, layer_end=1, model_total_layers=2) == []
+    # The unchanged whole-model lane must still retain its complete template.
+    assert len(loader(tmp_path, layer_start=0, layer_end=2, model_total_layers=2)) == 3
+
+
 def test_fast_slot_view_template_loader_stops_after_first_v3_graph(tmp_path):
     mods = _slot_view_imports()
     path = tmp_path / "manifest-1000.vmanifest"
