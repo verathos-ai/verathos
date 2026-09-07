@@ -1914,7 +1914,11 @@ def build_proof_blob_for_committed_sha(
         name = str(record.get("name", ""))
         if suffix in {".i8", ".i8.json"}:
             if str(record.get("proof_i8_sha256", "")).lower() == digest:
-                proof_i8_weight_matrix_from_manifest(manifest, name)
+                # Explicit peer requests must materialize both transport
+                # files even when ordinary proofs use the compact profile.
+                proof_i8_weight_matrix_from_manifest(
+                    manifest, name, cache_for_peer=True,
+                )
                 return True
 
             # MUL_MAT_ID commits one proof-domain matrix per routed expert.
@@ -1929,7 +1933,9 @@ def build_proof_blob_for_committed_sha(
             except ValueError:
                 expert = -1
             if expert >= 0:
-                proof_i8_expert_plane_from_manifest(manifest, name, expert)
+                proof_i8_expert_plane_from_manifest(
+                    manifest, name, expert, cache_for_peer=True,
+                )
                 return True
         elif str(record.get("f32_sha256", "")).lower() == digest:
             # Exact f32 transport is intentionally limited to small tensors.
@@ -2059,6 +2065,8 @@ def _proof_f32_weight_matrix_from_record_cache(
 def proof_i8_weight_matrix_from_manifest(
     manifest: Mapping[str, Any],
     tensor_name: str,
+    *,
+    cache_for_peer: bool = False,
 ) -> np.ndarray:
     """Load and cache a tensor's deterministic proof-domain W matrix."""
 
@@ -2094,7 +2102,7 @@ def proof_i8_weight_matrix_from_manifest(
                 selected.get("proof_i8_merkle_root", "")
             ):
                 raise RuntimeError("GGUF proof weight root mismatch")
-        if _should_persist_i8(selected):
+        if cache_for_peer or _should_persist_i8(selected):
             store_cached_proof_i8(selected, proof_i8, scale)
         return proof_i8
     model_file = str(manifest.get("model_file", ""))
@@ -2112,7 +2120,7 @@ def proof_i8_weight_matrix_from_manifest(
         chunk_size,
         expected_sha256=str(selected.get("proof_i8_sha256", "")),
     )
-    if _should_persist_i8(selected):
+    if cache_for_peer or _should_persist_i8(selected):
         store_cached_proof_i8(selected, proof_i8, scale)
     return proof_i8
 
@@ -2167,6 +2175,8 @@ def proof_i8_expert_plane_from_manifest(
     manifest: Mapping[str, Any],
     tensor_name: str,
     expert: int,
+    *,
+    cache_for_peer: bool = False,
 ) -> tuple[np.ndarray, float]:
     """Load one MoE expert's committed proof-domain W plane.
 
@@ -2227,7 +2237,7 @@ def proof_i8_expert_plane_from_manifest(
             raise RuntimeError(
                 f"GGUF expert plane root mismatch: {tensor_name!r} expert {expert}"
             )
-        if proof_weight_cache_profile() == "full":
+        if cache_for_peer or proof_weight_cache_profile() == "full":
             try:
                 store_cached_proof_i8(
                     {"proof_i8_sha256": shas[int(expert)]}, proof_i8, scale
@@ -2250,7 +2260,10 @@ def proof_i8_expert_plane_from_manifest(
             raise RuntimeError(
                 f"GGUF expert plane root mismatch: {tensor_name!r} expert {plane}"
             )
-        if proof_weight_cache_profile() == "full":
+        if (
+            (cache_for_peer and plane == int(expert))
+            or proof_weight_cache_profile() == "full"
+        ):
             try:
                 store_cached_proof_i8(
                     {"proof_i8_sha256": shas[plane]}, proof_i8, scale
