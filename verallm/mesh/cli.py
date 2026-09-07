@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from verallm.mesh.llama_cpp import (
@@ -1984,6 +1985,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
         if missing:
             raise SystemExit("--mesh or all of --uid, --hotkey, and --endpoint are required")
         capability = _capability_from_args(args)
+    from verallm.mesh import local_dial
+
+    # Only the connection address changes; capabilities and plans stay public.
+    local_dial.configure(capability.endpoint)
+    local_advertised_host = urlparse(capability.endpoint).hostname or ""
     verification_snapshot_loader = _snapshot_loader_for_serve(
         explicit_path=str(args.verification_snapshot or ""),
         state_path=persisted_state_path,
@@ -2636,7 +2642,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
             unready = [
                 endpoint
                 for endpoint in plan["rpc_endpoints"]
-                if not _rpc_endpoint_is_ready(endpoint, timeout=args.llama_rpc_ready_timeout)
+                if not _rpc_endpoint_is_ready(
+                    local_dial.endpoint_for_host(endpoint, local_advertised_host),
+                    timeout=args.llama_rpc_ready_timeout,
+                )
             ]
             if unready:
                 with llama_lock:
@@ -2699,7 +2708,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
                         flush=True,
                     )
                     return
-                cmd = list(payload["llama_server_command"])
+                cmd = local_dial.rpc_command_for_host(
+                    payload["llama_server_command"], local_advertised_host
+                )
                 cmd[0] = resolve_binary(cmd[0])
                 print(payload["llama_server_command_text"], flush=True)
                 llama_env = (

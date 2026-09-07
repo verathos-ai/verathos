@@ -13954,6 +13954,10 @@ def post_json(
     keepalive: bool = False,
     keepalive_fallback: bool = True,
 ) -> dict[str, Any]:
+    if internal_auth_secret:
+        from verallm.mesh.local_dial import endpoint as local_endpoint
+
+        url = local_endpoint(url)
     # Compact separators: proof-payload sign requests carry multi-MiB
     # element-heavy JSON, and default spaced separators inflate the wire
     # body 5-30% past caps checked on canonical (compact) JSON.
@@ -14022,10 +14026,13 @@ def probe_worker(
     """Fetch health and capability metadata from a worker endpoint."""
 
     base = normalize_endpoint(endpoint)
+    from verallm.mesh.local_dial import endpoint as local_endpoint
+
+    dial_base = local_endpoint(base) if internal_auth_secret else base
     start = time.perf_counter()
-    health = _fetch_json(urljoin(base, "health"), timeout=timeout)
+    health = _fetch_json(urljoin(dial_base, "health"), timeout=timeout)
     cap_payload = _fetch_json(
-        urljoin(base, "capability"),
+        urljoin(dial_base, "capability"),
         timeout=timeout,
         internal_auth_secret=internal_auth_secret,
     )
