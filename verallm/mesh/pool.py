@@ -8541,6 +8541,9 @@ class PoolWorkerConfig:
     # has a broken RPC client (recv failed in ggml_backend_rpc_add_server), so
     # driving wedges at "driving" forever while it works fine as a member.
     member_only: bool = False
+    # Explicit private CA trust must survive into a wallet-free driver's
+    # signing subprocess, not just the parent worker's HTTP opener.
+    manager_ca_file: str = ""
 
     def __post_init__(self) -> None:
         if bool(self.wallet_name) != bool(self.wallet_hotkey):
@@ -12572,6 +12575,7 @@ def pool_worker_loop(
         "manager_ca_sha256": str(
             getattr(config.token, "manager_ca_sha256", "") or ""
         ),
+        "manager_ca_file": str(config.manager_ca_file or ""),
     }
 
     def deliver_worker_report(

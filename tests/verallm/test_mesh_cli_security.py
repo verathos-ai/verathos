@@ -566,6 +566,52 @@ def _pinned_token(pin: str):
 _SELF_SIGNED_PEM = None
 
 
+def test_delegated_signer_inherits_explicit_manager_ca(tmp_path, monkeypatch):
+    import json
+    import ssl
+    import verallm.mesh.delegated_signing as delegated
+
+    cert = tmp_path / "manager.pem"
+    cert.write_text(_test_cert_pem(tmp_path))
+    path = tmp_path / "delegation.json"
+    path.write_text(json.dumps({
+        "manager_endpoint": "https://198.51.100.7:20102",
+        "manager_ca_file": str(cert),
+    }))
+    installed = []
+    monkeypatch.setattr(mesh_cli, "_install_per_host_manager_tls_context",
+                        lambda endpoint, context: installed.append((endpoint, context)))
+    monkeypatch.setattr(delegated, "coordinator_delegation_from_file", lambda _: SimpleNamespace(
+        coordinator_hotkey="test-hotkey", evm_address="0x1234",
+        keypair=object(), challenge_signer=object(),
+    ))
+    result = mesh_cli._serving_identity_from_args(SimpleNamespace(coordinator_sign_file=str(path)))
+    assert result[1] == "0x1234"
+    assert len(installed) == 1
+    assert installed[0][0] == "https://198.51.100.7:20102"
+    assert installed[0][1].verify_mode == ssl.CERT_REQUIRED
+    assert installed[0][1].cert_store_stats()["x509_ca"] >= 1
+
+
+@pytest.mark.parametrize("contents", [None, "not a certificate"])
+def test_delegated_signer_rejects_invalid_explicit_ca(tmp_path, monkeypatch, contents):
+    import json
+    import verallm.mesh.delegated_signing as delegated
+
+    cert = tmp_path / "manager.pem"
+    if contents is not None:
+        cert.write_text(contents)
+    path = tmp_path / "delegation.json"
+    path.write_text(json.dumps({
+        "manager_endpoint": "https://198.51.100.7:20102",
+        "manager_ca_file": str(cert),
+    }))
+    monkeypatch.setattr(delegated, "coordinator_delegation_from_file",
+                        lambda _: pytest.fail("must reject trust before requesting signatures"))
+    with pytest.raises(SystemExit, match="manager-ca-file"):
+        mesh_cli._serving_identity_from_args(SimpleNamespace(coordinator_sign_file=str(path)))
+
+
 def _test_cert_pem(tmp_path) -> str:
     """A real self-signed cert (minted once per run via openssl)."""
 

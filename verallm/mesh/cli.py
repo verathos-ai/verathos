@@ -1667,6 +1667,11 @@ def _serving_identity_from_args(
                     manager_ca_sha256=ca_sha256,
                 )
             )
+        elif manager_endpoint.startswith("https://"):
+            manager_ca_file = str(delegation_data.get("manager_ca_file", "") or "")
+            if manager_ca_file:
+                context = _manager_ca_file_context(manager_ca_file)
+                _install_per_host_manager_tls_context(manager_endpoint, context)
         delegation = coordinator_delegation_from_file(sign_file)
         if (
             evm_address
@@ -3032,6 +3037,19 @@ def _install_manager_tls_pin(token) -> None:
     _install_per_host_manager_tls_context(token.manager_endpoint, context)
 
 
+def _manager_ca_file_context(path: str) -> ssl.SSLContext:
+    """Load explicit private CA trust; callers scope it to one manager."""
+    ca_path = Path(path).expanduser()
+    if not ca_path.is_file():
+        raise SystemExit(f"--manager-ca-file is not a regular file: {ca_path}")
+    try:
+        context = ssl.create_default_context(cafile=str(ca_path))
+    except (OSError, ssl.SSLError) as exc:
+        raise SystemExit(f"--manager-ca-file is not a valid CA bundle: {ca_path}") from exc
+    context.check_hostname = False
+    return context
+
+
 def _pool_token_from_args(
     args: argparse.Namespace,
     *,
@@ -3042,17 +3060,7 @@ def _pool_token_from_args(
     manager_ca_file = str(getattr(args, "manager_ca_file", "") or "").strip()
     manager_ca_context = None
     if manager_ca_file:
-        ca_path = Path(manager_ca_file).expanduser()
-        if not ca_path.is_file():
-            raise SystemExit(f"--manager-ca-file is not a regular file: {ca_path}")
-        try:
-            manager_ca_context = ssl.create_default_context(cafile=str(ca_path))
-        except (OSError, ssl.SSLError) as exc:
-            raise SystemExit(f"--manager-ca-file is not a valid CA bundle: {ca_path}") from exc
-        # The context is already restricted to the token's exact host:port
-        # below. Private pool certificates are frequently minted for a
-        # provider address that differs from the worker's dialable hostname.
-        manager_ca_context.check_hostname = False
+        manager_ca_context = _manager_ca_file_context(manager_ca_file)
 
     from verallm.mesh.pool import MeshPoolToken, load_pool_token_file
 
@@ -4743,6 +4751,10 @@ def cmd_pool_worker(args: argparse.Namespace) -> None:
         vram_gb = vram_gb if vram_gb > 0 else detected_vram
     config = PoolWorkerConfig(
         token=_pool_token_from_args(args, required_scope=POOL_TOKEN_SCOPE_WORKER),
+        manager_ca_file=(
+            str(Path(args.manager_ca_file).expanduser().resolve())
+            if getattr(args, "manager_ca_file", "") else ""
+        ),
         repo_root=Path(args.repo_root or Path(__file__).resolve().parents[2]),
         workdir=Path(args.workdir),
         advertise_host=args.advertise_host,
