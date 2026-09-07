@@ -602,6 +602,7 @@ if failures:
 print("preflight OK: signer + native prover + PCS library all load")
 PYEOF
 
+mkdir -p "$(dirname "$CATALOG")"
 [ -f "$CATALOG" ] || echo "[]" > "$CATALOG"   # empty catalog = file-less member only
 
 # --- runtime environment ------------------------------------------------------
