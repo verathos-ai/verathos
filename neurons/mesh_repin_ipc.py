@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -75,7 +76,8 @@ def _validated_request(payload: dict[str, Any]) -> dict[str, Any]:
     if type(model_index) is not int or model_index < 0:
         raise ValueError("mesh repin model_index is invalid")
     requested_at = payload.get("requested_at")
-    if type(requested_at) not in (int, float) or requested_at < 0:
+    if (type(requested_at) not in (int, float)
+            or not math.isfinite(requested_at) or requested_at < 0):
         raise ValueError("mesh repin requested_at is invalid")
     reason = str(payload.get("reason", ""))[:MAX_REASON_CHARS]
     return {
@@ -164,9 +166,74 @@ def acknowledge_mesh_repin_request(path: str | Path) -> None:
     Path(path).unlink(missing_ok=True)
 
 
+def relay_mesh_repin_requests(
+    source_dir: str | Path, *, source_uid: int,
+    shared_state_path: str, limit: int = 32, max_age_seconds: float = 120,
+) -> int:
+    """Forward private liveness hints across an explicit local service boundary.
+
+    Run as the destination owner (root when reading another UID's directory).
+    Never forwards snapshot bytes or changes permissions. The normal consumer
+    retains authority validation and its per-slot/epoch fetch budget.
+    """
+    destination = mesh_repin_spool_dir(shared_state_path)
+    if Path(source_dir).resolve() == destination.resolve():
+        raise ValueError("source and destination repin spools must differ")
+    if source_uid != os.geteuid() and os.geteuid() != 0:
+        raise PermissionError("cross-user repin relay requires root")
+    directory_fd = os.open(source_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    relayed = 0
+    try:
+        metadata = os.fstat(directory_fd)
+        if metadata.st_uid != source_uid or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise PermissionError("source repin spool must be private and owned by configured UID")
+        # Bound local work even if a buggy producer fills the directory.
+        import itertools
+        with os.scandir(directory_fd) as entries:
+            names = [entry.name for entry in itertools.islice(entries, 128)]
+        for name in names:
+            if relayed >= min(32, max(0, limit)):
+                break
+            if not name.startswith("repin-") or not name.endswith(".json"):
+                continue
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+                try:
+                    info = os.fstat(fd)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != source_uid
+                            or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > MAX_REQUEST_BYTES):
+                        continue
+                    raw = os.read(fd, MAX_REQUEST_BYTES + 1)
+                finally:
+                    os.close(fd)
+                if len(raw) > MAX_REQUEST_BYTES:
+                    continue
+                request = _validated_request(json.loads(raw))
+                expected_name = f"repin-{request['address']}-{request['model_index']}.json"
+                if name != expected_name:
+                    continue
+                age = time.time() - request["requested_at"]
+                if age < -5 or age > min(120, max(0, max_age_seconds)):
+                    continue
+                enqueue_mesh_repin_request(
+                    address=request["address"], model_index=request["model_index"],
+                    reason=request["reason"], shared_state_path=shared_state_path,
+                )
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
+                    os.unlink(name, dir_fd=directory_fd)
+                relayed += 1
+            except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
+                continue
+    finally:
+        os.close(directory_fd)
+    return relayed
+
+
 __all__ = [
     "acknowledge_mesh_repin_request",
     "enqueue_mesh_repin_request",
     "mesh_repin_spool_dir",
     "pending_mesh_repin_requests",
+    "relay_mesh_repin_requests",
 ]

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import stat
+import os
+import json
+import pytest
 import time
 from types import SimpleNamespace
 
@@ -15,6 +18,51 @@ from verallm.mesh.private_files import write_owner_only_text
 
 
 ADDRESS = "0x" + "ab" * 20
+
+
+def test_private_relay_preserves_consumer_and_debounce(tmp_path, monkeypatch):
+    from neurons.mesh_repin_ipc import relay_mesh_repin_requests
+    source, target = tmp_path / "source", tmp_path / "target"
+    monkeypatch.setenv("VERATHOS_MESH_REPIN_DIR", str(source))
+    path = enqueue_mesh_repin_request(address=ADDRESS, model_index=3, reason="snapshot mismatch")
+    monkeypatch.setenv("VERATHOS_MESH_REPIN_DIR", str(target))
+    assert relay_mesh_repin_requests(source, source_uid=os.geteuid(), shared_state_path="unused") == 1
+    assert not path.exists()
+    pending = pending_mesh_repin_requests()
+    assert len(pending) == 1
+    assert pending[0][1]["model_index"] == 3
+    assert stat.S_IMODE(source.stat().st_mode) == 0o700
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("problem", ["stale", "future", "nan", "public_file", "symlink"])
+def test_private_relay_refuses_invalid_source(tmp_path, monkeypatch, problem):
+    from neurons.mesh_repin_ipc import relay_mesh_repin_requests
+    source, target = tmp_path / "source", tmp_path / "target"
+    monkeypatch.setenv("VERATHOS_MESH_REPIN_DIR", str(source))
+    path = enqueue_mesh_repin_request(address=ADDRESS, model_index=3, reason="snapshot mismatch")
+    payload = json.loads(path.read_text())
+    if problem in {"stale", "future", "nan"}:
+        payload["requested_at"] = {"stale": time.time()-300, "future": time.time()+300, "nan": float("nan")}[problem]
+        write_owner_only_text(path, json.dumps(payload))
+    elif problem == "public_file":
+        path.chmod(0o644)
+    else:
+        other = source / "other"
+        path.rename(other)
+        path.symlink_to(other)
+    monkeypatch.setenv("VERATHOS_MESH_REPIN_DIR", str(target))
+    assert relay_mesh_repin_requests(source, source_uid=os.geteuid(), shared_state_path="unused") == 0
+    assert not target.exists()
+
+
+def test_private_relay_refuses_public_directory(tmp_path, monkeypatch):
+    from neurons.mesh_repin_ipc import relay_mesh_repin_requests
+    source = tmp_path / "source"
+    source.mkdir(mode=0o755)
+    monkeypatch.setenv("VERATHOS_MESH_REPIN_DIR", str(tmp_path / "target"))
+    with pytest.raises(PermissionError):
+        relay_mesh_repin_requests(source, source_uid=os.geteuid(), shared_state_path="unused")
 
 
 def test_request_round_trips_owner_only(tmp_path, monkeypatch):
