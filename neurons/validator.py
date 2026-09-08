@@ -7061,6 +7061,7 @@ class ValidatorNeuron:
 
         state = SimpleNamespace(
             epoch_number=int(epoch_number),
+            _follower_scoring_snapshot=None,
             _current_epoch=int(epoch_number),
             _epoch_start_block=int(self._epoch_start_block),
             _epoch_miners=tuple(self._epoch_miners),
@@ -7527,7 +7528,16 @@ class ValidatorNeuron:
                 getattr(self, "_endpoint_policy_gate_reasons", {}) or {},
             )
         }
-        excluded_entries = probation_entries | endpoint_policy_entries
+        owner_probation_entries = self._follower_probation_weight_exclusions()
+        excluded_entries = (
+            probation_entries | endpoint_policy_entries | owner_probation_entries
+        )
+        if owner_probation_entries:
+            bt.logging.info(
+                "Follower owner probation weight gate: "
+                f"excluded={len(owner_probation_entries)} endpoint(s); "
+                "local EMA and probation history unchanged"
+            )
         if model_bucket_mode:
             weights, model_unallocated = self.scorer.get_model_bucket_weights(
                 model_budgets,
@@ -15750,8 +15760,12 @@ class ValidatorNeuron:
         address: str,
         model_index: int,
     ):
-        accepted = self._verdict_snapshot_follower.current
-        if accepted is None:
+        sentinel = object()
+        snapshot = self._epoch_close_value("_follower_scoring_snapshot", sentinel)
+        if snapshot is sentinel:
+            accepted = self._verdict_snapshot_follower.current
+            snapshot = accepted.snapshot if accepted is not None else None
+        if snapshot is None:
             return None
         key = self._miner_model_key(address, model_index)
         miner = next(
@@ -15768,7 +15782,7 @@ class ValidatorNeuron:
         )
         if miner is None:
             return None
-        for entry in accepted.snapshot.entries:
+        for entry in snapshot.entries:
             if entry.key != key:
                 continue
             if (
@@ -15788,6 +15802,10 @@ class ValidatorNeuron:
             current_epoch=epoch_number,
             at_close=True,
         )
+        if snapshot is not None and snapshot.epoch_number != int(epoch_number):
+            raise RuntimeError("owner scoring snapshot does not match closing epoch")
+        # Pin closing-epoch decisions against concurrent next-epoch prefetch.
+        self._set_epoch_close_value("_follower_scoring_snapshot", snapshot)
         if snapshot is None:
             return {}
         verdicts: Dict[Tuple[str, int], bool] = {}
@@ -15812,6 +15830,21 @@ class ValidatorNeuron:
             f"neutral={len(epoch_miners) - len(verdicts)}"
         )
         return verdicts
+
+    def _follower_probation_weight_exclusions(self) -> set[Tuple[str, int]]:
+        """Apply owner exclusion without manufacturing another local failure."""
+        if not self._proof_v3_follower_mode_active():
+            return set()
+        # A prefetch or unavailable feed is not fresh negative evidence.
+        snapshot = self._epoch_close_value("_follower_scoring_snapshot", None)
+        if snapshot is None:
+            return set()
+        excluded = set()
+        for miner in self._epoch_close_value("_epoch_miners", ()):
+            entry = self._follower_verdict_entry(miner.address, miner.model_index)
+            if entry is not None and entry.probation:
+                excluded.add(entry.key)
+        return excluded
 
     def _follower_capacity_gate_reason(
         self,

@@ -3056,6 +3056,31 @@ MESH_MODELS: tuple[MeshModelEntry, ...] = (
         ),
     ),
     MeshModelEntry(
+        hf_repo="microtensor-archive/mt-code-3g-r1238-5ED3LzEW",
+        tokenizer_hf_repo="Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        layers=28,
+        # Mesh-only: Microtensor subnet (Bittensor netuid 92) round-1238
+        # code-generation champion - qwen2 arch, 1.5B dense, Q4_K_M bake,
+        # network-certified quality 0.4629 (best of its round on both
+        # quality and latency). The submission repo ships only the GGUF:
+        # the tokenizer anchors to the qwen2.5-coder base whose config
+        # matches every dimension (vocab 151936, ctx 32768, hidden 1536,
+        # 28 blocks), and the chat template is committed from the GGUF
+        # metadata below.
+        quality_params_b=1.5,
+        chat_template_asset="mt_code_3g.jinja",
+        native_context_len=32_768,
+        quants=(
+            MeshQuantVariant(
+                mesh_model_id="mt-code-3g-r1238-q4-k-m",
+                gguf_scheme="q4_k_m",
+                hf_files=("model.gguf",),
+                model_bytes=986_048_032,
+                tensor_manifest_root="97bac745ba021cb558c8977e7271c31a31e52b2cb98c31ef1f4213ed8d22e24e",
+            ),
+        ),
+    ),
+    MeshModelEntry(
         hf_repo="ornith-ai/Ornith-1.5-35B-A3B-GGUF",
         tokenizer_hf_repo="ornith-ai/Ornith-1.5-35B-A3B",
         layers=40,

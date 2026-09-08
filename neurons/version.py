@@ -22,7 +22,7 @@ _VERSION_BASE = 1_000
 # release advances these constants without advancing MINER_* or VALIDATOR_*.
 RELEASE_MAJOR = 0
 RELEASE_MINOR = 2
-RELEASE_PATCH = 1
+RELEASE_PATCH = 2
 
 
 def _encode(major: int, minor: int, patch: int) -> int:
@@ -64,7 +64,7 @@ miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 
 VALIDATOR_MAJOR = 0
 VALIDATOR_MINOR = 2
-VALIDATOR_PATCH = 0
+VALIDATOR_PATCH = 2
 
 validator_version: int = _encode(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)
 validator_version_str: str = _version_str(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)
