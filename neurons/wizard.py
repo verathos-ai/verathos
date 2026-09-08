@@ -864,13 +864,11 @@ def step_model(net_info: dict, capacity_audit_env: Optional[dict[str, str]] = No
     print("\r" + " " * 50 + "\r", end="", flush=True)
 
     if _error[0] is not None:
-        print(yellow("  Registry not available — using auto selection."))
-        return {"model_id": "auto", "category": None}
+        raise RuntimeError("Model catalog unavailable. Repair the installation and retry setup.") from _error[0]
 
     gpu_info, recommend_models, ModelCategory = _result
     if not gpu_info or not gpu_info.get("available"):
-        print(yellow("  No GPU detected — using auto selection."))
-        return {"model_id": "auto", "category": None}
+        raise RuntimeError("No GPU detected. Check GPU availability before selecting a model.")
 
     tier = gpu_info["tier"]
     print(f"  GPU: {gpu_info['name']} ({gpu_info['vram_gb']} GB, tier {tier.name})")
@@ -879,9 +877,13 @@ def step_model(net_info: dict, capacity_audit_env: Optional[dict[str, str]] = No
     # Get recommendations
     recs = recommend_models(tier, verified_only=capacity_audit_required)
 
-    # Filter by on-chain models if chain config available
+    # A local catalog entry is not evidence of network registration.
     chain_config_path = net_info.get("config_path", "")
-    if chain_config_path and recs:
+    if not chain_config_path:
+        raise RuntimeError("Model selection requires a chain configuration. Select a network and retry.")
+    if recs:
+        _spinner_done = threading.Event()
+        _t = None
         try:
             import threading
             from neurons.model_resolve import _get_on_chain_models
@@ -898,8 +900,8 @@ def step_model(net_info: dict, capacity_audit_env: Optional[dict[str, str]] = No
             _t = threading.Thread(target=_spin, daemon=True)
             _t.start()
             on_chain = _get_on_chain_models(chain_config_path, net_info.get("network"))
-            _spinner_done.set()
-            _t.join()
+            if on_chain is None:
+                raise RuntimeError("Unable to verify on-chain models. Check the configured RPC and retry setup.")
             if on_chain is not None:
                 on_chain_set = {m.lower() for m in on_chain}
                 # Match by the recommendation's SPECIFIC checkpoint, not by
@@ -912,18 +914,27 @@ def step_model(net_info: dict, capacity_audit_env: Optional[dict[str, str]] = No
                     r for r in recs
                     if r.config.checkpoint.lower() in on_chain_set
                 ]
-                if filtered:
-                    recs = filtered
-                    print(f"  Filtered to {len(recs)} on-chain registered models")
-                    if capacity_audit_required:
-                        from neurons.model_resolve import _capacity_eligible_recommendations_from_ranked
-                        recs = _capacity_eligible_recommendations_from_ranked(recs)
-        except Exception:
-            pass  # chain query failed — show all recommendations
+                recs = filtered
+                print(f"  Filtered to {len(recs)} on-chain registered models")
+                if capacity_audit_required:
+                    from neurons.model_resolve import _capacity_eligible_recommendations_from_ranked
+                    recs = _capacity_eligible_recommendations_from_ranked(recs)
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not verify registered models. Check your network/RPC connection "
+                "and retry setup. No model was selected."
+            ) from exc
+        finally:
+            _spinner_done.set()
+            if _t is not None:
+                _t.join()
 
     if not recs:
-        print(yellow("  No models found for this GPU tier."))
-        return {"model_id": "auto", "category": None}
+        raise RuntimeError(
+            "No registered vLLM model is available for this GPU on the selected network. "
+            "Consider the Sleipnir mesh backend to contribute GPU capacity. "
+            "No model was selected."
+        )
 
     if capacity_audit_required:
         print("  Hot-capacity audit eligible models:")
