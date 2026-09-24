@@ -122,6 +122,11 @@ _FINAL_STAGE_TENSOR_NAMES = frozenset(
         "output_norm.weight",
         "model.norm.weight",
         "transformer.ln_f.weight",
+        # Hyper-connection stream merge in front of the output norm: a
+        # committed GEMM weight outside any blk.N, owned by the head stage.
+        "output_hc_fn.weight",
+        "output_hc_base.weight",
+        "output_hc_scale.weight",
     }
 )
 _GGML_POLICY_CONTEXT_FIELDS = (

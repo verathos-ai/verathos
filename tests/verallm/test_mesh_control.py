@@ -9527,6 +9527,61 @@ def test_slot_view_template_rejects_historical_whole_model_after_split(tmp_path)
     assert len(loader(tmp_path, layer_start=0, layer_end=2, model_total_layers=2)) == 3
 
 
+def test_trace_layer_index_owns_hyper_connection_head_tensors():
+    from verallm.mesh.ggml_proof import _trace_layer_index
+
+    for name in (
+        "output_hc_fn.weight",
+        "output_hc_base.weight",
+        "output_hc_scale.weight",
+    ):
+        assert (
+            _trace_layer_index(
+                {"tensor_name": name, "src0_name": name},
+                layer_start=40,
+                layer_end=43,
+                model_total_layers=43,
+            )
+            == 42
+        )
+        with pytest.raises(RuntimeError, match="outside the final stage"):
+            _trace_layer_index(
+                {"tensor_name": name, "src0_name": name},
+                layer_start=0,
+                layer_end=20,
+                model_total_layers=43,
+            )
+
+
+def test_slot_view_template_keeps_hyper_connection_head_gemm(tmp_path):
+    """A stage-bounded template must place every committed weight in a
+    layer. Hyper-connection models merge the residual streams with a GEMM
+    weight that sits outside every blk.N; if that name is unknown the whole
+    template is rejected and the stage can never commit a trace."""
+    mods = _slot_view_imports()
+    loader = mods["find_slot_view_template_for_window"]
+    path = tmp_path / "manifest-1000.vmanifest"
+    path.write_text("\n".join([
+        _v3_row(1000, 1, "blk.0.attn_q.weight", 1, 1, 0),
+        _v3_row(1001, 2, "output_hc_fn.weight", 1, 1, 1),
+        _v3_row(1002, 3, "output.weight", 1, 1, 2),
+    ]) + "\n", encoding="utf-8")
+    template = loader(tmp_path, file_token="1000", layer_start=0,
+                      layer_end=1, model_total_layers=1)
+    assert [op["tensor_name"] for op in template] == [
+        "blk.0.attn_q.weight",
+        "output_hc_fn.weight",
+        "output.weight",
+    ]
+    # A committed weight nobody can place still rejects the whole template.
+    path.write_text("\n".join([
+        _v3_row(1000, 1, "blk.0.attn_q.weight", 1, 1, 0),
+        _v3_row(1001, 2, "mystery_mix.weight", 1, 1, 1),
+    ]) + "\n", encoding="utf-8")
+    assert loader(tmp_path, file_token="1000", layer_start=0,
+                  layer_end=1, model_total_layers=1) == []
+
+
 def test_calibration_final_stage_template_uses_local_total_layers(tmp_path):
     from types import SimpleNamespace
     from verallm.mesh.worker import slot_template_model_layers
