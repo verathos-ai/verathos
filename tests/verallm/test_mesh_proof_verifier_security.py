@@ -482,7 +482,7 @@ def test_decode_verifier_optionally_binds_payload_to_graph_receipt_stage() -> No
     assert "graph receipt stage" in result.message
 
 
-def _secure_transcript_proof(tmp_path: Path):
+def _secure_transcript_proof(tmp_path: Path, tensor_name="blk.0.attn_q.weight"):
     k, n = 4, 130
     x = np.asarray([[1.0, -1.0, 0.5, 2.0]], dtype=np.float32)
     w = np.arange(k * n, dtype=np.float32).reshape(k, n) / 10.0
@@ -498,8 +498,8 @@ def _secure_transcript_proof(tmp_path: Path):
         created_unix_ns=7,
         graph_id="secure-graph",
         op_index=3,
-        tensor_name="blk.0.attn_q.weight",
-        src0_name="blk.0.attn_q.weight",
+        tensor_name=tensor_name,
+        src0_name=tensor_name,
         src1_name="secure-x",
         dst_name="secure-y",
         src0_shape=(k, n, 1, 1),
@@ -591,6 +591,53 @@ def _recommit_payload(payload: dict, receipt: dict) -> tuple[dict, dict]:
     payload["proof_commitment_hash"] = ggml_proof_payload_commitment_hash(payload)
     receipt["proof_commitment_hash"] = payload["proof_commitment_hash"]
     return payload, receipt
+
+
+@pytest.mark.parametrize("tensor_name", [
+    "output_hc_fn.weight", "output_hc_base.weight", "output_hc_scale.weight",
+])
+def test_hyper_connection_head_proof_roundtrip_and_stage_exclusion(
+    tmp_path: Path, tensor_name: str, monkeypatch,
+) -> None:
+    proof, receipt, context, trace, entry = _secure_transcript_proof(
+        tmp_path, tensor_name=tensor_name,
+    )
+    result = verify_ggml_gemm_proof_payload(
+        proof.proof_payload, receipt=receipt, mesh_receipt=context,
+    )
+    assert result.verified, result.message
+
+    # Knowing the tensor name must not permit proving it in an earlier stage.
+    wrong_stage = {**context, "model_total_layers": 2}
+    with pytest.raises(RuntimeError, match="outside the final stage"):
+        prove_ggml_mul_mat_trace(
+            trace, wrong_stage, tolerance_abs=1e-6, include_proof=True,
+            op_manifest_membership=op_manifest_membership_payload(
+                [entry], trace, stage_index=0,
+            ),
+            verify_before_return=False,
+        )
+
+    # A correctly generated proof cannot be replayed under altered geometry.
+    result = verify_ggml_gemm_proof_payload(
+        proof.proof_payload, receipt=receipt, mesh_receipt=wrong_stage,
+    )
+    assert not result.verified
+
+    # Reproduce the published verifier's omission on the same valid proof.
+    # A history of passing random samples cannot qualify this missing case.
+    from verallm.mesh import ggml_proof
+    monkeypatch.setattr(
+        ggml_proof, "_FINAL_STAGE_TENSOR_NAMES",
+        ggml_proof._FINAL_STAGE_TENSOR_NAMES - {
+            "output_hc_fn.weight", "output_hc_base.weight", "output_hc_scale.weight",
+        },
+    )
+    result = verify_ggml_gemm_proof_payload(
+        proof.proof_payload, receipt=receipt, mesh_receipt=context,
+    )
+    assert not result.verified
+    assert "ownership cannot be established" in result.message
 
 
 def test_transcript_label_is_recomputed_not_read_from_payload(tmp_path: Path) -> None:
