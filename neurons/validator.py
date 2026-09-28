@@ -17310,6 +17310,15 @@ class ValidatorNeuron:
         bt.logging.info(f"Identity mismatch for {miner.endpoint}: expected {miner.address[:10]}, recovered {recovered[:10]}")
         return False
 
+    # Optional OpenAI request fields a miner may advertise via /health.
+    # Anything outside this allowlist is ignored so a miner cannot inject
+    # arbitrary capability strings into the public /v1/models listing.
+    _ADVERTISABLE_SUPPORTED_PARAMETERS = (
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+    )
+
     def _fetch_miner_hardware_status(
         self,
         miner: ActiveMiner,
@@ -17337,6 +17346,15 @@ class ValidatorNeuron:
                     }
                 )
                 if isinstance(versions, list)
+                else []
+            )
+            params = data.get("supported_parameters")
+            miner.supported_parameters = (
+                [
+                    p for p in self._ADVERTISABLE_SUPPORTED_PARAMETERS
+                    if p in {x for x in params if isinstance(x, str)}
+                ]
+                if isinstance(params, list)
                 else []
             )
             if "hardware" not in data:
@@ -18586,6 +18604,9 @@ class ValidatorNeuron:
                 vram_gb=getattr(m, "vram_gb", 0),
                 compute_capability=getattr(m, "compute_capability", ""),
                 gpu_uuids=getattr(m, "gpu_uuids", []),
+                supported_parameters=list(
+                    getattr(m, "supported_parameters", []) or []
+                ),
                 expires_at=int(getattr(m, "expires_at", 0) or 0),
             )
             for m in miners

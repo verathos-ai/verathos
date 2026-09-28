@@ -59,6 +59,11 @@ class MinerEntry:
     vram_gb: int = 0
     compute_capability: str = ""
     gpu_uuids: List[str] = field(default_factory=list)
+    # Optional OpenAI request fields advertised by the miner's /health
+    # (validator-filtered allowlist).  The proxy aggregates these per model
+    # into GET /v1/models ``supported_parameters`` and uses them to route
+    # tool-calling requests.
+    supported_parameters: List[str] = field(default_factory=list)
     # On-chain lease expiry (unix seconds) as read at this epoch's discovery.
     # Refreshed on every shared-state write, so renewals are reflected; 0
     # means the lease is unknown, never that it expired.
@@ -210,7 +215,9 @@ def write_shared_state(
              "mesh_enabled": m.mesh_enabled,
              "gpu_name": m.gpu_name, "gpu_count": m.gpu_count,
              "vram_gb": m.vram_gb, "compute_capability": m.compute_capability,
-             "gpu_uuids": m.gpu_uuids, "expires_at": m.expires_at}
+             "gpu_uuids": m.gpu_uuids,
+             "supported_parameters": list(m.supported_parameters or []),
+             "expires_at": m.expires_at}
             for m in state.miner_endpoints
         ],
         "mesh_verification_snapshots": state.mesh_verification_snapshots,

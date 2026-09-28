@@ -47,6 +47,9 @@ class ActiveMiner:
     compute_capability: str = ""
     gpu_uuids: List[str] = field(default_factory=list)
     proof_protocol_versions: List[int] = field(default_factory=list)
+    # Optional OpenAI request fields this endpoint can serve (from /health),
+    # e.g. ["tools", "tool_choice", "parallel_tool_calls"].
+    supported_parameters: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # The on-chain quant marker is authoritative.  Preserve an explicit
