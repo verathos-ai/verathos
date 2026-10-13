@@ -3026,6 +3026,13 @@ def main():
         endpoint=args.endpoint,
         auto_update="enabled" if args.auto_update else "disabled",
     )
+    from neurons.decide_migration import miner_notice
+
+    decide_notice = miner_notice(
+        args.wallet, args.hotkey if args.wallet else None, config.netuid,
+    )
+    if decide_notice:
+        bt.logging.critical(decide_notice)
 
     if mesh_mode:
         # Mesh coordinator invocation: bind the public coordinator and pass

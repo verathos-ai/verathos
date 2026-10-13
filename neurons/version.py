@@ -21,8 +21,8 @@ _VERSION_BASE = 1_000
 # Release identity is independent of automatic-update thresholds. An opt-in
 # release advances these constants without advancing MINER_* or VALIDATOR_*.
 RELEASE_MAJOR = 0
-RELEASE_MINOR = 2
-RELEASE_PATCH = 3
+RELEASE_MINOR = 3
+RELEASE_PATCH = 1
 
 
 def _encode(major: int, minor: int, patch: int) -> int:
@@ -63,8 +63,8 @@ miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 # Opt-in code releases retain this threshold. Both roles use this comparison.
 
 VALIDATOR_MAJOR = 0
-VALIDATOR_MINOR = 2
-VALIDATOR_PATCH = 3
+VALIDATOR_MINOR = 3
+VALIDATOR_PATCH = 0
 
 validator_version: int = _encode(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)
 validator_version_str: str = _version_str(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)

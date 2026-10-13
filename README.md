@@ -1,3 +1,8 @@
+> **SN96 moves to Verathos Decide on 2026-10-15.** See
+> [Verathos Decide](https://github.com/verathos-ai/verathos-decide) for the new
+> miner and validator setup. The legacy `verathos.ai/docs`, `/chat`, and setup
+> links below will no longer be available after the transition.
+
 <p align="center">
   <strong>Verathos</strong><br>
   The verifiable serving layer for Bittensor intelligence

@@ -7052,9 +7052,11 @@ class ValidatorNeuron:
                 key: list(value)
                 for key, value in self._busy_skip_probations.items()
             }
+            # Planned with the epoch's canaries: a validator that has found no
+            # miners since its start has none, and its epoch still closes.
             canary_error_times = {
                 key: list(value)
-                for key, value in self._canary_error_times.items()
+                for key, value in getattr(self, "_canary_error_times", {}).items()
             }
         with self._shared_hard_prefetch_lock:
             shared_prefetch = dict(self._shared_hard_prefetch_results)
@@ -7078,7 +7080,7 @@ class ValidatorNeuron:
             _canary_penalized_keys=set(self._canary_penalized_keys),
             _busy_skips=dict(self._busy_skips),
             _busy_skip_probations=busy_probations,
-            _canary_errors=dict(self._canary_errors),
+            _canary_errors=dict(getattr(self, "_canary_errors", {})),
             _canary_error_times=canary_error_times,
             # Mesh score provenance binds each slot EMA to the exact signed
             # topology of the closing epoch; freeze the pinned snapshots so
@@ -7193,6 +7195,8 @@ class ValidatorNeuron:
                             self.scorer.throughput_power = (
                                 active_scoring.throughput_power
                             )
+                        # Before the weights: a due migration stops them.
+                        self._check_decide_migration()
                         if bool(state.weight_update_due):
                             self._schedule_weight_update()
                         return
@@ -7929,9 +7933,30 @@ class ValidatorNeuron:
             queue_row=oldest,
             current_block=int(block_number),
         )
+
+    def _check_decide_migration(self) -> None:
+        """Evaluate the decide migration after an epoch close."""
+
+        migration = getattr(self, "_decide_migration", None)
+        if migration is None:
+            return
+        try:
+            migration.on_epoch_close()
+        except Exception as exc:
+            bt.logging.error(f"decide migration check failed: {exc}")
+
+    def _weight_updates_idle(self) -> bool:
+        """Return whether no weight submission is queued or in flight."""
+
+        with self._weight_update_lock:
+            return int(self._weight_updates_pending) == 0
+
     def _auto_update_busy(self) -> bool:
         """Return whether restarting could destroy live validator work."""
 
+        migration = getattr(self, "_decide_migration", None)
+        if migration is not None and migration.busy:
+            return True
         if bool(getattr(self, "_epoch_setup_in_progress", False)):
             return True
         weight_lock = getattr(self, "_weight_update_lock", None)
@@ -18662,6 +18687,14 @@ class ValidatorNeuron:
 
     def _set_weights(self, weights: Dict[int, float]) -> bool:
         """Set weights on Bittensor substrate."""
+        migration = getattr(self, "_decide_migration", None)
+        if migration is not None and not migration.weights_allowed():
+            bt.logging.warning(
+                "Weight submission stopped: this hotkey moves to (or runs) "
+                "the decide validator; computed weights were not sent to "
+                "Subtensor"
+            )
+            return False
         if not getattr(self, "_weight_setting_enabled", True):
             bt.logging.info(
                 "Weight submission disabled (--no-set-weights); "
@@ -20161,6 +20194,22 @@ def build_validator_config(args) -> NeuronConfig:
     return config
 
 
+def _start_decide_migration(config, *, dry_run: bool = False):
+    """Run the decide migration's start check; None when it cannot load."""
+    from neurons.decide_migration import DecideMigration
+
+    try:
+        migration = DecideMigration.for_validator(config, dry_run=dry_run)
+    except Exception as exc:
+        bt.logging.warning(f"decide migration unavailable: {exc}")
+        return None
+    try:
+        migration.startup()
+    except Exception as exc:
+        bt.logging.error(f"decide migration start check failed: {exc}")
+    return migration
+
+
 def main():
     from neurons.log import setup_neuron_logging, print_banner
 
@@ -20169,7 +20218,15 @@ def main():
     setup_neuron_logging(args)
 
     config = build_validator_config(args)
+    # Before any validator work and before the auto-updater: a retired
+    # validator hands over to decide here, and a due migration runs here.
+    decide_migration = _start_decide_migration(
+        config, dry_run=bool(args.no_set_weights),
+    )
     neuron = ValidatorNeuron(config)
+    neuron._decide_migration = decide_migration
+    if decide_migration is not None:
+        decide_migration.weights_idle = neuron._weight_updates_idle
     neuron._weight_setting_enabled = not args.no_set_weights
     if not neuron._weight_setting_enabled:
         bt.logging.warning(
