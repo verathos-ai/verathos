@@ -54,7 +54,7 @@ DECIDE_TAG_SIGNERS = (
     'verathos-release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA7pWYysUPrBGrcYGk0BPMaWN9Li0S+czHKLlmsn3bal\n'
 )
 # First block at which validators move, per netuid. A netuid without a block never moves.
-NOT_BEFORE_BLOCK: dict[int, Optional[int]] = {96: None, 405: None}
+NOT_BEFORE_BLOCK: dict[int, Optional[int]] = {96: 9288720, 405: None}
 # The chain's name per netuid: decide's network when it does not reach this validator's node (see decide_network).
 CHAIN_NAMES = {96: "finney", 405: "test"}
 
